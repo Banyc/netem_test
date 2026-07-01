@@ -177,49 +177,6 @@ impl LossModel {
     }
 }
 
-// ─────────────────────────── token bucket ──────────────────────────────
-
-/// A simple token bucket for rate-limiting. Tokens are bytes; capacity equals
-/// `rate * burst` (burst in seconds, rounded up). Separate buckets must be
-/// kept per direction, as the spec requires.
-#[derive(Clone, Debug)]
-pub struct TokenBucket {
-    rate_bps: u64,
-    capacity: u64,
-    tokens: u64,
-    last: Instant,
-}
-
-impl TokenBucket {
-    pub fn new(rate_bps: u64, burst: Duration) -> Self {
-        let capacity = rate_bps.saturating_mul(burst.as_secs());
-        Self {
-            rate_bps,
-            capacity,
-            tokens: capacity,
-            last: Instant::now(),
-        }
-    }
-
-    /// Refill then attempt to consume `bytes` tokens. Returns `true` if the
-    /// packet is admitted.
-    pub fn try_consume(&mut self, bytes: u64, now: Instant) -> bool {
-        if self.rate_bps == 0 {
-            return true;
-        }
-        let elapsed = now.saturating_duration_since(self.last);
-        let refill = self.rate_bps.saturating_mul(elapsed.as_nanos() as u64) / 1_000_000_000;
-        self.tokens = self.capacity.min(self.tokens.saturating_add(refill));
-        self.last = now;
-        if self.tokens >= bytes {
-            self.tokens -= bytes;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 // ──────────────────────────── UDP transport ────────────────────────────
 
 /// Abstract UDP datagram transport.
@@ -296,8 +253,6 @@ pub struct NetemConfig {
     pub loss_model: LossModel,
     /// Rate limit in bits/s; `0` disables rate-limiting.
     pub rate: u64,
-    /// Token-bucket burst duration.
-    pub burst: Duration,
     /// PRNG seed for deterministic behaviour.
     pub seed: u64,
 }
@@ -317,7 +272,6 @@ impl Default for NetemConfig {
             gap: 0,
             loss_model: LossModel::default(),
             rate: 0,
-            burst: Duration::from_millis(10),
             seed: 0xC0FF_EEBE_EFC0_FFEE,
         }
     }
@@ -470,7 +424,9 @@ struct Runner {
     dup_cor: CorRng,
     reorder_cor: CorRng,
     clg: FourState,
-    bucket: TokenBucket,
+    /// Earliest time the next packet may be serialized (send-time shaper).
+    /// Tracks the per-direction serialization backlog for rate limiting.
+    next_send: Instant,
     queue: VecDeque<Queued>,
     reorder_counter: u32,
 }
@@ -490,7 +446,7 @@ impl Runner {
             loss_cor: CorRng::new(config.loss_corr),
             dup_cor: CorRng::new(config.dup_corr),
             reorder_cor: CorRng::new(config.reorder_corr),
-            bucket: TokenBucket::new(config.rate, config.burst),
+            next_send: Instant::now(),
             config,
             server_addr,
             stats,
@@ -561,22 +517,10 @@ impl Runner {
             return;
         }
 
-        // ── rate limit ───────────────────────────────────────────────
-        if self.config.rate != 0 {
-            let bytes = (data.len() as u64) * 8;
-            for _ in 0..count {
-                if !self.bucket.try_consume(bytes, now) {
-                    let mut s = self.stats.lock().unwrap();
-                    s.rate_limited += 1;
-                    // drop this copy
-                } else {
-                    self.enqueue(data, now);
-                }
-            }
-        } else {
-            for _ in 0..count {
-                self.enqueue(data, now);
-            }
+        // ── rate limit (send-time shaping) ──────────────────────────────
+        // netem rate delays packets by serialization time, never drops them.
+        for _ in 0..count {
+            self.enqueue(data, now);
         }
     }
 
@@ -601,13 +545,16 @@ impl Runner {
 
     fn enqueue(&mut self, data: &[u8], now: Instant) {
         // ── reorder ──────────────────────────────────────────────────
+        // Reorder only when gap != 0 and only after the reorder counter
+        // reaches gap - 1; use "reorder >= random" like sch_netem.
         let reorder = self.config.gap != 0
-            && self.reorder_counter < self.config.gap - 1
-            && self.config.reorder < self.reorder_cor.next(&mut self.rng);
+            && self.reorder_counter >= self.config.gap - 1
+            && self.config.reorder >= self.reorder_cor.next(&mut self.rng);
 
-        let (time_to_send, reordered) = if reorder {
+        let base = if reorder {
             self.reorder_counter = 0;
-            (now, true)
+            // Reordered packet is scheduled immediately.
+            now
         } else {
             let delay = self.sample_delay();
             self.reorder_counter = self.reorder_counter.wrapping_add(1);
@@ -615,10 +562,30 @@ impl Runner {
                 let mut s = self.stats.lock().unwrap();
                 s.delayed += 1;
             }
-            (now + delay, false)
+            now + delay
         };
 
-        if reordered {
+        // ── rate shaping ─────────────────────────────────────────────
+        // Schedule after max(now + configured_delay, previous scheduled
+        // send time) + packet_bits / rate_bps.
+        let time_to_send = if self.config.rate != 0 {
+            let packet_bits = (data.len() as u64).saturating_mul(8);
+            let serialize = Duration::from_nanos(
+                packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
+            );
+            let earliest = base.max(self.next_send);
+            let t = earliest + serialize;
+            self.next_send = t;
+            if t != base {
+                let mut s = self.stats.lock().unwrap();
+                s.rate_limited += 1;
+            }
+            t
+        } else {
+            base
+        };
+
+        if reorder {
             let mut s = self.stats.lock().unwrap();
             s.reordered += 1;
         }
@@ -823,7 +790,9 @@ struct DirectionRunner {
     dup_cor: CorRng,
     reorder_cor: CorRng,
     clg: FourState,
-    bucket: TokenBucket,
+    /// Earliest time the next packet may be serialized (send-time shaper).
+    /// Tracks the per-direction serialization backlog for rate limiting.
+    next_send: Instant,
     queue: VecDeque<Queued>,
     reorder_counter: u32,
 }
@@ -845,7 +814,7 @@ impl DirectionRunner {
             loss_cor: CorRng::new(config.loss_corr),
             dup_cor: CorRng::new(config.dup_corr),
             reorder_cor: CorRng::new(config.reorder_corr),
-            bucket: TokenBucket::new(config.rate, config.burst),
+            next_send: Instant::now(),
             queue_len: Arc::new(Mutex::new(0)),
             config,
             stats,
@@ -919,20 +888,10 @@ impl DirectionRunner {
             return;
         }
 
-        if self.config.rate != 0 {
-            let bytes = (data.len() as u64) * 8;
-            for _ in 0..count {
-                if !self.bucket.try_consume(bytes, now) {
-                    let mut s = self.stats.lock().unwrap();
-                    s.rate_limited += 1;
-                } else {
-                    self.enqueue(data, now);
-                }
-            }
-        } else {
-            for _ in 0..count {
-                self.enqueue(data, now);
-            }
+        // ── rate limit (send-time shaping) ──────────────────────────────
+        // netem rate delays packets by serialization time, never drops them.
+        for _ in 0..count {
+            self.enqueue(data, now);
         }
     }
 
@@ -953,13 +912,17 @@ impl DirectionRunner {
     }
 
     fn enqueue(&mut self, data: &[u8], now: Instant) {
+        // ── reorder ──────────────────────────────────────────────────
+        // Reorder only when gap != 0 and only after the reorder counter
+        // reaches gap - 1; use "reorder >= random" like sch_netem.
         let reorder = self.config.gap != 0
-            && self.reorder_counter < self.config.gap - 1
-            && self.config.reorder < self.reorder_cor.next(&mut self.rng);
+            && self.reorder_counter >= self.config.gap - 1
+            && self.config.reorder >= self.reorder_cor.next(&mut self.rng);
 
-        let (time_to_send, reordered) = if reorder {
+        let base = if reorder {
             self.reorder_counter = 0;
-            (now, true)
+            // Reordered packet is scheduled immediately.
+            now
         } else {
             let delay = self.sample_delay();
             self.reorder_counter = self.reorder_counter.wrapping_add(1);
@@ -967,10 +930,30 @@ impl DirectionRunner {
                 let mut s = self.stats.lock().unwrap();
                 s.delayed += 1;
             }
-            (now + delay, false)
+            now + delay
         };
 
-        if reordered {
+        // ── rate shaping ─────────────────────────────────────────────
+        // Schedule after max(now + configured_delay, previous scheduled
+        // send time) + packet_bits / rate_bps.
+        let time_to_send = if self.config.rate != 0 {
+            let packet_bits = (data.len() as u64).saturating_mul(8);
+            let serialize = Duration::from_nanos(
+                packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
+            );
+            let earliest = base.max(self.next_send);
+            let t = earliest + serialize;
+            self.next_send = t;
+            if t != base {
+                let mut s = self.stats.lock().unwrap();
+                s.rate_limited += 1;
+            }
+            t
+        } else {
+            base
+        };
+
+        if reorder {
             let mut s = self.stats.lock().unwrap();
             s.reordered += 1;
         }
@@ -1046,26 +1029,6 @@ mod tests {
             }
         }
         assert!(diffs > 60);
-    }
-
-    #[test]
-    fn token_bucket_admits_within_rate() {
-        let mut tb = TokenBucket::new(8_000, Duration::from_secs(1)); // 8 kbit/s, 1 s burst
-        let now = Instant::now();
-        // capacity = 8000 bits; consuming the full capacity empties the bucket.
-        assert!(tb.try_consume(8_000, now));
-        // bucket should be empty now
-        assert!(!tb.try_consume(1, now));
-        // after 1s, refilled
-        let later = now + Duration::from_secs(1);
-        assert!(tb.try_consume(8_000, later));
-    }
-
-    #[test]
-    fn token_bucket_zero_rate_always_admits() {
-        let mut tb = TokenBucket::new(0, Duration::ZERO);
-        let now = Instant::now();
-        assert!(tb.try_consume(u64::MAX / 2, now));
     }
 
     #[test]

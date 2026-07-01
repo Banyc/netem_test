@@ -151,25 +151,33 @@ fn netem_duplicate_produces_extra_packets() {
 #[ignore]
 fn netem_rate_limit_throttles_burst() {
     let (recv, server) = recv_socket();
-    // 8 kbit/s, 10 ms burst => capacity 80 bits. Each 8-byte payload = 64 bits.
-    // So roughly one packet per ~8ms; 20 packets should take >= ~150ms.
+    // 8 kbit/s. Each 8-byte payload = 64 bits, so serialization time is
+    // 8 ms per packet. With no latency, the send-time shaper spreads a
+    // 20-packet burst across ~160 ms instead of dropping anything.
     let cfg = NetemConfig {
         rate: 8_000,
-        burst: Duration::from_millis(10),
         ..NetemConfig::default()
     };
     let link = NetemLink::spawn(server, cfg).unwrap();
     let (got, elapsed) = burst(&link, &recv, 20, b"r", Duration::from_secs(2));
     link.stop();
     let stats = link.stats();
+    // Send-time shaping delays packets; it must never drop them.
+    assert_eq!(
+        stats.dropped, 0,
+        "rate shaping must not drop packets, got {stats:?}"
+    );
+    assert_eq!(
+        got, 20,
+        "all shaped packets should eventually be delivered, got {got}"
+    );
     assert!(
         stats.rate_limited > 0,
-        "some packets should be rate-limited"
+        "some packets should be rate-shaped, got {stats:?}"
     );
-    assert!(got < 20, "not all should be delivered in time, got {got}");
     assert!(
         elapsed >= Duration::from_millis(120),
-        "rate limit should spread delivery, got {elapsed:?}"
+        "rate shaping should spread delivery, got {elapsed:?}"
     );
 }
 
