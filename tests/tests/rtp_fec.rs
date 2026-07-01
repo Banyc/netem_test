@@ -1,0 +1,54 @@
+//! `rtp` + FEC recovery scenarios through [`netem_test::NetemPair`].
+//!
+//! Verifies that `rtp` with forward error correction enabled recovers lost
+//! data symbols via parity even when the netem proxy drops a few percent of
+//! packets in each direction.
+//!
+//! Run with:
+//!
+//! ```sh
+//! cargo test --test rtp_fec -- --ignored --nocapture --test-threads=1
+//! ```
+
+use std::time::Duration;
+
+use netem_test::{NetemConfig, NetemPair};
+use support::{
+    combined_stats, payload, rtp_connect, rtp_echo_payload, spawn_rtp_echo_server, with_timeout,
+};
+
+mod support;
+
+/// `rtp` with FEC enabled should recover under ~3% netem loss in each
+/// direction — the byte stream must arrive intact.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rtp_with_fec_recovers_under_netem_loss() {
+    let server_addr = spawn_rtp_echo_server(true).await.unwrap();
+
+    let lossy = NetemConfig {
+        loss: u32::MAX / 33, // ~3%
+        latency: Duration::from_millis(5),
+        seed: 99,
+        ..NetemConfig::default()
+    };
+    let pair = NetemPair::spawn(server_addr, lossy.clone(), lossy).unwrap();
+    let (read, write) = rtp_connect(pair.client_addr(), true).await;
+
+    let payload = payload(1024 * 1024);
+    let got = with_timeout(
+        Duration::from_secs(90),
+        "rtp+FEC 1MiB echo",
+        rtp_echo_payload(read, write, &payload),
+    )
+    .await;
+
+    assert_eq!(got, payload, "FEC + reliable layer must recover all data");
+
+    pair.stop();
+    let stats = combined_stats(&pair);
+    assert!(
+        stats.dropped > 0,
+        "proxy should have dropped some packets, got {stats:?}"
+    );
+}
