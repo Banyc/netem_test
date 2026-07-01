@@ -226,7 +226,7 @@ impl TokenBucket {
 ///
 /// Implemented as a trait object (`Box<dyn UdpTransport>`) so the harness can
 /// run against either real OS sockets or an in-memory loopback in tests.
-pub trait UdpTransport: Send + 'static {
+pub trait UdpTransport: Send + Sync + 'static {
     /// Receive a datagram into `buf`, returning `(len, from)`.
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
 
@@ -654,6 +654,365 @@ impl Runner {
             let Queued { data, dst, .. } = self.queue.pop_front().unwrap();
             *self.queue_len.lock().unwrap() = self.queue.len();
             if self.transport.send_to(&data, dst).is_ok() {
+                let mut s = self.stats.lock().unwrap();
+                s.forwarded += 1;
+            }
+        }
+    }
+}
+
+// ─────────────────────── bidirectional link ──────────────────────────────
+
+/// A running bidirectional emulated link. Datagrams arriving on the
+/// client-side socket are impaired per `c2s` and forwarded to the real
+/// server; datagrams arriving on the server-side socket (i.e. replies from
+/// the real server) are impaired per `s2c` and forwarded back to the client
+/// whose address is learned from the first client→server packet.
+///
+/// Dropping the handle does not stop the proxy threads; call
+/// [`NetemPair::stop`] for that.
+pub struct NetemPair {
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
+    stats_c2s: Arc<Mutex<Stats>>,
+    stats_s2c: Arc<Mutex<Stats>>,
+    stop: Arc<Mutex<bool>>,
+}
+
+impl NetemPair {
+    /// Spawn a bidirectional proxy. Clients send to the returned
+    /// [`NetemPair::client_addr`]; the proxy forwards to `server_addr` with
+    /// `c2s` impairment and forwards the server's replies back to the client
+    /// with `s2c` impairment. The client's return address is learned from the
+    /// first packet received on the client-side socket.
+    pub fn spawn(server_addr: SocketAddr, c2s: NetemConfig, s2c: NetemConfig) -> io::Result<Self> {
+        let localhost = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        Self::spawn_on(server_addr, c2s, s2c, localhost, localhost)
+    }
+
+    /// Spawn with explicit bind addresses for the two proxy sockets.
+    pub fn spawn_on(
+        server_addr: SocketAddr,
+        c2s: NetemConfig,
+        s2c: NetemConfig,
+        client_bind: SocketAddr,
+        server_bind: SocketAddr,
+    ) -> io::Result<Self> {
+        let client_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(client_bind)?);
+        let server_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(server_bind)?);
+        let client_addr = client_sock.local_addr()?;
+        Self::spawn_from_sockets(server_addr, c2s, s2c, client_sock, server_sock, client_addr)
+    }
+
+    fn spawn_from_sockets(
+        server_addr: SocketAddr,
+        c2s: NetemConfig,
+        s2c: NetemConfig,
+        client_sock: Box<dyn UdpTransport>,
+        server_sock: Box<dyn UdpTransport>,
+        client_addr: SocketAddr,
+    ) -> io::Result<Self> {
+        let stats_c2s = Arc::new(Mutex::new(Stats::default()));
+        let stats_s2c = Arc::new(Mutex::new(Stats::default()));
+        let stop = Arc::new(Mutex::new(false));
+        let learned_client = Arc::new(Mutex::<Option<SocketAddr>>::new(None));
+
+        let pair = Self {
+            client_addr,
+            server_addr,
+            stats_c2s: Arc::clone(&stats_c2s),
+            stats_s2c: Arc::clone(&stats_s2c),
+            stop: Arc::clone(&stop),
+        };
+
+        // Both sockets are shared between the two runners via `Arc`: each
+        // direction uses one socket to recv and the other to send.
+        let client_sock: Arc<dyn UdpTransport> = Arc::from(client_sock);
+        let server_sock: Arc<dyn UdpTransport> = Arc::from(server_sock);
+
+        // c2s: recv on client_sock, send on server_sock to server_addr; learn
+        // the client's address from the first packet.
+        let c2s_runner = DirectionRunner::new(
+            c2s,
+            stats_c2s,
+            Arc::clone(&stop),
+            Arc::clone(&client_sock),
+            Arc::clone(&server_sock),
+            Some(server_addr),
+            Arc::clone(&learned_client),
+        );
+        std::thread::Builder::new()
+            .name("netem-c2s".into())
+            .spawn(move || c2s_runner.run())?;
+
+        // s2c: recv on server_sock, send on client_sock to the learned client
+        // address.
+        let s2c_runner = DirectionRunner::new(
+            s2c,
+            stats_s2c,
+            stop,
+            server_sock,
+            client_sock,
+            None,
+            learned_client,
+        );
+        std::thread::Builder::new()
+            .name("netem-s2c".into())
+            .spawn(move || s2c_runner.run())?;
+
+        Ok(pair)
+    }
+
+    /// Address clients should send to.
+    pub fn client_addr(&self) -> SocketAddr {
+        self.client_addr
+    }
+
+    /// Address the proxy forwards client packets to (the real server).
+    pub fn server_addr(&self) -> SocketAddr {
+        self.server_addr
+    }
+
+    /// Stats for the client→server direction.
+    pub fn stats_c2s(&self) -> Stats {
+        *self.stats_c2s.lock().unwrap()
+    }
+
+    /// Stats for the server→client direction.
+    pub fn stats_s2c(&self) -> Stats {
+        *self.stats_s2c.lock().unwrap()
+    }
+
+    /// Combined stats across both directions.
+    pub fn stats(&self) -> Stats {
+        let a = self.stats_c2s();
+        let b = self.stats_s2c();
+        Stats {
+            delayed: a.delayed + b.delayed,
+            dropped: a.dropped + b.dropped,
+            duplicated: a.duplicated + b.duplicated,
+            reordered: a.reordered + b.reordered,
+            rate_limited: a.rate_limited + b.rate_limited,
+            forwarded: a.forwarded + b.forwarded,
+            received: a.received + b.received,
+        }
+    }
+
+    /// Signal both proxy threads to stop after the next iteration.
+    pub fn stop(&self) {
+        *self.stop.lock().unwrap() = true;
+    }
+}
+
+// ─────────────────────── per-direction runner ────────────────────────────
+
+struct DirectionRunner {
+    config: NetemConfig,
+    stats: Arc<Mutex<Stats>>,
+    queue_len: Arc<Mutex<usize>>,
+    stop: Arc<Mutex<bool>>,
+    recv: Arc<dyn UdpTransport>,
+    send: Arc<dyn UdpTransport>,
+    /// Fixed destination (the real server for c2s). When `None`, the runner
+    /// uses the learned client address (`learned_dst`).
+    fixed_dst: Option<SocketAddr>,
+    learned_dst: Arc<Mutex<Option<SocketAddr>>>,
+    rng: RndState,
+    delay_cor: CorRng,
+    loss_cor: CorRng,
+    dup_cor: CorRng,
+    reorder_cor: CorRng,
+    clg: FourState,
+    bucket: TokenBucket,
+    queue: VecDeque<Queued>,
+    reorder_counter: u32,
+}
+
+impl DirectionRunner {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        config: NetemConfig,
+        stats: Arc<Mutex<Stats>>,
+        stop: Arc<Mutex<bool>>,
+        recv: Arc<dyn UdpTransport>,
+        send: Arc<dyn UdpTransport>,
+        fixed_dst: Option<SocketAddr>,
+        learned_dst: Arc<Mutex<Option<SocketAddr>>>,
+    ) -> Self {
+        let rng = RndState::seed(config.seed);
+        Self {
+            delay_cor: CorRng::new(config.delay_corr),
+            loss_cor: CorRng::new(config.loss_corr),
+            dup_cor: CorRng::new(config.dup_corr),
+            reorder_cor: CorRng::new(config.reorder_corr),
+            bucket: TokenBucket::new(config.rate, config.burst),
+            queue_len: Arc::new(Mutex::new(0)),
+            config,
+            stats,
+            stop,
+            recv,
+            send,
+            fixed_dst,
+            learned_dst,
+            rng,
+            clg: FourState::default(),
+            queue: VecDeque::new(),
+            reorder_counter: 0,
+        }
+    }
+
+    fn run(mut self) {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            if *self.stop.lock().unwrap() {
+                break;
+            }
+            self.drain_ready(Instant::now());
+
+            match self.recv.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    // For c2s, learn the client address so the s2c runner can
+                    // send replies back to it.
+                    if self.fixed_dst.is_some() {
+                        *self.learned_dst.lock().unwrap() = Some(from);
+                    }
+                    self.handle_datagram(&buf[..n], Instant::now());
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn handle_datagram(&mut self, data: &[u8], now: Instant) {
+        {
+            let mut s = self.stats.lock().unwrap();
+            s.received += 1;
+        }
+
+        let mut count = 1u32;
+        if self.config.duplicate != 0
+            && self.config.duplicate >= self.dup_cor.next(&mut self.rng)
+        {
+            count += 1;
+            let mut s = self.stats.lock().unwrap();
+            s.duplicated += 1;
+        }
+
+        if self.config.loss_model.loss(
+            &mut self.clg,
+            &mut self.loss_cor,
+            &mut self.rng,
+            self.config.loss,
+        ) {
+            let mut s = self.stats.lock().unwrap();
+            s.dropped += 1;
+            count = count.saturating_sub(1);
+        }
+
+        if count == 0 {
+            return;
+        }
+
+        if self.config.rate != 0 {
+            let bytes = (data.len() as u64) * 8;
+            for _ in 0..count {
+                if !self.bucket.try_consume(bytes, now) {
+                    let mut s = self.stats.lock().unwrap();
+                    s.rate_limited += 1;
+                } else {
+                    self.enqueue(data, now);
+                }
+            }
+        } else {
+            for _ in 0..count {
+                self.enqueue(data, now);
+            }
+        }
+    }
+
+    fn sample_delay(&mut self) -> Duration {
+        if self.config.jitter.is_zero() {
+            return self.config.latency;
+        }
+        let rnd = self.delay_cor.next(&mut self.rng);
+        let sigma = self.config.jitter.as_nanos() as u64;
+        let spread = rnd % (2 * sigma as u32);
+        let delta = (spread as i64) - (sigma as i64);
+        let ns = self.config.latency.as_nanos() as i64 + delta;
+        if ns < 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(ns as u64)
+        }
+    }
+
+    fn enqueue(&mut self, data: &[u8], now: Instant) {
+        let reorder = self.config.gap != 0
+            && self.reorder_counter < self.config.gap - 1
+            && self.config.reorder < self.reorder_cor.next(&mut self.rng);
+
+        let (time_to_send, reordered) = if reorder {
+            self.reorder_counter = 0;
+            (now, true)
+        } else {
+            let delay = self.sample_delay();
+            self.reorder_counter = self.reorder_counter.wrapping_add(1);
+            if !delay.is_zero() {
+                let mut s = self.stats.lock().unwrap();
+                s.delayed += 1;
+            }
+            (now + delay, false)
+        };
+
+        if reordered {
+            let mut s = self.stats.lock().unwrap();
+            s.reordered += 1;
+        }
+
+        let dst = self
+            .fixed_dst
+            .or_else(|| *self.learned_dst.lock().unwrap());
+        let Some(dst) = dst else {
+            // No known destination yet (s2c before the first client packet).
+            return;
+        };
+
+        let item = Queued {
+            time_to_send,
+            data: data.to_vec(),
+            dst,
+        };
+        if let Some(pos) = self
+            .queue
+            .iter()
+            .rposition(|q| q.time_to_send <= time_to_send)
+        {
+            self.queue.insert(pos + 1, item);
+        } else {
+            self.queue.push_front(item);
+        }
+        *self.queue_len.lock().unwrap() = self.queue.len();
+    }
+
+    fn drain_ready(&mut self, now: Instant) {
+        loop {
+            let front = self.queue.front();
+            let ready = match front {
+                Some(q) => q.time_to_send <= now,
+                None => false,
+            };
+            if !ready {
+                break;
+            }
+            let Queued { data, dst, .. } = self.queue.pop_front().unwrap();
+            *self.queue_len.lock().unwrap() = self.queue.len();
+            if self.send.send_to(&data, dst).is_ok() {
                 let mut s = self.stats.lock().unwrap();
                 s.forwarded += 1;
             }

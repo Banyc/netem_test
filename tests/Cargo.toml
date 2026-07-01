@@ -6,6 +6,9 @@ license.workspace = true
 
 [dev-dependencies]
 netem-test = { path = "../netem-test" }
+rtp = { path = "../../rtp" }
+mux = { path = "../../mux" }
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [lib]
 path = "src/lib.rs"
