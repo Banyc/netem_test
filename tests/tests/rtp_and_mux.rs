@@ -71,7 +71,10 @@ async fn netem_pair_bidirectional_raw_udp_echo() {
     assert_eq!(&buf[..n], b"bidir-hello");
     pair.stop();
     let stats = pair.stats();
-    assert!(stats.forwarded >= 2, "both directions should forward, got {stats:?}");
+    assert!(
+        stats.forwarded >= 2,
+        "both directions should forward, got {stats:?}"
+    );
 }
 
 /// Spawn an `rtp` server that accepts one connection and echoes back
@@ -117,12 +120,7 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 
     // Spawn the bidirectional proxy in front of the rtp server. The client
     // will connect to the proxy's `client_addr` instead of the server.
-    let pair = NetemPair::spawn(
-        server_addr.parse().unwrap(),
-        clean(),
-        clean(),
-    )
-    .unwrap();
+    let pair = NetemPair::spawn(server_addr.parse().unwrap(), clean(), clean()).unwrap();
     let proxy_client_addr = pair.client_addr().to_string();
 
     let connected =
@@ -156,12 +154,7 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 async fn rtp_over_netem_reliability_survives_mild_loss() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 
-    let pair = NetemPair::spawn(
-        server_addr.parse().unwrap(),
-        mild_loss(),
-        mild_loss(),
-    )
-    .unwrap();
+    let pair = NetemPair::spawn(server_addr.parse().unwrap(), mild_loss(), mild_loss()).unwrap();
     let proxy_client_addr = pair.client_addr().to_string();
 
     let connected =
@@ -251,9 +244,10 @@ async fn rtp_with_fec_recovers_under_netem_loss() {
     let pair = NetemPair::spawn(server_addr.parse().unwrap(), lossy.clone(), lossy).unwrap();
     let proxy_client_addr = pair.client_addr().to_string();
 
-    let connected = rtp::udp::connect_without_handshake("0.0.0.0:0", &proxy_client_addr, None, true)
-        .await
-        .unwrap();
+    let connected =
+        rtp::udp::connect_without_handshake("0.0.0.0:0", &proxy_client_addr, None, true)
+            .await
+            .unwrap();
 
     let mut read = connected.read.into_async_read();
     let mut write = connected.write.into_async_write();
@@ -298,7 +292,8 @@ async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<String> {
             heartbeat_interval: Duration::from_secs(5),
         };
         let mut spawner = tokio::task::JoinSet::new();
-        let (_opener, mut accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+        let (_opener, mut accepter) =
+            mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
 
         while let Ok((mut stream_read, mut stream_write)) = accepter.accept().await {
             tokio::spawn(async move {
@@ -328,12 +323,7 @@ async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<String> {
 async fn mux_over_rtp_over_netem_clean_link_echoes() {
     let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
 
-    let pair = NetemPair::spawn(
-        server_addr.parse().unwrap(),
-        clean(),
-        clean(),
-    )
-    .unwrap();
+    let pair = NetemPair::spawn(server_addr.parse().unwrap(), clean(), clean()).unwrap();
     let proxy_client_addr = pair.client_addr().to_string();
 
     let connected =
@@ -391,12 +381,7 @@ async fn mux_over_rtp_survives_netem_latency() {
         seed: 42,
         ..NetemConfig::default()
     };
-    let pair = NetemPair::spawn(
-        server_addr.parse().unwrap(),
-        impaired.clone(),
-        impaired,
-    )
-    .unwrap();
+    let pair = NetemPair::spawn(server_addr.parse().unwrap(), impaired.clone(), impaired).unwrap();
     let proxy_client_addr = pair.client_addr().to_string();
 
     let connected =

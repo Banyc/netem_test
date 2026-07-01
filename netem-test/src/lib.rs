@@ -547,13 +547,24 @@ impl Runner {
         // ── reorder ──────────────────────────────────────────────────
         // Reorder only when gap != 0 and only after the reorder counter
         // reaches gap - 1; use "reorder >= random" like sch_netem.
+        //
+        // Mirrors the Linux `sch_netem` branch structure: the normal
+        // branch applies delay and (optionally) rate shaping, while the
+        // reorder branch schedules the packet for immediate send (`now`)
+        // and resets the reorder counter — rate shaping is *not* applied
+        // to reordered packets, so they always jump ahead of the shaped
+        // tail.
         let reorder = self.config.gap != 0
             && self.reorder_counter >= self.config.gap - 1
             && self.config.reorder >= self.reorder_cor.next(&mut self.rng);
 
-        let base = if reorder {
+        let time_to_send = if reorder {
             self.reorder_counter = 0;
-            // Reordered packet is scheduled immediately.
+            {
+                let mut s = self.stats.lock().unwrap();
+                s.reordered += 1;
+            }
+            // Reordered packet is scheduled immediately; no rate shaping.
             now
         } else {
             let delay = self.sample_delay();
@@ -562,33 +573,29 @@ impl Runner {
                 let mut s = self.stats.lock().unwrap();
                 s.delayed += 1;
             }
-            now + delay
-        };
+            let base = now + delay;
 
-        // ── rate shaping ─────────────────────────────────────────────
-        // Schedule after max(now + configured_delay, previous scheduled
-        // send time) + packet_bits / rate_bps.
-        let time_to_send = if self.config.rate != 0 {
-            let packet_bits = (data.len() as u64).saturating_mul(8);
-            let serialize = Duration::from_nanos(
-                packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
-            );
-            let earliest = base.max(self.next_send);
-            let t = earliest + serialize;
-            self.next_send = t;
-            if t != base {
-                let mut s = self.stats.lock().unwrap();
-                s.rate_limited += 1;
+            // ── rate shaping (normal branch only) ─────────────────────
+            // Schedule after max(now + configured_delay, previous
+            // scheduled send time) + packet_bits / rate_bps. Send-time
+            // shaping only delays packets; it never drops them.
+            if self.config.rate != 0 {
+                let packet_bits = (data.len() as u64).saturating_mul(8);
+                let serialize = Duration::from_nanos(
+                    packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
+                );
+                let earliest = base.max(self.next_send);
+                let t = earliest + serialize;
+                self.next_send = t;
+                if t != base {
+                    let mut s = self.stats.lock().unwrap();
+                    s.rate_limited += 1;
+                }
+                t
+            } else {
+                base
             }
-            t
-        } else {
-            base
         };
-
-        if reorder {
-            let mut s = self.stats.lock().unwrap();
-            s.reordered += 1;
-        }
 
         // keep queue sorted by time_to_send (simple insertion)
         let item = Queued {
@@ -865,9 +872,7 @@ impl DirectionRunner {
         }
 
         let mut count = 1u32;
-        if self.config.duplicate != 0
-            && self.config.duplicate >= self.dup_cor.next(&mut self.rng)
-        {
+        if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
             count += 1;
             let mut s = self.stats.lock().unwrap();
             s.duplicated += 1;
@@ -915,13 +920,24 @@ impl DirectionRunner {
         // ── reorder ──────────────────────────────────────────────────
         // Reorder only when gap != 0 and only after the reorder counter
         // reaches gap - 1; use "reorder >= random" like sch_netem.
+        //
+        // Mirrors the Linux `sch_netem` branch structure: the normal
+        // branch applies delay and (optionally) rate shaping, while the
+        // reorder branch schedules the packet for immediate send (`now`)
+        // and resets the reorder counter — rate shaping is *not* applied
+        // to reordered packets, so they always jump ahead of the shaped
+        // tail.
         let reorder = self.config.gap != 0
             && self.reorder_counter >= self.config.gap - 1
             && self.config.reorder >= self.reorder_cor.next(&mut self.rng);
 
-        let base = if reorder {
+        let time_to_send = if reorder {
             self.reorder_counter = 0;
-            // Reordered packet is scheduled immediately.
+            {
+                let mut s = self.stats.lock().unwrap();
+                s.reordered += 1;
+            }
+            // Reordered packet is scheduled immediately; no rate shaping.
             now
         } else {
             let delay = self.sample_delay();
@@ -930,37 +946,31 @@ impl DirectionRunner {
                 let mut s = self.stats.lock().unwrap();
                 s.delayed += 1;
             }
-            now + delay
-        };
+            let base = now + delay;
 
-        // ── rate shaping ─────────────────────────────────────────────
-        // Schedule after max(now + configured_delay, previous scheduled
-        // send time) + packet_bits / rate_bps.
-        let time_to_send = if self.config.rate != 0 {
-            let packet_bits = (data.len() as u64).saturating_mul(8);
-            let serialize = Duration::from_nanos(
-                packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
-            );
-            let earliest = base.max(self.next_send);
-            let t = earliest + serialize;
-            self.next_send = t;
-            if t != base {
-                let mut s = self.stats.lock().unwrap();
-                s.rate_limited += 1;
+            // ── rate shaping (normal branch only) ─────────────────────
+            // Schedule after max(now + configured_delay, previous
+            // scheduled send time) + packet_bits / rate_bps. Send-time
+            // shaping only delays packets; it never drops them.
+            if self.config.rate != 0 {
+                let packet_bits = (data.len() as u64).saturating_mul(8);
+                let serialize = Duration::from_nanos(
+                    packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
+                );
+                let earliest = base.max(self.next_send);
+                let t = earliest + serialize;
+                self.next_send = t;
+                if t != base {
+                    let mut s = self.stats.lock().unwrap();
+                    s.rate_limited += 1;
+                }
+                t
+            } else {
+                base
             }
-            t
-        } else {
-            base
         };
 
-        if reorder {
-            let mut s = self.stats.lock().unwrap();
-            s.reordered += 1;
-        }
-
-        let dst = self
-            .fixed_dst
-            .or_else(|| *self.learned_dst.lock().unwrap());
+        let dst = self.fixed_dst.or_else(|| *self.learned_dst.lock().unwrap());
         let Some(dst) = dst else {
             // No known destination yet (s2c before the first client packet).
             return;

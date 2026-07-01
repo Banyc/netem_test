@@ -183,6 +183,92 @@ fn netem_rate_limit_throttles_burst() {
 
 #[test]
 #[ignore]
+fn netem_reorder_with_rate_jumps_ahead() {
+    // Reorder + rate together: a reordered packet must be scheduled at `now`
+    // and must NOT be rate-shaped, so it is delivered ahead of the shaped
+    // tail. With gap=5 and reorder=u32::MAX (always reorder once the counter
+    // reaches gap-1), the 5th packet of a burst is reordered. A low rate
+    // (8 kbit/s ⇒ 8 ms per 8-byte payload) would otherwise delay every
+    // normal packet by at least the serialization backlog.
+    let (recv, server) = recv_socket();
+    let cfg = NetemConfig {
+        gap: 5,
+        reorder: u32::MAX,
+        rate: 8_000,
+        seed: 7,
+        ..NetemConfig::default()
+    };
+    let link = NetemLink::spawn(server, cfg).unwrap();
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dst = link.client_addr();
+    // Send 6 packets quickly; seq encoded in byte 0.
+    let mut payloads: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i + 1, 0xAA]).collect();
+    for p in &payloads {
+        client.send_to(p, dst).unwrap();
+    }
+
+    recv.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut arrival_order: Vec<u8> = Vec::new();
+    let mut first_arrival: Option<Duration> = None;
+    let start = Instant::now();
+    let mut buf = [0u8; 1500];
+    loop {
+        match recv.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                if first_arrival.is_none() {
+                    first_arrival = Some(start.elapsed());
+                }
+                if n > 0 {
+                    arrival_order.push(buf[0]);
+                }
+            }
+            Err(_) => break,
+        }
+        if start.elapsed() >= Duration::from_secs(2) {
+            break;
+        }
+    }
+    link.stop();
+    let stats = link.stats();
+
+    // Reorder happened.
+    assert!(
+        stats.reordered > 0,
+        "expected at least one reordered packet, got {stats:?}"
+    );
+    // Rate shaping never drops.
+    assert_eq!(
+        stats.dropped, 0,
+        "rate shaping must not drop packets, got {stats:?}"
+    );
+    // All packets eventually delivered.
+    assert_eq!(
+        arrival_order.len(),
+        6,
+        "all 6 packets should be delivered, got {:?}",
+        arrival_order
+    );
+    // The reordered packet (seq 5, the 5th sent) must arrive first — ahead
+    // of the rate-shaped tail. (seq is i+1, so the 5th packet has seq 5.)
+    assert_eq!(
+        arrival_order[0], 5,
+        "reordered packet should be delivered first, got {arrival_order:?}"
+    );
+    // And it should arrive immediately, well before the shaped tail (~40ms
+    // serialization backlog at 8 kbit/s for 5 prior packets).
+    let first = first_arrival.unwrap();
+    assert!(
+        first < Duration::from_millis(30),
+        "reordered packet should arrive immediately, got {first:?}"
+    );
+
+    // keep payloads referenced
+    let _ = &mut payloads;
+}
+
+#[test]
+#[ignore]
 fn netem_snapshot_reports_queue_and_stats() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
