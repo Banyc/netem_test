@@ -1,0 +1,11 @@
+[package]
+name = "tests"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+netem-test = { path = "../netem-test" }
+
+[lib]
+path = "src/lib.rs"

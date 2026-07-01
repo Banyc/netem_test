@@ -1,6 +1,8 @@
-[package]
-name = "netem_test"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["netem-test", "tests"]
 
-[dependencies]
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "GPL-2.0-only"

@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
-name = "netem_test"
+name = "netem-test"
 version = "0.1.0"
+
+[[package]]
+name = "tests"
+version = "0.1.0"
+dependencies = [
+ "netem-test",
+]
