@@ -44,6 +44,61 @@ fn burst(
     (got, start.elapsed())
 }
 
+/// Send `n` datagrams through `link` and receive until exactly `n` packets
+/// arrive at `recv`. The sequence number (1..=n) is encoded in byte 0 of each
+/// 8-byte payload; the remaining bytes are copied from `payload[1..]`.
+///
+/// Returns `(arrival_order, arrival_timestamps)` where `arrival_order[k]` is
+/// the seq of the k-th received packet and `arrival_timestamps[k]` is the
+/// elapsed `Duration` since `start` at which it arrived.
+///
+/// The receive loop only terminates when all `n` packets have arrived. The
+/// `timeout` is used only as the socket read timeout so the loop can detect
+/// missing packets (e.g. dropped by loss impairment) and stop instead of
+/// hanging forever; it is NOT used to bound a passing test by wait duration.
+fn burst_exact(
+    link: &NetemLink,
+    recv: &UdpSocket,
+    n: u32,
+    payload: &[u8; 8],
+    timeout: Duration,
+) -> (Vec<u8>, Vec<Duration>) {
+    assert!(
+        n <= 255,
+        "burst_exact encodes seq in byte 0, n must be <= 255"
+    );
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dst = link.client_addr();
+    let start = Instant::now();
+    for i in 0..n {
+        let mut p = *payload;
+        p[0] = (i as u8).wrapping_add(1); // seq = 1..=n
+        client.send_to(&p, dst).unwrap();
+    }
+
+    recv.set_read_timeout(Some(timeout)).unwrap();
+    let mut order: Vec<u8> = Vec::with_capacity(n as usize);
+    let mut stamps: Vec<Duration> = Vec::with_capacity(n as usize);
+    let mut buf = [0u8; 1500];
+    while (order.len() as u32) < n {
+        match recv.recv_from(&mut buf) {
+            Ok((len, _)) => {
+                if len > 0 {
+                    order.push(buf[0]);
+                    stamps.push(start.elapsed());
+                }
+            }
+            Err(_) => {
+                // Read timeout fired before all n packets arrived. Stop and
+                // return whatever we have so the caller can assert on the
+                // shortfall — do not mask missing packets by waiting longer.
+                break;
+            }
+        }
+    }
+    (order, stamps)
+}
+
 #[test]
 #[ignore]
 fn netem_passes_traffic_unimpaired() {
@@ -159,7 +214,7 @@ fn netem_rate_limit_throttles_burst() {
         ..NetemConfig::default()
     };
     let link = NetemLink::spawn(server, cfg).unwrap();
-    let (got, elapsed) = burst(&link, &recv, 20, b"r", Duration::from_secs(2));
+    let (order, stamps) = burst_exact(&link, &recv, 20, b"rate1234", Duration::from_secs(2));
     link.stop();
     let stats = link.stats();
     // Send-time shaping delays packets; it must never drop them.
@@ -168,16 +223,34 @@ fn netem_rate_limit_throttles_burst() {
         "rate shaping must not drop packets, got {stats:?}"
     );
     assert_eq!(
-        got, 20,
-        "all shaped packets should eventually be delivered, got {got}"
+        order.len(),
+        20,
+        "all shaped packets should eventually be delivered, got {order:?}"
     );
     assert!(
         stats.rate_limited > 0,
         "some packets should be rate-shaped, got {stats:?}"
     );
+    // Exact in-order delivery: seq 1..=20 in the order they were sent. The
+    // shaper delays each packet but preserves FIFO order.
+    assert_eq!(
+        order,
+        (1u8..=20).collect::<Vec<_>>(),
+        "shaper should deliver packets in send order, got {order:?}"
+    );
+    // Elapsed is measured from the start to the timestamp of the LAST received
+    // packet — i.e. real delivery completion, not the socket read timeout.
+    let elapsed = *stamps.last().unwrap();
+    // ~160 ms of serialization at 8 kbit/s for 20 packets; require >= 120 ms.
     assert!(
         elapsed >= Duration::from_millis(120),
         "rate shaping should spread delivery, got {elapsed:?}"
+    );
+    // Sanity upper bound: well below the 2 s read timeout, proving the test
+    // passes by observing delivery, not by waiting for a timeout.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "rate shaping should complete well under the timeout, got {elapsed:?}"
     );
 }
 
@@ -200,35 +273,9 @@ fn netem_reorder_with_rate_jumps_ahead() {
     };
     let link = NetemLink::spawn(server, cfg).unwrap();
 
-    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let dst = link.client_addr();
-    // Send 6 packets quickly; seq encoded in byte 0.
-    let mut payloads: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i + 1, 0xAA]).collect();
-    for p in &payloads {
-        client.send_to(p, dst).unwrap();
-    }
-
-    recv.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    let mut arrival_order: Vec<u8> = Vec::new();
-    let mut first_arrival: Option<Duration> = None;
-    let start = Instant::now();
-    let mut buf = [0u8; 1500];
-    loop {
-        match recv.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                if first_arrival.is_none() {
-                    first_arrival = Some(start.elapsed());
-                }
-                if n > 0 {
-                    arrival_order.push(buf[0]);
-                }
-            }
-            Err(_) => break,
-        }
-        if start.elapsed() >= Duration::from_secs(2) {
-            break;
-        }
-    }
+    // Send 6 packets quickly; seq encoded in byte 0 of the 8-byte payload.
+    // b"reorder!" has seq byte overwritten with 1..=6 by burst_exact.
+    let (order, stamps) = burst_exact(&link, &recv, 6, b"reorder!", Duration::from_secs(2));
     link.stop();
     let stats = link.stats();
 
@@ -242,29 +289,33 @@ fn netem_reorder_with_rate_jumps_ahead() {
         stats.dropped, 0,
         "rate shaping must not drop packets, got {stats:?}"
     );
-    // All packets eventually delivered.
+    // All packet identities 1..=6 arrive (no loss).
+    let mut seen = order.clone();
+    seen.sort_unstable();
     assert_eq!(
-        arrival_order.len(),
+        seen,
+        (1u8..=6).collect::<Vec<_>>(),
+        "all 6 packet identities should arrive, got {order:?}"
+    );
+    assert_eq!(
+        order.len(),
         6,
-        "all 6 packets should be delivered, got {:?}",
-        arrival_order
+        "all 6 packets should be delivered, got {order:?}"
     );
     // The reordered packet (seq 5, the 5th sent) must arrive first — ahead
     // of the rate-shaped tail. (seq is i+1, so the 5th packet has seq 5.)
     assert_eq!(
-        arrival_order[0], 5,
-        "reordered packet should be delivered first, got {arrival_order:?}"
+        order[0], 5,
+        "reordered packet should be delivered first, got {order:?}"
     );
     // And it should arrive immediately, well before the shaped tail (~40ms
-    // serialization backlog at 8 kbit/s for 5 prior packets).
-    let first = first_arrival.unwrap();
+    // serialization backlog at 8 kbit/s for 5 prior packets). Measured from
+    // the first arrival timestamp, not a socket timeout.
+    let first = stamps[0];
     assert!(
         first < Duration::from_millis(30),
         "reordered packet should arrive immediately, got {first:?}"
     );
-
-    // keep payloads referenced
-    let _ = &mut payloads;
 }
 
 #[test]
