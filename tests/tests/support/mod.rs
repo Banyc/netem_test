@@ -6,7 +6,13 @@
 //! guards, and `rtp` / `mux` echo servers) so each focused test target stays
 //! small and readable.
 
-use std::time::{Duration, Instant};
+#![allow(dead_code)]
+
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use netem_test::{NetemConfig, NetemPair, Stats};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -150,45 +156,119 @@ where
 
 /// Spawn an `rtp` server that accepts one connection and runs a `mux` server
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
-/// echoed back. Returns the rtp server's listening address.
-pub async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
+/// handed to `handle_stream`, which owns its read/write halves. Returns the
+/// rtp server's listening address.
+///
+/// The listener is wrapped in an [`Arc`] so a background `accept()`-loop can
+/// keep driving `udp_listener`'s dispatcher for the server's lifetime:
+/// `accept()` both establishes new connections *and* dispatches packets to
+/// existing ones (via `try_send` to their per-conn channels). Without a
+/// background accept-loop, the dispatcher stops after the first connection
+/// and subsequent datagrams are never forwarded to it, so the reliable
+/// layer stalls. This is required by `udp_listener`'s docs ("You still need
+/// to put `accept()` in a loop to drive the packet dispatch among the
+/// sub-connections").
+async fn spawn_mux_over_rtp_server<F, Fut>(
+    fec: bool,
+    handle_stream: F,
+) -> std::io::Result<std::net::SocketAddr>
+where
+    F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
-    tokio::spawn(async move {
-        let accepted = match listener.accept_without_handshake(fec).await {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-        let read = accepted.read.into_async_read();
-        let write = accepted.write.into_async_write();
-
-        let config = mux::MuxConfig {
-            initiation: mux::Initiation::Server,
-            heartbeat_interval: Duration::from_secs(5),
-        };
-        let mut spawner = tokio::task::JoinSet::new();
-        let (_opener, mut accepter) =
-            mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
-
-        while let Ok((mut stream_read, mut stream_write)) = accepter.accept().await {
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                loop {
-                    match stream_read.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if stream_write.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
+    let listener = Arc::new(listener);
+    tokio::spawn({
+        let listener = Arc::clone(&listener);
+        async move {
+            // First (and only) rtp connection.
+            let accepted = match listener.accept_without_handshake(fec).await {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            // Keep driving `udp_listener`'s dispatcher for the lifetime of the
+            // server: `accept()` both establishes new connections and
+            // dispatches packets to existing ones. Without a background
+            // accept-loop, the dispatcher stops after the first connection
+            // and subsequent datagrams are never forwarded to it, so the
+            // reliable layer stalls.
+            tokio::spawn({
+                let listener = Arc::clone(&listener);
+                async move {
+                    loop {
+                        if listener.accept_without_handshake(fec).await.is_err() {
+                            break;
                         }
-                        Err(_) => break,
                     }
                 }
-                let _ = stream_write.shutdown();
             });
+
+            let read = accepted.read.into_async_read();
+            let write = accepted.write.into_async_write();
+
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Server,
+                heartbeat_interval: Duration::from_secs(5),
+            };
+            let mut spawner = tokio::task::JoinSet::new();
+            let (_opener, mut accepter) =
+                mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+
+            while let Ok((stream_read, stream_write)) = accepter.accept().await {
+                let handle_stream = &handle_stream;
+                tokio::spawn(handle_stream(stream_read, stream_write));
+            }
         }
     });
     Ok(addr)
+}
+
+/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
+/// on top of the resulting reliable byte stream. Each accepted mux stream is
+/// echoed back. Returns the rtp server's listening address.
+pub async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
+    spawn_mux_over_rtp_server(fec, |mut stream_read, mut stream_write| async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match stream_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stream_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stream_write.shutdown();
+    })
+    .await
+}
+
+/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
+/// on top of the resulting reliable byte stream. Each accepted mux stream is
+/// read to EOF into a `Vec<u8>` and sent on the returned channel (capacity
+/// 16) if the read succeeded or the buffer is non-empty, then the write half
+/// is shut down. Returns the rtp server's listening address and the receiver
+/// for completed payloads.
+pub async fn spawn_mux_over_rtp_sink_server(
+    fec: bool,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let addr = spawn_mux_over_rtp_server(fec, move |mut stream_read, mut stream_write| {
+        let tx = tx.clone();
+        async move {
+            let mut buf = Vec::new();
+            let read_ok = stream_read.read_to_end(&mut buf).await.is_ok();
+            if read_ok || !buf.is_empty() {
+                let _ = tx.send(buf).await;
+            }
+            let _ = stream_write.shutdown();
+        }
+    })
+    .await?;
+    Ok((addr, rx))
 }
 
 /// Wrap a reliable byte-stream pair in a `mux` client and return the stream
@@ -209,19 +289,30 @@ where
 
 /// Open a mux stream, write `payload`, shut the stream down, and read the
 /// full echo back until EOF.
+///
+/// The write and the read run concurrently with `tokio::join!` instead of
+/// write-then-read: once the payload exceeds the mux flow-control window a
+/// sequential write blocks forever waiting for the peer to drain (which it
+/// can only do by echoing), deadlocking the stream.
 pub async fn mux_echo_round_trip(opener: &mux::StreamOpener, payload: &[u8]) -> Vec<u8> {
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
-    stream_write.write_all(payload).await.unwrap();
-    stream_write.shutdown().unwrap();
-    let mut got = Vec::new();
-    let mut buf = vec![0u8; 8 * 1024];
-    loop {
-        match stream_read.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => got.extend_from_slice(&buf[..n]),
-            Err(e) => panic!("mux stream read failed: {e:?}"),
+    let write_fut = async {
+        stream_write.write_all(payload).await.unwrap();
+        stream_write.shutdown().unwrap();
+    };
+    let read_fut = async {
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match stream_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("mux stream read failed: {e:?}"),
+            }
         }
-    }
+        got
+    };
+    let (_, got) = tokio::join!(write_fut, read_fut);
     got
 }
 
@@ -229,24 +320,65 @@ pub async fn mux_echo_round_trip(opener: &mux::StreamOpener, payload: &[u8]) -> 
 /// echo back, and return `(received, elapsed)` where `elapsed` is measured
 /// from just before the write to the completion of the read. Used by perf
 /// and latency tests to print throughput with `--nocapture`.
+///
+/// The write and the read run concurrently with `tokio::join!` instead of
+/// write-then-read: once the payload exceeds the mux flow-control window a
+/// sequential write blocks forever waiting for the peer to drain (which it
+/// can only do by echoing), deadlocking the stream.
 pub async fn mux_timed_echo_round_trip(
     opener: &mux::StreamOpener,
     payload: &[u8],
 ) -> (Vec<u8>, Duration) {
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
     let start = Instant::now();
+    let write_fut = async {
+        stream_write.write_all(payload).await.unwrap();
+        stream_write.shutdown().unwrap();
+    };
+    let read_fut = async {
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match stream_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("mux stream read failed: {e:?}"),
+            }
+        }
+        got
+    };
+    let (_, got) = tokio::join!(write_fut, read_fut);
+    (got, start.elapsed())
+}
+
+/// Open a mux stream, write `payload`, shut the write half down, then read
+/// to EOF to wait for the peer to finish draining. Returns the elapsed time
+/// measured from just before the write to the completion of the peer-EOF
+/// read — the wall-clock time the peer needed to receive the whole payload.
+///
+/// `ErrorKind::BrokenPipe` during the peer-EOF wait is tolerated: `rtp`'s
+/// broken-pipe heuristic can fire after a completed upload (the ACK path
+/// stalls once the peer has no more data to send), and delivery is already
+/// verified by the sink-side equality assert. In that case the returned
+/// duration may undercount delivery, so a warning is printed. Any other
+/// read error panics.
+pub async fn mux_send_payload(opener: &mux::StreamOpener, payload: &[u8]) -> Duration {
+    let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+    let start = Instant::now();
     stream_write.write_all(payload).await.unwrap();
     stream_write.shutdown().unwrap();
-    let mut got = Vec::new();
-    let mut buf = vec![0u8; 8 * 1024];
-    loop {
-        match stream_read.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => got.extend_from_slice(&buf[..n]),
-            Err(e) => panic!("mux stream read failed: {e:?}"),
+    let mut sink = Vec::new();
+    match stream_read.read_to_end(&mut sink).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            eprintln!(
+                "[mux_send_payload] BrokenPipe during peer-EOF wait; \
+                 duration may undercount delivery"
+            );
         }
+        Err(e) => panic!("mux_send_payload peer-EOF read failed: {e:?}"),
     }
-    (got, start.elapsed())
+    start.elapsed()
 }
 
 /// Combined stats across both directions of a [`NetemPair`].
