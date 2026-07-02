@@ -185,13 +185,39 @@ impl LossModel {
 /// run against either real OS sockets or an in-memory loopback in tests.
 pub trait UdpTransport: Send + Sync + 'static {
     /// Receive a datagram into `buf`, returning `(len, from)`.
+    ///
+    /// If no datagram is available, the call should block until either a
+    /// datagram arrives or the transport's configured receive timeout
+    /// expires, returning [`io::ErrorKind::TimedOut`] / [`WouldBlock`]
+    /// accordingly.
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+
+    /// Receive a datagram into `buf`, waiting at most `timeout`.
+    ///
+    /// Returns `Ok((len, from))` on success, `Err(WouldBlock)` / `Err(TimedOut)`
+    /// if no datagram arrived before the deadline, and other errors for
+    /// transport failures. The transport should be left in a usable state so
+    /// subsequent receives work.
+    fn recv_from_timeout(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> io::Result<(usize, SocketAddr)>;
 
     /// Send `data` to `dst`.
     fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()>;
 
     /// Local address of the bound socket.
     fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Set the receive timeout used by [`recv_from`] when no explicit timeout
+    /// is supplied. Passing [`Duration::ZERO`] disables the timeout (block
+    /// indefinitely). Implementations may fall back to a short polling timeout
+    /// internally.
+    fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()>;
+
+    /// Current receive timeout, if any.
+    fn recv_timeout(&self) -> io::Result<Option<Duration>>;
 }
 
 /// Standard-library `UdpSocket` backed transport.
@@ -213,12 +239,37 @@ impl UdpTransport for StdUdpTransport {
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.sock.recv_from(buf)
     }
+
+    fn recv_from_timeout(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> io::Result<(usize, SocketAddr)> {
+        self.sock.set_read_timeout(Some(timeout))?;
+        let res = self.sock.recv_from(buf);
+        self.sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+        res
+    }
+
     fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
         self.sock.send_to(data, dst)?;
         Ok(())
     }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.sock.local_addr()
+    }
+
+    fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
+        if timeout.is_zero() {
+            self.sock.set_read_timeout(None)
+        } else {
+            self.sock.set_read_timeout(Some(timeout))
+        }
+    }
+
+    fn recv_timeout(&self) -> io::Result<Option<Duration>> {
+        self.sock.read_timeout()
     }
 }
 
@@ -469,9 +520,10 @@ impl Runner {
             // Drain ready packets first so latency is honoured.
             self.drain_ready(Instant::now());
 
-            // Block briefly on recv so we don't spin; non-blocking would be
-            // ideal but the dyn transport is sync. Use a short timeout.
-            match self.transport.recv_from(&mut buf) {
+            // Block briefly on recv so we don't spin. Use the explicit
+            // timeout API so the receive deadline is decoupled from the
+            // transport's default read timeout and can be asserted by tests.
+            match self.transport.recv_from_timeout(&mut buf, Duration::from_millis(5)) {
                 Ok((n, from)) => {
                     self.handle_datagram(&buf[..n], from, Instant::now());
                 }
@@ -845,7 +897,9 @@ impl DirectionRunner {
             }
             self.drain_ready(Instant::now());
 
-            match self.recv.recv_from(&mut buf) {
+            // Use the explicit timeout API so the receive deadline is
+            // decoupled from the transport's default read timeout.
+            match self.recv.recv_from_timeout(&mut buf, Duration::from_millis(5)) {
                 Ok((n, from)) => {
                     // For c2s, learn the client address so the s2c runner can
                     // send replies back to it.
