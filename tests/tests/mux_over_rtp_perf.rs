@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::{
-    combined_stats, lossy_400kib_per_sec, mux_client_connect, mux_send_payload,
+    combined_stats, hostile_real_link, lossy_400kib_per_sec, mux_client_connect, mux_send_payload,
     mux_timed_echo_round_trip, payload, print_perf, rtp_connect, spawn_mux_over_rtp_echo_server,
     spawn_mux_over_rtp_sink_server, with_timeout,
 };
@@ -197,4 +197,65 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
     let stats = combined_stats(&pair);
     eprintln!("[perf] mux-over-rtp small-while-bulk stats: {stats:?}");
     assert!(stats.forwarded > 0, "proxy should forward packets");
+}
+
+/// `mux` over `rtp` should deliver a 400 MiB payload intact through a hostile
+/// link profiled from real ICMP measurements against `google.com` /
+/// `8.8.8.8` (~15% loss, 300 ms latency, 500 ms jitter stddev) to a read-only
+/// sink, and report throughput with `--nocapture`. The fat pipe + long latency
+/// inflates the bandwidth-delay product, growing the proxy's internal queue
+/// past tens of thousands of entries and exposing O(n²) insertion, per-packet
+/// lock contention, and per-packet allocation — bottlenecks the mild synthetic
+/// presets cannot reach.
+///
+/// At 15% loss the throughput is dominated by `rtp`'s ARQ, not the proxy: a
+/// 10 MiB run takes ~10 min (~0.016 MiB/s), so 400 MiB takes many hours. The
+/// timeout is set generously; run this only when investigating proxy-level
+/// behaviour under a real fat, hostile pipe.
+///
+/// Run with:
+///
+/// ```sh
+/// cargo test --release --test mux_over_rtp_perf \
+///     mux_over_rtp_400mib_hostile_perf -- --ignored --nocapture --test-threads=1
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn mux_over_rtp_400mib_hostile_perf() {
+    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(false).await.unwrap();
+
+    let impaired = hostile_real_link();
+    let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
+    let (read, write) = rtp_connect(pair.client_addr(), false).await;
+    let (opener, _spawner) = mux_client_connect(read, write);
+
+    let payload = payload(400 * 1024 * 1024);
+    let elapsed = with_timeout(
+        Duration::from_secs(3600 * 8),
+        "mux-over-rtp 400MiB hostile perf",
+        mux_send_payload(&opener, &payload),
+    )
+    .await;
+
+    let got = with_timeout(
+        Duration::from_secs(3600 * 8),
+        "mux-over-rtp 400MiB hostile perf receive",
+        async { received.recv().await.expect("sink channel closed") },
+    )
+    .await;
+
+    assert_eq!(got, payload, "mux stream must deliver all 400MiB intact");
+    print_perf("mux-over-rtp 400MiB hostile", payload.len(), elapsed);
+
+    pair.stop();
+    let stats = combined_stats(&pair);
+    eprintln!("[perf] mux-over-rtp 400MiB hostile stats: {stats:?}");
+    assert!(
+        stats.dropped > 0,
+        "hostile link should drop some, got {stats:?}"
+    );
+    assert!(
+        stats.delayed > 0,
+        "hostile link should delay packets, got {stats:?}"
+    );
 }

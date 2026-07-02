@@ -60,6 +60,21 @@ pub fn lossy_400kib_per_sec() -> NetemConfig {
     }
 }
 
+/// A hostile link profiled from real ICMP measurements against `google.com`
+/// and `8.8.8.8` from this machine: ~15% loss, ~500 ms latency, ~500 ms
+/// jitter (stddev). Used by the 400 MiB perf scenario to expose proxy-level
+/// bottlenecks (queue insertion, per-packet locking, allocation) that the
+/// mild synthetic presets cannot reach.
+pub fn hostile_real_link() -> NetemConfig {
+    NetemConfig {
+        loss: u32::MAX / 100 * 15, // ~15%
+        latency: Duration::from_millis(300),
+        jitter: Duration::from_millis(500),
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
 // ─────────────────────────── deterministic payload ───────────────────────
 
 /// Generate a deterministic payload of `n` bytes. The modulus is a prime so

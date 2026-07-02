@@ -12,9 +12,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -340,6 +342,39 @@ pub struct Stats {
     pub received: u64,
 }
 
+/// Atomic backing store for [`Stats`] so the runner thread can update counters
+/// without taking a lock. `snapshot()` produces a plain `Stats` for the
+/// public API.
+#[derive(Default)]
+struct AtomicStats {
+    delayed: AtomicU64,
+    dropped: AtomicU64,
+    duplicated: AtomicU64,
+    reordered: AtomicU64,
+    rate_limited: AtomicU64,
+    forwarded: AtomicU64,
+    received: AtomicU64,
+}
+
+impl AtomicStats {
+    #[inline]
+    fn inc(&self, f: impl Fn(&AtomicStats) -> &AtomicU64) {
+        f(self).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Stats {
+        Stats {
+            delayed: self.delayed.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            duplicated: self.duplicated.load(Ordering::Relaxed),
+            reordered: self.reordered.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            forwarded: self.forwarded.load(Ordering::Relaxed),
+            received: self.received.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Read-only snapshot of a link's state at a point in time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Snapshot {
@@ -352,8 +387,35 @@ pub struct Snapshot {
 #[derive(Clone)]
 struct Queued {
     time_to_send: Instant,
+    /// Monotonic insertion sequence used as a tiebreaker so the min-heap
+    /// preserves FIFO order among packets with equal `time_to_send`. Without
+    /// this, `BinaryHeap` returns equal-timestamp packets in arbitrary order,
+    /// which reorders the byte stream and trips the reliable layer.
+    seq: u64,
     data: Vec<u8>,
     dst: SocketAddr,
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, other: &Self) -> bool {
+        (self.time_to_send, self.seq) == (other.time_to_send, other.seq)
+    }
+}
+
+impl Eq for Queued {}
+
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Queued {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.time_to_send
+            .cmp(&other.time_to_send)
+            .then(self.seq.cmp(&other.seq))
+    }
 }
 
 // ───────────────────────────── the link ─────────────────────────────────
@@ -363,8 +425,8 @@ struct Queued {
 pub struct NetemLink {
     client_addr: SocketAddr,
     server_addr: SocketAddr,
-    stats: Arc<Mutex<Stats>>,
-    queue_len: Arc<Mutex<usize>>,
+    stats: Arc<AtomicStats>,
+    queue_len: Arc<AtomicU64>,
     stop: Arc<Mutex<bool>>,
 }
 
@@ -406,8 +468,8 @@ impl NetemLink {
         transport: Box<dyn UdpTransport>,
     ) -> io::Result<Self> {
         let client_addr = transport.local_addr()?;
-        let stats = Arc::new(Mutex::new(Stats::default()));
-        let queue_len = Arc::new(Mutex::new(0));
+        let stats = Arc::new(AtomicStats::default());
+        let queue_len = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(Mutex::new(false));
 
         let link = Self {
@@ -438,12 +500,12 @@ impl NetemLink {
 
     /// Current impairment counters.
     pub fn stats(&self) -> Stats {
-        *self.stats.lock().unwrap()
+        self.stats.snapshot()
     }
 
     /// Current queue depth.
     pub fn queue_len(&self) -> usize {
-        *self.queue_len.lock().unwrap()
+        self.queue_len.load(Ordering::Relaxed) as usize
     }
 
     /// Atomic snapshot.
@@ -465,8 +527,8 @@ impl NetemLink {
 struct Runner {
     config: NetemConfig,
     server_addr: SocketAddr,
-    stats: Arc<Mutex<Stats>>,
-    queue_len: Arc<Mutex<usize>>,
+    stats: Arc<AtomicStats>,
+    queue_len: Arc<AtomicU64>,
     stop: Arc<Mutex<bool>>,
     transport: Box<dyn UdpTransport>,
     rng: RndState,
@@ -478,16 +540,17 @@ struct Runner {
     /// Earliest time the next packet may be serialized (send-time shaper).
     /// Tracks the per-direction serialization backlog for rate limiting.
     next_send: Instant,
-    queue: VecDeque<Queued>,
+    queue: BinaryHeap<Reverse<Queued>>,
     reorder_counter: u32,
+    seq: u64,
 }
 
 impl Runner {
     fn new(
         config: NetemConfig,
         server_addr: SocketAddr,
-        stats: Arc<Mutex<Stats>>,
-        queue_len: Arc<Mutex<usize>>,
+        stats: Arc<AtomicStats>,
+        queue_len: Arc<AtomicU64>,
         stop: Arc<Mutex<bool>>,
         transport: Box<dyn UdpTransport>,
     ) -> Self {
@@ -506,8 +569,9 @@ impl Runner {
             transport,
             rng,
             clg: FourState::default(),
-            queue: VecDeque::new(),
+            queue: BinaryHeap::new(),
             reorder_counter: 0,
+            seq: 0,
         }
     }
 
@@ -539,17 +603,13 @@ impl Runner {
     }
 
     fn handle_datagram(&mut self, data: &[u8], _from: SocketAddr, now: Instant) {
-        {
-            let mut s = self.stats.lock().unwrap();
-            s.received += 1;
-        }
+        self.stats.inc(|s| &s.received);
 
         // ── duplication ──────────────────────────────────────────────
         let mut count = 1u32;
         if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
             count += 1;
-            let mut s = self.stats.lock().unwrap();
-            s.duplicated += 1;
+            self.stats.inc(|s| &s.duplicated);
         }
 
         // ── loss ─────────────────────────────────────────────────────
@@ -559,8 +619,7 @@ impl Runner {
             &mut self.rng,
             self.config.loss,
         ) {
-            let mut s = self.stats.lock().unwrap();
-            s.dropped += 1;
+            self.stats.inc(|s| &s.dropped);
             // A lost packet still consumes a duplication slot.
             count = count.saturating_sub(1);
         }
@@ -612,18 +671,14 @@ impl Runner {
 
         let time_to_send = if reorder {
             self.reorder_counter = 0;
-            {
-                let mut s = self.stats.lock().unwrap();
-                s.reordered += 1;
-            }
+            self.stats.inc(|s| &s.reordered);
             // Reordered packet is scheduled immediately; no rate shaping.
             now
         } else {
             let delay = self.sample_delay();
             self.reorder_counter = self.reorder_counter.wrapping_add(1);
             if !delay.is_zero() {
-                let mut s = self.stats.lock().unwrap();
-                s.delayed += 1;
+                self.stats.inc(|s| &s.delayed);
             }
             let base = now + delay;
 
@@ -640,8 +695,7 @@ impl Runner {
                 let t = earliest + serialize;
                 self.next_send = t;
                 if t != base {
-                    let mut s = self.stats.lock().unwrap();
-                    s.rate_limited += 1;
+                    self.stats.inc(|s| &s.rate_limited);
                 }
                 t
             } else {
@@ -652,36 +706,29 @@ impl Runner {
         // keep queue sorted by time_to_send (simple insertion)
         let item = Queued {
             time_to_send,
+            seq: self.seq,
             data: data.to_vec(),
             dst: self.server_addr,
         };
-        if let Some(pos) = self
-            .queue
-            .iter()
-            .rposition(|q| q.time_to_send <= time_to_send)
-        {
-            self.queue.insert(pos + 1, item);
-        } else {
-            self.queue.push_front(item);
-        }
-        *self.queue_len.lock().unwrap() = self.queue.len();
+        self.seq = self.seq.wrapping_add(1);
+        self.queue.push(Reverse(item));
+        self.queue_len.store(self.queue.len() as u64, Ordering::Relaxed);
     }
 
     fn drain_ready(&mut self, now: Instant) {
         loop {
-            let front = self.queue.front();
-            let ready = match front {
-                Some(q) => q.time_to_send <= now,
-                None => false,
-            };
+            let ready = self
+                .queue
+                .peek()
+                .map(|q| q.0.time_to_send <= now)
+                .unwrap_or(false);
             if !ready {
                 break;
             }
-            let Queued { data, dst, .. } = self.queue.pop_front().unwrap();
-            *self.queue_len.lock().unwrap() = self.queue.len();
+            let Reverse(Queued { data, dst, .. }) = self.queue.pop().unwrap();
+            self.queue_len.store(self.queue.len() as u64, Ordering::Relaxed);
             if self.transport.send_to(&data, dst).is_ok() {
-                let mut s = self.stats.lock().unwrap();
-                s.forwarded += 1;
+                self.stats.inc(|s| &s.forwarded);
             }
         }
     }
@@ -700,8 +747,8 @@ impl Runner {
 pub struct NetemPair {
     client_addr: SocketAddr,
     server_addr: SocketAddr,
-    stats_c2s: Arc<Mutex<Stats>>,
-    stats_s2c: Arc<Mutex<Stats>>,
+    stats_c2s: Arc<AtomicStats>,
+    stats_s2c: Arc<AtomicStats>,
     stop: Arc<Mutex<bool>>,
 }
 
@@ -738,8 +785,8 @@ impl NetemPair {
         server_sock: Box<dyn UdpTransport>,
         client_addr: SocketAddr,
     ) -> io::Result<Self> {
-        let stats_c2s = Arc::new(Mutex::new(Stats::default()));
-        let stats_s2c = Arc::new(Mutex::new(Stats::default()));
+        let stats_c2s = Arc::new(AtomicStats::default());
+        let stats_s2c = Arc::new(AtomicStats::default());
         let stop = Arc::new(Mutex::new(false));
         let learned_client = Arc::new(Mutex::<Option<SocketAddr>>::new(None));
 
@@ -801,12 +848,12 @@ impl NetemPair {
 
     /// Stats for the client→server direction.
     pub fn stats_c2s(&self) -> Stats {
-        *self.stats_c2s.lock().unwrap()
+        self.stats_c2s.snapshot()
     }
 
     /// Stats for the server→client direction.
     pub fn stats_s2c(&self) -> Stats {
-        *self.stats_s2c.lock().unwrap()
+        self.stats_s2c.snapshot()
     }
 
     /// Combined stats across both directions.
@@ -834,8 +881,8 @@ impl NetemPair {
 
 struct DirectionRunner {
     config: NetemConfig,
-    stats: Arc<Mutex<Stats>>,
-    queue_len: Arc<Mutex<usize>>,
+    stats: Arc<AtomicStats>,
+    queue_len: Arc<AtomicU64>,
     stop: Arc<Mutex<bool>>,
     recv: Arc<dyn UdpTransport>,
     send: Arc<dyn UdpTransport>,
@@ -852,15 +899,16 @@ struct DirectionRunner {
     /// Earliest time the next packet may be serialized (send-time shaper).
     /// Tracks the per-direction serialization backlog for rate limiting.
     next_send: Instant,
-    queue: VecDeque<Queued>,
+    queue: BinaryHeap<Reverse<Queued>>,
     reorder_counter: u32,
+    seq: u64,
 }
 
 impl DirectionRunner {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: NetemConfig,
-        stats: Arc<Mutex<Stats>>,
+        stats: Arc<AtomicStats>,
         stop: Arc<Mutex<bool>>,
         recv: Arc<dyn UdpTransport>,
         send: Arc<dyn UdpTransport>,
@@ -874,7 +922,7 @@ impl DirectionRunner {
             dup_cor: CorRng::new(config.dup_corr),
             reorder_cor: CorRng::new(config.reorder_corr),
             next_send: Instant::now(),
-            queue_len: Arc::new(Mutex::new(0)),
+            queue_len: Arc::new(AtomicU64::new(0)),
             config,
             stats,
             stop,
@@ -884,8 +932,9 @@ impl DirectionRunner {
             learned_dst,
             rng,
             clg: FourState::default(),
-            queue: VecDeque::new(),
+            queue: BinaryHeap::new(),
             reorder_counter: 0,
+            seq: 0,
         }
     }
 
@@ -920,16 +969,12 @@ impl DirectionRunner {
     }
 
     fn handle_datagram(&mut self, data: &[u8], now: Instant) {
-        {
-            let mut s = self.stats.lock().unwrap();
-            s.received += 1;
-        }
+        self.stats.inc(|s| &s.received);
 
         let mut count = 1u32;
         if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
             count += 1;
-            let mut s = self.stats.lock().unwrap();
-            s.duplicated += 1;
+            self.stats.inc(|s| &s.duplicated);
         }
 
         if self.config.loss_model.loss(
@@ -938,8 +983,7 @@ impl DirectionRunner {
             &mut self.rng,
             self.config.loss,
         ) {
-            let mut s = self.stats.lock().unwrap();
-            s.dropped += 1;
+            self.stats.inc(|s| &s.dropped);
             count = count.saturating_sub(1);
         }
 
@@ -987,18 +1031,14 @@ impl DirectionRunner {
 
         let time_to_send = if reorder {
             self.reorder_counter = 0;
-            {
-                let mut s = self.stats.lock().unwrap();
-                s.reordered += 1;
-            }
+            self.stats.inc(|s| &s.reordered);
             // Reordered packet is scheduled immediately; no rate shaping.
             now
         } else {
             let delay = self.sample_delay();
             self.reorder_counter = self.reorder_counter.wrapping_add(1);
             if !delay.is_zero() {
-                let mut s = self.stats.lock().unwrap();
-                s.delayed += 1;
+                self.stats.inc(|s| &s.delayed);
             }
             let base = now + delay;
 
@@ -1015,8 +1055,7 @@ impl DirectionRunner {
                 let t = earliest + serialize;
                 self.next_send = t;
                 if t != base {
-                    let mut s = self.stats.lock().unwrap();
-                    s.rate_limited += 1;
+                    self.stats.inc(|s| &s.rate_limited);
                 }
                 t
             } else {
@@ -1032,36 +1071,29 @@ impl DirectionRunner {
 
         let item = Queued {
             time_to_send,
+            seq: self.seq,
             data: data.to_vec(),
             dst,
         };
-        if let Some(pos) = self
-            .queue
-            .iter()
-            .rposition(|q| q.time_to_send <= time_to_send)
-        {
-            self.queue.insert(pos + 1, item);
-        } else {
-            self.queue.push_front(item);
-        }
-        *self.queue_len.lock().unwrap() = self.queue.len();
+        self.seq = self.seq.wrapping_add(1);
+        self.queue.push(Reverse(item));
+        self.queue_len.store(self.queue.len() as u64, Ordering::Relaxed);
     }
 
     fn drain_ready(&mut self, now: Instant) {
         loop {
-            let front = self.queue.front();
-            let ready = match front {
-                Some(q) => q.time_to_send <= now,
-                None => false,
-            };
+            let ready = self
+                .queue
+                .peek()
+                .map(|q| q.0.time_to_send <= now)
+                .unwrap_or(false);
             if !ready {
                 break;
             }
-            let Queued { data, dst, .. } = self.queue.pop_front().unwrap();
-            *self.queue_len.lock().unwrap() = self.queue.len();
+            let Reverse(Queued { data, dst, .. }) = self.queue.pop().unwrap();
+            self.queue_len.store(self.queue.len() as u64, Ordering::Relaxed);
             if self.send.send_to(&data, dst).is_ok() {
-                let mut s = self.stats.lock().unwrap();
-                s.forwarded += 1;
+                self.stats.inc(|s| &s.forwarded);
             }
         }
     }
