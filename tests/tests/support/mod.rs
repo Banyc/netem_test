@@ -87,12 +87,19 @@ where
 /// Spawn an `rtp` server that accepts one connection and echoes back
 /// everything it receives until the peer closes. Returns the server's
 /// listening address.
-pub async fn spawn_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
+///
+/// `mss` controls the RTP maximum segment size passed to
+/// [`Listener::accept_without_handshake_with_mss`]. Use [`rtp::udp::NO_FEC_MSS`]
+/// for the default size.
+pub async fn spawn_rtp_echo_server_with_mss(
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<std::net::SocketAddr> {
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
     tokio::spawn(async move {
         loop {
-            let accepted = match listener.accept_without_handshake(fec).await {
+            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -118,6 +125,11 @@ pub async fn spawn_rtp_echo_server(fec: bool) -> std::io::Result<std::net::Socke
     Ok(addr)
 }
 
+/// Spawn an `rtp` echo server using the default MSS.
+pub async fn spawn_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
+    spawn_rtp_echo_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
+}
+
 /// Connect an `rtp` client to a proxy's client-side address and return the
 /// resulting reliable byte-stream halves. Pass [`NetemPair::client_addr`] as
 /// `proxy_client_addr`; `fec` must match the server's FEC setting.
@@ -128,10 +140,30 @@ pub async fn rtp_connect(
     impl AsyncRead + Unpin + Send,
     impl AsyncWrite + Unpin + Send,
 ) {
-    let connected =
-        rtp::udp::connect_without_handshake("0.0.0.0:0", &proxy_client_addr.to_string(), None, fec)
-            .await
-            .unwrap();
+    rtp_connect_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Connect an `rtp` client with a custom MSS.
+///
+/// `mss` is passed to [`rtp::udp::connect_without_handshake_with_mss`];
+/// `proxy_client_addr` should be [`NetemPair::client_addr`].
+pub async fn rtp_connect_with_mss(
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+) -> (
+    impl AsyncRead + Unpin + Send,
+    impl AsyncWrite + Unpin + Send,
+) {
+    let connected = rtp::udp::connect_without_handshake_with_mss(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        None,
+        fec,
+        mss,
+    )
+    .await
+    .unwrap();
     (
         connected.read.into_async_read(),
         connected.write.into_async_write(),
@@ -159,6 +191,9 @@ where
 /// handed to `handle_stream`, which owns its read/write halves. Returns the
 /// rtp server's listening address.
 ///
+/// `mss` is passed to the RTP accept helpers; use [`rtp::udp::NO_FEC_MSS`] for
+/// the default size.
+///
 /// The listener is wrapped in an [`Arc`] so a background `accept()`-loop can
 /// keep driving `udp_listener`'s dispatcher for the server's lifetime:
 /// `accept()` both establishes new connections *and* dispatches packets to
@@ -168,8 +203,9 @@ where
 /// layer stalls. This is required by `udp_listener`'s docs ("You still need
 /// to put `accept()` in a loop to drive the packet dispatch among the
 /// sub-connections").
-async fn spawn_mux_over_rtp_server<F, Fut>(
+async fn spawn_mux_over_rtp_server_with_mss<F, Fut>(
     fec: bool,
+    mss: usize,
     handle_stream: F,
 ) -> std::io::Result<std::net::SocketAddr>
 where
@@ -183,7 +219,7 @@ where
         let listener = Arc::clone(&listener);
         async move {
             // First (and only) rtp connection.
-            let accepted = match listener.accept_without_handshake(fec).await {
+            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -197,7 +233,7 @@ where
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
-                        if listener.accept_without_handshake(fec).await.is_err() {
+                        if listener.accept_without_handshake_with_mss(fec, mss).await.is_err() {
                             break;
                         }
                     }
@@ -227,8 +263,11 @@ where
 /// Spawn an `rtp` server that accepts one connection and runs a `mux` server
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
 /// echoed back. Returns the rtp server's listening address.
-pub async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
-    spawn_mux_over_rtp_server(fec, |mut stream_read, mut stream_write| async move {
+pub async fn spawn_mux_over_rtp_echo_server_with_mss(
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<std::net::SocketAddr> {
+    spawn_mux_over_rtp_server_with_mss(fec, mss, |mut stream_read, mut stream_write| async move {
         let mut buf = vec![0u8; 8 * 1024];
         loop {
             match stream_read.read(&mut buf).await {
@@ -246,19 +285,28 @@ pub async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<std::n
     .await
 }
 
+/// Spawn a mux-over-RTP echo server using the default MSS.
+pub async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
+    spawn_mux_over_rtp_echo_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
+}
+
 /// Spawn an `rtp` server that accepts one connection and runs a `mux` server
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
 /// read to EOF into a `Vec<u8>` and sent on the returned channel (capacity
 /// 16) if the read succeeded or the buffer is non-empty, then the write half
 /// is shut down. Returns the rtp server's listening address and the receiver
 /// for completed payloads.
-pub async fn spawn_mux_over_rtp_sink_server(
+pub async fn spawn_mux_over_rtp_sink_server_with_mss(
     fec: bool,
+    mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let addr = spawn_mux_over_rtp_server(fec, move |mut stream_read, mut stream_write| {
-        let tx = tx.clone();
-        async move {
+    let addr = spawn_mux_over_rtp_server_with_mss(
+        fec,
+        mss,
+        move |mut stream_read, mut stream_write| {
+            let tx = tx.clone();
+            async move {
             let mut buf = Vec::new();
             let read_ok = stream_read.read_to_end(&mut buf).await.is_ok();
             if read_ok || !buf.is_empty() {
@@ -269,6 +317,13 @@ pub async fn spawn_mux_over_rtp_sink_server(
     })
     .await?;
     Ok((addr, rx))
+}
+
+/// Spawn a mux-over-RTP sink server using the default MSS.
+pub async fn spawn_mux_over_rtp_sink_server(
+    fec: bool,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
+    spawn_mux_over_rtp_sink_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Wrap a reliable byte-stream pair in a `mux` client and return the stream
