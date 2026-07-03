@@ -10,7 +10,10 @@
 
 use std::{
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -61,7 +64,7 @@ pub fn lossy_400kib_per_sec() -> NetemConfig {
 }
 
 /// A hostile link profiled from real ICMP measurements against `google.com`
-/// and `8.8.8.8` from this machine: ~15% loss, ~500 ms latency, ~500 ms
+/// and `8.8.8.8` from this machine: ~15% loss, ~300 ms latency, ~500 ms
 /// jitter (stddev). Used by the 400 MiB perf scenario to expose proxy-level
 /// bottlenecks (queue insertion, per-packet locking, allocation) that the
 /// mild synthetic presets cannot reach.
@@ -463,4 +466,120 @@ pub fn print_perf(label: &str, bytes: usize, elapsed: Duration) {
     let mib = bytes as f64 / (1024.0 * 1024.0);
     let throughput_mibps = mib / secs;
     eprintln!("[perf] {label}: {bytes} bytes in {elapsed:?} ({throughput_mibps:.3} MiB/s)");
+}
+
+/// Shared progress counter for the [`spawn_mux_over_rtp_counting_sink_server`]
+/// goodput sink. It tracks how many payload bytes were delivered and whether
+/// any byte failed the deterministic payload check.
+pub struct SinkProgress {
+    /// Total payload bytes accepted by the sink and verified against the
+    /// deterministic `(offset % 251)` pattern.
+    pub delivered: AtomicU64,
+    /// Set to `true` if any accepted byte did not match the expected pattern.
+    pub corrupt: AtomicBool,
+}
+
+impl SinkProgress {
+    /// Create a fresh counter with zero delivered bytes and no corruption flag.
+    pub fn new() -> Self {
+        Self {
+            delivered: AtomicU64::new(0),
+            corrupt: AtomicBool::new(false),
+        }
+    }
+
+    /// Number of payload bytes successfully delivered to the sink so far.
+    pub fn delivered_bytes(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
+
+    /// Whether the sink has observed any corrupted payload byte.
+    pub fn is_corrupt(&self) -> bool {
+        self.corrupt.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for SinkProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
+/// on top of it. Each accepted mux stream is read chunk-by-chunk into a 64 KiB
+/// buffer and verified against the deterministic payload pattern. Verified
+/// bytes are atomically added to the returned [`SinkProgress::delivered`];
+/// a mismatch sets [`SinkProgress::corrupt`] and stops counting that stream.
+///
+/// This sink is intentionally kept mid-flight: it does *not* buffer the full
+/// payload or read to EOF, so a snapshot of `delivered_bytes()` taken while
+/// the transfer is still alive reflects true goodput without an inflated
+/// delivery snapshot.
+pub async fn spawn_mux_over_rtp_counting_sink_server(
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
+    let progress = Arc::new(SinkProgress::new());
+    let addr = spawn_mux_over_rtp_server_with_mss(
+        fec,
+        mss,
+        {
+            let progress = Arc::clone(&progress);
+            move |mut stream_read, mut stream_write| {
+                let progress = Arc::clone(&progress);
+                async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset: u64 = 0;
+                    loop {
+                        match stream_read.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if progress.is_corrupt() {
+                                    continue;
+                                }
+                                let mut corrupt = false;
+                                for (j, &actual) in buf[..n].iter().enumerate() {
+                                    let expected = ((offset + j as u64) % 251) as u8;
+                                    if actual != expected {
+                                        corrupt = true;
+                                        break;
+                                    }
+                                }
+                                if corrupt {
+                                    progress.corrupt.store(true, Ordering::Relaxed);
+                                } else {
+                                    offset += n as u64;
+                                    progress.delivered.fetch_add(n as u64, Ordering::Relaxed);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = stream_write.shutdown();
+                }
+            }
+        },
+    )
+    .await?;
+    Ok((addr, progress))
+}
+
+/// Convenience wrapper using the default RTP MSS.
+pub async fn spawn_mux_over_rtp_counting_sink_server_default(
+    fec: bool,
+) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
+    spawn_mux_over_rtp_counting_sink_server(fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Sort `samples` and print perf summaries for the median and worst
+/// (slowest) runs. Used by the ceiling probes so a single slow warm-up episode
+/// does not distort the reported throughput.
+pub fn print_median_worst(label: &str, bytes: usize, mut samples: Vec<Duration>) {
+    samples.sort();
+    let n = samples.len();
+    assert!(n > 0, "print_median_worst called with empty samples");
+    let median_label = format!("{label} [median of {n}]");
+    let worst_label = format!("{label} [worst of {n}]");
+    print_perf(&median_label, bytes, samples[n / 2]);
+    print_perf(&worst_label, bytes, samples[n - 1]);
 }
