@@ -325,6 +325,18 @@ async fn probe_hostile_goodput_30s() {
         "hostile link should drop and delay packets, got {stats:?}"
     );
 
+    // The sink verifies every accepted byte but a corrupt byte only freezes the
+    // counter, so the freeze must be asserted explicitly rather than left to the
+    // goodput floor.
+    assert!(
+        !progress.is_corrupt(),
+        "sink saw bytes diverging from the payload pattern"
+    );
+    assert!(
+        delivered <= HOSTILE_BULK as u64,
+        "sink counted more bytes than were sent: {delivered}"
+    );
+
     let goodput_mib_s = delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     assert!(
         goodput_mib_s >= HOSTILE_GOODPUT_FLOOR_MIB_S,
