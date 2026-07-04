@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use netem_test::{NetemConfig, NetemPair, Stats};
+use netem_test::{FourStateLoss, LossModel, NetemConfig, NetemPair, Stats};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 
@@ -78,12 +78,108 @@ pub fn hostile_real_link() -> NetemConfig {
     }
 }
 
+/// Two-state Gilbert-Elliott loss model on top of the four-state `sch_netem`
+/// representation.
+///
+/// `loss_pct` is the long-term loss probability (0–100). `mean_burst_len` is the
+/// average number of consecutive lost packets (must be ≥ 1.0). The model is
+/// parameterised so that bursts have `mean_burst_len` losses and gaps have a
+/// geometrically-distributed number of deliveries between bursts.
+///
+/// Maps to [`FourStateLoss`] probabilities scaled so `u32::MAX == 1.0`:
+/// * `p14` = isolated loss probability from a gap.
+/// * `p23` = probability a delivered packet inside a burst is followed by another
+///   loss.
+/// * `p31` = 1.0, so a burst always returns to the gap state after the first
+///   delivered packet following the burst.
+/// * `p13` = `p32` = 0.
+pub fn gilbert_elliott_loss(loss_pct: f64, mean_burst_len: f64) -> LossModel {
+    assert!(
+        (0.0..=100.0).contains(&loss_pct),
+        "loss_pct must be in [0, 100]"
+    );
+    assert!(
+        mean_burst_len >= 1.0,
+        "mean_burst_len must be >= 1.0"
+    );
+
+    // Long-term probability of being in the burst (loss) state.
+    let p_burst = loss_pct / 100.0;
+    // Mean number of delivered packets between isolated burst triggers, given
+    // mean_burst_len and p_burst. Derived from the steady-state equations for
+    // the two-state model.
+    let mean_gap_len = if p_burst == 0.0 {
+        f64::INFINITY
+    } else {
+        mean_burst_len * (1.0 - p_burst) / p_burst
+    };
+
+    // p14: per-delivered-packet chance to enter an isolated burst loss.
+    let p14 = 1.0 / (mean_gap_len + 1.0);
+    // p23: per-burst-packet chance to extend the burst by another loss.
+    let p23 = 1.0 - 1.0 / mean_burst_len;
+
+    let scale = |p: f64| -> u32 {
+        let clamped = p.clamp(0.0, 1.0);
+        (clamped * u32::MAX as f64).round() as u32
+    };
+
+    LossModel::FourState(FourStateLoss {
+        p13: 0,
+        p31: u32::MAX,
+        p32: 0,
+        p14: scale(p14),
+        p23: scale(p23),
+    })
+}
+
+/// Bidirectional `NetemPair` config with the Gilbert-Elliott burst loss model.
+///
+/// No rate cap, no latency beyond the optional one-way `owd`, and a
+/// deterministic seed so the tests are reproducible.
+pub fn burst_loss_link(
+    loss_pct: f64,
+    mean_burst_len: f64,
+    owd: Duration,
+    seed: u64,
+) -> NetemConfig {
+    NetemConfig {
+        loss_model: gilbert_elliott_loss(loss_pct, mean_burst_len),
+        latency: owd,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
+/// Bidirectional `NetemPair` config with independent random loss.
+///
+/// `loss_pct` is the per-packet drop probability (0–100). This is useful as a
+/// baseline in the burst-vs-random comparison tests.
+pub fn random_loss_link(loss_pct: f64, owd: Duration, seed: u64) -> NetemConfig {
+    let loss = ((loss_pct / 100.0) * u32::MAX as f64).clamp(0.0, u32::MAX as f64) as u32;
+    NetemConfig {
+        loss,
+        latency: owd,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
 // ─────────────────────────── deterministic payload ───────────────────────
 
 /// Generate a deterministic payload of `n` bytes. The modulus is a prime so
 /// the byte pattern is non-trivial and reproducible across runs.
 pub fn payload(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+/// Deterministic payload whose length is a multiple of the 251-byte pattern
+/// period. When the caller loops over this buffer with partial writes, the
+/// wrapped stream still matches the `(global_offset % 251)` pattern expected by
+/// the byte-counting sinks.
+pub fn cyclic_payload(n: usize) -> Vec<u8> {
+    let n = n - (n % 251);
+    payload(n)
 }
 
 // ─────────────────────────── timeout wrapper ─────────────────────────────
@@ -344,6 +440,351 @@ pub async fn spawn_mux_over_rtp_sink_server(
     spawn_mux_over_rtp_sink_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
 }
 
+/// Spawn an `rtp` server that accepts one connection and reads into a 64 KiB
+/// buffer, verifying the deterministic payload pattern byte-by-byte as it
+/// arrives. The read half keeps running until the peer closes.
+///
+/// The listener is wrapped in an [`Arc`] so a background `accept()`-loop can
+/// keep driving `udp_listener`'s dispatcher for the server's lifetime: without
+/// a loop, the dispatcher stops forwarding datagrams to the accepted
+/// connection and the reliable layer stalls.
+///
+/// Returns the server's listening address and an [`AtomicU64`] counter that is
+/// incremented with the number of *new* verified payload bytes on every
+/// successful read. This lets tests observe live goodput without waiting for an
+/// EOF.
+pub async fn spawn_rtp_byte_sink_server(
+    fec: bool,
+) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
+    spawn_rtp_byte_sink_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Spawn an `rtp` byte sink server using a custom MSS.
+pub async fn spawn_rtp_byte_sink_server_with_mss(
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
+    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr();
+    let listener = Arc::new(listener);
+
+    let delivered = Arc::new(AtomicU64::new(0));
+    let delivered_for_server = Arc::clone(&delivered);
+    tokio::spawn({
+        let listener = Arc::clone(&listener);
+        async move {
+            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            // Keep driving the listener's dispatcher so packets keep flowing to
+            // the accepted connection. Extra incoming connections are accepted
+            // and ignored.
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move {
+                loop {
+                    if listener.accept_without_handshake_with_mss(fec, mss).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut read = accepted.read.into_async_read();
+            // Hold the write half alive so the connection stays open while we
+            // only receive.
+            let _write = accepted.write;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut offset: u64 = 0;
+            loop {
+                match read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut ok = true;
+                        for (j, &actual) in buf[..n].iter().enumerate() {
+                            let expected = ((offset + j as u64) % 251) as u8;
+                            if actual != expected {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            offset += n as u64;
+                            delivered_for_server.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    Ok((addr, delivered))
+}
+
+/// Spawn an `rtp` server that accepts one connection and parses the same
+/// per-message framing as [`send_timestamped_messages`]: `[4-byte LE total frame
+/// length][payload][8-byte LE send timestamp in micros since `base]`].
+///
+/// The server records the one-way latency of every received message as
+/// `now_us.saturating_sub(sent_us) / 1000.0` milliseconds and pushes the sample
+/// into the returned channel. The read loop continues until the peer closes.
+/// The write half is kept alive until then so the connection is not garbage
+/// collected while only pings are flowing.
+///
+/// The listener is wrapped in an [`Arc`] and driven by a background accept loop
+/// so the `udp_listener` dispatcher keeps forwarding datagrams to the accepted
+/// connection for the server's lifetime.
+pub async fn spawn_rtp_msg_latency_sink(
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+    spawn_rtp_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
+}
+
+/// [`spawn_rtp_msg_latency_sink`] with a custom RTP MSS.
+pub async fn spawn_rtp_msg_latency_sink_with_mss(
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr();
+    let listener = Arc::new(listener);
+
+    tokio::spawn({
+        let listener = Arc::clone(&listener);
+        async move {
+            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move {
+                loop {
+                    if listener.accept_without_handshake_with_mss(fec, mss).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut read = accepted.read.into_async_read();
+            let _write = accepted.write;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut offset = 0usize;
+        loop {
+            if offset >= buf.len() {
+                buf.resize(buf.len().saturating_mul(2), 0u8);
+            }
+            let n = match read.read(&mut buf[offset..]).await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            offset += n;
+            loop {
+                if offset < 4 {
+                    break;
+                }
+                let frame_len =
+                    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if frame_len < 12 {
+                    // Invalid frame; drop the connection.
+                    break;
+                }
+                if offset < frame_len {
+                    break;
+                }
+                let payload_end = frame_len - 8;
+                let sent_us = u64::from_le_bytes([
+                    buf[payload_end],
+                    buf[payload_end + 1],
+                    buf[payload_end + 2],
+                    buf[payload_end + 3],
+                    buf[payload_end + 4],
+                    buf[payload_end + 5],
+                    buf[payload_end + 6],
+                    buf[payload_end + 7],
+                ]);
+                let now_us = base.elapsed().as_micros() as u64;
+                let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                let _ = tx.send(latency_ms);
+                buf.copy_within(frame_len..offset, 0);
+                offset -= frame_len;
+            }
+        }
+    }});
+    Ok((addr, rx))
+}
+
+/// Open a fresh `rtp` connection through the proxy and return the async write
+/// half. A background task keeps the read half alive so ACKs are processed and
+/// the sender does not stall.
+///
+/// This is the sender side for the live-goodput probes. The caller writes data
+/// through the returned write half and drops it (or aborts the writing task)
+/// when done; the read-keepalive task exits automatically when the peer closes.
+pub async fn spawn_rtp_bulk_upload(
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+) -> std::io::Result<rtp::socket::WriteStream> {
+    spawn_rtp_bulk_upload_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// [`spawn_rtp_bulk_upload`] with a custom MSS.
+pub async fn spawn_rtp_bulk_upload_with_mss(
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<rtp::socket::WriteStream> {
+    let connected = rtp::udp::connect_without_handshake_with_mss(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        None,
+        fec,
+        mss,
+    )
+    .await?;
+    let mut read = connected.read.into_async_read();
+    let write = connected.write.into_async_write();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    Ok(write)
+}
+
+/// Spawn a mux-over-RTP server that accepts one connection and parses a simple
+/// per-message framing on each accepted mux stream: each record carries a
+/// 4-byte little-endian total frame length (including the 4-byte length itself
+/// and the 8-byte timestamp trailer), followed by the payload, followed by an
+/// 8-byte little-endian send timestamp in microseconds since `base`.
+///
+/// The server records the one-way latency of every received message as
+/// `now_us.saturating_sub(sent_us) / 1000.0` milliseconds and pushes the sample
+/// into the returned channel. The read loop continues until the peer closes.
+///
+/// Using `mux` over RTP is important for sparse-message streams: `mux` emits
+/// periodic heartbeat frames that keep the underlying RTP connection alive and
+/// acknowledged, avoiding the RTP layer's proactive broken-pipe heuristic that
+/// fires on quiet unidirectional streams.
+pub async fn spawn_mux_msg_latency_sink(
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+    spawn_mux_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
+}
+
+/// [`spawn_mux_msg_latency_sink`] with a custom RTP MSS.
+pub async fn spawn_mux_msg_latency_sink_with_mss(
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+    let addr = spawn_mux_over_rtp_server_with_mss(
+        fec,
+        mss,
+        move |mut stream_read, mut stream_write| {
+            let tx = tx.clone();
+            async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut offset = 0usize;
+                loop {
+                    let n = match stream_read.read(&mut buf[offset..]).await {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    offset += n;
+                    // Parse complete frames from the accumulated buffer.
+                    loop {
+                        if offset < 4 {
+                            break;
+                        }
+                        let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                        if frame_len < 12 {
+                            // Invalid frame; drop the whole connection.
+                            break;
+                        }
+                        if offset < frame_len {
+                            break;
+                        }
+                        let payload_end = frame_len - 8;
+                        let sent_us = u64::from_le_bytes([
+                            buf[payload_end],
+                            buf[payload_end + 1],
+                            buf[payload_end + 2],
+                            buf[payload_end + 3],
+                            buf[payload_end + 4],
+                            buf[payload_end + 5],
+                            buf[payload_end + 6],
+                            buf[payload_end + 7],
+                        ]);
+                        let now_us = base.elapsed().as_micros() as u64;
+                        let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                        let _ = tx.send(latency_ms);
+                        buf.copy_within(frame_len..offset, 0);
+                        offset -= frame_len;
+                    }
+                }
+                let _ = stream_write.shutdown();
+            }
+        },
+    )
+    .await?;
+    Ok((addr, rx))
+}
+
+/// Send timestamped messages through a reliable byte-stream write half.
+///
+/// Each message is framed as `[4-byte LE total frame length][payload][8-byte
+/// LE send timestamp in micros since `base`]`. Messages are sent at `interval`
+/// using [`tokio::time::interval`] with [`MissedTickBehavior::Delay`] so a
+/// missed deadline does not burst the offered load. The payload is a repeated
+/// 12-byte sequence (rest-padded) so the server can verify message integrity.
+///
+/// Returns the number of messages sent. The caller is responsible for keeping
+/// `write` alive for the duration of the test (e.g. by not shutting down the
+/// underlying stream early).
+pub async fn send_timestamped_messages(
+    write: &mut (impl AsyncWrite + Unpin),
+    base: Instant,
+    msg_bytes: usize,
+    interval: Duration,
+    run_for: Duration,
+) -> u64 {
+    assert!(msg_bytes >= 12, "message framing needs at least 12 bytes");
+    let mut interval = tokio::time::interval(interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sent = 0u64;
+    let payload_bytes = msg_bytes - 12;
+    let payload: Vec<u8> = (0..payload_bytes).map(|i| (i % 251) as u8).collect();
+    let start = Instant::now();
+    loop {
+        interval.tick().await;
+        if start.elapsed() >= run_for {
+            break;
+        }
+        let sent_us = base.elapsed().as_micros() as u64;
+        let mut frame = Vec::with_capacity(msg_bytes);
+        frame.extend_from_slice(&((msg_bytes as u32).to_le_bytes()));
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&sent_us.to_le_bytes());
+        if write.write_all(&frame).await.is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    sent
+}
+
 /// Wrap a reliable byte-stream pair in a `mux` client and return the stream
 /// opener plus the supervision `JoinSet` (kept alive for the test duration).
 pub fn mux_client_connect<R, W>(read: R, write: W) -> (mux::StreamOpener, JoinSet<mux::MuxError>)
@@ -582,4 +1023,13 @@ pub fn print_median_worst(label: &str, bytes: usize, mut samples: Vec<Duration>)
     let worst_label = format!("{label} [worst of {n}]");
     print_perf(&median_label, bytes, samples[n / 2]);
     print_perf(&worst_label, bytes, samples[n - 1]);
+}
+
+/// Return the p-th percentile of `sorted` using nearest-rank, truncating the
+/// index. `sorted` must be sorted ascending and non-empty.
+pub fn percentile(sorted: &[f64], p: f64) -> f64 {
+    assert!(!sorted.is_empty(), "percentile called on empty samples");
+    assert!((0.0..=1.0).contains(&p), "percentile p must be in [0.0, 1.0]");
+    let rank = ((sorted.len() as f64 - 1.0) * p).floor() as usize;
+    sorted[rank.min(sorted.len() - 1)]
 }

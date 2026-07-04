@@ -16,7 +16,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -222,6 +222,31 @@ pub trait UdpTransport: Send + Sync + 'static {
     fn recv_timeout(&self) -> io::Result<Option<Duration>>;
 }
 
+impl<T: UdpTransport + ?Sized> UdpTransport for Arc<T> {
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        (**self).recv_from(buf)
+    }
+    fn recv_from_timeout(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> io::Result<(usize, SocketAddr)> {
+        (**self).recv_from_timeout(buf, timeout)
+    }
+    fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
+        (**self).send_to(data, dst)
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        (**self).local_addr()
+    }
+    fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
+        (**self).set_recv_timeout(timeout)
+    }
+    fn recv_timeout(&self) -> io::Result<Option<Duration>> {
+        (**self).recv_timeout()
+    }
+}
+
 /// Standard-library `UdpSocket` backed transport.
 #[derive(Debug)]
 pub struct StdUdpTransport {
@@ -308,6 +333,12 @@ pub struct NetemConfig {
     pub rate: u64,
     /// PRNG seed for deterministic behaviour.
     pub seed: u64,
+    /// sch_netem-style packet queue `limit`. `0` means unbounded legacy
+    /// behaviour. When non-zero, it bounds the whole delay heap including
+    /// latency/jitter-held in-flight packets, so latency×rate configs must size
+    /// `limit` above the latency×rate (in packets) plus the intended bottleneck
+    /// buffer. Kernel `sch_netem` defaults to 1000.
+    pub limit: usize,
 }
 
 impl Default for NetemConfig {
@@ -326,11 +357,13 @@ impl Default for NetemConfig {
             loss_model: LossModel::default(),
             rate: 0,
             seed: 0xC0FF_EEBE_EFC0_FFEE,
+            limit: 0,
         }
     }
 }
 
-/// Live impairment counters – mirrors `struct tc_netem_xstats`.
+/// Live impairment counters – mirrors `struct tc_netem_xstats` plus the
+/// separate overflow-drop counter required by the packet queue limit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub delayed: u64,
@@ -340,6 +373,8 @@ pub struct Stats {
     pub rate_limited: u64,
     pub forwarded: u64,
     pub received: u64,
+    /// Packets dropped because the per-direction queue exceeded `limit`.
+    pub overflow_dropped: u64,
 }
 
 /// Atomic backing store for [`Stats`] so the runner thread can update counters
@@ -354,6 +389,7 @@ struct AtomicStats {
     rate_limited: AtomicU64,
     forwarded: AtomicU64,
     received: AtomicU64,
+    overflow_dropped: AtomicU64,
 }
 
 impl AtomicStats {
@@ -371,6 +407,7 @@ impl AtomicStats {
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             forwarded: self.forwarded.load(Ordering::Relaxed),
             received: self.received.load(Ordering::Relaxed),
+            overflow_dropped: self.overflow_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -427,6 +464,7 @@ pub struct NetemLink {
     server_addr: SocketAddr,
     stats: Arc<AtomicStats>,
     queue_len: Arc<AtomicU64>,
+    blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
 }
 
@@ -470,6 +508,7 @@ impl NetemLink {
         let client_addr = transport.local_addr()?;
         let stats = Arc::new(AtomicStats::default());
         let queue_len = Arc::new(AtomicU64::new(0));
+        let blackout = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(Mutex::new(false));
 
         let link = Self {
@@ -477,10 +516,11 @@ impl NetemLink {
             server_addr,
             stats: Arc::clone(&stats),
             queue_len: Arc::clone(&queue_len),
+            blackout: Arc::clone(&blackout),
             stop: Arc::clone(&stop),
         };
 
-        let runner = Runner::new(config, server_addr, stats, queue_len, stop, transport);
+        let runner = Runner::new(config, server_addr, stats, queue_len, blackout, stop, transport);
         std::thread::Builder::new()
             .name("netem-link".into())
             .spawn(move || runner.run())?;
@@ -516,6 +556,13 @@ impl NetemLink {
         }
     }
 
+    /// Enable or disable the 100% loss blackout gate. Packets already queued
+    /// continue to drain; newly received packets are counted as dropped while
+    /// the gate is closed.
+    pub fn set_blackout(&self, on: bool) {
+        self.blackout.store(on, Ordering::Relaxed);
+    }
+
     /// Signal the proxy thread to stop after the next iteration.
     pub fn stop(&self) {
         *self.stop.lock().unwrap() = true;
@@ -529,6 +576,7 @@ struct Runner {
     server_addr: SocketAddr,
     stats: Arc<AtomicStats>,
     queue_len: Arc<AtomicU64>,
+    blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
     transport: Box<dyn UdpTransport>,
     rng: RndState,
@@ -551,6 +599,7 @@ impl Runner {
         server_addr: SocketAddr,
         stats: Arc<AtomicStats>,
         queue_len: Arc<AtomicU64>,
+        blackout: Arc<AtomicBool>,
         stop: Arc<Mutex<bool>>,
         transport: Box<dyn UdpTransport>,
     ) -> Self {
@@ -565,6 +614,7 @@ impl Runner {
             server_addr,
             stats,
             queue_len,
+            blackout,
             stop,
             transport,
             rng,
@@ -604,6 +654,15 @@ impl Runner {
 
     fn handle_datagram(&mut self, data: &[u8], _from: SocketAddr, now: Instant) {
         self.stats.inc(|s| &s.received);
+
+        // ── blackout gate ────────────────────────────────────────────
+        // Drop every incoming packet while the gate is closed. This runs after
+        // the packet is counted as received so Stats.received includes gated
+        // packets and Stats.dropped counts them.
+        if self.blackout.load(Ordering::Relaxed) {
+            self.stats.inc(|s| &s.dropped);
+            return;
+        }
 
         // ── duplication ──────────────────────────────────────────────
         let mut count = 1u32;
@@ -655,6 +714,15 @@ impl Runner {
     }
 
     fn enqueue(&mut self, data: &[u8], now: Instant) {
+        // ── queue limit (tail-drop) ──────────────────────────────────
+        // Check before the reorder/schedule logic so a tail-dropped packet
+        // consumes no PRNG draw, never advances next_send, and leaves the
+        // reorder_counter untouched.
+        if self.config.limit != 0 && self.queue.len() >= self.config.limit {
+            self.stats.inc(|s| &s.overflow_dropped);
+            return;
+        }
+
         // ── reorder ──────────────────────────────────────────────────
         // Reorder only when gap != 0 and only after the reorder counter
         // reaches gap - 1; use "reorder >= random" like sch_netem.
@@ -749,6 +817,10 @@ pub struct NetemPair {
     server_addr: SocketAddr,
     stats_c2s: Arc<AtomicStats>,
     stats_s2c: Arc<AtomicStats>,
+    queue_len_c2s: Arc<AtomicU64>,
+    queue_len_s2c: Arc<AtomicU64>,
+    blackout_c2s: Arc<AtomicBool>,
+    blackout_s2c: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
 }
 
@@ -787,6 +859,10 @@ impl NetemPair {
     ) -> io::Result<Self> {
         let stats_c2s = Arc::new(AtomicStats::default());
         let stats_s2c = Arc::new(AtomicStats::default());
+        let queue_len_c2s = Arc::new(AtomicU64::new(0));
+        let queue_len_s2c = Arc::new(AtomicU64::new(0));
+        let blackout_c2s = Arc::new(AtomicBool::new(false));
+        let blackout_s2c = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(Mutex::new(false));
         let learned_client = Arc::new(Mutex::<Option<SocketAddr>>::new(None));
 
@@ -795,6 +871,10 @@ impl NetemPair {
             server_addr,
             stats_c2s: Arc::clone(&stats_c2s),
             stats_s2c: Arc::clone(&stats_s2c),
+            queue_len_c2s: Arc::clone(&queue_len_c2s),
+            queue_len_s2c: Arc::clone(&queue_len_s2c),
+            blackout_c2s: Arc::clone(&blackout_c2s),
+            blackout_s2c: Arc::clone(&blackout_s2c),
             stop: Arc::clone(&stop),
         };
 
@@ -808,6 +888,8 @@ impl NetemPair {
         let c2s_runner = DirectionRunner::new(
             c2s,
             stats_c2s,
+            queue_len_c2s,
+            blackout_c2s,
             Arc::clone(&stop),
             Arc::clone(&client_sock),
             Arc::clone(&server_sock),
@@ -823,6 +905,8 @@ impl NetemPair {
         let s2c_runner = DirectionRunner::new(
             s2c,
             stats_s2c,
+            queue_len_s2c,
+            blackout_s2c,
             stop,
             server_sock,
             client_sock,
@@ -856,6 +940,16 @@ impl NetemPair {
         self.stats_s2c.snapshot()
     }
 
+    /// Queue depth for the client→server direction.
+    pub fn queue_len_c2s(&self) -> usize {
+        self.queue_len_c2s.load(Ordering::Relaxed) as usize
+    }
+
+    /// Queue depth for the server→client direction.
+    pub fn queue_len_s2c(&self) -> usize {
+        self.queue_len_s2c.load(Ordering::Relaxed) as usize
+    }
+
     /// Combined stats across both directions.
     pub fn stats(&self) -> Stats {
         let a = self.stats_c2s();
@@ -868,7 +962,34 @@ impl NetemPair {
             rate_limited: a.rate_limited + b.rate_limited,
             forwarded: a.forwarded + b.forwarded,
             received: a.received + b.received,
+            overflow_dropped: a.overflow_dropped + b.overflow_dropped,
         }
+    }
+
+    /// Per-direction snapshots.
+    pub fn snapshot_c2s(&self) -> Snapshot {
+        Snapshot {
+            stats: self.stats_c2s(),
+            queue_len: self.queue_len_c2s(),
+        }
+    }
+
+    pub fn snapshot_s2c(&self) -> Snapshot {
+        Snapshot {
+            stats: self.stats_s2c(),
+            queue_len: self.queue_len_s2c(),
+        }
+    }
+
+    /// Enable or disable the 100% loss blackout gate for a direction. Packets
+    /// already queued continue to drain; newly received packets are counted as
+    /// dropped while the gate is closed.
+    pub fn set_blackout_c2s(&self, on: bool) {
+        self.blackout_c2s.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_blackout_s2c(&self, on: bool) {
+        self.blackout_s2c.store(on, Ordering::Relaxed);
     }
 
     /// Signal both proxy threads to stop after the next iteration.
@@ -883,6 +1004,7 @@ struct DirectionRunner {
     config: NetemConfig,
     stats: Arc<AtomicStats>,
     queue_len: Arc<AtomicU64>,
+    blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
     recv: Arc<dyn UdpTransport>,
     send: Arc<dyn UdpTransport>,
@@ -909,6 +1031,8 @@ impl DirectionRunner {
     fn new(
         config: NetemConfig,
         stats: Arc<AtomicStats>,
+        queue_len: Arc<AtomicU64>,
+        blackout: Arc<AtomicBool>,
         stop: Arc<Mutex<bool>>,
         recv: Arc<dyn UdpTransport>,
         send: Arc<dyn UdpTransport>,
@@ -922,9 +1046,10 @@ impl DirectionRunner {
             dup_cor: CorRng::new(config.dup_corr),
             reorder_cor: CorRng::new(config.reorder_corr),
             next_send: Instant::now(),
-            queue_len: Arc::new(AtomicU64::new(0)),
             config,
             stats,
+            queue_len,
+            blackout,
             stop,
             recv,
             send,
@@ -971,6 +1096,12 @@ impl DirectionRunner {
     fn handle_datagram(&mut self, data: &[u8], now: Instant) {
         self.stats.inc(|s| &s.received);
 
+        // ── blackout gate ────────────────────────────────────────────
+        if self.blackout.load(Ordering::Relaxed) {
+            self.stats.inc(|s| &s.dropped);
+            return;
+        }
+
         let mut count = 1u32;
         if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
             count += 1;
@@ -1015,6 +1146,12 @@ impl DirectionRunner {
     }
 
     fn enqueue(&mut self, data: &[u8], now: Instant) {
+        // ── queue limit (tail-drop) ──────────────────────────────────
+        if self.config.limit != 0 && self.queue.len() >= self.config.limit {
+            self.stats.inc(|s| &s.overflow_dropped);
+            return;
+        }
+
         // ── reorder ──────────────────────────────────────────────────
         // Reorder only when gap != 0 and only after the reorder counter
         // reaches gap - 1; use "reorder >= random" like sch_netem.
@@ -1103,6 +1240,8 @@ impl DirectionRunner {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     #[test]
@@ -1178,5 +1317,267 @@ mod tests {
         assert_eq!(c.loss, 0);
         assert_eq!(c.duplicate, 0);
         assert_eq!(c.rate, 0);
+        assert_eq!(c.limit, 0);
+    }
+
+    /// In-memory transport that records sent payloads and can return them on
+    /// `recv_from`. Used to drive [`Runner`] deterministically in unit tests.
+    #[derive(Debug)]
+    struct MockTransport {
+        recv: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+        sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+        local_addr: SocketAddr,
+    }
+
+    impl MockTransport {
+        fn new(local_addr: SocketAddr) -> Self {
+            Self {
+                recv: Mutex::new(VecDeque::new()),
+                sent: Mutex::new(Vec::new()),
+                local_addr,
+            }
+        }
+
+        fn push_recv(&self, data: Vec<u8>, from: SocketAddr) {
+            self.recv.lock().unwrap().push_back((data, from));
+        }
+    }
+
+    impl UdpTransport for MockTransport {
+        fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            let mut q = self.recv.lock().unwrap();
+            let (data, from) = q.pop_front().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "no queued datagrams")
+            })?;
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            Ok((n, from))
+        }
+
+        fn recv_from_timeout(
+            &self,
+            buf: &mut [u8],
+            _timeout: Duration,
+        ) -> io::Result<(usize, SocketAddr)> {
+            self.recv_from(buf)
+        }
+
+        fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
+            self.sent.lock().unwrap().push((data.to_vec(), dst));
+            Ok(())
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+
+        fn set_recv_timeout(&self, _timeout: Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn recv_timeout(&self) -> io::Result<Option<Duration>> {
+            Ok(None)
+        }
+    }
+
+    /// Build a [`Runner`] directly and expose it via `handle_datagram` / `drain_ready`.
+    fn mock_runner(config: NetemConfig) -> (Runner, Arc<MockTransport>) {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let captured = Arc::new(MockTransport::new(server_addr));
+        let runner = Runner::new(
+            config,
+            server_addr,
+            Arc::new(AtomicStats::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(false)),
+            Box::new(Arc::clone(&captured) as Arc<dyn UdpTransport>),
+        );
+        (runner, captured)
+    }
+
+    /// Helper: run a single datagram through a [`Runner`] and return the runner
+    /// plus the send-side mock.
+    fn one_packet_runner(
+        data: &[u8],
+        from: SocketAddr,
+        config: NetemConfig,
+    ) -> (Runner, Arc<MockTransport>) {
+        let (mut runner, sent) = mock_runner(config);
+        runner.handle_datagram(data, from, Instant::now());
+        (runner, sent)
+    }
+
+    #[test]
+    fn limit_zero_is_unbounded() {
+        let mut config = NetemConfig::default();
+        config.latency = Duration::from_secs(1);
+        config.limit = 0;
+        let (mut runner, sent) = one_packet_runner(b"x", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), config);
+        // Pile 10 packets on the delayed heap with no draining.
+        for i in 0..10u8 {
+            runner.handle_datagram(&[i], SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), Instant::now());
+        }
+        assert_eq!(runner.queue.len(), 11);
+        assert_eq!(runner.stats.snapshot().overflow_dropped, 0);
+        assert_eq!(runner.stats.snapshot().received, 11);
+        drop(sent);
+    }
+
+    #[test]
+    fn limit_tail_drops_and_counts_overflow() {
+        let mut config = NetemConfig::default();
+        config.latency = Duration::from_secs(1);
+        config.limit = 4;
+        let (mut runner, sent) = one_packet_runner(b"x", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), config);
+        // With limit=4, the first 4 packets fill the queue; the 6th-10th are tail-dropped.
+        for i in 0..10u8 {
+            runner.handle_datagram(&[i], SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), Instant::now());
+        }
+        assert_eq!(runner.queue.len(), 4);
+        let s = runner.stats.snapshot();
+        assert_eq!(s.received, 11);
+        assert_eq!(s.overflow_dropped, 7);
+        assert_eq!(s.dropped, 0); // no loss model drops
+        drop(sent);
+    }
+
+    #[test]
+    fn overflow_drops_do_not_advance_shaper_clock_or_reorder_slot() {
+        let mut config = NetemConfig::default();
+        config.rate = 8_000; // 1 byte per ms
+        config.limit = 2;
+        // Fill queue to capacity.
+        let (mut runner, sent) = one_packet_runner(b"a", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), config);
+        runner.handle_datagram(b"b", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), Instant::now());
+        let first_next_send = runner.next_send;
+        let first_counter = runner.reorder_counter;
+        // The next packet must be tail-dropped, leaving state unchanged.
+        runner.handle_datagram(b"overflow", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), Instant::now());
+        assert_eq!(runner.next_send, first_next_send);
+        assert_eq!(runner.reorder_counter, first_counter);
+        assert_eq!(runner.stats.snapshot().overflow_dropped, 1);
+        drop(sent);
+    }
+
+    #[test]
+    fn limit_decisions_consume_no_prng_draws() {
+        let mut config = NetemConfig::default();
+        config.latency = Duration::from_secs(1);
+        config.limit = 1;
+        // Gap/reorder/reorder_corr are zero so no reorder draws happen anyway;
+        // this test primarily exercises that tail-drop returns early.
+        let (mut runner, sent) = one_packet_runner(b"a", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), config);
+        let rng_before = runner.rng;
+        runner.handle_datagram(b"overflow", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), Instant::now());
+        assert_eq!(runner.rng.s1, rng_before.s1);
+        assert_eq!(runner.rng.s2, rng_before.s2);
+        assert_eq!(runner.rng.s3, rng_before.s3);
+        assert_eq!(runner.rng.s4, rng_before.s4);
+        drop(sent);
+    }
+
+    #[test]
+    fn blackout_gates_at_forward_time_and_toggles_instantly() {
+        let mut config = NetemConfig::default();
+        // Latency small enough that the first packet has drained by the time we
+        // inspect, while the second is gated.
+        config.latency = Duration::from_millis(1);
+        let (mut runner, sent) = one_packet_runner(b"before", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), config.clone());
+        runner.blackout.store(true, Ordering::Relaxed);
+        runner.handle_datagram(b"after", SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)), Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+        runner.drain_ready(Instant::now());
+        let s = runner.stats.snapshot();
+        assert_eq!(s.received, 2);
+        assert_eq!(s.dropped, 1);
+        assert_eq!(s.forwarded, 1);
+        assert_eq!(sent.sent.lock().unwrap().len(), 1);
+        drop(sent);
+    }
+
+    #[test]
+    fn netem_pair_exposes_per_direction_queue_depth() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3000));
+        let mut c2s = NetemConfig::default();
+        c2s.latency = Duration::from_secs(1);
+        c2s.limit = 5;
+        let mut s2c = NetemConfig::default();
+        s2c.latency = Duration::from_millis(500);
+        s2c.limit = 2;
+
+        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            4001,
+        ))));
+        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let client_addr = client_sock.local_addr().unwrap();
+        let pair = NetemPair::spawn_from_sockets(
+            server_addr,
+            c2s,
+            s2c,
+            Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
+            Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
+            client_addr,
+        )
+        .unwrap();
+
+        // Pump c2s: send 3 client packets; with limit 5 they all queue.
+        for i in 0..3u8 {
+            client_sock.push_recv(vec![i], SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5000)));
+        }
+        // Give the runner thread a moment to pick them up.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(pair.queue_len_c2s(), 3);
+        assert_eq!(pair.queue_len_s2c(), 0);
+        pair.stop();
+    }
+
+    #[test]
+    fn pair_blackout_toggles_at_runtime() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3100));
+        let mut c2s = NetemConfig::default();
+        c2s.latency = Duration::from_millis(2);
+        let mut s2c = NetemConfig::default();
+        s2c.latency = Duration::from_millis(2);
+
+        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            4002,
+        ))));
+        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let client_addr = client_sock.local_addr().unwrap();
+        let pair = NetemPair::spawn_from_sockets(
+            server_addr,
+            c2s,
+            s2c,
+            Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
+            Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
+            client_addr,
+        )
+        .unwrap();
+
+        // First packet forwarded normally.
+        client_sock.push_recv(vec![1], SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(pair.stats_c2s().forwarded >= 1);
+
+        // Enable blackout and send more packets.
+        pair.set_blackout_c2s(true);
+        client_sock.push_recv(vec![2], SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)));
+        client_sock.push_recv(vec![3], SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)));
+        std::thread::sleep(Duration::from_millis(50));
+        let gated = pair.stats_c2s();
+        assert_eq!(gated.received, 3);
+        assert_eq!(gated.dropped, 2);
+
+        // Disable blackout; subsequent packets forward again.
+        pair.set_blackout_c2s(false);
+        client_sock.push_recv(vec![4], SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)));
+        std::thread::sleep(Duration::from_millis(50));
+        let final_stats = pair.stats_c2s();
+        assert!(final_stats.forwarded >= 2);
+        assert_eq!(final_stats.received, 4);
+        pair.stop();
     }
 }
