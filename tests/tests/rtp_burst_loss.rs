@@ -32,6 +32,10 @@ const BULK_WINDOW_S: u64 = 12;
 /// Minimum anti-stall floor: burst loss must outperform independent random loss
 /// of the same average rate.
 const MIN_BURST_VS_RANDOM_RATIO: f64 = 1.0;
+/// Absolute anti-stall floor for the random-loss baseline. The ratio assertion
+/// above passes even when both 12 s runs stall near zero, so the random-loss
+/// baseline must also make real progress.
+const RANDOM_GOODPUT_STALL_FLOOR_MIB_S: f64 = 1.0;
 
 /// Number of messages sent by the sparse-message tail-latency probe.
 const SPARSE_MSG_COUNT: u64 = 200;
@@ -43,9 +47,10 @@ const SPARSE_MSG_BYTES: usize = 64;
 const SPARSE_DELIVERY_FLOOR_PCT: f64 = 0.98;
 /// Floor: p99 one-way latency under burst loss must stay below ~2.5 s.
 const SPARSE_P99_LATENCY_MS: f64 = 2500.0;
-/// Floor: p50 one-way latency under burst loss must stay below ~600 ms once TLP
-/// lands.
-const SPARSE_P50_LATENCY_MS: f64 = 600.0;
+/// Floor: p50 one-way latency under burst loss must stay below ~300 ms. The
+/// median is not RTO-quantized; stock behaviour is ~55 ms at this test's 100 ms
+/// RTT (OWD = 50 ms), so this leaves a generous allowance.
+const SPARSE_P50_LATENCY_MS: f64 = 300.0;
 
 /// Burst-loss profile: long-term 5% loss, mean burst length 8.
 const BURST_LOSS_PCT: f64 = 5.0;
@@ -103,6 +108,10 @@ async fn rtp_bulk_goodput_burst_loss_not_worse_than_random() {
     };
     eprintln!("[rtp_burst_loss] burst/random ratio = {ratio:.3}");
     assert!(
+        random_goodput >= RANDOM_GOODPUT_STALL_FLOOR_MIB_S,
+        "random-loss baseline stalled: {random_goodput:.3} MiB/s < {RANDOM_GOODPUT_STALL_FLOOR_MIB_S} MiB/s"
+    );
+    assert!(
         ratio >= MIN_BURST_VS_RANDOM_RATIO,
         "burst-loss goodput {burst_goodput:.3} MiB/s must not be worse than random-loss {random_goodput:.3} MiB/s (ratio {ratio:.3} < {MIN_BURST_VS_RANDOM_RATIO})"
     );
@@ -155,7 +164,7 @@ async fn run_rtp_sink_upload(
 /// loss rather than RTP's idle broken-pipe heuristic. The server records
 /// one-way latency for every delivered message. After draining, we assert:
 /// * received / sent >= 98%
-/// * p50 <= 600 ms
+/// * p50 <= 300 ms
 /// * p99 <= 2500 ms
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]

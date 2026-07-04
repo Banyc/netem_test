@@ -88,12 +88,16 @@ pub fn hostile_real_link() -> NetemConfig {
 /// geometrically-distributed number of deliveries between bursts.
 ///
 /// Maps to [`FourStateLoss`] probabilities scaled so `u32::MAX == 1.0`:
-/// * `p14` = isolated loss probability from a gap.
-/// * `p23` = probability a delivered packet inside a burst is followed by another
-///   loss.
-/// * `p31` = 1.0, so a burst always returns to the gap state after the first
-///   delivered packet following the burst.
-/// * `p13` = `p32` = 0.
+/// * `p13` = probability a delivered packet in the gap state moves into the
+///   burst-loss state (that packet is lost).
+/// * `p31` = probability the burst-loss state returns to the gap state (that
+///   delivered packet ends the burst).
+/// * `p14` = `p23` = `p32` = 0.
+///
+/// Staying in burst-loss loses every packet, so burst and gap lengths are
+/// geometric with means `1/p31` and `1/p13` respectively. `p14` cannot express
+/// bursts because its successor state `LostInGap` always delivers the next
+/// packet.
 pub fn gilbert_elliott_loss(loss_pct: f64, mean_burst_len: f64) -> LossModel {
     assert!(
         (0.0..=100.0).contains(&loss_pct),
@@ -115,22 +119,17 @@ pub fn gilbert_elliott_loss(loss_pct: f64, mean_burst_len: f64) -> LossModel {
         mean_burst_len * (1.0 - p_burst) / p_burst
     };
 
-    // p14: per-delivered-packet chance to enter an isolated burst loss.
-    let p14 = 1.0 / (mean_gap_len + 1.0);
-    // p23: per-burst-packet chance to extend the burst by another loss.
-    let p23 = 1.0 - 1.0 / mean_burst_len;
-
     let scale = |p: f64| -> u32 {
         let clamped = p.clamp(0.0, 1.0);
         (clamped * u32::MAX as f64).round() as u32
     };
 
     LossModel::FourState(FourStateLoss {
-        p13: 0,
-        p31: u32::MAX,
+        p13: scale(1.0 / mean_gap_len),
+        p31: scale(1.0 / mean_burst_len),
         p32: 0,
-        p14: scale(p14),
-        p23: scale(p23),
+        p14: 0,
+        p23: 0,
     })
 }
 
