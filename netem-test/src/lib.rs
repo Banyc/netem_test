@@ -419,6 +419,85 @@ pub struct Snapshot {
     pub queue_len: usize,
 }
 
+// ───────────────────────────── shared shaper ───────────────────────────
+
+/// Multi-flow shared-bottleneck serialization clock.
+///
+/// Several [`NetemPair`] directions can share one [`SharedShaper`] so that
+/// N flows contend for a single link rate instead of each flow getting its
+/// own independent cap. Per-packet propagation delay, loss, jitter, and the
+/// per-direction queue limit stay with each [`DirectionRunner`]; only the
+/// send-time serialization clock and the optional shared tail-drop buffer are
+/// shared.
+#[derive(Clone, Debug)]
+pub struct SharedShaper(Arc<Mutex<ShaperState>>);
+
+#[derive(Debug)]
+struct ShaperState {
+    /// Shared rate in bits per second.
+    rate: u64,
+    /// Shared tail-drop buffer in bytes. `0` means unbounded.
+    limit_bytes: u64,
+    /// Earliest time the next packet may leave the shared bottleneck.
+    next_send: Instant,
+    /// Packets dropped because they exceeded `limit_bytes`.
+    dropped: u64,
+}
+
+impl SharedShaper {
+    /// Create a shared shaper. `rate_bps` must be greater than zero.
+    /// `limit_bytes` is the shared tail-drop buffer; use `0` for unbounded.
+    pub fn new(rate_bps: u64, limit_bytes: u64) -> Self {
+        assert!(rate_bps > 0, "SharedShaper rate must be greater than zero");
+        Self(Arc::new(Mutex::new(ShaperState {
+            rate: rate_bps,
+            limit_bytes,
+            next_send: Instant::now(),
+            dropped: 0,
+        })))
+    }
+
+    /// Current configured rate in bits per second.
+    pub fn rate_bps(&self) -> u64 {
+        self.0.lock().unwrap().rate
+    }
+
+    /// Number of packets tail-dropped by the shared shaper.
+    pub fn dropped(&self) -> u64 {
+        self.0.lock().unwrap().dropped
+    }
+
+    /// Bytes currently sitting in the shared serialization backlog as of `now`.
+    pub fn backlog_bytes(&self, now: Instant) -> u64 {
+        let state = self.0.lock().unwrap();
+        let backlog_ns = state.next_send.saturating_duration_since(now).as_nanos() as u128;
+        (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64
+    }
+
+    /// Schedule a packet of `len` bytes arriving at `base` through the shared
+    /// bottleneck.
+    ///
+    /// Returns `Some(exit_time)` if the packet is accepted, or `None` if it is
+    /// tail-dropped because `limit_bytes` would be exceeded. The returned
+    /// exit time does *not* include per-flow propagation delay; the caller must
+    /// add its own latency/jitter afterwards.
+    pub fn schedule(&self, base: Instant, len: usize) -> Option<Instant> {
+        let mut state = self.0.lock().unwrap();
+        let backlog_ns = state.next_send.saturating_duration_since(base).as_nanos() as u128;
+        let backlog = (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64;
+        if state.limit_bytes != 0 && backlog.saturating_add(len as u64) > state.limit_bytes {
+            state.dropped += 1;
+            return None;
+        }
+        let packet_bits = (len as u64).saturating_mul(8);
+        let serialize_ns =
+            (packet_bits as u128).saturating_mul(1_000_000_000) / state.rate as u128;
+        let t = base.max(state.next_send) + Duration::from_nanos(serialize_ns as u64);
+        state.next_send = t;
+        Some(t)
+    }
+}
+
 // ───────────────────────────── queued packet ───────────────────────────
 
 #[derive(Clone)]
@@ -846,9 +925,69 @@ impl NetemPair {
         let client_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(client_bind)?);
         let server_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(server_bind)?);
         let client_addr = client_sock.local_addr()?;
-        Self::spawn_from_sockets(server_addr, c2s, s2c, client_sock, server_sock, client_addr)
+        Self::spawn_from_sockets_shared(
+            server_addr,
+            c2s,
+            s2c,
+            client_sock,
+            server_sock,
+            client_addr,
+            None,
+            None,
+        )
     }
 
+    /// Spawn a bidirectional proxy with optional shared shapers.
+    ///
+    /// This is the same as [`NetemPair::spawn`], but a direction can be given a
+    /// [`SharedShaper`] so that multiple flows contend for one bottleneck rate.
+    /// The corresponding direction's `config.rate` must be `0`; otherwise the
+    /// call panics with a "double-shape" message.
+    pub fn spawn_shared(
+        server_addr: SocketAddr,
+        c2s: NetemConfig,
+        s2c: NetemConfig,
+        c2s_shared: Option<SharedShaper>,
+        s2c_shared: Option<SharedShaper>,
+    ) -> io::Result<Self> {
+        let localhost = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        Self::spawn_shared_on(
+            server_addr,
+            c2s,
+            s2c,
+            c2s_shared,
+            s2c_shared,
+            localhost,
+            localhost,
+        )
+    }
+
+    /// Spawn with shared shapers and explicit bind addresses.
+    pub fn spawn_shared_on(
+        server_addr: SocketAddr,
+        c2s: NetemConfig,
+        s2c: NetemConfig,
+        c2s_shared: Option<SharedShaper>,
+        s2c_shared: Option<SharedShaper>,
+        client_bind: SocketAddr,
+        server_bind: SocketAddr,
+    ) -> io::Result<Self> {
+        let client_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(client_bind)?);
+        let server_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(server_bind)?);
+        let client_addr = client_sock.local_addr()?;
+        Self::spawn_from_sockets_shared(
+            server_addr,
+            c2s,
+            s2c,
+            client_sock,
+            server_sock,
+            client_addr,
+            c2s_shared,
+            s2c_shared,
+        )
+    }
+
+    #[allow(dead_code)]
     fn spawn_from_sockets(
         server_addr: SocketAddr,
         c2s: NetemConfig,
@@ -857,6 +996,34 @@ impl NetemPair {
         server_sock: Box<dyn UdpTransport>,
         client_addr: SocketAddr,
     ) -> io::Result<Self> {
+        Self::spawn_from_sockets_shared(
+            server_addr,
+            c2s,
+            s2c,
+            client_sock,
+            server_sock,
+            client_addr,
+            None,
+            None,
+        )
+    }
+
+    fn spawn_from_sockets_shared(
+        server_addr: SocketAddr,
+        c2s: NetemConfig,
+        s2c: NetemConfig,
+        client_sock: Box<dyn UdpTransport>,
+        server_sock: Box<dyn UdpTransport>,
+        client_addr: SocketAddr,
+        c2s_shared: Option<SharedShaper>,
+        s2c_shared: Option<SharedShaper>,
+    ) -> io::Result<Self> {
+        if c2s_shared.is_some() {
+            assert_eq!(c2s.rate, 0, "double-shape: c2s has both config.rate and a SharedShaper");
+        }
+        if s2c_shared.is_some() {
+            assert_eq!(s2c.rate, 0, "double-shape: s2c has both config.rate and a SharedShaper");
+        }
         let stats_c2s = Arc::new(AtomicStats::default());
         let stats_s2c = Arc::new(AtomicStats::default());
         let queue_len_c2s = Arc::new(AtomicU64::new(0));
@@ -895,6 +1062,7 @@ impl NetemPair {
             Arc::clone(&server_sock),
             Some(server_addr),
             Arc::clone(&learned_client),
+            c2s_shared,
         );
         std::thread::Builder::new()
             .name("netem-c2s".into())
@@ -912,6 +1080,7 @@ impl NetemPair {
             client_sock,
             None,
             learned_client,
+            s2c_shared,
         );
         std::thread::Builder::new()
             .name("netem-s2c".into())
@@ -1012,6 +1181,9 @@ struct DirectionRunner {
     /// uses the learned client address (`learned_dst`).
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<Mutex<Option<SocketAddr>>>,
+    /// Optional shared-bottleneck shaper. When set, it replaces the per-
+    /// direction `config.rate` serialization clock.
+    shared: Option<SharedShaper>,
     rng: RndState,
     delay_cor: CorRng,
     loss_cor: CorRng,
@@ -1026,7 +1198,7 @@ struct DirectionRunner {
     seq: u64,
 }
 
-impl DirectionRunner {
+    impl DirectionRunner {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: NetemConfig,
@@ -1038,6 +1210,7 @@ impl DirectionRunner {
         send: Arc<dyn UdpTransport>,
         fixed_dst: Option<SocketAddr>,
         learned_dst: Arc<Mutex<Option<SocketAddr>>>,
+        shared: Option<SharedShaper>,
     ) -> Self {
         let rng = RndState::seed(config.seed);
         Self {
@@ -1055,6 +1228,7 @@ impl DirectionRunner {
             send,
             fixed_dst,
             learned_dst,
+            shared,
             rng,
             clg: FourState::default(),
             queue: BinaryHeap::new(),
@@ -1177,26 +1351,46 @@ impl DirectionRunner {
             if !delay.is_zero() {
                 self.stats.inc(|s| &s.delayed);
             }
-            let base = now + delay;
 
-            // ── rate shaping (normal branch only) ─────────────────────
-            // Schedule after max(now + configured_delay, previous
-            // scheduled send time) + packet_bits / rate_bps. Send-time
-            // shaping only delays packets; it never drops them.
-            if self.config.rate != 0 {
-                let packet_bits = (data.len() as u64).saturating_mul(8);
-                let serialize = Duration::from_nanos(
-                    packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
-                );
-                let earliest = base.max(self.next_send);
-                let t = earliest + serialize;
-                self.next_send = t;
-                if t != base {
-                    self.stats.inc(|s| &s.rate_limited);
+            // ── shared bottleneck (normal branch only) ──────────────────
+            // Shape at packet arrival time, then add per-flow propagation
+            // delay. This avoids the latency×rate phantom buffer headroom
+            // that the kernel's delay-first order would give long-RTT flows.
+            if let Some(shared) = &self.shared {
+                match shared.schedule(now, data.len()) {
+                    Some(t) => {
+                        if t != now {
+                            self.stats.inc(|s| &s.rate_limited);
+                        }
+                        t + delay
+                    }
+                    None => {
+                        self.stats.inc(|s| &s.overflow_dropped);
+                        return;
+                    }
                 }
-                t
             } else {
-                base
+                let base = now + delay;
+
+                // ── rate shaping (normal branch only) ───────────────────
+                // Schedule after max(now + configured_delay, previous
+                // scheduled send time) + packet_bits / rate_bps. Send-time
+                // shaping only delays packets; it never drops them.
+                if self.config.rate != 0 {
+                    let packet_bits = (data.len() as u64).saturating_mul(8);
+                    let serialize = Duration::from_nanos(
+                        packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
+                    );
+                    let earliest = base.max(self.next_send);
+                    let t = earliest + serialize;
+                    self.next_send = t;
+                    if t != base {
+                        self.stats.inc(|s| &s.rate_limited);
+                    }
+                    t
+                } else {
+                    base
+                }
             }
         };
 
@@ -1579,5 +1773,248 @@ mod tests {
         assert!(final_stats.forwarded >= 2);
         assert_eq!(final_stats.received, 4);
         pair.stop();
+    }
+
+    // ─────────────────────────── shared-shaper tests ────────────────────────
+
+    #[test]
+    fn shared_shaper_rate_must_be_nonzero() {
+        let result = std::panic::catch_unwind(|| SharedShaper::new(0, 0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn shared_shaper_exact_fifo_arithmetic() {
+        let shaper = SharedShaper::new(800_000, 0);
+        let base = Instant::now();
+        let len = 1000usize;
+        let mut last = None;
+        for i in 0..10 {
+            let t = shaper.schedule(base, len).unwrap();
+            let expected = base + Duration::from_millis(10 * (i + 1));
+            let diff = if t >= expected { t - expected } else { expected - t };
+            assert!(
+                diff <= Duration::from_micros(1),
+                "packet {i} expected {expected:?} got {t:?}"
+            );
+            last = Some(t);
+        }
+        assert_eq!(shaper.dropped(), 0);
+        let aggregate = last.unwrap() - base;
+        assert!(
+            aggregate >= Duration::from_millis(100)
+                && aggregate <= Duration::from_millis(100) + Duration::from_micros(10),
+            "aggregate serialization {aggregate:?}"
+        );
+    }
+
+    #[test]
+    fn shared_shaper_tail_drop_at_byte_limit() {
+        let shaper = SharedShaper::new(8_000, 120);
+        let base = Instant::now();
+        // 100 B serializes in 100 ms and fits.
+        let t1 = shaper.schedule(base, 100).unwrap();
+        assert_eq!(shaper.dropped(), 0);
+        assert!(t1 >= base);
+        // 50 B at the same instant would exceed the 120 B shared buffer.
+        assert!(shaper.schedule(base, 50).is_none());
+        assert_eq!(shaper.dropped(), 1);
+        // After the first packet drains, another 100 B is accepted.
+        let base2 = base + Duration::from_millis(100);
+        let t2 = shaper.schedule(base2, 100).unwrap();
+        assert_eq!(shaper.dropped(), 1);
+        assert!(t2 >= base2);
+    }
+
+    #[test]
+    fn shared_shaper_backlog_bytes_reports_and_drains() {
+        let shaper = SharedShaper::new(8_000, 0);
+        let base = Instant::now();
+        assert_eq!(shaper.backlog_bytes(base), 0);
+        shaper.schedule(base, 100);
+        assert_eq!(shaper.backlog_bytes(base), 100);
+        assert_eq!(shaper.backlog_bytes(base + Duration::from_millis(50)), 50);
+        assert_eq!(shaper.backlog_bytes(base + Duration::from_millis(100)), 0);
+    }
+
+    #[test]
+    fn shared_shaper_clone_shares_state() {
+        let a = SharedShaper::new(800_000, 0);
+        let b = a.clone();
+        let base = Instant::now();
+        a.schedule(base, 1000);
+        assert_eq!(b.backlog_bytes(base), 1000);
+        assert_eq!(b.dropped(), 0);
+        assert_eq!(b.rate_bps(), 800_000);
+    }
+
+    #[test]
+    fn shared_shaper_overflow_counts_in_direction_stats() {
+        let shared = SharedShaper::new(8_000, 80);
+        let mut c2s = NetemConfig::default();
+        c2s.rate = 0;
+        let s2c = NetemConfig::default();
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6000));
+        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            6001,
+        ))));
+        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let client_addr = client_sock.local_addr().unwrap();
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
+        let pair = NetemPair::spawn_from_sockets_shared(
+            server_addr,
+            c2s,
+            s2c,
+            Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
+            Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
+            client_addr,
+            Some(shared),
+            None,
+        )
+        .unwrap();
+
+        // 100 B > 80 B limit: drop.
+        client_sock.push_recv(vec![0u8; 100], from);
+        // 60 B fits and serializes for 60 ms.
+        client_sock.push_recv(vec![1u8; 60], from);
+        // 30 B while the 60 B packet is still draining: 60 + 30 > 80 B: drop.
+        client_sock.push_recv(vec![2u8; 30], from);
+        std::thread::sleep(Duration::from_millis(150));
+        pair.stop();
+
+        let stats = pair.stats_c2s();
+        assert_eq!(stats.received, 3);
+        assert_eq!(stats.forwarded, 1, "only the 60 B packet should exit");
+        assert_eq!(
+            stats.overflow_dropped, 2,
+            "shared-buffer overflow should count as overflow_dropped"
+        );
+        assert_eq!(stats.dropped, 0, "overflow drops are not loss-model drops");
+    }
+
+    #[test]
+    #[should_panic(expected = "double-shape")]
+    fn spawn_shared_panics_on_c2s_double_shape() {
+        let mut c2s = NetemConfig::default();
+        c2s.rate = 1_000_000;
+        let server = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6100));
+        let _ = NetemPair::spawn_shared(
+            server,
+            c2s,
+            NetemConfig::default(),
+            Some(SharedShaper::new(1_000_000, 0)),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "double-shape")]
+    fn spawn_shared_panics_on_s2c_double_shape() {
+        let mut s2c = NetemConfig::default();
+        s2c.rate = 1_000_000;
+        let server = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6200));
+        let _ = NetemPair::spawn_shared(
+            server,
+            NetemConfig::default(),
+            s2c,
+            None,
+            Some(SharedShaper::new(1_000_000, 0)),
+        );
+    }
+
+    #[test]
+    fn spawn_shared_two_udp_flows_serialize_to_shared_rate() {
+        let shaper = SharedShaper::new(400 * 1024 * 8, 0);
+        let packet_size = 1024usize;
+        let packets_per_flow = 50usize;
+
+        let server_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr_a = server_a.local_addr().unwrap();
+        let addr_b = server_b.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = server_a.recv_from(&mut buf) {
+                let _ = server_a.send_to(&buf[..n], from);
+            }
+        });
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = server_b.recv_from(&mut buf) {
+                let _ = server_b.send_to(&buf[..n], from);
+            }
+        });
+
+        let pair_a = NetemPair::spawn_shared(
+            addr_a,
+            NetemConfig::default(),
+            NetemConfig::default(),
+            Some(shaper.clone()),
+            None,
+        )
+        .unwrap();
+        let pair_b = NetemPair::spawn_shared(
+            addr_b,
+            NetemConfig::default(),
+            NetemConfig::default(),
+            Some(shaper.clone()),
+            None,
+        )
+        .unwrap();
+
+        let client_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_a
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client_b
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let payload_a: Vec<u8> = (0..packet_size).map(|i| (i % 251) as u8).collect();
+        let payload_b: Vec<u8> = (0..packet_size).map(|i| (255 - (i % 251)) as u8).collect();
+
+        let start = Instant::now();
+        for _ in 0..packets_per_flow {
+            client_a.send_to(&payload_a, pair_a.client_addr()).unwrap();
+            client_b.send_to(&payload_b, pair_b.client_addr()).unwrap();
+        }
+
+        let mut got_a = 0usize;
+        let mut got_b = 0usize;
+        let mut buf = [0u8; 2048];
+        while got_a < packets_per_flow || got_b < packets_per_flow {
+            if let Ok((n, _)) = client_a.recv_from(&mut buf) {
+                assert_eq!(n, packet_size, "flow A reply size mismatch");
+                got_a += 1;
+            }
+            if let Ok((n, _)) = client_b.recv_from(&mut buf) {
+                assert_eq!(n, packet_size, "flow B reply size mismatch");
+                got_b += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        pair_a.stop();
+        pair_b.stop();
+
+        assert_eq!(got_a, packets_per_flow);
+        assert_eq!(got_b, packets_per_flow);
+        let stats_a = pair_a.stats_c2s();
+        let stats_b = pair_b.stats_c2s();
+        assert_eq!(stats_a.forwarded, packets_per_flow as u64);
+        assert_eq!(stats_b.forwarded, packets_per_flow as u64);
+        assert_eq!(stats_a.overflow_dropped + stats_b.overflow_dropped, 0);
+
+        // Per-flow caps would finish ~125 ms; the shared cap forces ~250 ms.
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "shared shaper should serialize both flows, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(3),
+            "shared shaper should finish within 3 s, elapsed {elapsed:?}"
+        );
     }
 }
