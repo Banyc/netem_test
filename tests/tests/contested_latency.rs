@@ -149,7 +149,6 @@ async fn contested_rep(
         bulk_secs: straggler.as_secs_f64(),
     };
 
-    print_contested_rep("rep", &result, 0, None);
     pair.stop();
     result
 }
@@ -210,7 +209,7 @@ fn print_contested_rep(label: &str, r: &ContestedRepResult, rep: usize, rate_bps
             sorted.last().copied().unwrap_or(0.0),
         )
     } else {
-        (0.0, 0.0, 0.0, 0.0)
+        (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
     };
     let (q_mean, q_p95, q_max) = if !r.queue_samples.is_empty() {
         let mut sorted = r.queue_samples.clone();
@@ -245,11 +244,13 @@ fn print_contested_rep(label: &str, r: &ContestedRepResult, rep: usize, rate_bps
         bulk = bulk_mibps,
     );
     if let Some(rate) = rate_bps {
-        let serialization_ms_per_pkt = 1400.0 * 8.0 * 1000.0 / rate as f64;
-        eprintln!(
-            "[contested {label} rep={rep}] attribution: q_mean x {serialization_ms_per_pkt:.2} ms/pkt = {:.1} ms vs p50 {p50:.1} ms",
-            q_mean as f64 * serialization_ms_per_pkt,
-        );
+        if rate > 0 {
+            let serialization_ms_per_pkt = 1400.0 * 8.0 * 1000.0 / rate as f64;
+            eprintln!(
+                "[contested {label} rep={rep}] attribution: q_mean x {serialization_ms_per_pkt:.2} ms/pkt = {:.1} ms vs p50 {p50:.1} ms",
+                q_mean as f64 * serialization_ms_per_pkt,
+            );
+        }
     }
 }
 

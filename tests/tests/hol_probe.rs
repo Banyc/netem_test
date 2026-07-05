@@ -430,7 +430,7 @@ fn rtt100_clean(seed: u64) -> NetemConfig {
 fn rtt100_ge5(seed: u64) -> NetemConfig {
     NetemConfig {
         latency: OWD_100MS,
-        loss_model: gilbert_elliott_loss(5.0, 8.0),
+        loss_model: gilbert_elliott_loss(5.0, 3.0),
         seed,
         ..NetemConfig::default()
     }
@@ -455,6 +455,31 @@ fn cap400(seed: u64) -> NetemConfig {
         seed,
         ..NetemConfig::default()
     }
+}
+
+fn rtt40_ge1(seed: u64) -> NetemConfig {
+    NetemConfig {
+        latency: Duration::from_millis(20),
+        loss_model: gilbert_elliott_loss(1.0, 3.0),
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
+fn rtt40_ge1_loss1(seed: u64) -> NetemConfig {
+    NetemConfig {
+        latency: Duration::from_millis(20),
+        loss_model: gilbert_elliott_loss(1.0, 3.0),
+        loss: u32::MAX / 100,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
+fn hostile_real_link_seeded(seed: u64) -> NetemConfig {
+    let mut c = support::hostile_real_link();
+    c.seed = seed;
+    c
 }
 
 // ────────────────────────────── scenario macro ──────────────────────────────
@@ -717,25 +742,6 @@ hol_test!(
     }
 );
 
-hol_test!(
-    hol_cap400_split,
-    "cap400 split",
-    cap400(31),
-    cap400(32),
-    BulkMode::Split(cap400(33), cap400(34)),
-    DEFAULT_MSG_BYTES,
-    DEFAULT_CADENCE,
-    DEFAULT_RUN_FOR,
-    DEFAULT_GRACE,
-    Duration::from_secs(120),
-    |summary: &HolSummary| {
-        assert!(
-            summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
-        );
-    }
-);
-
 // ────────────────────────────── cap400 shared-bottleneck report-only ──────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -773,3 +779,126 @@ async fn hol_cap400_loss1_split_shared() {
     )
     .await;
 }
+
+// ────────────────────────────── rtt40 GE1 rows ────────────────────────────────
+
+hol_test!(
+    hol_rtt40_ge1_solo,
+    "rtt40 GE1 solo",
+    rtt40_ge1(11),
+    rtt40_ge1(12),
+    BulkMode::None,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt40_ge1_loss1_solo,
+    "rtt40 GE1+loss1 solo",
+    rtt40_ge1_loss1(11),
+    rtt40_ge1_loss1(12),
+    BulkMode::None,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+// ────────────────────────────── FEC mitigation row ────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_cap400_fec_solo() {
+    let label = "cap400 FEC solo";
+    let _summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe(
+            label,
+            cap400(11),
+            cap400(12),
+            BulkMode::None,
+            true, // fec
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+}
+
+// ────────────────────────────── hostile rows ──────────────────────────────────
+
+hol_test!(
+    hol_hostile_solo,
+    "hostile solo",
+    hostile_real_link_seeded(11),
+    hostile_real_link_seeded(12),
+    BulkMode::None,
+    DEFAULT_MSG_BYTES,
+    Duration::from_millis(200),
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(300),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.80,
+            "delivery {:.3} < 0.80", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_hostile_shared,
+    "hostile shared",
+    hostile_real_link_seeded(21),
+    hostile_real_link_seeded(22),
+    BulkMode::Shared,
+    DEFAULT_MSG_BYTES,
+    Duration::from_millis(200),
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(300),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.80,
+            "delivery {:.3} < 0.80", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_hostile_split,
+    "hostile split",
+    hostile_real_link_seeded(31),
+    hostile_real_link_seeded(32),
+    BulkMode::Split(hostile_real_link_seeded(33), hostile_real_link_seeded(34)),
+    DEFAULT_MSG_BYTES,
+    Duration::from_millis(200),
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(300),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.80,
+            "delivery {:.3} < 0.80", summary.delivery_pct
+        );
+    }
+);

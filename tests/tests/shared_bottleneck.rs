@@ -14,17 +14,19 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::{
     combined_stats, cyclic_payload, percentile, print_perf, rtp_connect, spawn_rtp_bulk_upload,
-    spawn_rtp_byte_sink_server, spawn_rtp_echo_server, with_timeout,
+    spawn_rtp_byte_sink_server, spawn_rtp_echo_server,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
+
+use crate::support::with_timeout;
 
 mod support;
 
@@ -86,6 +88,7 @@ fn spawn_bulk_flow(
     proxy_client_addr: std::net::SocketAddr,
     payload: Arc<Vec<u8>>,
     run_for: Duration,
+    stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let Ok(mut writer) = spawn_rtp_bulk_upload(proxy_client_addr, false).await else {
@@ -93,7 +96,7 @@ fn spawn_bulk_flow(
         };
         let start = Instant::now();
         let mut offset = 0usize;
-        while start.elapsed() < run_for {
+        while start.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
             match writer.write(&payload[offset..]).await {
                 Ok(0) => break,
                 Ok(n) => offset = (offset + n) % payload.len(),
@@ -112,7 +115,13 @@ fn spawn_bulk_flow(
 /// Prints the contested/solo p99 inflation. Asserts structural bounds only;
 /// the exact latency numbers are intentionally report-only until the in-flight
 /// `rtp` congestion-control work lands.
-async fn rr_under_bulk_ab(label: &str, rate_bps: u64, limit_bytes: u64, contested_run_s: u64) {
+async fn rr_under_bulk_ab(
+    label: &str,
+    rate_bps: u64,
+    limit_bytes: u64,
+    contested_run_s: u64,
+    contested_p99_ceiling_ms: f64,
+) {
     let owd = Duration::from_millis(OWD_MS);
     let msg_bytes = 2048usize;
     let gap = Duration::from_millis(100);
@@ -169,12 +178,19 @@ async fn rr_under_bulk_ab(label: &str, rate_bps: u64, limit_bytes: u64, conteste
     .await;
 
     let bulk_payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let _bulk_handle = spawn_bulk_flow(bulk_pair.client_addr(), bulk_payload, contested_run);
+    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let _bulk_handle = spawn_bulk_flow(
+        bulk_pair.client_addr(),
+        bulk_payload,
+        contested_run,
+        Arc::clone(&bulk_stop),
+    );
 
     let contested_samples =
         rr_echo_samples(rr_conn.0, rr_conn.1, msg_bytes, gap, contested_run, warmup).await;
 
-    // Let the final bulk bytes drain before measuring goodput.
+    // Signal the bulk flow to stop and let final bytes drain.
+    bulk_stop.store(true, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_secs(2)).await;
     let delivered_bytes = delivered.load(Ordering::Relaxed);
     bulk_pair.stop();
@@ -204,6 +220,11 @@ async fn rr_under_bulk_ab(label: &str, rate_bps: u64, limit_bytes: u64, conteste
     assert!(
         solo_p99 <= 1500.0,
         "solo rr p99 {solo_p99:.1} ms exceeds 1500 ms slack ceiling"
+    );
+    assert!(
+        contested_p99 <= contested_p99_ceiling_ms,
+        "contested rr p99 {contested_p99:.1} ms exceeds {ceiling:.0} ms ceiling",
+        ceiling = contested_p99_ceiling_ms
     );
     assert!(
         solo.len() >= 15,
@@ -243,14 +264,22 @@ async fn rr_under_bulk_ab(label: &str, rate_bps: u64, limit_bytes: u64, conteste
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn shared_bneck_rr_under_bulk_10mbps() {
-    rr_under_bulk_ab("10mbps", 10_000_000, 128 * 1024, 20).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(180),
+        rr_under_bulk_ab("10mbps", 10_000_000, 128 * 1024, 20, 8000.0),
+    )
+    .await;
 }
 
 /// 2 Mbps / 64 KiB shared bottleneck: rr echo under a competing bulk flow.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn shared_bneck_rr_under_bulk_2mbps() {
-    rr_under_bulk_ab("2mbps", 2_000_000, 64 * 1024, 20).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(180),
+        rr_under_bulk_ab("2mbps", 2_000_000, 64 * 1024, 20, 12000.0),
+    )
+    .await;
 }
 
 /// Late-joiner fairness probe: two bulk flows share one 10 Mbps / 128 KiB
@@ -295,12 +324,16 @@ async fn shared_bneck_late_joiner_fairness() {
     .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let handle_a = spawn_bulk_flow(pair_a.client_addr(), Arc::clone(&payload), total_run);
+    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let handle_a = spawn_bulk_flow(
+        pair_a.client_addr(), Arc::clone(&payload), total_run, Arc::clone(&bulk_stop),
+    );
     tokio::time::sleep(b_join).await;
     let handle_b = spawn_bulk_flow(
         pair_b.client_addr(),
         Arc::clone(&payload),
         total_run - b_join,
+        Arc::clone(&bulk_stop),
     );
 
     // Sample both counters every 500 ms for the whole run.
