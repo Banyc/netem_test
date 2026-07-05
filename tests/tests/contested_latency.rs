@@ -1,0 +1,398 @@
+//! Contested-latency scenarios: a sparse interactive ping stream and a bulk
+//! upload share the same mux-over-RTP connection and the same NetemPair.
+//!
+//! These tests are `#[ignore]`-d by default so they do not slow normal builds.
+//! Run them with:
+//!
+//! ```sh
+//! cargo test --release --test contested_latency -- --ignored --nocapture --test-threads=1
+//! ```
+
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use netem_test::{NetemConfig, NetemPair};
+use support::{
+    combined_stats, gilbert_elliott_loss, hostile_real_link, mux_client_connect, percentile,
+    print_perf, spawn_mux_latency_bulk_server, with_timeout,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+mod support;
+
+/// Ping message size.
+const PING_BYTES: usize = 200;
+
+/// Queue-length sampler interval.
+const QUEUE_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Result of a single contested-latency repetition.
+#[derive(Clone, Debug, Default)]
+struct ContestedRepResult {
+    sent: u64,
+    received: u64,
+    latencies: Vec<f64>,
+    queue_samples: Vec<usize>,
+    bulk_bytes: u64,
+    bulk_secs: f64,
+}
+
+/// Run one repetition: bulk sink + `b'L'` ping on the same mux connection and
+/// the same NetemPair. Samples `pair.queue_len_c2s()` every 10 ms in a
+/// background task (the caller must abort the returned sampler handle before
+/// stopping the pair).
+async fn contested_rep(
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    fec: bool,
+    cadence: Duration,
+    straggler: Duration,
+) -> ContestedRepResult {
+    let base = Instant::now();
+    let (server_addr, mut latencies, bulk_counter) =
+        spawn_mux_latency_bulk_server(fec, base).await.unwrap();
+    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+    let connected = rtp::udp::connect_without_handshake_with_mss(
+        "0.0.0.0:0",
+        &pair.client_addr().to_string(),
+        None,
+        fec,
+        rtp::udp::NO_FEC_MSS,
+    )
+    .await
+    .unwrap();
+    let (opener, _mux_spawner) = mux_client_connect(
+        connected.read.into_async_read(),
+        connected.write.into_async_write(),
+    );
+
+    // Open the ping stream and the bulk stream on the same mux connection.
+    let (mut ping_read, mut ping_write) = opener.open().await.unwrap();
+    let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match ping_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match bulk_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    // Bulk payload: 64 MiB cyclic buffer, enough to keep any cap busy.
+    let payload = Arc::new(support::cyclic_payload(64 * 1024 * 1024));
+
+    // Start queue-length sampler.
+    let stop_sampler = Arc::new(AtomicBool::new(false));
+    let stop_sampler_for_task = Arc::clone(&stop_sampler);
+    let pair_for_sampler = NetemPair::spawn(
+        pair.server_addr(),
+        NetemConfig::default(),
+        NetemConfig::default(),
+    )
+    .unwrap();
+    // Hold the pair alive only as long as the sampler runs.
+    let sampler_handle = tokio::spawn(async move {
+        let mut samples = Vec::new();
+        let start = Instant::now();
+        while !stop_sampler_for_task.load(Ordering::Relaxed) {
+            tokio::time::sleep(QUEUE_SAMPLE_INTERVAL).await;
+            samples.push(pair_for_sampler.queue_len_c2s());
+            if start.elapsed() >= straggler + Duration::from_secs(2) {
+                break;
+            }
+        }
+        pair_for_sampler.stop();
+        samples
+    });
+
+    // Run bulk and ping concurrently for `straggler`.
+    let ping_fut = send_tagged_pings(&mut ping_write, base, PING_BYTES, cadence, straggler);
+    let bulk_fut = run_mux_bulk_stream(&mut bulk_write, Arc::clone(&payload), straggler);
+    let (sent, _written) = tokio::join!(ping_fut, bulk_fut);
+
+    // Let stragglers drain, then stop the sampler before the pair.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stop_sampler.store(true, Ordering::Relaxed);
+    let queue_samples = sampler_handle.await.unwrap_or_default();
+
+    // Drain latency channel.
+    let mut samples = Vec::new();
+    while let Ok(lat) = latencies.try_recv() {
+        samples.push(lat);
+    }
+
+    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let result = ContestedRepResult {
+        sent,
+        received: samples.len() as u64,
+        latencies: samples,
+        queue_samples,
+        bulk_bytes,
+        bulk_secs: straggler.as_secs_f64(),
+    };
+
+    print_contested_rep("rep", &result, 0, None);
+    pair.stop();
+    result
+}
+
+/// Send `b'L'`-tagged timestamped ping messages through a mux stream.
+async fn send_tagged_pings(
+    write: &mut mux::StreamWriter,
+    base: Instant,
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+) -> u64 {
+    if write.write_all(&[b'L']).await.is_err() {
+        return 0;
+    }
+    support::send_timestamped_messages(write, base, msg_bytes, cadence, run_for).await
+}
+
+/// Send a deterministic `b'B'` bulk stream through a mux stream write half.
+async fn run_mux_bulk_stream(
+    write: &mut mux::StreamWriter,
+    payload: Arc<Vec<u8>>,
+    active_for: Duration,
+) -> u64 {
+    if write.write_all(&[b'B']).await.is_err() {
+        return 0;
+    }
+    let start = Instant::now();
+    let mut offset = 0usize;
+    let mut written = 0u64;
+    while start.elapsed() < active_for {
+        match write.write(&payload[offset..]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                offset = (offset + n) % payload.len();
+                written += n as u64;
+            }
+            Err(_) => break,
+        }
+    }
+    written
+}
+
+fn print_contested_rep(label: &str, r: &ContestedRepResult, rep: usize, rate_bps: Option<u64>) {
+    let n = r.latencies.len();
+    let delivery = if r.sent == 0 {
+        0.0
+    } else {
+        r.received as f64 / r.sent as f64
+    };
+    let (p50, p90, p99, max) = if n > 0 {
+        let mut sorted = r.latencies.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (
+            percentile(&sorted, 0.50),
+            percentile(&sorted, 0.90),
+            percentile(&sorted, 0.99),
+            sorted.last().copied().unwrap_or(0.0),
+        )
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    };
+    let (q_mean, q_p95, q_max) = if !r.queue_samples.is_empty() {
+        let mut sorted = r.queue_samples.clone();
+        sorted.sort();
+        (
+            percentile(&sorted.iter().map(|x| *x as f64).collect::<Vec<_>>(), 0.50) as usize,
+            percentile(&sorted.iter().map(|x| *x as f64).collect::<Vec<_>>(), 0.95) as usize,
+            *sorted.last().unwrap(),
+        )
+    } else {
+        (0, 0, 0)
+    };
+    let bulk_mibps = if r.bulk_secs > 0.0 {
+        r.bulk_bytes as f64 / (1024.0 * 1024.0) / r.bulk_secs
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[contested {label} rep={rep}] sent={sent} recv={recv} delivery={del:.3} \
+         p50={p50:.1} p90={p90:.1} p99={p99:.1} max={max:.1} \
+         q_mean={q_mean} q_p95={q_p95} q_max={q_max} bulk={bulk:.3} MiB/s",
+        sent = r.sent,
+        recv = r.received,
+        del = delivery,
+        p50 = p50,
+        p90 = p90,
+        p99 = p99,
+        max = max,
+        q_mean = q_mean,
+        q_p95 = q_p95,
+        q_max = q_max,
+        bulk = bulk_mibps,
+    );
+    if let Some(rate) = rate_bps {
+        let serialization_ms_per_pkt = 1400.0 * 8.0 * 1000.0 / rate as f64;
+        eprintln!(
+            "[contested {label} rep={rep}] attribution: q_mean x {serialization_ms_per_pkt:.2} ms/pkt = {:.1} ms vs p50 {p50:.1} ms",
+            q_mean as f64 * serialization_ms_per_pkt,
+        );
+    }
+}
+
+/// Run `contested_rep` three times with seeds `100 + 10*rep`, print the
+/// median-of-3 p50/p99, and return aggregate summary values.
+async fn run_scenario(
+    name: &str,
+    build_config: impl Fn(u64) -> (NetemConfig, NetemConfig),
+    cadence: Duration,
+    straggler: Duration,
+) -> (f64, f64, f64) {
+    let mut p50s = Vec::new();
+    let mut p99s = Vec::new();
+    let mut deliveries = Vec::new();
+    for rep in 0..3 {
+        let (c2s, s2c) = build_config(100 + 10 * rep as u64);
+        let result = contested_rep(c2s, s2c, false, cadence, straggler).await;
+        if !result.latencies.is_empty() {
+            let mut sorted = result.latencies.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            p50s.push(percentile(&sorted, 0.50));
+            p99s.push(percentile(&sorted, 0.99));
+        }
+        let delivery = if result.sent == 0 {
+            0.0
+        } else {
+            result.received as f64 / result.sent as f64
+        };
+        deliveries.push(delivery);
+        print_contested_rep(name, &result, rep + 1, c2s.rate.into());
+    }
+    p50s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    p99s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_p50 = if p50s.len() >= 2 {
+        p50s[p50s.len() / 2]
+    } else {
+        p50s.first().copied().unwrap_or(0.0)
+    };
+    let median_p99 = if p99s.len() >= 2 {
+        p99s[p99s.len() / 2]
+    } else {
+        p99s.first().copied().unwrap_or(0.0)
+    };
+    let min_delivery = deliveries.iter().copied().fold(1.0, f64::min);
+    eprintln!(
+        "[contested {name}] median-of-3 p50={median_p50:.1} ms p99={median_p99:.1} ms min_delivery={min_delivery:.3}",
+    );
+    (median_p50, median_p99, min_delivery)
+}
+
+// ────────────────────────────── scenarios ───────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn contested_capped_clean() {
+    let (p50, p99, delivery) = with_timeout(
+        Duration::from_secs(120),
+        "contested_capped_clean",
+        run_scenario(
+            "capped_clean",
+            |seed| {
+                (
+                    NetemConfig {
+                        rate: 400 * 1024 * 8,
+                        latency: Duration::from_millis(5),
+                        limit: 4096,
+                        seed,
+                        ..NetemConfig::default()
+                    },
+                    NetemConfig {
+                        rate: 400 * 1024 * 8,
+                        latency: Duration::from_millis(5),
+                        limit: 4096,
+                        seed: seed + 1,
+                        ..NetemConfig::default()
+                    },
+                )
+            },
+            Duration::from_millis(25),
+            Duration::from_secs(3),
+        ),
+    )
+    .await;
+    assert!(p50 <= 200.0, "median p50 {p50:.1} ms > 200 ms");
+    assert!(p99 <= 300.0, "median p99 {p99:.1} ms > 300 ms");
+    assert!(delivery >= 0.99, "min delivery {delivery:.3} < 0.99");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn contested_capped_jitter_loss() {
+    let (_p50, _p99, _delivery) = with_timeout(
+        Duration::from_secs(180),
+        "contested_capped_jitter_loss",
+        run_scenario(
+            "capped_jitter_loss",
+            |seed| {
+                let loss = ((2.0 / 100.0) * u32::MAX as f64).clamp(0.0, u32::MAX as f64) as u32;
+                (
+                    NetemConfig {
+                        rate: 400 * 1024 * 8,
+                        loss,
+                        latency: Duration::from_millis(25),
+                        jitter: Duration::from_millis(20),
+                        limit: 4096,
+                        seed,
+                        ..NetemConfig::default()
+                    },
+                    NetemConfig {
+                        rate: 400 * 1024 * 8,
+                        loss,
+                        latency: Duration::from_millis(25),
+                        jitter: Duration::from_millis(20),
+                        limit: 4096,
+                        seed: seed + 1,
+                        ..NetemConfig::default()
+                    },
+                )
+            },
+            Duration::from_millis(25),
+            Duration::from_secs(5),
+        ),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn contested_hostile() {
+    let (_p50, _p99, _delivery) = with_timeout(
+        Duration::from_secs(300),
+        "contested_hostile",
+        run_scenario(
+            "hostile",
+            |seed| {
+                let mut c2s = hostile_real_link();
+                c2s.limit = 4096;
+                c2s.seed = seed;
+                let mut s2c = hostile_real_link();
+                s2c.limit = 4096;
+                s2c.seed = seed + 1;
+                (c2s, s2c)
+            },
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        ),
+    )
+    .await;
+}
