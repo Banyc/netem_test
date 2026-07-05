@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::HashMap,
     future::Future,
     sync::{
         Arc,
@@ -19,7 +20,7 @@ use std::{
 
 use netem_test::{FourStateLoss, LossModel, NetemConfig, NetemPair, Stats};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinSet;
 
 // ─────────────────────────── impairment presets ───────────────────────────
@@ -1155,6 +1156,183 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     assert!((0.0..=1.0).contains(&p), "percentile p must be in [0.0, 1.0]");
     let rank = ((sorted.len() as f64 - 1.0) * p).floor() as usize;
     sorted[rank.min(sorted.len() - 1)]
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dual‑mux helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Server that accepts two RTP connections (lane‑hello paired) and handles
+/// both latency‑echo (tag byte `b'L'`) and bulk‑sink streams on the paired
+/// dual‑lane mux. Returns `(addr, lat_rx, bulk_counter)` like
+/// [`spawn_mux_latency_bulk_server`].
+pub async fn spawn_dual_mux_latency_bulk_server(
+    fec: bool,
+    _base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let addr = listener.local_addr();
+    let (_tx, rx) = mpsc::unbounded_channel::<f64>();
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+
+    // Background accept loop keeps the udp_listener dispatcher alive.
+    let listener_bg = Arc::clone(&listener);
+    tokio::spawn(async move {
+        loop {
+            if listener_bg
+                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let bulk_for_main = Arc::clone(&bulk_delivered);
+    tokio::spawn(async move {
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
+        let config = mux::MuxConfig {
+            initiation: mux::Initiation::Server,
+            heartbeat_interval: Duration::from_secs(5),
+        };
+
+        loop {
+            let accepted = match listener
+                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+                .await
+            {
+                Ok(a) => a,
+                Err(_) => break,
+            };
+            let reader = accepted.read.into_async_read();
+            let writer = accepted.write.into_async_write();
+
+            let result = mux::spawn_dual_mux_acceptor(
+                reader,
+                writer,
+                config.clone(),
+                Duration::from_secs(3),
+            )
+            .await;
+
+            match result {
+                Ok((_class, nonce, pa)) => {
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push(pa);
+                    if entries.len() == 2 {
+                        let pa2 = entries.pop().unwrap();
+                        let pa1 = entries.pop().unwrap();
+                        pending.remove(&nonce);
+
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, mut accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            tokio::spawn(async move {
+                                let _spawner = pair_spawner;
+                                while let Ok((mut reader, mut writer, _class)) =
+                                    accepter.accept().await
+                                {
+                                    let bulk = Arc::clone(&bulk);
+                                    tokio::spawn(async move {
+                                        let mut tag = [0u8; 1];
+                                        if reader.read_exact(&mut tag).await.is_err() {
+                                            let _ = writer.shutdown();
+                                            return;
+                                        }
+                                        if tag[0] == b'L' {
+                                            let mut buf = vec![0u8; 64 * 1024];
+                                            loop {
+                                                match reader.read(&mut buf).await {
+                                                    Ok(0) | Err(_) => break,
+                                                    Ok(n) => {
+                                                        if writer
+                                                            .write_all(&buf[..n])
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let mut buf = vec![0u8; 64 * 1024];
+                                            let mut offset: u64 = 0;
+                                            loop {
+                                                match reader.read(&mut buf).await {
+                                                    Ok(0) | Err(_) => break,
+                                                    Ok(n) => {
+                                                        let mut ok = true;
+                                                        for (j, &actual) in
+                                                            buf[..n].iter().enumerate()
+                                                        {
+                                                            let expected =
+                                                                ((offset + j as u64) % 251)
+                                                                    as u8;
+                                                            if actual != expected {
+                                                                ok = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if ok {
+                                                            offset += n as u64;
+                                                            bulk.fetch_add(
+                                                                n as u64,
+                                                                Ordering::Relaxed,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let _ = writer.shutdown();
+                                    });
+                                }
+                            });
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
+    Ok((addr, rx, bulk_delivered))
+}
+
+/// Connect to a dual‑mux server by opening two RTP connections, writing
+/// lane hellos, and spawning mux sessions over each. Returns the dual‑lane
+/// facade and the [`JoinSet`] that must be kept alive.
+pub async fn dual_mux_client_connect(
+    server_addr: std::net::SocketAddr,
+    fec: bool,
+) -> Result<
+    (mux::DualStreamOpener, mux::DualStreamAccepter, JoinSet<mux::MuxError>),
+    mux::DualMuxError,
+> {
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+    };
+    let mut spawner = JoinSet::new();
+
+    let connect = |adr: std::net::SocketAddr, f: bool| async move {
+        let (r, w) = rtp_connect(adr, f).await;
+        Some((r, w))
+    };
+
+    let (opener, accepter) = mux::spawn_dual_mux_connector(
+        || connect(server_addr, fec),
+        || connect(server_addr, fec),
+        config,
+        &mut spawner,
+    )
+    .await?;
+
+    Ok((opener, accepter, spawner))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
