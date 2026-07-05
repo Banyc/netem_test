@@ -29,6 +29,9 @@ const PING_BYTES: usize = 200;
 /// Queue-length sampler interval.
 const QUEUE_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Bulk ramp time before the ping window starts (mirrors hol_probe).
+const BULK_RAMP: Duration = Duration::from_millis(1500);
+
 /// Result of a single contested-latency repetition.
 #[derive(Clone, Debug, Default)]
 struct ContestedRepResult {
@@ -54,7 +57,7 @@ async fn contested_rep(
     let base = Instant::now();
     let (server_addr, mut latencies, bulk_counter) =
         spawn_mux_latency_bulk_server(fec, base).await.unwrap();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+    let pair = Arc::new(NetemPair::spawn(server_addr, c2s, s2c).unwrap());
 
     let connected = rtp::udp::connect_without_handshake_with_mss(
         "0.0.0.0:0",
@@ -96,34 +99,34 @@ async fn contested_rep(
     // Bulk payload: 64 MiB cyclic buffer, enough to keep any cap busy.
     let payload = Arc::new(support::cyclic_payload(64 * 1024 * 1024));
 
-    // Start queue-length sampler.
+    // Start queue-length sampler on the LOADED pair.
     let stop_sampler = Arc::new(AtomicBool::new(false));
     let stop_sampler_for_task = Arc::clone(&stop_sampler);
-    let pair_for_sampler = NetemPair::spawn(
-        pair.server_addr(),
-        NetemConfig::default(),
-        NetemConfig::default(),
-    )
-    .unwrap();
-    // Hold the pair alive only as long as the sampler runs.
+    let sampler_pair = Arc::clone(&pair);
     let sampler_handle = tokio::spawn(async move {
         let mut samples = Vec::new();
         let start = Instant::now();
         while !stop_sampler_for_task.load(Ordering::Relaxed) {
             tokio::time::sleep(QUEUE_SAMPLE_INTERVAL).await;
-            samples.push(pair_for_sampler.queue_len_c2s());
+            samples.push(sampler_pair.queue_len_c2s());
             if start.elapsed() >= straggler + Duration::from_secs(2) {
                 break;
             }
         }
-        pair_for_sampler.stop();
+        // Don't stop the pair — the caller does it.
         samples
     });
 
-    // Run bulk and ping concurrently for `straggler`.
-    let ping_fut = send_tagged_pings(&mut ping_write, base, PING_BYTES, cadence, straggler);
+    // Run bulk and ping concurrently. Ping runs for the full window;
+    // bulk sleeps BULK_RAMP (1.5s) so the ping has a solo baseline
+    // before congestion builds.
+    let ping_window = straggler + BULK_RAMP;
+    let ping_fut = send_tagged_pings(&mut ping_write, base, PING_BYTES, cadence, ping_window);
     let bulk_fut = run_mux_bulk_stream(&mut bulk_write, Arc::clone(&payload), straggler);
-    let (sent, _written) = tokio::join!(ping_fut, bulk_fut);
+    let (sent, _written) = tokio::join!(ping_fut, async {
+        tokio::time::sleep(BULK_RAMP).await;
+        bulk_fut.await
+    });
 
     // Let stragglers drain, then stop the sampler before the pair.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -327,7 +330,7 @@ async fn contested_capped_clean() {
                 )
             },
             Duration::from_millis(25),
-            Duration::from_secs(3),
+            Duration::from_secs(10),
         ),
     )
     .await;
@@ -368,7 +371,7 @@ async fn contested_capped_jitter_loss() {
                 )
             },
             Duration::from_millis(25),
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         ),
     )
     .await;

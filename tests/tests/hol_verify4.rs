@@ -116,14 +116,21 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
             stop.store(true, Ordering::Relaxed);
             break;
         }
-        match stream_write
-            .write_all(&payload[offset..offset + CHUNK])
-            .await
-        {
-            Ok(()) => {
-                offset = (offset + CHUNK) % payload.len();
+        let remaining = payload.len() - offset;
+        if remaining >= CHUNK {
+            match stream_write.write_all(&payload[offset..offset + CHUNK]).await {
+                Ok(()) => offset = (offset + CHUNK) % payload.len(),
+                Err(_) => break,
             }
-            Err(_) => break,
+        } else {
+            // Wrap: write tail then head
+            if let Err(_) = stream_write.write_all(&payload[offset..]).await {
+                break;
+            }
+            if let Err(_) = stream_write.write_all(&payload[..CHUNK - remaining]).await {
+                break;
+            }
+            offset = CHUNK - remaining;
         }
     }
     let elapsed = start.elapsed();
@@ -155,11 +162,20 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     let mut offset = 0usize;
     let start = Instant::now();
     while start.elapsed() < BULK_WINDOW {
-        match writer.write_all(&payload[offset..offset + CHUNK]).await {
-            Ok(()) => {
-                offset = (offset + CHUNK) % payload.len();
+        let remaining = payload.len() - offset;
+        if remaining >= CHUNK {
+            match writer.write_all(&payload[offset..offset + CHUNK]).await {
+                Ok(()) => offset = (offset + CHUNK) % payload.len(),
+                Err(_) => break,
             }
-            Err(_) => break,
+        } else {
+            if let Err(_) = writer.write_all(&payload[offset..]).await {
+                break;
+            }
+            if let Err(_) = writer.write_all(&payload[..CHUNK - remaining]).await {
+                break;
+            }
+            offset = CHUNK - remaining;
         }
     }
     let elapsed = start.elapsed();

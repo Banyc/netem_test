@@ -189,18 +189,8 @@ pub async fn run_hol_probe(
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
 
     // Run the interactive sender and the bulk sender concurrently.
-    let rr_fut = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
-    let bulk_fut = async {
-        if let Some(mut w) = shared_bulk_write {
-            tokio::time::sleep(BULK_RAMP).await;
-            run_mux_bulk_stream(&mut w, Arc::clone(&payload), active_for).await
-        } else {
-            0u64
-        }
-    };
-    let (sent, _shared_bulk_written) = tokio::join!(rr_fut, bulk_fut);
-
-    // For split modes, the bulk flow runs independently on a separate pair.
+    // For split modes, spawn the bulk flow on its own pair BEFORE the
+    // join so it runs concurrently with the interactive sender.
     let split_bulk_handle = match &bulk {
         BulkMode::Split(_, _) | BulkMode::SplitSharedBneck(_, _) => {
             let client_addr = bulk_pair_opt.as_ref().unwrap().client_addr();
@@ -214,9 +204,23 @@ pub async fn run_hol_probe(
         }
         _ => None,
     };
-    if let Some(h) = split_bulk_handle {
-        let _ = h.await;
-    }
+
+    let rr_fut = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
+    let bulk_fut = async {
+        if let Some(mut w) = shared_bulk_write {
+            tokio::time::sleep(BULK_RAMP).await;
+            run_mux_bulk_stream(&mut w, Arc::clone(&payload), active_for).await
+        } else {
+            0u64
+        }
+    };
+    let split_fut = async {
+        if let Some(h) = split_bulk_handle {
+            let _ = h.await;
+        }
+        0u64
+    };
+    let (sent, _shared_bulk_written, _) = tokio::join!(rr_fut, bulk_fut, split_fut);
 
     // Allow stragglers to arrive before draining the latency channel.
     tokio::time::sleep(grace).await;
