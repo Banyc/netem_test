@@ -263,6 +263,7 @@ async fn run_scenario(
     let mut deliveries = Vec::new();
     for rep in 0..3 {
         let (c2s, s2c) = build_config(100 + 10 * rep as u64);
+        let rate = c2s.rate;
         let result = contested_rep(c2s, s2c, false, cadence, straggler).await;
         if !result.latencies.is_empty() {
             let mut sorted = result.latencies.clone();
@@ -276,7 +277,7 @@ async fn run_scenario(
             result.received as f64 / result.sent as f64
         };
         deliveries.push(delivery);
-        print_contested_rep(name, &result, rep + 1, c2s.rate.into());
+        print_contested_rep(name, &result, rep + 1, rate.into());
     }
     p50s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     p99s.sort_by(|a, b| a.partial_cmp(b).unwrap());

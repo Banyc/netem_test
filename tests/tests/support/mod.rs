@@ -317,7 +317,7 @@ where
 /// layer stalls. This is required by `udp_listener`'s docs ("You still need
 /// to put `accept()` in a loop to drive the packet dispatch among the
 /// sub-connections").
-async fn spawn_mux_over_rtp_server_with_mss<F, Fut>(
+pub async fn spawn_mux_over_rtp_server_with_mss<F, Fut>(
     fec: bool,
     mss: usize,
     handle_stream: F,

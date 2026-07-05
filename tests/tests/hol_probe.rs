@@ -119,6 +119,8 @@ pub async fn run_hol_probe(
             (pair, Some(bulk_pair), counter)
         }
         BulkMode::SplitSharedBneck(shaper_c2s, shaper_s2c) => {
+            let c2s_bulk = c2s.clone();
+            let s2c_bulk = s2c.clone();
             let pair = NetemPair::spawn_shared(
                 server_addr,
                 c2s,
@@ -130,8 +132,8 @@ pub async fn run_hol_probe(
             let (sink_addr, counter) = spawn_rtp_byte_sink_server(fec).await.unwrap();
             let bulk_pair = NetemPair::spawn_shared(
                 sink_addr,
-                c2s,
-                s2c,
+                c2s_bulk,
+                s2c_bulk,
                 Some(shaper_c2s.clone()),
                 Some(shaper_s2c.clone()),
             )
@@ -170,7 +172,7 @@ pub async fn run_hol_probe(
     // For Shared mode, open a second mux stream for the bulk flow.
     let mut shared_bulk_write = None;
     if matches!(bulk, BulkMode::Shared) {
-        let (bulk_read, bulk_write) = opener.open().await.unwrap();
+        let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8 * 1024];
             loop {
@@ -465,7 +467,7 @@ macro_rules! hol_test {
         $run_for:expr,
         $grace:expr,
         $timeout:expr,
-        $gates:block
+        $gates:expr
     ) => {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore]
@@ -478,7 +480,8 @@ macro_rules! hol_test {
                 ),
             )
             .await;
-            $gates
+            let check: fn(&HolSummary) = $gates;
+            check(&summary);
         }
     };
 }
@@ -496,13 +499,13 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
-        assert!(summary.p50 <= 250.0, "p50 {summary.p50:.1} ms > 250 ms");
-        assert!(summary.p99 <= 800.0, "p99 {summary.p99:.1} ms > 800 ms");
+        assert!(summary.p50 <= 250.0, "p50 {:.1} ms > 250 ms", summary.p50);
+        assert!(summary.p99 <= 800.0, "p99 {:.1} ms > 800 ms", summary.p99);
     }
 );
 
@@ -517,13 +520,13 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
-        assert!(summary.p50 <= 250.0, "p50 {summary.p50:.1} ms > 250 ms");
-        assert!(summary.p99 <= 800.0, "p99 {summary.p99:.1} ms > 800 ms");
+        assert!(summary.p50 <= 250.0, "p50 {:.1} ms > 250 ms", summary.p50);
+        assert!(summary.p99 <= 800.0, "p99 {:.1} ms > 800 ms", summary.p99);
     }
 );
 
@@ -538,13 +541,13 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
-        assert!(summary.p50 <= 250.0, "p50 {summary.p50:.1} ms > 250 ms");
-        assert!(summary.p99 <= 800.0, "p99 {summary.p99:.1} ms > 800 ms");
+        assert!(summary.p50 <= 250.0, "p50 {:.1} ms > 250 ms", summary.p50);
+        assert!(summary.p99 <= 800.0, "p99 {:.1} ms > 800 ms", summary.p99);
     }
 );
 
@@ -561,10 +564,10 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
     }
 );
@@ -580,10 +583,10 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
     }
 );
@@ -599,10 +602,10 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
     }
 );
@@ -620,10 +623,10 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
     }
 );
@@ -639,10 +642,10 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
     }
 );
@@ -658,10 +661,10 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
     }
 );
@@ -679,13 +682,13 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
-        assert!(summary.p50 <= 100.0, "p50 {summary.p50:.1} ms > 100 ms");
-        assert!(summary.p99 <= 400.0, "p99 {summary.p99:.1} ms > 400 ms");
+        assert!(summary.p50 <= 100.0, "p50 {:.1} ms > 100 ms", summary.p50);
+        assert!(summary.p99 <= 400.0, "p99 {:.1} ms > 400 ms", summary.p99);
     }
 );
 
@@ -700,13 +703,13 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
-        assert!(summary.p50 <= 500.0, "p50 {summary.p50:.1} ms > 500 ms");
-        assert!(summary.p99 <= 1200.0, "p99 {summary.p99:.1} ms > 1200 ms");
+        assert!(summary.p50 <= 500.0, "p50 {:.1} ms > 500 ms", summary.p50);
+        assert!(summary.p99 <= 1200.0, "p99 {:.1} ms > 1200 ms", summary.p99);
     }
 );
 
@@ -721,10 +724,10 @@ hol_test!(
     DEFAULT_RUN_FOR,
     DEFAULT_GRACE,
     Duration::from_secs(120),
-    {
+    |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {summary.delivery_pct:.3} < 0.95"
+            "delivery {:.3} < 0.95", summary.delivery_pct
         );
     }
 );

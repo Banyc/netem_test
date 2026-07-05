@@ -26,7 +26,7 @@ use support::{
     spawn_mux_over_rtp_server_with_mss, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server,
     with_timeout,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 
 mod support;
