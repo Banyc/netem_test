@@ -22,11 +22,12 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use mux::{DeliveryMode, DualMessageReceiver, DualMessageSender, LaneClass};
+use mux::{DeliveryMode, DualMessageSender, LaneClass};
 use netem_test::{NetemConfig, NetemPair};
 use support::{
     cyclic_payload, dual_mux_client_connect, mux_client_connect, percentile,
-    spawn_dual_mux_latency_bulk_server, spawn_mux_latency_bulk_server, SplitMix64,
+    spawn_dual_msg_channel_server, spawn_dual_mux_latency_bulk_server,
+    spawn_mux_latency_bulk_server, SplitMix64,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -655,18 +656,19 @@ async fn dyn_dual_hint_static() {
 // Arm F: dual_message per-message routing (DualMessageSender / Receiver)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn dyn_dual_message_rep(
+async fn dyn_dual_msg_channel_rep(
     seed_base: u64,
     run_secs: u64,
+    mode: DeliveryMode,
 ) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
 
     let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+        spawn_dual_msg_channel_server(false, base, mode).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (opener, accepter, _spawner) =
+    let (opener, _accepter, _spawner) =
         dual_mux_client_connect(pair.client_addr(), false).await.unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
@@ -693,17 +695,7 @@ async fn dyn_dual_message_rep(
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    // Open a tagged stream for the DualMessage lane.
-    {
-        let (_, mut tag_w) = opener.open(LaneClass::Interactive).await
-            .expect("open interactive for dual_message");
-        tag_w.write_all(LATENCY_TAG).await.expect("write latency tag");
-        let _ = tag_w.shutdown();
-    }
-
-    let sender = DualMessageSender::new(opener, DeliveryMode::Unordered);
-    let mut receiver = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
-
+    let sender = DualMessageSender::new(opener, mode);
     let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let mut small_latencies = Vec::new();
     let mut burst_latencies = Vec::new();
@@ -711,7 +703,6 @@ async fn dyn_dual_message_rep(
     let start = Instant::now();
 
     while start.elapsed() < run_for {
-        sent += 1;
         let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
             msg_rng.uniform_usize(4 * 1024, 64 * 1024)
         } else {
@@ -723,10 +714,7 @@ async fn dyn_dual_message_rep(
         if sender.send(&frame).await.is_err() {
             break;
         }
-        match receiver.recv().await {
-            Ok(Some(_echo)) => {}
-            _ => break,
-        }
+        sent += 1;
 
         match lat_rx.recv().await {
             Some(lat) => {
@@ -752,11 +740,26 @@ async fn dyn_dual_message_rep(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn dyn_dual_message() {
+async fn dyn_dual_msg_channel() {
     let reps = dyn_reps();
     let mut results = Vec::new();
     for rep in 0..reps {
-        results.push(dyn_dual_message_rep(rep as u64, dyn_run_secs()).await);
+        results.push(
+            dyn_dual_msg_channel_rep(rep as u64, dyn_run_secs(), DeliveryMode::Unordered).await,
+        );
     }
-    summarize("dual_message (F)", &results);
+    summarize("dual_msg_channel (F Unordered)", &results);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn dyn_dual_msg_channel_ordered() {
+    let reps = dyn_reps();
+    let mut results = Vec::new();
+    for rep in 0..reps {
+        results.push(
+            dyn_dual_msg_channel_rep(rep as u64, dyn_run_secs(), DeliveryMode::Ordered).await,
+        );
+    }
+    summarize("dual_msg_channel (F Ordered)", &results);
 }

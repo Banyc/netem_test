@@ -1454,6 +1454,165 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
     Ok((addr, rx, bulk_delivered))
 }
 
+/// Dual‑mux server that accepts the bulk stream out‑of‑band as a raw lane
+/// stream, then drives a [`mux::DualMessageReceiver`] loop for latency
+/// messages. Latency is computed from the embedded send timestamp and
+/// pushed to the returned [`UnboundedReceiver`].
+pub async fn spawn_dual_msg_channel_server(
+    fec: bool,
+    base: Instant,
+    mode: mux::DeliveryMode,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let addr = listener.local_addr();
+    let (tx, rx) = mpsc::unbounded_channel::<f64>();
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+
+    let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
+
+    let listener_bg = Arc::clone(&listener);
+    tokio::spawn(async move {
+        loop {
+            match listener_bg
+                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+                .await
+            {
+                Ok(accepted) => {
+                    let _ = accept_tx.send(accepted);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let bulk_for_main = Arc::clone(&bulk_delivered);
+    tokio::spawn(async move {
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
+        let config = mux::MuxConfig {
+            initiation: mux::Initiation::Server,
+            heartbeat_interval: Duration::from_secs(5),
+        };
+
+        while let Some(accepted) = accept_rx.recv().await {
+            let reader = accepted.read.into_async_read();
+            let writer = accepted.write.into_async_write();
+
+            let result = mux::spawn_dual_mux_acceptor(
+                reader,
+                writer,
+                config.clone(),
+                Duration::from_secs(3),
+            )
+            .await;
+
+            match result {
+                Ok((_class, nonce, pa)) => {
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push(pa);
+                    if entries.len() == 2 {
+                        let pa2 = entries.pop().unwrap();
+                        let pa1 = entries.pop().unwrap();
+                        pending.remove(&nonce);
+
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, mut accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _spawner = pair_spawner;
+
+                                let bulk = Arc::clone(&bulk);
+                                if let Ok((mut reader, writer, _class)) =
+                                    accepter.accept().await
+                                {
+                                    tokio::spawn(async move {
+                                        let _w = writer;
+                                        let mut buf = vec![0u8; 64 * 1024];
+                                        let mut offset: u64 = 0;
+                                        loop {
+                                            match reader.read(&mut buf).await {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(n) => {
+                                                    let mut ok = true;
+                                                    for (j, &actual) in
+                                                        buf[..n].iter().enumerate()
+                                                    {
+                                                        let expected =
+                                                            ((offset + j as u64) % 251)
+                                                                as u8;
+                                                        if actual != expected {
+                                                            ok = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if ok {
+                                                        offset += n as u64;
+                                                        bulk.fetch_add(
+                                                            n as u64,
+                                                            Ordering::Relaxed,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+
+                                let mut receiver =
+                                    mux::DualMessageReceiver::new(accepter, mode);
+                                loop {
+                                    match receiver.recv().await {
+                                        Ok(Some(payload)) => {
+                                            if payload.len() >= 12 {
+                                                let frame_len = u32::from_le_bytes([
+                                                    payload[0],
+                                                    payload[1],
+                                                    payload[2],
+                                                    payload[3],
+                                                ])
+                                                as usize;
+                                                if frame_len >= 12
+                                                    && payload.len() >= frame_len
+                                                {
+                                                    let payload_end = frame_len - 8;
+                                                    let sent_us = u64::from_le_bytes([
+                                                        payload[payload_end],
+                                                        payload[payload_end + 1],
+                                                        payload[payload_end + 2],
+                                                        payload[payload_end + 3],
+                                                        payload[payload_end + 4],
+                                                        payload[payload_end + 5],
+                                                        payload[payload_end + 6],
+                                                        payload[payload_end + 7],
+                                                    ]);
+                                                    let now_us =
+                                                        base.elapsed().as_micros() as u64;
+                                                    let latency_ms =
+                                                        now_us.saturating_sub(sent_us)
+                                                            as f64
+                                                            / 1000.0;
+                                                    let _ = tx.send(latency_ms);
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => break,
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
+    Ok((addr, rx, bulk_delivered))
+}
+
 /// Connect to a dual‑mux server by opening two RTP connections, writing
 /// lane hellos, and spawning mux sessions over each. Returns the dual‑lane
 /// facade and the [`JoinSet`] that must be kept alive.
