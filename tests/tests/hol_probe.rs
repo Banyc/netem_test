@@ -482,6 +482,22 @@ fn hostile_real_link_seeded(seed: u64) -> NetemConfig {
     c
 }
 
+// ══════════════════════════════ reference matrix ══════════════════════════════
+// ┌────────────────┬─────────┬───────────┬───────────┬─────────────┬────────────┬──────────┐
+// │ link           │  rtt    │ loss      │ jitter    │ rate        │ queue      │ modes    │
+// ├────────────────┼─────────┼───────────┼───────────┼─────────────┼────────────┼──────────┤
+// │ rtt100 clean   │  100 ms │    0      │    0      │ unbounded   │ unbounded  │ SOL SHR  │
+// │ rtt100 GE5     │  100 ms │ 5% GI bus │    0      │ unbounded   │ unbounded  │ SOL SHR  │
+// │ rtt100 GE5 v2  │  100 ms │ 5% GI bus │    0      │ unbounded   │ unbounded  │ SOL SHR  │
+// │ rtt100 GE5 v3  │  100 ms │ 5% GI bus │    0      │ unbounded   │ unbounded  │ SOL SHR SPL│
+// │ rtt100 GE1+loss│  100 ms │ 1% GI bus │    0      │ unbounded   │ unbounded  │ SOL SHR SPL│
+// │ cap400         │   20 ms │ 1% indep  │   2 ms    │ 400 kbps    │  4096 B    │ SOL SHR  │
+// │ cap400 ShrShp  │   20 ms │ 1% indep  │   2 ms    │ 400 kbps shp│     0      │ SSHB RPT  │
+// │ rtt40  GE1     │   40 ms │ 1% GI bus │    0      │ unbounded   │ unbounded  │ SOL SHR SPL│
+// │ rtt40  GE1+loss│   40 ms │ 1% GI bus │    0      │ unbounded   │ unbounded  │ SOL SHR SPL│
+// │ FEC cap400     │   20 ms │ 1% indep  │   2 ms    │ 400 kbps    │  4096 B    │ SOL (FEC) │
+// │ hostile        │  varied │ burst+indp│  varied   │ varied      │  4096 B    │ SOL SHR SPL│
+// └────────────────┴─────────┴───────────┴───────────┴─────────────┴────────────┴──────────┘
 // ────────────────────────────── scenario macro ──────────────────────────────
 
 macro_rules! hol_test {
@@ -626,6 +642,103 @@ hol_test!(
     rtt100_ge5(31),
     rtt100_ge5(32),
     BulkMode::Split(rtt100_ge5(33), rtt100_ge5(34)),
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+// ─────────────────────── rtt100 GE5 seed-variant rows ────────────────────────
+
+hol_test!(
+    hol_rtt100_ge5_v2_solo,
+    "rtt100 GE5 v2 solo",
+    rtt100_ge5(41),
+    rtt100_ge5(42),
+    BulkMode::None,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt100_ge5_v2_shared,
+    "rtt100 GE5 v2 shared",
+    rtt100_ge5(51),
+    rtt100_ge5(52),
+    BulkMode::Shared,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt100_ge5_v3_solo,
+    "rtt100 GE5 v3 solo",
+    rtt100_ge5(61),
+    rtt100_ge5(62),
+    BulkMode::None,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt100_ge5_v3_shared,
+    "rtt100 GE5 v3 shared",
+    rtt100_ge5(71),
+    rtt100_ge5(72),
+    BulkMode::Shared,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt100_ge5_v3_split,
+    "rtt100 GE5 v3 split",
+    rtt100_ge5(81),
+    rtt100_ge5(82),
+    BulkMode::Split(rtt100_ge5(83), rtt100_ge5(84)),
     DEFAULT_MSG_BYTES,
     DEFAULT_CADENCE,
     DEFAULT_RUN_FOR,
@@ -807,6 +920,82 @@ hol_test!(
     rtt40_ge1_loss1(11),
     rtt40_ge1_loss1(12),
     BulkMode::None,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt40_ge1_shared,
+    "rtt40 GE1 shared",
+    rtt40_ge1(21),
+    rtt40_ge1(22),
+    BulkMode::Shared,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt40_ge1_split,
+    "rtt40 GE1 split",
+    rtt40_ge1(31),
+    rtt40_ge1(32),
+    BulkMode::Split(rtt40_ge1(33), rtt40_ge1(34)),
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt40_ge1_loss1_shared,
+    "rtt40 GE1+loss1 shared",
+    rtt40_ge1_loss1(21),
+    rtt40_ge1_loss1(22),
+    BulkMode::Shared,
+    DEFAULT_MSG_BYTES,
+    DEFAULT_CADENCE,
+    DEFAULT_RUN_FOR,
+    DEFAULT_GRACE,
+    Duration::from_secs(120),
+    |summary: &HolSummary| {
+        assert!(
+            summary.delivery_pct >= 0.95,
+            "delivery {:.3} < 0.95", summary.delivery_pct
+        );
+    }
+);
+
+hol_test!(
+    hol_rtt40_ge1_loss1_split,
+    "rtt40 GE1+loss1 split",
+    rtt40_ge1_loss1(31),
+    rtt40_ge1_loss1(32),
+    BulkMode::Split(rtt40_ge1_loss1(33), rtt40_ge1_loss1(34)),
     DEFAULT_MSG_BYTES,
     DEFAULT_CADENCE,
     DEFAULT_RUN_FOR,

@@ -1924,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_shared_two_udp_flows_serialize_to_shared_rate() {
+    fn spawn_shared_two_udp_flows_serialize_to_shared_rate_and_route_correctly() {
         let shaper = SharedShaper::new(400 * 1024 * 8, 0);
         let packet_size = 1024usize;
         let packets_per_flow = 50usize;
@@ -1973,41 +1973,61 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
 
-        let payload_a: Vec<u8> = (0..packet_size).map(|i| (i % 251) as u8).collect();
-        let payload_b: Vec<u8> = (0..packet_size).map(|i| (255 - (i % 251)) as u8).collect();
+        // Tag each flow with a distinct marker byte so replies can be verified.
+        let mut payload_a: Vec<u8> = vec![0xAA; packet_size];
+        payload_a[0] = 0xAA;
+        let mut payload_b: Vec<u8> = vec![0xBB; packet_size];
+        payload_b[0] = 0xBB;
 
         let start = Instant::now();
         for _ in 0..packets_per_flow {
             client_a.send_to(&payload_a, pair_a.client_addr()).unwrap();
             client_b.send_to(&payload_b, pair_b.client_addr()).unwrap();
+            // Pace sends to avoid kernel local-LAN drop.
+            std::thread::sleep(Duration::from_micros(200));
         }
 
-        let mut got_a = 0usize;
-        let mut got_b = 0usize;
+        let phase_start = Instant::now();
         let mut buf = [0u8; 2048];
-        while got_a < packets_per_flow || got_b < packets_per_flow {
+        let mut got_a: Vec<Vec<u8>> = Vec::new();
+        let mut got_b: Vec<Vec<u8>> = Vec::new();
+        while got_a.len() < packets_per_flow || got_b.len() < packets_per_flow {
+            assert!(
+                phase_start.elapsed() < Duration::from_secs(5),
+                "replies not received within 5 s phase deadline"
+            );
             if let Ok((n, _)) = client_a.recv_from(&mut buf) {
                 assert_eq!(n, packet_size, "flow A reply size mismatch");
-                got_a += 1;
+                assert_eq!(buf[0], 0xAA, "flow A reply routed to wrong socket");
+                got_a.push(buf[..n].to_vec());
             }
             if let Ok((n, _)) = client_b.recv_from(&mut buf) {
                 assert_eq!(n, packet_size, "flow B reply size mismatch");
-                got_b += 1;
+                assert_eq!(buf[0], 0xBB, "flow B reply routed to wrong socket");
+                got_b.push(buf[..n].to_vec());
             }
         }
         let elapsed = start.elapsed();
         pair_a.stop();
         pair_b.stop();
 
-        assert_eq!(got_a, packets_per_flow);
-        assert_eq!(got_b, packets_per_flow);
+        assert_eq!(got_a.len(), packets_per_flow);
+        assert_eq!(got_b.len(), packets_per_flow);
+        // Verify every reply carries the correct tag and size.
+        for reply in &got_a {
+            assert_eq!(reply.len(), packet_size);
+            assert_eq!(reply[0], 0xAA);
+        }
+        for reply in &got_b {
+            assert_eq!(reply.len(), packet_size);
+            assert_eq!(reply[0], 0xBB);
+        }
         let stats_a = pair_a.stats_c2s();
         let stats_b = pair_b.stats_c2s();
         assert_eq!(stats_a.forwarded, packets_per_flow as u64);
         assert_eq!(stats_b.forwarded, packets_per_flow as u64);
         assert_eq!(stats_a.overflow_dropped + stats_b.overflow_dropped, 0);
 
-        // Per-flow caps would finish ~125 ms; the shared cap forces ~250 ms.
         assert!(
             elapsed >= Duration::from_millis(200),
             "shared shaper should serialize both flows, elapsed {elapsed:?}"
@@ -2015,6 +2035,105 @@ mod tests {
         assert!(
             elapsed <= Duration::from_secs(3),
             "shared shaper should finish within 3 s, elapsed {elapsed:?}"
+        );
+    }
+
+    /// Two flows queue behind one bottleneck in arrival order.
+    /// Packets from different source addresses are forwarded in the order
+    /// they arrive at the single paired runner.
+    #[test]
+    fn two_flows_queue_arrival_order_shared_bottleneck() {
+        let shaper = SharedShaper::new(8_000_000, 0);
+        let mut c2s = NetemConfig::default();
+        c2s.rate = 0;
+        let s2c = NetemConfig::default();
+        let server_addr =
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6300));
+        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(
+            SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6301),
+        )));
+        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let client_addr = client_sock.local_addr().unwrap();
+
+        let pair = NetemPair::spawn_from_sockets_shared(
+            server_addr,
+            c2s,
+            s2c,
+            Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
+            Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
+            client_addr,
+            Some(shaper.clone()),
+            None,
+        )
+        .unwrap();
+
+        let from_a = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
+        let from_b = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7001));
+
+        // Push interleaved from two different source addresses.
+        client_sock.push_recv(vec![0xAA, 0x01], from_a);
+        client_sock.push_recv(vec![0xBB, 0x01], from_b);
+        client_sock.push_recv(vec![0xAA, 0x02], from_a);
+        client_sock.push_recv(vec![0xBB, 0x02], from_b);
+        client_sock.push_recv(vec![0xAA, 0x03], from_a);
+
+        std::thread::sleep(Duration::from_millis(200));
+        pair.stop();
+
+        let sent = server_sock.sent.lock().unwrap();
+        let tags: Vec<u8> = sent.iter().map(|(data, _)| data[0]).collect();
+        assert_eq!(
+            tags,
+            vec![0xAA, 0xBB, 0xAA, 0xBB, 0xAA],
+            "packets must be forwarded in arrival order: {tags:?}"
+        );
+    }
+
+    /// Bottleneck overflow (tail-drop at shared byte limit) increments
+    /// `overflow_dropped` on the direction carrying the overflowed packet.
+    #[test]
+    fn shared_bottleneck_overflow_counts_overflow_dropped() {
+        let shaper = SharedShaper::new(8_000, 80);
+        let mut c2s = NetemConfig::default();
+        c2s.rate = 0;
+        let s2c = NetemConfig::default();
+        let server_addr =
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6400));
+        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(
+            SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6401),
+        )));
+        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let client_addr = client_sock.local_addr().unwrap();
+
+        let pair = NetemPair::spawn_from_sockets_shared(
+            server_addr,
+            c2s,
+            s2c,
+            Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
+            Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
+            client_addr,
+            Some(shaper.clone()),
+            None,
+        )
+        .unwrap();
+
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
+
+        // 50 B + 40 B = 90 > 80 B limit: second packet overflows.
+        client_sock.push_recv(vec![0u8; 50], from);
+        client_sock.push_recv(vec![0u8; 40], from);
+
+        std::thread::sleep(Duration::from_millis(200));
+        pair.stop();
+
+        let stats = pair.stats_c2s();
+        let sent = server_sock.sent.lock().unwrap();
+        let fwd: Vec<usize> = sent.iter().map(|(data, _)| data.len()).collect();
+        assert_eq!(fwd, vec![50], "only the 50 B packet should forward");
+        assert_eq!(stats.forwarded, 1);
+        assert_eq!(
+            stats.overflow_dropped, 1,
+            "the overflowed 40 B packet must increment overflow_dropped"
         );
     }
 }

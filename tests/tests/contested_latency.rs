@@ -281,7 +281,7 @@ async fn run_scenario(
             result.received as f64 / result.sent as f64
         };
         deliveries.push(delivery);
-        print_contested_rep(name, &result, rep + 1, rate.into());
+        print_contested_rep(name, &result, rep + 1, (rate > 0).then_some(rate));
     }
     p50s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     p99s.sort_by(|a, b| a.partial_cmp(b).unwrap());
