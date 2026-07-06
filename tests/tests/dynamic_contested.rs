@@ -25,23 +25,20 @@ use std::time::{Duration, Instant};
 use mux::{DeliveryMode, DualMessageReceiver, DualMessageSender, LaneClass};
 use netem_test::{NetemConfig, NetemPair};
 use support::{
-    cyclic_payload, dual_mux_client_connect, percentile, rtp_connect,
-    spawn_dual_mux_latency_bulk_server, spawn_mux_latency_bulk_server,
-    spawn_rtp_bulk_upload, SplitMix64,
+    cyclic_payload, dual_mux_client_connect, mux_client_connect, percentile,
+    spawn_dual_mux_latency_bulk_server, spawn_mux_latency_bulk_server, SplitMix64,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
 
 const MSG_SEED_BASE: u64 = 0xD15E;
-#[allow(dead_code)]
-const BULK_SEED_BASE: u64 = 0xB01D;
+const BULK_RAMP: Duration = Duration::from_millis(1500);
 const LATENCY_CADENCE: Duration = Duration::from_millis(25);
 const SMALL_MSG_BYTES: usize = 200;
-const BURST_RATIO: u64 = 16; // 1-in-16 messages is a burst
-const BULK_RAMP: Duration = Duration::from_millis(1500);
+const BURST_RATIO: u64 = 16;
+const RATE_BPS: u64 = 400 * 1024 * 8;
 
-/// Env knobs: DYN_RUN_SECS (default 15), DYN_REPS (default 3).
 fn dyn_run_secs() -> u64 {
     std::env::var("DYN_RUN_SECS")
         .ok()
@@ -84,10 +81,8 @@ fn bottleneck_config(seed: u64, rate_bps: u64) -> (NetemConfig, NetemConfig) {
     )
 }
 
-const RATE_BPS: u64 = 400 * 1024 * 8;
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// Traffic generation
+// Results and helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 struct DynTrafficResult {
@@ -98,99 +93,20 @@ struct DynTrafficResult {
     bulk_bytes: u64,
 }
 
-/// Generate one repetition of the mixed-size latency flow against bulk.
-async fn dyn_single_mux_rep(
-    seed_base: u64,
-    run_secs: u64,
-) -> DynTrafficResult {
-    let run_for = Duration::from_secs(run_secs);
-    let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
+const LATENCY_TAG: &[u8] = b"L";
 
-    let (server_addr, _lat_rx, bulk_counter) =
-        spawn_mux_latency_bulk_server(false, Instant::now()).await.unwrap();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
-    let (mut rr_read, mut rr_write) = rtp_connect(pair.client_addr(), false).await;
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
-    let bulk_stop = Arc::new(AtomicBool::new(false));
-
-    // Spawn bulk pump
-    let bulk_payload = Arc::clone(&payload);
-    let bulk_stop_clone = Arc::clone(&bulk_stop);
-    let bulk_addr = pair.client_addr();
-    let bulk_handle = tokio::spawn(async move {
-        let Ok(mut writer) = spawn_rtp_bulk_upload(bulk_addr, false).await else { return; };
-        let mut offset = 0usize;
-        while !bulk_stop_clone.load(Ordering::Relaxed) {
-            match writer.write(&bulk_payload[offset..]).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => offset = (offset + n) % bulk_payload.len(),
-            }
-        }
-    });
-
-    let mut small_latencies = Vec::new();
-    let mut burst_latencies = Vec::new();
-    let mut sent = 0u64;
-    let start = Instant::now();
-
-    while start.elapsed() < run_for {
-        sent += 1;
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
-            msg_rng.uniform_usize(4 * 1024, 64 * 1024)
-        } else {
-            SMALL_MSG_BYTES
-        };
-        let is_burst = msg_size > SMALL_MSG_BYTES;
-
-        let t0 = Instant::now();
-        let payload = vec![b'L'];
-        // Write timestamp as string for simplicity
-        let ts = t0.elapsed().as_nanos().to_le_bytes();
-        let mut frame = payload;
-        frame.extend_from_slice(&ts);
-        // Pad to msg_size
-        frame.resize(msg_size, 0u8);
-
-        if rr_write.write_all(&frame).await.is_err() {
-            break;
-        }
-
-        // Read echo
-        let mut echo_buf = [0u8; 8];
-        if rr_read.read_exact(&mut echo_buf).await.is_err() {
-            break;
-        }
-        let rtt = t0.elapsed();
-        let lat = rtt.as_secs_f64() * 1000.0;
-
-        if is_burst {
-            burst_latencies.push(lat);
-        } else {
-            small_latencies.push(lat);
-        }
-
-        tokio::time::sleep(LATENCY_CADENCE).await;
-    }
-
-    bulk_stop.store(true, Ordering::Relaxed);
-    let _ = bulk_handle.await;
-
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-
-    DynTrafficResult {
-        small_latencies,
-        burst_latencies,
-        sent,
-        received,
-        bulk_bytes,
-    }
+fn make_latency_frame(msg_size: usize, base: Instant) -> Vec<u8> {
+    assert!(msg_size >= 12, "msg_size {msg_size} too small for framing");
+    let sent_us = base.elapsed().as_micros() as u64;
+    let frame_len = msg_size as u32;
+    let payload_bytes = msg_size - 12;
+    let mut frame = Vec::with_capacity(msg_size);
+    frame.extend_from_slice(&frame_len.to_le_bytes());
+    frame.resize(4 + payload_bytes, b'X');
+    frame.extend_from_slice(&sent_us.to_le_bytes());
+    frame
 }
 
-/// Summarize across reps and print a grep-able summary line.
 fn summarize(label: &str, results: &[DynTrafficResult]) {
     let mut all_small: Vec<f64> = results.iter().flat_map(|r| r.small_latencies.clone()).collect();
     let mut all_burst: Vec<f64> = results.iter().flat_map(|r| r.burst_latencies.clone()).collect();
@@ -204,7 +120,7 @@ fn summarize(label: &str, results: &[DynTrafficResult]) {
             / results.iter().map(|r| r.sent).sum::<u64>() as f64
     };
     let bulk_total: u64 = results.iter().map(|r| r.bulk_bytes).sum();
-    let bulk_secs = results.len() as f64 * 15.0; // approximate
+    let bulk_secs = results.len() as f64 * dyn_run_secs() as f64;
 
     eprintln!(
         "[dyn {label}] small p50/p90/p99={:.0}/{:.0}/{:.0} ms  burst_p50={:.0} ms  bulk={:.3} MiB/s  delivery={:.3}",
@@ -230,19 +146,123 @@ fn percentile_opt(sorted: &[f64], p: f64) -> f64 {
     percentile(sorted, p)
 }
 
+async fn run_latency_flow(
+    base: Instant,
+    seed_base: u64,
+    run_for: Duration,
+    lat_write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    lat_rx: &mut tokio::sync::mpsc::UnboundedReceiver<f64>,
+) -> (Vec<f64>, Vec<f64>, u64) {
+    lat_write.write_all(LATENCY_TAG).await.expect("write latency tag");
+    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
+    let mut small_latencies = Vec::new();
+    let mut burst_latencies = Vec::new();
+    let mut sent = 0u64;
+    let start = Instant::now();
+    while start.elapsed() < run_for {
+        sent += 1;
+        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
+            msg_rng.uniform_usize(4 * 1024, 64 * 1024)
+        } else {
+            SMALL_MSG_BYTES
+        };
+        let is_burst = msg_size > SMALL_MSG_BYTES;
+        let frame = make_latency_frame(msg_size, base);
+        if lat_write.write_all(&frame).await.is_err() {
+            break;
+        }
+        match lat_rx.recv().await {
+            Some(lat) => {
+                if is_burst {
+                    burst_latencies.push(lat);
+                } else {
+                    small_latencies.push(lat);
+                }
+            }
+            None => break,
+        }
+        tokio::time::sleep(LATENCY_CADENCE).await;
+    }
+    (small_latencies, burst_latencies, sent)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Arm A: single-mux baseline
 // ═══════════════════════════════════════════════════════════════════════════════
+
+async fn dyn_single_mux_rep(
+    seed_base: u64,
+    run_secs: u64,
+) -> DynTrafficResult {
+    let run_for = Duration::from_secs(run_secs);
+    let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
+    let base = Instant::now();
+
+    let (server_addr, mut lat_rx, bulk_counter) =
+        spawn_mux_latency_bulk_server(false, base).await.unwrap();
+    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+    let connected = rtp::udp::connect_without_handshake_with_mss(
+        "0.0.0.0:0",
+        &pair.client_addr().to_string(),
+        None,
+        false,
+        rtp::udp::NO_FEC_MSS,
+    )
+    .await
+    .unwrap();
+    let (opener, _mux_spawner) = mux_client_connect(
+        connected.read.into_async_read(),
+        connected.write.into_async_write(),
+    );
+
+    let (mut _lat_read, mut lat_write) = opener.open().await.unwrap();
+    let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop { match _lat_read.read(&mut buf).await { Ok(0) | Err(_) => break, _ => {} } }
+    });
+
+    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let bulk_handle = {
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
+        tokio::spawn(async move {
+            let mut offset = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                match bulk_write.write(&payload[offset..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => offset = (offset + n) % payload.len(),
+                }
+            }
+            let _ = bulk_write.shutdown();
+        })
+    };
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop { match bulk_read.read(&mut buf).await { Ok(0) | Err(_) => break, _ => {} } }
+    });
+
+    let (small, burst, sent) =
+        run_latency_flow(base, seed_base, run_for, &mut lat_write, &mut lat_rx).await;
+    let _ = lat_write.shutdown();
+    bulk_stop.store(true, Ordering::Relaxed);
+    let _ = bulk_handle.await;
+    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let received = (small.len() + burst.len()) as u64;
+
+    DynTrafficResult { small_latencies: small, burst_latencies: burst, sent, received, bulk_bytes }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn dyn_single_mux() {
     let reps = dyn_reps();
-    let run_secs = dyn_run_secs();
     let mut results = Vec::new();
-
     for rep in 0..reps {
-        results.push(dyn_single_mux_rep(rep as u64, run_secs).await);
+        results.push(dyn_single_mux_rep(rep as u64, dyn_run_secs()).await);
     }
     summarize("single_mux (A)", &results);
 }
@@ -257,96 +277,58 @@ async fn dyn_dual_auto_small_first_rep(
 ) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
+    let base = Instant::now();
 
-    let (server_addr, _lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, Instant::now()).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
     let (opener, _accepter, _spawner) =
         dual_mux_client_connect(pair.client_addr(), false).await.unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let bulk_stop = Arc::new(AtomicBool::new(false));
-
+    let bulk_opener = opener.clone();
     let bulk_handle = {
-        let bulk_payload = Arc::clone(&payload);
-        let bulk_stop_clone = Arc::clone(&bulk_stop);
-        let bulk_addr = pair.client_addr();
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
         tokio::spawn(async move {
-            let Ok(mut writer) = spawn_rtp_bulk_upload(bulk_addr, false).await else {
-                return;
+            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
             };
             let mut offset = 0usize;
-            while !bulk_stop_clone.load(Ordering::Relaxed) {
-                match writer.write(&bulk_payload[offset..]).await {
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % bulk_payload.len(),
+                    Ok(n) => offset = (offset + n) % payload.len(),
                 }
             }
+            let _ = w.shutdown();
         })
     };
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let (mut auto_reader, mut auto_writer) = opener.open_auto();
-    let mut small_latencies = Vec::new();
-    let mut burst_latencies = Vec::new();
-    let mut sent = 0u64;
-    let start = Instant::now();
-
-    while start.elapsed() < run_for {
-        sent += 1;
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
-            msg_rng.uniform_usize(4 * 1024, 64 * 1024)
-        } else {
-            SMALL_MSG_BYTES
-        };
-        let is_burst = msg_size > SMALL_MSG_BYTES;
-
-        let t0 = Instant::now();
-        let ts = t0.elapsed().as_nanos().to_le_bytes();
-        let mut frame = vec![b'L'];
-        frame.extend_from_slice(&ts);
-        frame.resize(msg_size, 0);
-
-        if auto_writer.write_all(&frame).await.is_err() {
-            break;
-        }
-        let mut echo_buf = [0u8; 8];
-        if auto_reader.read_exact(&mut echo_buf).await.is_err() {
-            break;
-        }
-        let rtt = t0.elapsed();
-        let lat = rtt.as_secs_f64() * 1000.0;
-
-        if is_burst {
-            burst_latencies.push(lat);
-        } else {
-            small_latencies.push(lat);
-        }
-
-        tokio::time::sleep(LATENCY_CADENCE).await;
-    }
-
+    let (auto_reader, mut auto_writer) = opener.open_auto();
+    let (small, burst, sent) =
+        run_latency_flow(base, seed_base, run_for, &mut auto_writer, &mut lat_rx).await;
     let _ = auto_writer.shutdown();
+    drop(auto_reader);
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
-
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let received = (small.len() + burst.len()) as u64;
 
-    DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
+    DynTrafficResult { small_latencies: small, burst_latencies: burst, sent, received, bulk_bytes }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn dyn_dual_auto_small_first() {
     let reps = dyn_reps();
-    let run_secs = dyn_run_secs();
     let mut results = Vec::new();
     for rep in 0..reps {
-        results.push(dyn_dual_auto_small_first_rep(rep as u64, run_secs).await);
+        results.push(dyn_dual_auto_small_first_rep(rep as u64, dyn_run_secs()).await);
     }
     summarize("dual_auto_small_first (B)", &results);
 }
@@ -361,118 +343,92 @@ async fn dyn_dual_auto_big_first_rep(
 ) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
+    let base = Instant::now();
 
-    let (server_addr, _lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, Instant::now()).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
     let (opener, _accepter, _spawner) =
         dual_mux_client_connect(pair.client_addr(), false).await.unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let bulk_stop = Arc::new(AtomicBool::new(false));
-
+    let bulk_opener = opener.clone();
     let bulk_handle = {
-        let bulk_payload = Arc::clone(&payload);
-        let bulk_stop_clone = Arc::clone(&bulk_stop);
-        let bulk_addr = pair.client_addr();
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
         tokio::spawn(async move {
-            let Ok(mut writer) = spawn_rtp_bulk_upload(bulk_addr, false).await else {
-                return;
+            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
             };
             let mut offset = 0usize;
-            while !bulk_stop_clone.load(Ordering::Relaxed) {
-                match writer.write(&bulk_payload[offset..]).await {
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % bulk_payload.len(),
+                    Ok(n) => offset = (offset + n) % payload.len(),
                 }
             }
+            let _ = w.shutdown();
         })
     };
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let (mut auto_reader, mut auto_writer) = opener.open_auto();
-    let mut small_latencies = Vec::new();
-    let mut burst_latencies = Vec::new();
-    let mut sent = 0u64;
-    let start = Instant::now();
+    let (auto_reader, mut auto_writer) = opener.open_auto();
 
-    // FIRST write is forced to be a burst (> 2 KiB) so auto classifies as Bulk
-    let first_size = 4 * 1024;
-    let t0 = Instant::now();
-    let ts = t0.elapsed().as_nanos().to_le_bytes();
-    let mut frame = vec![b'L'];
-    frame.extend_from_slice(&ts);
-    frame.resize(first_size, 0);
-    if auto_writer.write_all(&frame).await.is_err() {
+    // FIRST write is forced to be large (> 2 KiB) so auto classifies as Bulk.
+    let first_size: usize = 4 * 1024;
+    let first_frame = make_latency_frame(first_size, base);
+    if auto_writer.write_all(LATENCY_TAG).await.is_err()
+        || auto_writer.write_all(&first_frame).await.is_err()
+    {
         let _ = auto_writer.shutdown();
+        drop(auto_reader);
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
-        let received = (small_latencies.len() + burst_latencies.len()) as u64;
-        let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-        return DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes };
-    }
-    let mut echo_buf = [0u8; 8];
-    if auto_reader.read_exact(&mut echo_buf).await.is_ok() {
-        let rtt = t0.elapsed();
-        burst_latencies.push(rtt.as_secs_f64() * 1000.0);
-    }
-    sent += 1;
-
-    while start.elapsed() < run_for {
-        sent += 1;
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
-            msg_rng.uniform_usize(4 * 1024, 64 * 1024)
-        } else {
-            SMALL_MSG_BYTES
+        return DynTrafficResult {
+            small_latencies: vec![], burst_latencies: vec![],
+            sent: 0, received: 0,
+            bulk_bytes: bulk_counter.load(Ordering::Relaxed),
         };
-        let is_burst = msg_size > SMALL_MSG_BYTES;
-
-        let t0 = Instant::now();
-        let ts = t0.elapsed().as_nanos().to_le_bytes();
-        let mut frame = vec![b'L'];
-        frame.extend_from_slice(&ts);
-        frame.resize(msg_size, 0);
-
-        if auto_writer.write_all(&frame).await.is_err() {
-            break;
-        }
-        let mut echo_buf = [0u8; 8];
-        if auto_reader.read_exact(&mut echo_buf).await.is_err() {
-            break;
-        }
-        let rtt = t0.elapsed();
-        let lat = rtt.as_secs_f64() * 1000.0;
-
-        if is_burst {
-            burst_latencies.push(lat);
-        } else {
-            small_latencies.push(lat);
-        }
-
-        tokio::time::sleep(LATENCY_CADENCE).await;
+    }
+    if let Some(lat) = lat_rx.recv().await {
+        let rest_run = run_for.saturating_sub(base.elapsed());
+        let (small, mut burst, mut sent) =
+            run_latency_flow(base, seed_base, rest_run, &mut auto_writer, &mut lat_rx).await;
+        burst.insert(0, lat);
+        sent += 1;
+        let _ = auto_writer.shutdown();
+        drop(auto_reader);
+        bulk_stop.store(true, Ordering::Relaxed);
+        let _ = bulk_handle.await;
+        let received = (small.len() + burst.len()) as u64;
+        return DynTrafficResult {
+            small_latencies: small, burst_latencies: burst,
+            sent, received,
+            bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+        };
     }
 
     let _ = auto_writer.shutdown();
+    drop(auto_reader);
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
-
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-
-    DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
+    DynTrafficResult {
+        small_latencies: vec![], burst_latencies: vec![],
+        sent: 1, received: 0,
+        bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn dyn_dual_auto_big_first() {
     let reps = dyn_reps();
-    let run_secs = dyn_run_secs();
     let mut results = Vec::new();
     for rep in 0..reps {
-        results.push(dyn_dual_auto_big_first_rep(rep as u64, run_secs).await);
+        results.push(dyn_dual_auto_big_first_rep(rep as u64, dyn_run_secs()).await);
     }
     summarize("dual_auto_big_first (C)", &results);
 }
@@ -487,38 +443,39 @@ async fn dyn_dual_auto_per_message_rep(
 ) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
+    let base = Instant::now();
 
-    let (server_addr, _lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, Instant::now()).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
     let (opener, _accepter, _spawner) =
         dual_mux_client_connect(pair.client_addr(), false).await.unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let bulk_stop = Arc::new(AtomicBool::new(false));
-
+    let bulk_opener = opener.clone();
     let bulk_handle = {
-        let bulk_payload = Arc::clone(&payload);
-        let bulk_stop_clone = Arc::clone(&bulk_stop);
-        let bulk_addr = pair.client_addr();
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
         tokio::spawn(async move {
-            let Ok(mut writer) = spawn_rtp_bulk_upload(bulk_addr, false).await else {
-                return;
+            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
             };
             let mut offset = 0usize;
-            while !bulk_stop_clone.load(Ordering::Relaxed) {
-                match writer.write(&bulk_payload[offset..]).await {
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % bulk_payload.len(),
+                    Ok(n) => offset = (offset + n) % payload.len(),
                 }
             }
+            let _ = w.shutdown();
         })
     };
 
     tokio::time::sleep(BULK_RAMP).await;
 
+    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let mut small_latencies = Vec::new();
     let mut burst_latencies = Vec::new();
     let mut sent = 0u64;
@@ -532,30 +489,26 @@ async fn dyn_dual_auto_per_message_rep(
             SMALL_MSG_BYTES
         };
         let is_burst = msg_size > SMALL_MSG_BYTES;
+        let frame = make_latency_frame(msg_size, base);
 
-        let (mut reader, mut writer) = opener.open_auto();
-
-        let t0 = Instant::now();
-        let ts = t0.elapsed().as_nanos().to_le_bytes();
-        let mut frame = vec![b'L'];
-        frame.extend_from_slice(&ts);
-        frame.resize(msg_size, 0);
-
-        if writer.write_all(&frame).await.is_err() {
+        let (reader, mut writer) = opener.open_auto();
+        if writer.write_all(LATENCY_TAG).await.is_err()
+            || writer.write_all(&frame).await.is_err()
+        {
             break;
         }
         let _ = writer.shutdown();
-        let mut echo_buf = [0u8; 8];
-        if reader.read_exact(&mut echo_buf).await.is_err() {
-            break;
-        }
-        let rtt = t0.elapsed();
-        let lat = rtt.as_secs_f64() * 1000.0;
+        drop(reader);
 
-        if is_burst {
-            burst_latencies.push(lat);
-        } else {
-            small_latencies.push(lat);
+        match lat_rx.recv().await {
+            Some(lat) => {
+                if is_burst {
+                    burst_latencies.push(lat);
+                } else {
+                    small_latencies.push(lat);
+                }
+            }
+            None => break,
         }
 
         tokio::time::sleep(LATENCY_CADENCE).await;
@@ -563,9 +516,8 @@ async fn dyn_dual_auto_per_message_rep(
 
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
-
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
     DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
 }
@@ -574,10 +526,9 @@ async fn dyn_dual_auto_per_message_rep(
 #[ignore]
 async fn dyn_dual_auto_per_message() {
     let reps = dyn_reps();
-    let run_secs = dyn_run_secs();
     let mut results = Vec::new();
     for rep in 0..reps {
-        results.push(dyn_dual_auto_per_message_rep(rep as u64, run_secs).await);
+        results.push(dyn_dual_auto_per_message_rep(rep as u64, dyn_run_secs()).await);
     }
     summarize("dual_auto_per_message (D)", &results);
 }
@@ -592,44 +543,43 @@ async fn dyn_dual_hint_static_rep(
 ) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
+    let base = Instant::now();
 
-    let (server_addr, _lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, Instant::now()).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
     let (opener, _accepter, _spawner) =
         dual_mux_client_connect(pair.client_addr(), false).await.unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let bulk_stop = Arc::new(AtomicBool::new(false));
-
+    let bulk_opener = opener.clone();
     let bulk_handle = {
-        let bulk_payload = Arc::clone(&payload);
-        let bulk_stop_clone = Arc::clone(&bulk_stop);
-        let bulk_addr = pair.client_addr();
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
         tokio::spawn(async move {
-            let Ok(mut writer) = spawn_rtp_bulk_upload(bulk_addr, false).await else {
-                return;
+            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
             };
             let mut offset = 0usize;
-            while !bulk_stop_clone.load(Ordering::Relaxed) {
-                match writer.write(&bulk_payload[offset..]).await {
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % bulk_payload.len(),
+                    Ok(n) => offset = (offset + n) % payload.len(),
                 }
             }
+            let _ = w.shutdown();
         })
     };
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    // Open a persistent interactive stream for all latency messages
-    let (mut int_reader, mut int_writer) = opener
-        .open(LaneClass::Interactive)
-        .await
-        .expect("open interactive");
+    let (int_reader, mut int_writer) =
+        opener.open(LaneClass::Interactive).await.expect("open interactive");
+    int_writer.write_all(LATENCY_TAG).await.expect("write latency tag");
 
+    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let mut small_latencies = Vec::new();
     let mut burst_latencies = Vec::new();
     let mut sent = 0u64;
@@ -643,48 +593,39 @@ async fn dyn_dual_hint_static_rep(
             SMALL_MSG_BYTES
         };
         let is_burst = msg_size > SMALL_MSG_BYTES;
-
-        let t0 = Instant::now();
-        let ts = t0.elapsed().as_nanos().to_le_bytes();
-        let mut frame = vec![b'L'];
-        frame.extend_from_slice(&ts);
-        frame.resize(msg_size, 0);
+        let frame = make_latency_frame(msg_size, base);
 
         if is_burst {
-            // Open a fresh bulk stream for the burst
-            if let Ok((mut br, mut bw)) = opener.open(LaneClass::Bulk).await {
+            if let Ok((_, mut bw)) = opener.open(LaneClass::Bulk).await {
+                let _ = bw.write_all(LATENCY_TAG).await;
                 if bw.write_all(&frame).await.is_err() {
                     break;
                 }
                 let _ = bw.shutdown();
-                let mut echo_buf = [0u8; 8];
-                if br.read_exact(&mut echo_buf).await.is_err() {
-                    break;
+                match lat_rx.recv().await {
+                    Some(lat) => burst_latencies.push(lat),
+                    None => break,
                 }
-                let rtt = t0.elapsed();
-                burst_latencies.push(rtt.as_secs_f64() * 1000.0);
             }
         } else {
             if int_writer.write_all(&frame).await.is_err() {
                 break;
             }
-            let mut echo_buf = [0u8; 8];
-            if int_reader.read_exact(&mut echo_buf).await.is_err() {
-                break;
+            match lat_rx.recv().await {
+                Some(lat) => small_latencies.push(lat),
+                None => break,
             }
-            let rtt = t0.elapsed();
-            small_latencies.push(rtt.as_secs_f64() * 1000.0);
         }
 
         tokio::time::sleep(LATENCY_CADENCE).await;
     }
 
     let _ = int_writer.shutdown();
+    drop(int_reader);
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
-
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
     DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
 }
@@ -693,10 +634,9 @@ async fn dyn_dual_hint_static_rep(
 #[ignore]
 async fn dyn_dual_hint_static() {
     let reps = dyn_reps();
-    let run_secs = dyn_run_secs();
     let mut results = Vec::new();
     for rep in 0..reps {
-        results.push(dyn_dual_hint_static_rep(rep as u64, run_secs).await);
+        results.push(dyn_dual_hint_static_rep(rep as u64, dyn_run_secs()).await);
     }
     summarize("dual_hint_static (E)", &results);
 }
@@ -711,41 +651,50 @@ async fn dyn_dual_message_rep(
 ) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
+    let base = Instant::now();
 
-    let (server_addr, _lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, Instant::now()).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
     let (opener, accepter, _spawner) =
         dual_mux_client_connect(pair.client_addr(), false).await.unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let bulk_stop = Arc::new(AtomicBool::new(false));
-
+    let bulk_opener = opener.clone();
     let bulk_handle = {
-        let bulk_payload = Arc::clone(&payload);
-        let bulk_stop_clone = Arc::clone(&bulk_stop);
-        let bulk_addr = pair.client_addr();
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
         tokio::spawn(async move {
-            let Ok(mut writer) = spawn_rtp_bulk_upload(bulk_addr, false).await else {
-                return;
+            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
             };
             let mut offset = 0usize;
-            while !bulk_stop_clone.load(Ordering::Relaxed) {
-                match writer.write(&bulk_payload[offset..]).await {
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % bulk_payload.len(),
+                    Ok(n) => offset = (offset + n) % payload.len(),
                 }
             }
+            let _ = w.shutdown();
         })
     };
 
     tokio::time::sleep(BULK_RAMP).await;
 
+    // Open a tagged stream for the DualMessage lane.
+    {
+        let (_, mut tag_w) = opener.open(LaneClass::Interactive).await
+            .expect("open interactive for dual_message");
+        tag_w.write_all(LATENCY_TAG).await.expect("write latency tag");
+        let _ = tag_w.shutdown();
+    }
+
     let sender = DualMessageSender::new(opener, DeliveryMode::Unordered);
     let mut receiver = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
 
+    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let mut small_latencies = Vec::new();
     let mut burst_latencies = Vec::new();
     let mut sent = 0u64;
@@ -759,27 +708,25 @@ async fn dyn_dual_message_rep(
             SMALL_MSG_BYTES
         };
         let is_burst = msg_size > SMALL_MSG_BYTES;
+        let frame = make_latency_frame(msg_size, base);
 
-        let t0 = Instant::now();
-        let ts = t0.elapsed().as_nanos().to_le_bytes();
-        let mut msg_payload = vec![b'L'];
-        msg_payload.extend_from_slice(&ts);
-        msg_payload.resize(msg_size, 0);
-
-        if sender.send(&msg_payload).await.is_err() {
+        if sender.send(&frame).await.is_err() {
             break;
         }
         match receiver.recv().await {
-            Ok(Some(_echo)) => {
-                let rtt = t0.elapsed();
-                let lat = rtt.as_secs_f64() * 1000.0;
+            Ok(Some(_echo)) => {}
+            _ => break,
+        }
+
+        match lat_rx.recv().await {
+            Some(lat) => {
                 if is_burst {
                     burst_latencies.push(lat);
                 } else {
                     small_latencies.push(lat);
                 }
             }
-            _ => break,
+            None => break,
         }
 
         tokio::time::sleep(LATENCY_CADENCE).await;
@@ -787,9 +734,8 @@ async fn dyn_dual_message_rep(
 
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
-
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
     DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
 }
@@ -798,10 +744,9 @@ async fn dyn_dual_message_rep(
 #[ignore]
 async fn dyn_dual_message() {
     let reps = dyn_reps();
-    let run_secs = dyn_run_secs();
     let mut results = Vec::new();
     for rep in 0..reps {
-        results.push(dyn_dual_message_rep(rep as u64, run_secs).await);
+        results.push(dyn_dual_message_rep(rep as u64, dyn_run_secs()).await);
     }
     summarize("dual_message (F)", &results);
 }

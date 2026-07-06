@@ -1168,23 +1168,26 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// [`spawn_mux_latency_bulk_server`].
 pub async fn spawn_dual_mux_latency_bulk_server(
     fec: bool,
-    _base: Instant,
+    base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
-    let (_tx, rx) = mpsc::unbounded_channel::<f64>();
+    let (tx, rx) = mpsc::unbounded_channel::<f64>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
 
-    // Background accept loop keeps the udp_listener dispatcher alive.
+    let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
+
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
         loop {
-            if listener_bg
+            match listener_bg
                 .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
                 .await
-                .is_err()
             {
-                break;
+                Ok(accepted) => {
+                    let _ = accept_tx.send(accepted);
+                }
+                Err(_) => break,
             }
         }
     });
@@ -1197,14 +1200,7 @@ pub async fn spawn_dual_mux_latency_bulk_server(
             heartbeat_interval: Duration::from_secs(5),
         };
 
-        loop {
-            let accepted = match listener
-                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
-                .await
-            {
-                Ok(a) => a,
-                Err(_) => break,
-            };
+        while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
 
@@ -1230,12 +1226,14 @@ pub async fn spawn_dual_mux_latency_bulk_server(
                             mux::complete_pairing(pa1, pa2, &mut pair_spawner)
                         {
                             let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
                             tokio::spawn(async move {
                                 let _spawner = pair_spawner;
                                 while let Ok((mut reader, mut writer, _class)) =
                                     accepter.accept().await
                                 {
                                     let bulk = Arc::clone(&bulk);
+                                    let tx = tx.clone();
                                     tokio::spawn(async move {
                                         let mut tag = [0u8; 1];
                                         if reader.read_exact(&mut tag).await.is_err() {
@@ -1244,18 +1242,45 @@ pub async fn spawn_dual_mux_latency_bulk_server(
                                         }
                                         if tag[0] == b'L' {
                                             let mut buf = vec![0u8; 64 * 1024];
+                                            let mut offset = 0usize;
                                             loop {
-                                                match reader.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => break,
-                                                    Ok(n) => {
-                                                        if writer
-                                                            .write_all(&buf[..n])
-                                                            .await
-                                                            .is_err()
-                                                        {
-                                                            break;
-                                                        }
+                                                let n = match reader.read(&mut buf[offset..]).await {
+                                                    Ok(n) => n,
+                                                    Err(_) => break,
+                                                };
+                                                if n == 0 {
+                                                    break;
+                                                }
+                                                offset += n;
+                                                loop {
+                                                    if offset < 4 {
+                                                        break;
                                                     }
+                                                    let frame_len = u32::from_le_bytes([
+                                                        buf[0], buf[1], buf[2], buf[3],
+                                                    ]) as usize;
+                                                    if frame_len < 12 {
+                                                        break;
+                                                    }
+                                                    if offset < frame_len {
+                                                        break;
+                                                    }
+                                                    let payload_end = frame_len - 8;
+                                                    let sent_us = u64::from_le_bytes([
+                                                        buf[payload_end],
+                                                        buf[payload_end + 1],
+                                                        buf[payload_end + 2],
+                                                        buf[payload_end + 3],
+                                                        buf[payload_end + 4],
+                                                        buf[payload_end + 5],
+                                                        buf[payload_end + 6],
+                                                        buf[payload_end + 7],
+                                                    ]);
+                                                    let now_us = base.elapsed().as_micros() as u64;
+                                                    let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                                    let _ = tx.send(latency_ms);
+                                                    buf.copy_within(frame_len..offset, 0);
+                                                    offset -= frame_len;
                                                 }
                                             }
                                         } else {
