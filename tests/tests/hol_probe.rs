@@ -11,14 +11,14 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::Ordering,
 };
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::{
     combined_stats, cyclic_payload, gilbert_elliott_loss, mux_client_connect, percentile,
-    print_perf, rtp_connect, send_timestamped_messages, spawn_mux_latency_bulk_server,
+    send_timestamped_messages, spawn_mux_latency_bulk_server,
     spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,8 +32,8 @@ const OWD_100MS: Duration = Duration::from_millis(50);
 const DEFAULT_MSG_BYTES: usize = 256;
 /// Default cadence between interactive messages.
 const DEFAULT_CADENCE: Duration = Duration::from_millis(25);
-/// Default interactive run time.
-const DEFAULT_RUN_FOR: Duration = Duration::from_secs(15);
+/// Default interactive run time: 1.5 s ramp + 15 s steady-state ping window.
+const DEFAULT_RUN_FOR: Duration = Duration::from_millis(16_500);
 /// Default grace period for stragglers.
 const DEFAULT_GRACE: Duration = Duration::from_secs(3);
 /// Bulk ramp: interactive runs solo for this long before the bulk flow starts.

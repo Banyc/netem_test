@@ -22,20 +22,19 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::{
-    burst_loss_link, cyclic_payload, mux_client_connect, rtp_connect,
+    burst_loss_link, cyclic_payload, mux_client_connect,
     spawn_mux_over_rtp_server_with_mss, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server,
     with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::task::JoinSet;
 
 mod support;
 
 /// Wall-clock budget for each probe (1.5 s ramp + 15 s run + 3 s grace + slack).
 const BULK_WINDOW: Duration = Duration::from_millis(19_500);
 
-/// Bulk write chunk size: 256 KiB.
-const CHUNK: usize = 256 * 1024;
+/// Bulk write chunk size: 251-aligned (~256 KiB).
+const CHUNK: usize = 262_044;
 
 /// Spawn a mux-over-RTP server that accepts a single `mux` session and treats
 /// every accepted stream as a deterministic bulk byte sink.
@@ -108,32 +107,20 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     });
 
     let stop = Arc::new(AtomicBool::new(false));
-    let payload = cyclic_payload(64 * 1024 * 1024);
-    let mut offset = 0usize;
+    let payload = cyclic_payload(CHUNK);
     let start = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if start.elapsed() >= BULK_WINDOW {
             stop.store(true, Ordering::Relaxed);
             break;
         }
-        let remaining = payload.len() - offset;
-        if remaining >= CHUNK {
-            match stream_write.write_all(&payload[offset..offset + CHUNK]).await {
-                Ok(()) => offset = (offset + CHUNK) % payload.len(),
-                Err(_) => break,
-            }
-        } else {
-            // Wrap: write tail then head
-            if let Err(_) = stream_write.write_all(&payload[offset..]).await {
-                break;
-            }
-            if let Err(_) = stream_write.write_all(&payload[..CHUNK - remaining]).await {
-                break;
-            }
-            offset = CHUNK - remaining;
+        match stream_write.write_all(&payload[..CHUNK]).await {
+            Ok(()) => {}
+            Err(_) => break,
         }
     }
     let elapsed = start.elapsed();
+    let delivered_at_window = delivered.load(Ordering::Relaxed);
     let _ = stream_write.shutdown();
 
     // Wait for the mux supervision tasks to settle before stopping the pair.
@@ -142,7 +129,11 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 
     let total = delivered.load(Ordering::Relaxed);
     let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
-    eprintln!("[v4 {label}] delivered={total}B elapsed={elapsed:?} bulk={mibps:.3} MiB/s");
+    let mibps_window = delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
+    eprintln!(
+        "[v4 {label}] delivered={total}B (at-window={delivered_at_window}B) \
+         elapsed={elapsed:?} bulk={mibps:.3} MiB/s bulk-window={mibps_window:.3} MiB/s",
+    );
     total
 }
 
@@ -158,27 +149,16 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     let mut writer = spawn_rtp_bulk_upload(pair.client_addr(), false)
         .await
         .unwrap();
-    let payload = cyclic_payload(64 * 1024 * 1024);
-    let mut offset = 0usize;
+    let payload = cyclic_payload(CHUNK);
     let start = Instant::now();
     while start.elapsed() < BULK_WINDOW {
-        let remaining = payload.len() - offset;
-        if remaining >= CHUNK {
-            match writer.write_all(&payload[offset..offset + CHUNK]).await {
-                Ok(()) => offset = (offset + CHUNK) % payload.len(),
-                Err(_) => break,
-            }
-        } else {
-            if let Err(_) = writer.write_all(&payload[offset..]).await {
-                break;
-            }
-            if let Err(_) = writer.write_all(&payload[..CHUNK - remaining]).await {
-                break;
-            }
-            offset = CHUNK - remaining;
+        match writer.write_all(&payload[..CHUNK]).await {
+            Ok(()) => {}
+            Err(_) => break,
         }
     }
     let elapsed = start.elapsed();
+    let delivered_at_window = delivered.load(Ordering::Relaxed);
 
     // Explicitly drop the writer so the server sees EOF and stops counting.
     drop(writer);
@@ -188,7 +168,11 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 
     let total = delivered.load(Ordering::Relaxed);
     let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
-    eprintln!("[v4 {label}] delivered={total}B elapsed={elapsed:?} bulk={mibps:.3} MiB/s");
+    let mibps_window = delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
+    eprintln!(
+        "[v4 {label}] delivered={total}B (at-window={delivered_at_window}B) \
+         elapsed={elapsed:?} bulk={mibps:.3} MiB/s bulk-window={mibps_window:.3} MiB/s",
+    );
     total
 }
 

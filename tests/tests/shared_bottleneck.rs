@@ -14,7 +14,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -325,11 +325,11 @@ async fn shared_bneck_late_joiner_fairness() {
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
-    let handle_a = spawn_bulk_flow(
+    let _handle_a = spawn_bulk_flow(
         pair_a.client_addr(), Arc::clone(&payload), total_run, Arc::clone(&bulk_stop),
     );
     tokio::time::sleep(b_join).await;
-    let handle_b = spawn_bulk_flow(
+    let _handle_b = spawn_bulk_flow(
         pair_b.client_addr(),
         Arc::clone(&payload),
         total_run - b_join,
