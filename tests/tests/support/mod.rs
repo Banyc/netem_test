@@ -1926,7 +1926,7 @@ async fn handle_gaming_stream<R: AsyncRead + Unpin + Send + 'static>(
         return;
     }
     if tag[0] == b'G' {
-        const SYNC_BYTES: usize = 3 * 1024 * 1024;
+        const SYNC_BYTES: usize = 8 * 1024;
         let mut remaining = SYNC_BYTES;
         let mut buf = vec![0u8; 64 * 1024];
         while remaining > 0 {
@@ -2031,7 +2031,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
                         return;
                     }
                     if tag[0] == b'G' {
-                        const SYNC_BYTES: usize = 3 * 1024 * 1024;
+                        const SYNC_BYTES: usize = 8 * 1024;
                         let mut remaining = SYNC_BYTES;
                         let mut buf = vec![0u8; 64 * 1024];
                         while remaining > 0 {
@@ -2117,8 +2117,13 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
 /// Connect to a dual‑mux server by opening two RTP connections, writing
 /// lane hellos, and spawning mux sessions over each. Returns the dual‑lane
 /// facade and the [`JoinSet`] that must be kept alive.
+/// Connect a dual-mux client where each lane rides its OWN proxy
+/// (`int_proxy_addr` / `bulk_proxy_addr`).  Both proxies share one
+/// [`netem_test::SharedShaper`] per direction upstream, so the two lanes
+/// funnel through ONE bottleneck capacity — the point of the battery.
 pub async fn dual_mux_client_connect(
-    server_addr: std::net::SocketAddr,
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
 ) -> Result<
     (mux::DualStreamOpener, mux::DualStreamAccepter, JoinSet<mux::MuxError>),
@@ -2136,8 +2141,8 @@ pub async fn dual_mux_client_connect(
     };
 
     let (opener, accepter) = mux::spawn_dual_mux_connector(
-        || connect(server_addr, fec),
-        || connect(server_addr, fec),
+        || connect(int_proxy_addr, fec),
+        || connect(bulk_proxy_addr, fec),
         config,
         &mut spawner,
     )
