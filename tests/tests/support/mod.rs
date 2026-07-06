@@ -803,6 +803,115 @@ pub async fn spawn_mux_latency_bulk_server(
     Ok((addr, rx, bulk_delivered))
 }
 
+/// Like [`spawn_mux_latency_bulk_server`] but with a custom RTP MSS.
+pub async fn spawn_mux_sized_latency_bulk_server(
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+    let addr = spawn_mux_over_rtp_server_with_mss(
+        fec,
+        mss,
+        {
+            let tx = tx.clone();
+            let bulk_delivered = Arc::clone(&bulk_delivered);
+            move |mut stream_read, mut stream_write| {
+                let tx = tx.clone();
+                let bulk_delivered = Arc::clone(&bulk_delivered);
+                async move {
+                    let mut tag = [0u8; 1];
+                    let n = match stream_read.read(&mut tag).await {
+                        Ok(n) => n,
+                        Err(_) => {
+                            let _ = stream_write.shutdown();
+                            return;
+                        }
+                    };
+                    if n == 0 {
+                        let _ = stream_write.shutdown();
+                        return;
+                    }
+
+                    if tag[0] == b'L' {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut offset = 0usize;
+                        loop {
+                            let n = match stream_read.read(&mut buf[offset..]).await {
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            offset += n;
+                            loop {
+                                if offset < 4 {
+                                    break;
+                                }
+                                let frame_len = u32::from_le_bytes([
+                                    buf[0], buf[1], buf[2], buf[3],
+                                ]) as usize;
+                                if frame_len < 12 {
+                                    break;
+                                }
+                                if offset < frame_len {
+                                    break;
+                                }
+                                let payload_end = frame_len - 8;
+                                let sent_us = u64::from_le_bytes([
+                                    buf[payload_end],
+                                    buf[payload_end + 1],
+                                    buf[payload_end + 2],
+                                    buf[payload_end + 3],
+                                    buf[payload_end + 4],
+                                    buf[payload_end + 5],
+                                    buf[payload_end + 6],
+                                    buf[payload_end + 7],
+                                ]);
+                                let now_us = base.elapsed().as_micros() as u64;
+                                let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                let _ = tx.send(latency_ms);
+                                buf.copy_within(frame_len..offset, 0);
+                                offset -= frame_len;
+                            }
+                        }
+                    } else {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut offset: u64 = 0;
+                        loop {
+                            let n = match stream_read.read(&mut buf).await {
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            let mut ok = true;
+                            for (j, &actual) in buf[..n].iter().enumerate() {
+                                let expected = ((offset + j as u64) % 251) as u8;
+                                if actual != expected {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                offset += n as u64;
+                                bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+
+                    let _ = stream_write.shutdown();
+                }
+            }
+        },
+    )
+    .await?;
+    Ok((addr, rx, bulk_delivered))
+}
+
 /// [`spawn_mux_msg_latency_sink`] with a custom RTP MSS.
 pub async fn spawn_mux_msg_latency_sink_with_mss(
     fec: bool,
@@ -1170,6 +1279,23 @@ pub async fn spawn_dual_mux_latency_bulk_server(
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_latency_bulk_server_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Like [`spawn_dual_mux_latency_bulk_server`] but with a custom RTP MSS.
+pub async fn spawn_dual_mux_sized_latency_bulk_server(
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_latency_bulk_server_with_mss(fec, base, mss).await
+}
+
+async fn spawn_dual_mux_latency_bulk_server_with_mss(
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::unbounded_channel::<f64>();
@@ -1181,7 +1307,7 @@ pub async fn spawn_dual_mux_latency_bulk_server(
     tokio::spawn(async move {
         loop {
             match listener_bg
-                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+                .accept_without_handshake_with_mss(fec, mss)
                 .await
             {
                 Ok(accepted) => {

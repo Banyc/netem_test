@@ -152,15 +152,14 @@ async fn run_latency_flow(
     run_for: Duration,
     lat_write: &mut (impl tokio::io::AsyncWrite + Unpin),
     lat_rx: &mut tokio::sync::mpsc::UnboundedReceiver<f64>,
+    tag_written: bool,
 ) -> (Vec<f64>, Vec<f64>, u64) {
-    lat_write.write_all(LATENCY_TAG).await.expect("write latency tag");
     let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let mut small_latencies = Vec::new();
     let mut burst_latencies = Vec::new();
     let mut sent = 0u64;
     let start = Instant::now();
     while start.elapsed() < run_for {
-        sent += 1;
         let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
             msg_rng.uniform_usize(4 * 1024, 64 * 1024)
         } else {
@@ -168,9 +167,18 @@ async fn run_latency_flow(
         };
         let is_burst = msg_size > SMALL_MSG_BYTES;
         let frame = make_latency_frame(msg_size, base);
-        if lat_write.write_all(&frame).await.is_err() {
+        let write_buf = if !tag_written && sent == 0 {
+            let mut tagged = Vec::with_capacity(LATENCY_TAG.len() + frame.len());
+            tagged.extend_from_slice(LATENCY_TAG);
+            tagged.extend_from_slice(&frame);
+            tagged
+        } else {
+            frame
+        };
+        if lat_write.write_all(&write_buf).await.is_err() {
             break;
         }
+        sent += 1;
         match lat_rx.recv().await {
             Some(lat) => {
                 if is_burst {
@@ -246,7 +254,7 @@ async fn dyn_single_mux_rep(
     });
 
     let (small, burst, sent) =
-        run_latency_flow(base, seed_base, run_for, &mut lat_write, &mut lat_rx).await;
+        run_latency_flow(base, seed_base, run_for, &mut lat_write, &mut lat_rx, false).await;
     let _ = lat_write.shutdown();
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
@@ -311,7 +319,7 @@ async fn dyn_dual_auto_small_first_rep(
 
     let (auto_reader, mut auto_writer) = opener.open_auto();
     let (small, burst, sent) =
-        run_latency_flow(base, seed_base, run_for, &mut auto_writer, &mut lat_rx).await;
+        run_latency_flow(base, seed_base, run_for, &mut auto_writer, &mut lat_rx, false).await;
     let _ = auto_writer.shutdown();
     drop(auto_reader);
     bulk_stop.store(true, Ordering::Relaxed);
@@ -380,8 +388,10 @@ async fn dyn_dual_auto_big_first_rep(
     // FIRST write is forced to be large (> 2 KiB) so auto classifies as Bulk.
     let first_size: usize = 4 * 1024;
     let first_frame = make_latency_frame(first_size, base);
-    if auto_writer.write_all(LATENCY_TAG).await.is_err()
-        || auto_writer.write_all(&first_frame).await.is_err()
+    let mut first_buf = Vec::with_capacity(LATENCY_TAG.len() + first_frame.len());
+    first_buf.extend_from_slice(LATENCY_TAG);
+    first_buf.extend_from_slice(&first_frame);
+    if auto_writer.write_all(&first_buf).await.is_err()
     {
         let _ = auto_writer.shutdown();
         drop(auto_reader);
@@ -396,7 +406,7 @@ async fn dyn_dual_auto_big_first_rep(
     if let Some(lat) = lat_rx.recv().await {
         let rest_run = run_for.saturating_sub(base.elapsed());
         let (small, mut burst, mut sent) =
-            run_latency_flow(base, seed_base, rest_run, &mut auto_writer, &mut lat_rx).await;
+            run_latency_flow(base, seed_base, rest_run, &mut auto_writer, &mut lat_rx, true).await;
         burst.insert(0, lat);
         sent += 1;
         let _ = auto_writer.shutdown();
@@ -492,8 +502,8 @@ async fn dyn_dual_auto_per_message_rep(
         let frame = make_latency_frame(msg_size, base);
 
         let (reader, mut writer) = opener.open_auto();
-        if writer.write_all(LATENCY_TAG).await.is_err()
-            || writer.write_all(&frame).await.is_err()
+        let write_buf = [LATENCY_TAG, &frame[..]].concat();
+        if writer.write_all(&write_buf).await.is_err()
         {
             break;
         }
