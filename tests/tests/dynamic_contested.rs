@@ -1021,13 +1021,11 @@ fn spawn_bulk_pump(
         };
         let _ = w.write_all(BULK_TAG).await;
         let mut offset = 0usize;
-        let chunk = 1024;
         while !stop.load(Ordering::Relaxed) {
-            match w.write(&payload[offset..offset + chunk]).await {
+            match w.write(&payload[offset..]).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => offset = (offset + n) % (payload.len() - chunk),
+                Ok(n) => offset = (offset + n) % payload.len(),
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = w.shutdown();
     })
