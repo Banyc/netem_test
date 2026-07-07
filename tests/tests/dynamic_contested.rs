@@ -109,6 +109,7 @@ struct DynTrafficResult {
 }
 
 const LATENCY_TAG: &[u8] = b"L";
+const BULK_TAG: &[u8] = b"B";
 
 fn make_latency_frame(msg_size: usize, base: Instant) -> Vec<u8> {
     assert!(msg_size >= 12, "msg_size {msg_size} too small for framing");
@@ -262,6 +263,7 @@ async fn dyn_single_mux_rep(
         let payload = Arc::clone(&payload);
         let stop = Arc::clone(&bulk_stop);
         tokio::spawn(async move {
+            let _ = bulk_write.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match bulk_write.write(&payload[offset..]).await {
@@ -357,6 +359,7 @@ async fn dyn_dual_auto_small_first_rep(
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let _ = w.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match w.write(&payload[offset..]).await {
@@ -452,6 +455,7 @@ async fn dyn_dual_auto_big_first_rep(
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let _ = w.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match w.write(&payload[offset..]).await {
@@ -583,6 +587,7 @@ async fn dyn_dual_auto_per_message_rep(
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let _ = w.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match w.write(&payload[offset..]).await {
@@ -712,6 +717,7 @@ async fn dyn_dual_hint_static_rep(
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let _ = w.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match w.write(&payload[offset..]).await {
@@ -1013,6 +1019,7 @@ fn spawn_bulk_pump(
             Ok(v) => v,
             Err(_) => return,
         };
+        let _ = w.write_all(BULK_TAG).await;
         let mut offset = 0usize;
         let chunk = 1024;
         while !stop.load(Ordering::Relaxed) {
@@ -1290,6 +1297,7 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
             loop { match bulk_read.read(&mut buf).await { Ok(0) | Err(_) => break, _ => {} } }
         });
         tokio::spawn(async move {
+            let _ = bulk_write.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match bulk_write.write(&payload[offset..]).await {
@@ -1476,6 +1484,7 @@ async fn dyn_dual_auto_small_first_migrating_rep(
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let _ = w.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match w.write(&payload[offset..]).await {
@@ -1570,6 +1579,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let _ = w.write_all(BULK_TAG).await;
             let mut offset = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match w.write(&payload[offset..]).await {
