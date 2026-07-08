@@ -361,6 +361,7 @@ where
             let config = mux::MuxConfig {
                 initiation: mux::Initiation::Server,
                 heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
             };
             let mut spawner = tokio::task::JoinSet::new();
             let (_opener, mut accepter) =
@@ -1028,6 +1029,7 @@ where
     let config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
         heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: false,
     };
     let mut spawner = JoinSet::new();
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
@@ -1324,6 +1326,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
+            frame_reassembly: false,
         };
 
         while let Some(accepted) = accept_rx.recv().await {
@@ -1491,6 +1494,7 @@ pub async fn spawn_dual_msg_channel_server(
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
+            frame_reassembly: false,
         };
 
         while let Some(accepted) = accept_rx.recv().await {
@@ -1649,6 +1653,7 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
+            frame_reassembly: false,
         };
 
         while let Some(accepted) = accept_rx.recv().await {
@@ -1838,6 +1843,7 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
+            frame_reassembly: false,
         };
 
         while let Some(accepted) = accept_rx.recv().await {
@@ -2132,6 +2138,7 @@ pub async fn dual_mux_client_connect(
     let config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
         heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: false,
     };
     let mut spawner = JoinSet::new();
 
