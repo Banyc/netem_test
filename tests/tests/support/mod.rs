@@ -2189,3 +2189,679 @@ impl SplitMix64 {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Frame‑delivery adapter
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use std::sync::Mutex;
+
+use rtp::transmission::frame_delivery::FrameDelivery;
+use rtp::transmission::fec_tuning::FecTuning;
+
+/// AsyncWrite adapter over [`rtp::socket::WriteSocket`] that guarantees
+/// ONE mux frame = ONE rtp frame.  Each `poll_write` sends the *whole*
+/// incoming buffer as a single RTP frame via [`WriteSocket::send_frame`]; a
+/// partial send surfaces [`std::io::ErrorKind::WriteZero`] so a future
+/// rtp/mux change can never silently split a mux frame across two rtp
+/// frames (which would corrupt reassembly).
+pub struct RtpFrameDeliveryWriter {
+    socket: Mutex<rtp::socket::WriteSocket>,
+}
+
+impl RtpFrameDeliveryWriter {
+    fn new(socket: rtp::socket::WriteSocket) -> Self {
+        Self {
+            socket: Mutex::new(socket),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for RtpFrameDeliveryWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let data = buf.to_vec();
+        let len = data.len();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut s = self.socket.lock().unwrap();
+                s.send_frame(&data).await
+            })
+        });
+        match result {
+            Ok(n) if n == len => std::task::Poll::Ready(Ok(n)),
+            Ok(_) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "RtpFrameDeliveryWriter: partial rtp frame send",
+            ))),
+            Err(e) => std::task::Poll::Ready(Err(std::io::Error::from(e))),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl std::marker::Unpin for RtpFrameDeliveryWriter {}
+
+/// AsyncRead adapter over [`rtp::socket::ReadSocket`] that yields each
+/// delivered RTP frame's bytes in RTP delivery order.  In frame-delivery
+/// mode every `recv_frame()` call returns one complete frame (possibly out
+/// of order across mux frames when holes exist); this adapter buffers one
+/// frame at a time and drains it through [`tokio::io::AsyncRead`].
+pub struct RtpFrameReader {
+    socket: Mutex<rtp::socket::ReadSocket>,
+    buf: Vec<u8>,
+    pos: usize,
+    eof: bool,
+}
+
+impl RtpFrameReader {
+    fn new(socket: rtp::socket::ReadSocket) -> Self {
+        Self {
+            socket: Mutex::new(socket),
+            buf: Vec::new(),
+            pos: 0,
+            eof: false,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for RtpFrameReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        target: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.eof {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if self.pos < self.buf.len() {
+            let remain = self.buf.len() - self.pos;
+            let n = remain.min(target.remaining());
+            target.put_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let s = self.socket.lock().unwrap();
+                s.recv_frame().await
+            })
+        });
+        match result {
+            Ok(Some(frame)) => {
+                self.buf = frame;
+                self.pos = 0;
+                let n = self.buf.len().min(target.remaining());
+                target.put_slice(&self.buf[..n]);
+                self.pos = n;
+                std::task::Poll::Ready(Ok(()))
+            }
+            Ok(None) => {
+                self.eof = true;
+                std::task::Poll::Ready(Ok(()))
+            }
+            Err(e) => std::task::Poll::Ready(Err(std::io::Error::from(e))),
+        }
+    }
+}
+
+impl std::marker::Unpin for RtpFrameReader {}
+
+/// Connect an rtp client using frame delivery.  Returns the frame-preserving
+/// reader and writer adapters that guarantee one-mux-frame-per-one-rtp-frame.
+pub async fn rtp_frame_delivery_connect(
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    rtp_frame_delivery_connect_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Connect an rtp client using frame delivery with a custom MSS.
+pub async fn rtp_frame_delivery_connect_with_mss(
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    let connected = rtp::udp::connect_with_mss_fec_tuning_and_frame_delivery(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        None,
+        false,
+        fec,
+        mss,
+        FecTuning::default(),
+        FrameDelivery::enabled(),
+    )
+    .await
+    .unwrap();
+    (
+        RtpFrameReader::new(connected.read),
+        RtpFrameDeliveryWriter::new(connected.write),
+    )
+}
+
+/// Connect a dual-mux client with frame reassembly enabled on both lanes.
+/// Each lane rides its own frame-delivery RTP connection.
+pub async fn dual_mux_client_connect_frame_reassembly(
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
+    fec: bool,
+) -> Result<
+    (
+        mux::DualStreamOpener,
+        mux::DualStreamAccepter,
+        JoinSet<mux::MuxError>,
+    ),
+    mux::DualMuxError,
+> {
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: true,
+    };
+    let mut spawner = JoinSet::new();
+
+    async fn frame_connect(
+        addr: std::net::SocketAddr,
+        fec: bool,
+    ) -> Option<(RtpFrameReader, RtpFrameDeliveryWriter)> {
+        let (r, w) = rtp_frame_delivery_connect(addr, fec).await;
+        Some((r, w))
+    }
+
+    let (opener, accepter) = mux::spawn_dual_mux_connector(
+        || frame_connect(int_proxy_addr, fec),
+        || frame_connect(bulk_proxy_addr, fec),
+        config,
+        &mut spawner,
+    )
+    .await?;
+
+    Ok((opener, accepter, spawner))
+}
+
+/// Connect a dual-mux client with per-lane mode flags.
+///
+/// `interactive_frame` enables frame-reassembly on the interactive lane;
+/// `bulk_frame` enables frame-reassembly on the bulk lane.  When a lane's
+/// flag is true its RTP connection uses frame delivery; when false the
+/// stock byte-stream RTP connection is used.
+pub async fn dual_mux_client_connect_with_lane_modes(
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
+    fec: bool,
+    interactive_frame: bool,
+    bulk_frame: bool,
+) -> Result<
+    (
+        mux::DualStreamOpener,
+        mux::DualStreamAccepter,
+        JoinSet<mux::MuxError>,
+    ),
+    mux::DualMuxError,
+> {
+    let int_config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: interactive_frame,
+    };
+    let bulk_config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: bulk_frame,
+    };
+
+    type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+    type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
+    async fn connect_lane(
+        addr: std::net::SocketAddr,
+        fec: bool,
+        frame: bool,
+    ) -> Option<(BoxedRead, BoxedWrite)> {
+        if frame {
+            let (r, w) = rtp_frame_delivery_connect(addr, fec).await;
+            Some((Box::new(r), Box::new(w)))
+        } else {
+            let (r, w) = rtp_connect(addr, fec).await;
+            Some((Box::new(r), Box::new(w)))
+        }
+    }
+
+    let mut super_spawner = JoinSet::new();
+
+    let nonce = mux::PairingNonce::generate();
+
+    let Some((int_reader, mut int_writer)) =
+        connect_lane(int_proxy_addr, fec, interactive_frame).await
+    else {
+        return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+    };
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+
+    let Some((bulk_reader, mut bulk_writer)) =
+        connect_lane(bulk_proxy_addr, fec, bulk_frame).await
+    else {
+        return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+    };
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+
+    let mut int_spawner = JoinSet::new();
+    let (int_opener, int_accepter) = mux::spawn_mux_no_reconnection(
+        int_reader,
+        int_writer,
+        int_config,
+        &mut int_spawner,
+    );
+    let mut bulk_spawner = JoinSet::new();
+    let (bulk_opener, bulk_accepter) = mux::spawn_mux_no_reconnection(
+        bulk_reader,
+        bulk_writer,
+        bulk_config,
+        &mut bulk_spawner,
+    );
+
+    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+        int_opener,
+        int_accepter,
+        int_spawner,
+        bulk_opener,
+        bulk_accepter,
+        bulk_spawner,
+        &mut super_spawner,
+    );
+
+    Ok((opener, accepter, super_spawner))
+}
+
+// ─────────────── dual‑lane frame‑delivery server helpers ───────────────
+
+/// Dual‑mux latency‑bulk server with frame‑reassembly enabled.
+///
+/// Like [`spawn_dual_mux_latency_bulk_server`] but the server’s mux sessions
+/// use `frame_reassembly: true` so that extended‑data frames from a
+/// frame‑delivery RTP connection are reassembled correctly.
+pub async fn spawn_dual_mux_frame_delivery_latency_bulk_server(
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_latency_bulk_server_with_config(
+        fec,
+        base,
+        mux::MuxConfig {
+            initiation: mux::Initiation::Server,
+            heartbeat_interval: Duration::from_secs(5),
+            frame_reassembly: true,
+        },
+    )
+    .await
+}
+
+/// Dual‑mux latency‑bulk server with per‑lane mode flags.
+///
+/// `interactive_frame` enables frame‑reassembly on the interactive lane’s
+/// mux session; `bulk_frame` does the same for the bulk lane.
+pub async fn spawn_dual_mux_latency_bulk_server_with_lane_modes(
+    fec: bool,
+    base: Instant,
+    interactive_frame: bool,
+    bulk_frame: bool,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    let int_config = mux::MuxConfig {
+        initiation: mux::Initiation::Server,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: interactive_frame,
+    };
+    let bulk_config = mux::MuxConfig {
+        initiation: mux::Initiation::Server,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: bulk_frame,
+    };
+    spawn_dual_mux_latency_bulk_server_with_per_lane_configs(fec, base, int_config, bulk_config)
+        .await
+}
+
+/// Shared implementation: dual‑mux server with per‑lane [`mux::MuxConfig`]s.
+async fn spawn_dual_mux_latency_bulk_server_with_config(
+    fec: bool,
+    base: Instant,
+    config: mux::MuxConfig,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_latency_bulk_server_with_per_lane_configs(fec, base, config.clone(), config)
+        .await
+}
+
+async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
+    fec: bool,
+    base: Instant,
+    int_config: mux::MuxConfig,
+    bulk_config: mux::MuxConfig,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let addr = listener.local_addr();
+    let (tx, rx) = mpsc::unbounded_channel::<f64>();
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+
+    let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
+
+    let listener_bg = Arc::clone(&listener);
+    tokio::spawn(async move {
+        loop {
+            match listener_bg
+                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+                .await
+            {
+                Ok(accepted) => {
+                    let _ = accept_tx.send(accepted);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let bulk_for_main = Arc::clone(&bulk_delivered);
+    tokio::spawn(async move {
+        let mut pending: HashMap<mux::PairingNonce, Vec<(mux::PendingAcceptor, mux::MuxConfig)>> =
+            HashMap::new();
+
+        while let Some(accepted) = accept_rx.recv().await {
+            let reader = accepted.read.into_async_read();
+            let writer = accepted.write.into_async_write();
+
+            let result = mux::spawn_dual_mux_acceptor(
+                reader,
+                writer,
+                int_config.clone(),
+                Duration::from_secs(3),
+            )
+            .await;
+
+            match result {
+                Ok((class, nonce, pa)) => {
+                    let cfg = match class {
+                        mux::LaneClass::Interactive => int_config.clone(),
+                        mux::LaneClass::Bulk => bulk_config.clone(),
+                    };
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push((pa, cfg));
+                    if entries.len() == 2 {
+                        let (pa2, cfg2) = entries.pop().unwrap();
+                        let (pa1, cfg1) = entries.pop().unwrap();
+                        pending.remove(&nonce);
+
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, mut accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _spawner = pair_spawner;
+                                let _cfg1 = cfg1;
+                                let _cfg2 = cfg2;
+                                while let Ok((mut reader, mut writer, _class)) =
+                                    accepter.accept().await
+                                {
+                                    let bulk = Arc::clone(&bulk);
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        let mut tag = [0u8; 1];
+                                        if reader.read_exact(&mut tag).await.is_err() {
+                                            let _ = writer.shutdown();
+                                            return;
+                                        }
+                                        if tag[0] == b'L' {
+                                            let mut buf = vec![0u8; 64 * 1024];
+                                            let mut offset = 0usize;
+                                            loop {
+                                                let n = match reader.read(&mut buf[offset..]).await {
+                                                    Ok(n) => n,
+                                                    Err(_) => break,
+                                                };
+                                                if n == 0 {
+                                                    break;
+                                                }
+                                                offset += n;
+                                                loop {
+                                                    if offset < 4 {
+                                                        break;
+                                                    }
+                                                    let frame_len = u32::from_le_bytes([
+                                                        buf[0], buf[1], buf[2], buf[3],
+                                                    ]) as usize;
+                                                    if frame_len < 12 {
+                                                        break;
+                                                    }
+                                                    if offset < frame_len {
+                                                        break;
+                                                    }
+                                                    let payload_end = frame_len - 8;
+                                                    let sent_us = u64::from_le_bytes([
+                                                        buf[payload_end],
+                                                        buf[payload_end + 1],
+                                                        buf[payload_end + 2],
+                                                        buf[payload_end + 3],
+                                                        buf[payload_end + 4],
+                                                        buf[payload_end + 5],
+                                                        buf[payload_end + 6],
+                                                        buf[payload_end + 7],
+                                                    ]);
+                                                    let now_us =
+                                                        base.elapsed().as_micros() as u64;
+                                                    let latency_ms = now_us
+                                                        .saturating_sub(sent_us)
+                                                        as f64
+                                                        / 1000.0;
+                                                    let _ = tx.send(latency_ms);
+                                                    buf.copy_within(frame_len..offset, 0);
+                                                    offset -= frame_len;
+                                                }
+                                            }
+                                        } else {
+                                            let mut buf = vec![0u8; 64 * 1024];
+                                            let mut offset: u64 = 0;
+                                            loop {
+                                                match reader.read(&mut buf).await {
+                                                    Ok(0) | Err(_) => break,
+                                                    Ok(n) => {
+                                                        let mut ok = true;
+                                                        for (j, &actual) in
+                                                            buf[..n].iter().enumerate()
+                                                        {
+                                                            let expected =
+                                                                ((offset + j as u64) % 251)
+                                                                    as u8;
+                                                            if actual != expected {
+                                                                ok = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if ok {
+                                                            offset += n as u64;
+                                                            bulk.fetch_add(
+                                                                n as u64,
+                                                                Ordering::Relaxed,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let _ = writer.shutdown();
+                                    });
+                                }
+                            });
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
+    Ok((addr, rx, bulk_delivered))
+}
+
+/// Spawn a frame-delivery RTP server that accepts one connection, wraps it
+/// in a frame-reassembly mux server, and handles latency/bulk streams.
+/// Returns `(addr, lat_rx, bulk_counter)` like [`spawn_mux_latency_bulk_server`]
+/// but the server uses `frame_reassembly: true` and each RTP connection is
+/// accepted in frame-delivery mode.
+pub async fn spawn_mux_frame_delivery_latency_bulk_server(
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let addr = listener.local_addr();
+
+    let fd = FrameDelivery::enabled();
+    let listener_accept = Arc::clone(&listener);
+    let bulk_delivered_for_server = Arc::clone(&bulk_delivered);
+    tokio::spawn(async move {
+        let accepted = match listener_accept
+            .accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+                fec,
+                rtp::udp::NO_FEC_MSS,
+                FecTuning::default(),
+                fd,
+            )
+            .await
+        {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        tokio::spawn({
+            let listener = Arc::clone(&listener);
+            async move {
+                loop {
+                    if listener
+                        .accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+                            fec,
+                            rtp::udp::NO_FEC_MSS,
+                            FecTuning::default(),
+                            fd,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let read = accepted.read.into_async_read();
+        let write = accepted.write.into_async_write();
+        let config = mux::MuxConfig {
+            initiation: mux::Initiation::Server,
+            heartbeat_interval: Duration::from_secs(5),
+            frame_reassembly: true,
+        };
+        let mut spawner = JoinSet::new();
+        let (_opener, mut accepter) =
+            mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+
+        while let Ok((mut reader, mut writer)) = accepter.accept().await {
+            let tx = tx.clone();
+            let bulk = Arc::clone(&bulk_delivered_for_server);
+            tokio::spawn(async move {
+                let mut tag = [0u8; 1];
+                if reader.read_exact(&mut tag).await.is_err() {
+                    let _ = writer.shutdown();
+                    return;
+                }
+                if tag[0] == b'L' {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset = 0usize;
+                    loop {
+                        let n = match reader.read(&mut buf[offset..]).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        offset += n;
+                        loop {
+                            if offset < 4 {
+                                break;
+                            }
+                            let frame_len =
+                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                            if frame_len < 12 || offset < frame_len {
+                                break;
+                            }
+                            let payload_end = frame_len - 8;
+                            let sent_us = u64::from_le_bytes([
+                                buf[payload_end],
+                                buf[payload_end + 1],
+                                buf[payload_end + 2],
+                                buf[payload_end + 3],
+                                buf[payload_end + 4],
+                                buf[payload_end + 5],
+                                buf[payload_end + 6],
+                                buf[payload_end + 7],
+                            ]);
+                            let now_us = base.elapsed().as_micros() as u64;
+                            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                            let _ = tx.send(latency_ms);
+                            buf.copy_within(frame_len..offset, 0);
+                            offset -= frame_len;
+                        }
+                    }
+                } else {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset: u64 = 0;
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let mut ok = true;
+                                for (j, &actual) in buf[..n].iter().enumerate() {
+                                    let expected = ((offset + j as u64) % 251) as u8;
+                                    if actual != expected {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                if ok {
+                                    offset += n as u64;
+                                    bulk.fetch_add(n as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = writer.shutdown();
+            });
+        }
+    });
+
+    Ok((addr, rx, bulk_delivered))
+}
+

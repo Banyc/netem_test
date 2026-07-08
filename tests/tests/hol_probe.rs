@@ -17,9 +17,12 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::{
-    combined_stats, cyclic_payload, gilbert_elliott_loss, mux_client_connect, percentile,
-    send_timestamped_messages, spawn_mux_latency_bulk_server,
-    spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, with_timeout,
+    combined_stats, cyclic_payload, dual_mux_client_connect_with_lane_modes, gilbert_elliott_loss,
+    mux_client_connect, percentile, rtp_frame_delivery_connect,
+    send_timestamped_messages, spawn_dual_mux_latency_bulk_server,
+    spawn_mux_frame_delivery_latency_bulk_server, spawn_mux_latency_bulk_server,
+    spawn_mux_msg_latency_sink, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server,
+    with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1091,3 +1094,813 @@ hol_test!(
         );
     }
 );
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Frame‑delivery & dual‑lane runners
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run an HOL probe on a single frame-delivery RTP connection with a
+/// reassembly mux on top.  Interactive and bulk streams share one RTP
+/// connection whose frames are preserved end-to-end — every mux frame maps
+/// to exactly one RTP frame.  Returns a [`HolSummary`].
+async fn run_hol_probe_frame_delivery_shared(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    fec: bool,
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+    grace: Duration,
+) -> HolSummary {
+    let base = Instant::now();
+    let (server_addr, mut latencies, mux_bulk_counter) =
+        spawn_mux_frame_delivery_latency_bulk_server(fec, base).await.unwrap();
+
+    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+    let (reader, writer) =
+        rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: true,
+    };
+    let mut spawner = tokio::task::JoinSet::new();
+    let (opener, _accepter) =
+        mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+
+    let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match rr_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match bulk_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let active_for = run_for - BULK_RAMP;
+    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+
+    let rr_fut = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
+    let bulk_fut = async {
+        let mut w = bulk_write;
+        tokio::time::sleep(BULK_RAMP).await;
+        run_mux_bulk_stream(&mut w, Arc::clone(&payload), active_for).await
+    };
+    let (sent, _bulk_written) = tokio::join!(rr_fut, bulk_fut);
+    drop(spawner);
+
+    tokio::time::sleep(grace).await;
+    let mut samples = Vec::new();
+    while let Ok(lat) = latencies.try_recv() {
+        samples.push(lat);
+    }
+
+    let received = samples.len() as u64;
+    let bulk_bytes = mux_bulk_counter.load(Ordering::Relaxed);
+    let bulk_secs = active_for.as_secs_f64();
+    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+
+    print_hol_summary(label, &summary);
+    eprintln!("[hol {label}] pair stats = {:?}", combined_stats(&pair));
+    pair.stop();
+    summary
+}
+
+/// Run an HOL probe on a dual-lane setup: two independent RTP connections
+/// (one per lane), each with its own [`NetemPair`].  `interactive_frame` /
+/// `bulk_frame` control per-lane frame‑delivery.
+///
+/// The interactive stream rides the interactive lane; the bulk stream rides
+/// the bulk lane.  The two lanes share the same server address (dual‑mux
+/// acceptor pairs them by nonce).
+async fn run_hol_probe_dual_lane(
+    label: &str,
+    interactive_frame: bool,
+    bulk_frame: bool,
+    int_c2s: NetemConfig,
+    int_s2c: NetemConfig,
+    bulk_c2s: NetemConfig,
+    bulk_s2c: NetemConfig,
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+    grace: Duration,
+) -> HolSummary {
+    let base = Instant::now();
+    let (server_addr, mut latencies, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+
+    let int_pair = NetemPair::spawn(server_addr, int_c2s, int_s2c).unwrap();
+    let bulk_pair = NetemPair::spawn(server_addr, bulk_c2s, bulk_s2c).unwrap();
+
+    let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
+        int_pair.client_addr(),
+        bulk_pair.client_addr(),
+        false,
+        interactive_frame,
+        bulk_frame,
+    )
+    .await
+    .unwrap();
+
+    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bulk_opener = opener.clone();
+    let bulk_handle = {
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
+        tokio::spawn(async move {
+            let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let _ = w.write_all(&[b'B']).await;
+            let mut offset = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => offset = (offset + n) % payload.len(),
+                }
+            }
+            let _ = w.shutdown();
+        })
+    };
+
+    tokio::time::sleep(BULK_RAMP).await;
+
+    let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match rr_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)
+        .await;
+    let _ = rr_write.shutdown();
+
+    bulk_stop.store(true, Ordering::Relaxed);
+    let _ = bulk_handle.await;
+
+    tokio::time::sleep(grace).await;
+    let mut samples = Vec::new();
+    while let Ok(lat) = latencies.try_recv() {
+        samples.push(lat);
+    }
+
+    let received = samples.len() as u64;
+    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
+    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+
+    print_hol_summary(label, &summary);
+    eprintln!(
+        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+        combined_stats(&int_pair),
+        combined_stats(&bulk_pair)
+    );
+    int_pair.stop();
+    bulk_pair.stop();
+    summary
+}
+
+/// Dual‑lane HOL probe with TWO interactive streams on the interactive
+/// lane (tagged `b'A'` / `b'B'`) plus one bulk stream on the bulk lane.
+/// Returns `(summary_a, summary_b, ` combined summary across both, `bulk_mibps)`.
+#[allow(clippy::too_many_arguments)]
+async fn run_hol_probe_dual_lane_two_interactive(
+    label: &str,
+    interactive_frame: bool,
+    int_c2s: NetemConfig,
+    int_s2c: NetemConfig,
+    bulk_c2s: NetemConfig,
+    bulk_s2c: NetemConfig,
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+    grace: Duration,
+) -> (HolSummary, HolSummary, HolSummary, f64) {
+    let base = Instant::now();
+    let (server_addr, mut latencies_all, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+
+    let int_pair = NetemPair::spawn(server_addr, int_c2s, int_s2c).unwrap();
+    let bulk_pair = NetemPair::spawn(server_addr, bulk_c2s, bulk_s2c).unwrap();
+
+    let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
+        int_pair.client_addr(),
+        bulk_pair.client_addr(),
+        false,
+        interactive_frame,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bulk_opener = opener.clone();
+    let bulk_handle = {
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
+        tokio::spawn(async move {
+            let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let _ = w.write_all(&[b'B']).await;
+            let mut offset = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => offset = (offset + n) % payload.len(),
+                }
+            }
+            let _ = w.shutdown();
+        })
+    };
+
+    let (mut read_a, mut write_a) = opener.open_auto();
+    let (mut read_b, mut write_b) = opener.open_auto();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match read_a.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match read_b.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    tokio::time::sleep(BULK_RAMP).await;
+
+    if write_a.write_all(&[b'A']).await.is_err() {
+        let _ = write_a.shutdown();
+        drop(write_b);
+        bulk_stop.store(true, Ordering::Relaxed);
+        let _ = bulk_handle.await;
+        return (
+            HolSummary::default(),
+            HolSummary::default(),
+            HolSummary::default(),
+            0.0,
+        );
+    }
+    if write_b.write_all(&[b'B']).await.is_err() {
+        let _ = write_b.shutdown();
+        let _ = write_a.shutdown();
+        bulk_stop.store(true, Ordering::Relaxed);
+        let _ = bulk_handle.await;
+        return (
+            HolSummary::default(),
+            HolSummary::default(),
+            HolSummary::default(),
+            0.0,
+        );
+    }
+
+    let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
+    let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
+    let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
+    let _ = write_a.shutdown();
+    let _ = write_b.shutdown();
+
+    bulk_stop.store(true, Ordering::Relaxed);
+    let _ = bulk_handle.await;
+
+    tokio::time::sleep(grace).await;
+    let mut samples = Vec::new();
+    let mut samples_a = Vec::new();
+    let mut samples_b = Vec::new();
+    while let Ok(lat) = latencies_all.try_recv() {
+        samples.push(lat);
+        // Tags A and B are stream identifiers; the latency channel merges all
+        // streams, so we split by comparing to the per-stream sent counts.
+        if samples_a.len() < sent_a as usize {
+            samples_a.push(lat);
+        } else {
+            samples_b.push(lat);
+        }
+    }
+
+    let active_for = run_for - BULK_RAMP;
+    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let bulk_secs = active_for.as_secs_f64();
+    let bulk_mibps = if bulk_secs > 0.0 {
+        bulk_bytes as f64 / (1024.0 * 1024.0) / bulk_secs
+    } else {
+        0.0
+    };
+
+    let n_all = samples.len() as u64;
+    let combined = summarize(samples, sent_a + sent_b, n_all, bulk_bytes, bulk_secs);
+    let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
+    let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
+
+    eprintln!(
+        "[hol {label} A] p50={p50_a:.1} p99={p99_a:.1} max={max_a:.1}",
+        p50_a = summary_a.p50,
+        p99_a = summary_a.p99,
+        max_a = summary_a.max,
+    );
+    eprintln!(
+        "[hol {label} B] p50={p50_b:.1} p99={p99_b:.1} max={max_b:.1}",
+        p50_b = summary_b.p50,
+        p99_b = summary_b.p99,
+        max_b = summary_b.max,
+    );
+    print_hol_summary(&format!("{label}_combined"), &combined);
+    eprintln!(
+        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+        combined_stats(&int_pair),
+        combined_stats(&bulk_pair),
+    );
+
+    int_pair.stop();
+    bulk_pair.stop();
+    (summary_a, summary_b, combined, bulk_mibps)
+}
+
+/// Solo frame‑delivery interactive baseline: single frame‑delivery RTP
+/// connection, one interactive stream, no bulk contender.
+async fn run_frame_delivery_solo_interactive(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    fec: bool,
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+    grace: Duration,
+) -> HolSummary {
+    let base = Instant::now();
+    let (server_addr, mut latencies) =
+        spawn_mux_msg_latency_sink(fec, base).await.unwrap();
+    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+    let (reader, writer) =
+        rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: true,
+    };
+    let mut spawner = tokio::task::JoinSet::new();
+    let (opener, _accepter) =
+        mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+
+    let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match stream_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let sent =
+        send_timestamped_messages(&mut stream_write, base, msg_bytes, cadence, run_for).await;
+    drop(spawner);
+
+    tokio::time::sleep(grace).await;
+    let mut samples = Vec::new();
+    while let Ok(lat) = latencies.try_recv() {
+        samples.push(lat);
+    }
+
+    let recv = samples.len() as u64;
+    let summary = summarize(samples, sent, recv, 0, 0.0);
+    print_hol_summary(label, &summary);
+    pair.stop();
+    summary
+}
+
+/// Two‑interactive baseline on a single frame‑delivery RTP connection:
+/// two tagged streams (b'A'/b'B'), no bulk contender.
+#[allow(clippy::too_many_arguments)]
+async fn run_frame_delivery_two_interactive(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    fec: bool,
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+    grace: Duration,
+) -> (HolSummary, HolSummary, HolSummary) {
+    let base = Instant::now();
+    let (server_addr, mut latencies) =
+        spawn_mux_msg_latency_sink(fec, base).await.unwrap();
+    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+    let (reader, writer) =
+        rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: true,
+    };
+    let mut spawner = tokio::task::JoinSet::new();
+    let (opener, _accepter) =
+        mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+
+    let (mut read_a, mut write_a) = opener.open().await.unwrap();
+    let (mut read_b, mut write_b) = opener.open().await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match read_a.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match read_b.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
+    let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
+    let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
+    let _ = write_a.shutdown();
+    let _ = write_b.shutdown();
+    drop(spawner);
+
+    tokio::time::sleep(grace).await;
+    let mut samples = Vec::new();
+    let mut samples_a = Vec::new();
+    let mut samples_b = Vec::new();
+    while let Ok(lat) = latencies.try_recv() {
+        samples.push(lat);
+        if samples_a.len() < sent_a as usize {
+            samples_a.push(lat);
+        } else {
+            samples_b.push(lat);
+        }
+    }
+
+    let combined =
+        summarize(samples.clone(), sent_a + sent_b, samples.len() as u64, 0, 0.0);
+    let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
+    let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
+
+    eprintln!(
+        "[hol {label} A] p50={p50_a:.1} p99={p99_a:.1} max={max_a:.1}",
+        p50_a = summary_a.p50,
+        p99_a = summary_a.p99,
+        max_a = summary_a.max,
+    );
+    eprintln!(
+        "[hol {label} B] p50={p50_b:.1} p99={p99_b:.1} max={max_b:.1}",
+        p50_b = summary_b.p50,
+        p99_b = summary_b.p99,
+        max_b = summary_b.max,
+    );
+    print_hol_summary(&format!("{label}_combined"), &combined);
+
+    pair.stop();
+    (summary_a, summary_b, combined)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Frame‑delivery & dual‑lane scenarios (all #[ignore])
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ───── single‑connection frame‑delivery ─────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge5_shared_frame_delivery() {
+    let label = "rtt100 GE5 shared frame-delivery";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_frame_delivery_shared(
+            label,
+            rtt100_ge5(21),
+            rtt100_ge5(22),
+            false,
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(
+        summary.delivery_pct >= 0.95,
+        "delivery {:.3} < 0.95",
+        summary.delivery_pct
+    );
+    assert!(
+        summary.p50 <= 100.0,
+        "frame-delivery p50 {:.1} ms > 100 ms",
+        summary.p50
+    );
+    assert!(
+        summary.p99 <= 300.0,
+        "frame-delivery p99 {:.1} ms > 300 ms",
+        summary.p99
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge5_two_interactive_frame_delivery() {
+    let label = "rtt100 GE5 two-interactive frame-delivery";
+    let (summary_a, summary_b, combined) = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_frame_delivery_two_interactive(
+            label,
+            rtt100_ge5(31),
+            rtt100_ge5(32),
+            false,
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(combined.delivery_pct >= 0.90, "combined delivery too low");
+    let solo_ref = 50.0;
+    assert!(
+        summary_a.p50 <= solo_ref * 2.5,
+        "stream A p50 {:.1} > {:.0}",
+        summary_a.p50,
+        solo_ref * 2.5,
+    );
+    assert!(
+        summary_b.p50 <= solo_ref * 2.5,
+        "stream B p50 {:.1} > {:.0}",
+        summary_b.p50,
+        solo_ref * 2.5,
+    );
+}
+
+// ───── diagnostics: frame‑delivery shared on various link profiles ─────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_clean_shared_frame_delivery_diag() {
+    let label = "rtt100 clean shared frame-delivery diag";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_frame_delivery_shared(
+            label,
+            rtt100_clean(41),
+            rtt100_clean(42),
+            false,
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(summary.delivery_pct > 0.0, "no delivery");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge1_shared_frame_delivery_diag() {
+    let label = "rtt100 GE1 shared frame-delivery diag";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_frame_delivery_shared(
+            label,
+            rtt100_ge1_loss1(51),
+            rtt100_ge1_loss1(52),
+            false,
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(summary.delivery_pct > 0.0, "no delivery");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_hostile_shared_frame_delivery_diag() {
+    let label = "hostile shared frame-delivery diag";
+    let summary = with_timeout(
+        Duration::from_secs(300),
+        label,
+        run_hol_probe_frame_delivery_shared(
+            label,
+            hostile_real_link_seeded(61),
+            hostile_real_link_seeded(62),
+            false,
+            DEFAULT_MSG_BYTES,
+            Duration::from_millis(200),
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(summary.delivery_pct > 0.0, "no delivery");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_cap400_shared_frame_delivery_diag() {
+    let label = "cap400 shared frame-delivery diag";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_frame_delivery_shared(
+            label,
+            cap400(71),
+            cap400(72),
+            false,
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(summary.delivery_pct > 0.0, "no delivery");
+}
+
+// ───── dual‑lane: stock lanes ─────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge5_shared_dual_lane() {
+    let label = "rtt100 GE5 shared dual-lane";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_dual_lane(
+            label,
+            false,
+            false,
+            rtt100_ge5(91),
+            rtt100_ge5(92),
+            rtt100_ge5(93),
+            rtt100_ge5(94),
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(
+        summary.delivery_pct >= 0.95,
+        "delivery {:.3} < 0.95",
+        summary.delivery_pct
+    );
+}
+
+// ───── dual‑lane: both lanes frame‑delivery ─────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge5_shared_dual_lane_frame_delivery() {
+    let label = "rtt100 GE5 shared dual-lane frame-delivery";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_dual_lane(
+            label,
+            true,
+            true,
+            rtt100_ge5(101),
+            rtt100_ge5(102),
+            rtt100_ge5(103),
+            rtt100_ge5(104),
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(
+        summary.delivery_pct >= 0.95,
+        "delivery {:.3} < 0.95",
+        summary.delivery_pct
+    );
+}
+
+// ───── asymmetric: interactive frame, bulk stock ─────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge5_shared_dual_lane_asym_frame_diag() {
+    let label = "rtt100 GE5 shared dual-lane asym frame diag";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_dual_lane(
+            label,
+            true,
+            false,
+            rtt100_ge5(111),
+            rtt100_ge5(112),
+            rtt100_ge5(113),
+            rtt100_ge5(114),
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(summary.delivery_pct > 0.0, "no delivery");
+}
+
+// ───── two‑interactive intra‑lane isolation ─────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge5_dual_lane_two_interactive_stock_diag() {
+    let label = "rtt100 GE5 dual-lane two-interactive stock";
+    let (summary_a, summary_b, _combined, _bulk) = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_dual_lane_two_interactive(
+            label,
+            false,
+            rtt100_ge5(121),
+            rtt100_ge5(122),
+            rtt100_ge5(123),
+            rtt100_ge5(124),
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(summary_a.delivery_pct > 0.0, "stream A no delivery");
+    assert!(summary_b.delivery_pct > 0.0, "stream B no delivery");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn hol_rtt100_ge5_dual_lane_two_interactive_frame_diag() {
+    let label = "rtt100 GE5 dual-lane two-interactive frame";
+    let (summary_a, summary_b, _combined, _bulk) = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_dual_lane_two_interactive(
+            label,
+            true,
+            rtt100_ge5(131),
+            rtt100_ge5(132),
+            rtt100_ge5(133),
+            rtt100_ge5(134),
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(summary_a.delivery_pct > 0.0, "stream A no delivery");
+    assert!(summary_b.delivery_pct > 0.0, "stream B no delivery");
+}
