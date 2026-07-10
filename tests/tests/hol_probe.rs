@@ -19,7 +19,8 @@ use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::{
     combined_stats, cyclic_payload, dual_mux_client_connect_with_lane_modes, gilbert_elliott_loss,
     mux_client_connect, percentile, rtp_frame_delivery_connect,
-    send_timestamped_messages, spawn_dual_mux_latency_bulk_server,
+    send_timestamped_messages,
+    spawn_dual_mux_latency_bulk_server_with_separate_listeners,
     spawn_mux_frame_delivery_latency_bulk_server, spawn_mux_latency_bulk_server,
     spawn_mux_msg_latency_sink, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server,
     with_timeout,
@@ -1186,8 +1187,8 @@ async fn run_hol_probe_frame_delivery_shared(
 /// `bulk_frame` control per-lane frame‑delivery.
 ///
 /// The interactive stream rides the interactive lane; the bulk stream rides
-/// the bulk lane.  The two lanes share the same server address (dual‑mux
-/// acceptor pairs them by nonce).
+/// the bulk lane.  When either lane requests frame‑delivery the server uses
+/// separate listeners so each lane's accept method is fixed at accept time.
 async fn run_hol_probe_dual_lane(
     label: &str,
     interactive_frame: bool,
@@ -1202,11 +1203,18 @@ async fn run_hol_probe_dual_lane(
     grace: Duration,
 ) -> HolSummary {
     let base = Instant::now();
-    let (server_addr, mut latencies, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+    let (int_addr, bulk_addr, mut latencies, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server_with_separate_listeners(
+            false,
+            base,
+            interactive_frame,
+            bulk_frame,
+        )
+        .await
+        .unwrap();
 
-    let int_pair = NetemPair::spawn(server_addr, int_c2s, int_s2c).unwrap();
-    let bulk_pair = NetemPair::spawn(server_addr, bulk_c2s, bulk_s2c).unwrap();
+    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
 
     let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
         int_pair.client_addr(),
@@ -1299,11 +1307,18 @@ async fn run_hol_probe_dual_lane_two_interactive(
     grace: Duration,
 ) -> (HolSummary, HolSummary, HolSummary, f64) {
     let base = Instant::now();
-    let (server_addr, mut latencies_all, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+    let (int_addr, bulk_addr, mut latencies_all, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server_with_separate_listeners(
+            false,
+            base,
+            interactive_frame,
+            false,
+        )
+        .await
+        .unwrap();
 
-    let int_pair = NetemPair::spawn(server_addr, int_c2s, int_s2c).unwrap();
-    let bulk_pair = NetemPair::spawn(server_addr, bulk_c2s, bulk_s2c).unwrap();
+    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
 
     let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
         int_pair.client_addr(),
@@ -1820,8 +1835,8 @@ async fn hol_rtt100_ge5_shared_dual_lane_frame_delivery() {
     )
     .await;
     assert!(
-        summary.delivery_pct >= 0.95,
-        "delivery {:.3} < 0.95",
+        summary.delivery_pct >= 0.999,
+        "delivery {:.3} < 0.999",
         summary.delivery_pct
     );
 }
@@ -1903,4 +1918,147 @@ async fn hol_rtt100_ge5_dual_lane_two_interactive_frame_diag() {
     .await;
     assert!(summary_a.delivery_pct > 0.0, "stream A no delivery");
     assert!(summary_b.delivery_pct > 0.0, "stream B no delivery");
+}
+
+// ───── separate‑listener: asymmetric frame delivery + teardown ─────
+
+/// Run an HOL probe on a dual-lane setup with SEPARATE interactive and bulk
+/// listeners.  Each lane's RTP frame‑delivery mode is fixed at accept time
+/// on its dedicated listener, so the interactive listener can use
+/// frame‑delivery while the bulk listener uses stock byte‑stream — the
+/// server never has to guess the lane class before the mux lane‑hello.
+#[allow(clippy::too_many_arguments)]
+async fn run_hol_probe_dual_lane_separate_listeners(
+    label: &str,
+    interactive_frame: bool,
+    bulk_frame: bool,
+    int_c2s: NetemConfig,
+    int_s2c: NetemConfig,
+    bulk_c2s: NetemConfig,
+    bulk_s2c: NetemConfig,
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+    grace: Duration,
+) -> HolSummary {
+    let base = Instant::now();
+    let (int_addr, bulk_addr, mut latencies, bulk_counter) =
+        spawn_dual_mux_latency_bulk_server_with_separate_listeners(
+            false,
+            base,
+            interactive_frame,
+            bulk_frame,
+        )
+        .await
+        .unwrap();
+
+    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+
+    let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
+        int_pair.client_addr(),
+        bulk_pair.client_addr(),
+        false,
+        interactive_frame,
+        bulk_frame,
+    )
+    .await
+    .unwrap();
+
+    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bulk_opener = opener.clone();
+    let bulk_handle = {
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
+        tokio::spawn(async move {
+            let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let _ = w.write_all(&[b'B']).await;
+            let mut offset = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                match w.write(&payload[offset..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => offset = (offset + n) % payload.len(),
+                }
+            }
+            let _ = w.shutdown();
+        })
+    };
+
+    tokio::time::sleep(BULK_RAMP).await;
+
+    let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match rr_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    let sent =
+        run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
+    let _ = rr_write.shutdown();
+
+    bulk_stop.store(true, Ordering::Relaxed);
+    let _ = bulk_handle.await;
+
+    tokio::time::sleep(grace).await;
+    let mut samples = Vec::new();
+    while let Ok(lat) = latencies.try_recv() {
+        samples.push(lat);
+    }
+
+    let received = samples.len() as u64;
+    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
+    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+
+    print_hol_summary(label, &summary);
+    eprintln!(
+        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+        combined_stats(&int_pair),
+        combined_stats(&bulk_pair),
+    );
+    int_pair.stop();
+    bulk_pair.stop();
+    summary
+}
+
+/// Asymmetric frame‑delivery dual‑lane test: interactive lane uses
+/// frame‑delivery (on its own dedicated listener), bulk lane uses stock
+/// byte‑stream (on its own dedicated listener).  Under 5 % Gilbert‑Elliott
+/// loss the probe must deliver messages and tear down cleanly without
+/// wedging the runtime.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn dual_lane_asym_frame_delivers_and_tears_down() {
+    let label = "asym separate-listener frame teardown";
+    let summary = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_hol_probe_dual_lane_separate_listeners(
+            label,
+            true,
+            false,
+            rtt100_ge5(141),
+            rtt100_ge5(142),
+            rtt100_ge5(143),
+            rtt100_ge5(144),
+            DEFAULT_MSG_BYTES,
+            DEFAULT_CADENCE,
+            DEFAULT_RUN_FOR,
+            DEFAULT_GRACE,
+        ),
+    )
+    .await;
+    assert!(
+        summary.delivery_pct >= 0.95,
+        "delivery {:.3} < 0.95 — adapter may be wedged",
+        summary.delivery_pct
+    );
 }
