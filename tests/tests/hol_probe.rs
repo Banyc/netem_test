@@ -20,7 +20,7 @@ use support::{
     combined_stats, cyclic_payload, dual_mux_client_connect_with_lane_modes, gilbert_elliott_loss,
     mux_client_connect, percentile, rtp_frame_delivery_connect,
     send_timestamped_messages,
-    spawn_dual_mux_latency_bulk_server_with_separate_listeners,
+    spawn_dual_mux_latency_bulk_server_two_listeners,
     spawn_mux_frame_delivery_latency_bulk_server, spawn_mux_latency_bulk_server,
     spawn_mux_msg_latency_sink, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server,
     with_timeout,
@@ -1204,7 +1204,7 @@ async fn run_hol_probe_dual_lane(
 ) -> HolSummary {
     let base = Instant::now();
     let (int_addr, bulk_addr, mut latencies, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server_with_separate_listeners(
+        spawn_dual_mux_latency_bulk_server_two_listeners(
             false,
             base,
             interactive_frame,
@@ -1308,7 +1308,7 @@ async fn run_hol_probe_dual_lane_two_interactive(
 ) -> (HolSummary, HolSummary, HolSummary, f64) {
     let base = Instant::now();
     let (int_addr, bulk_addr, mut latencies_all, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server_with_separate_listeners(
+        spawn_dual_mux_latency_bulk_server_two_listeners(
             false,
             base,
             interactive_frame,
@@ -1943,7 +1943,7 @@ async fn run_hol_probe_dual_lane_separate_listeners(
 ) -> HolSummary {
     let base = Instant::now();
     let (int_addr, bulk_addr, mut latencies, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server_with_separate_listeners(
+        spawn_dual_mux_latency_bulk_server_two_listeners(
             false,
             base,
             interactive_frame,
