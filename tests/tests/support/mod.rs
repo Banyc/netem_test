@@ -104,10 +104,7 @@ pub fn gilbert_elliott_loss(loss_pct: f64, mean_burst_len: f64) -> LossModel {
         (0.0..=100.0).contains(&loss_pct),
         "loss_pct must be in [0, 100]"
     );
-    assert!(
-        mean_burst_len >= 1.0,
-        "mean_burst_len must be >= 1.0"
-    );
+    assert!(mean_burst_len >= 1.0, "mean_burst_len must be >= 1.0");
 
     // Long-term probability of being in the burst (loss) state.
     let p_burst = loss_pct / 100.0;
@@ -348,7 +345,11 @@ where
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
-                        if listener.accept_without_handshake_with_mss(fec, mss).await.is_err() {
+                        if listener
+                            .accept_without_handshake_with_mss(fec, mss)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -417,21 +418,19 @@ pub async fn spawn_mux_over_rtp_sink_server_with_mss(
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        fec,
-        mss,
-        move |mut stream_read, mut stream_write| {
+    let addr =
+        spawn_mux_over_rtp_server_with_mss(fec, mss, move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             async move {
-            let mut buf = Vec::new();
-            let read_ok = stream_read.read_to_end(&mut buf).await.is_ok();
-            if read_ok || !buf.is_empty() {
-                let _ = tx.send(buf).await;
+                let mut buf = Vec::new();
+                let read_ok = stream_read.read_to_end(&mut buf).await.is_ok();
+                if read_ok || !buf.is_empty() {
+                    let _ = tx.send(buf).await;
+                }
+                let _ = stream_write.shutdown();
             }
-            let _ = stream_write.shutdown();
-        }
-    })
-    .await?;
+        })
+        .await?;
     Ok((addr, rx))
 }
 
@@ -485,7 +484,11 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
             let listener = Arc::clone(&listener);
             tokio::spawn(async move {
                 loop {
-                    if listener.accept_without_handshake_with_mss(fec, mss).await.is_err() {
+                    if listener
+                        .accept_without_handshake_with_mss(fec, mss)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -537,7 +540,10 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
 pub async fn spawn_rtp_msg_latency_sink(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<f64>,
+)> {
     spawn_rtp_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
@@ -546,7 +552,10 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
     fec: bool,
     base: Instant,
     mss: usize,
-) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<f64>,
+)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
@@ -562,59 +571,63 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
             let listener = Arc::clone(&listener);
             tokio::spawn(async move {
                 loop {
-                    if listener.accept_without_handshake_with_mss(fec, mss).await.is_err() {
+                    if listener
+                        .accept_without_handshake_with_mss(fec, mss)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
             });
             let mut read = accepted.read.into_async_read();
             let _write = accepted.write;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut offset = 0usize;
-        loop {
-            if offset >= buf.len() {
-                buf.resize(buf.len().saturating_mul(2), 0u8);
-            }
-            let n = match read.read(&mut buf[offset..]).await {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if n == 0 {
-                break;
-            }
-            offset += n;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut offset = 0usize;
             loop {
-                if offset < 4 {
+                if offset >= buf.len() {
+                    buf.resize(buf.len().saturating_mul(2), 0u8);
+                }
+                let n = match read.read(&mut buf[offset..]).await {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
                     break;
                 }
-                let frame_len =
-                    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                if frame_len < 12 {
-                    // Invalid frame; drop the connection.
-                    break;
+                offset += n;
+                loop {
+                    if offset < 4 {
+                        break;
+                    }
+                    let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                    if frame_len < 12 {
+                        // Invalid frame; drop the connection.
+                        break;
+                    }
+                    if offset < frame_len {
+                        break;
+                    }
+                    let payload_end = frame_len - 8;
+                    let sent_us = u64::from_le_bytes([
+                        buf[payload_end],
+                        buf[payload_end + 1],
+                        buf[payload_end + 2],
+                        buf[payload_end + 3],
+                        buf[payload_end + 4],
+                        buf[payload_end + 5],
+                        buf[payload_end + 6],
+                        buf[payload_end + 7],
+                    ]);
+                    let now_us = base.elapsed().as_micros() as u64;
+                    let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                    let _ = tx.send(latency_ms);
+                    buf.copy_within(frame_len..offset, 0);
+                    offset -= frame_len;
                 }
-                if offset < frame_len {
-                    break;
-                }
-                let payload_end = frame_len - 8;
-                let sent_us = u64::from_le_bytes([
-                    buf[payload_end],
-                    buf[payload_end + 1],
-                    buf[payload_end + 2],
-                    buf[payload_end + 3],
-                    buf[payload_end + 4],
-                    buf[payload_end + 5],
-                    buf[payload_end + 6],
-                    buf[payload_end + 7],
-                ]);
-                let now_us = base.elapsed().as_micros() as u64;
-                let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                let _ = tx.send(latency_ms);
-                buf.copy_within(frame_len..offset, 0);
-                offset -= frame_len;
             }
         }
-    }});
+    });
     Ok((addr, rx))
 }
 
@@ -677,7 +690,10 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
 pub async fn spawn_mux_msg_latency_sink(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<f64>,
+)> {
     spawn_mux_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
@@ -700,106 +716,101 @@ pub async fn spawn_mux_latency_bulk_server(
 ) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        fec,
-        rtp::udp::NO_FEC_MSS,
-        {
+    let addr = spawn_mux_over_rtp_server_with_mss(fec, rtp::udp::NO_FEC_MSS, {
+        let tx = tx.clone();
+        let bulk_delivered = Arc::clone(&bulk_delivered);
+        move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             let bulk_delivered = Arc::clone(&bulk_delivered);
-            move |mut stream_read, mut stream_write| {
-                let tx = tx.clone();
-                let bulk_delivered = Arc::clone(&bulk_delivered);
-                async move {
-                    let mut tag = [0u8; 1];
-                    let n = match stream_read.read(&mut tag).await {
-                        Ok(n) => n,
-                        Err(_) => {
-                            let _ = stream_write.shutdown();
-                            return;
-                        }
-                    };
-                    if n == 0 {
+            async move {
+                let mut tag = [0u8; 1];
+                let n = match stream_read.read(&mut tag).await {
+                    Ok(n) => n,
+                    Err(_) => {
                         let _ = stream_write.shutdown();
                         return;
                     }
+                };
+                if n == 0 {
+                    let _ = stream_write.shutdown();
+                    return;
+                }
 
-                    if tag[0] == b'L' {
-                        // Timestamped latency frame parser.
-                        let mut buf = vec![0u8; 64 * 1024];
-                        let mut offset = 0usize;
-                        loop {
-                            let n = match stream_read.read(&mut buf[offset..]).await {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-                            if n == 0 {
-                                break;
-                            }
-                            offset += n;
-                            loop {
-                                if offset < 4 {
-                                    break;
-                                }
-                                let frame_len = u32::from_le_bytes([
-                                    buf[0], buf[1], buf[2], buf[3],
-                                ]) as usize;
-                                if frame_len < 12 {
-                                    break;
-                                }
-                                if offset < frame_len {
-                                    break;
-                                }
-                                let payload_end = frame_len - 8;
-                                let sent_us = u64::from_le_bytes([
-                                    buf[payload_end],
-                                    buf[payload_end + 1],
-                                    buf[payload_end + 2],
-                                    buf[payload_end + 3],
-                                    buf[payload_end + 4],
-                                    buf[payload_end + 5],
-                                    buf[payload_end + 6],
-                                    buf[payload_end + 7],
-                                ]);
-                                let now_us = base.elapsed().as_micros() as u64;
-                                let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                                let _ = tx.send(latency_ms);
-                                buf.copy_within(frame_len..offset, 0);
-                                offset -= frame_len;
-                            }
+                if tag[0] == b'L' {
+                    // Timestamped latency frame parser.
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset = 0usize;
+                    loop {
+                        let n = match stream_read.read(&mut buf[offset..]).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 {
+                            break;
                         }
-                    } else {
-                        // Bulk byte sink: verify the deterministic pattern and
-                        // count verified bytes. The tag byte itself is excluded.
-                        let mut buf = vec![0u8; 64 * 1024];
-                        let mut offset: u64 = 0;
+                        offset += n;
                         loop {
-                            let n = match stream_read.read(&mut buf).await {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-                            if n == 0 {
+                            if offset < 4 {
                                 break;
                             }
-                            let mut ok = true;
-                            for (j, &actual) in buf[..n].iter().enumerate() {
-                                let expected = ((offset + j as u64) % 251) as u8;
-                                if actual != expected {
-                                    ok = false;
-                                    break;
-                                }
+                            let frame_len =
+                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                            if frame_len < 12 {
+                                break;
                             }
-                            if ok {
-                                offset += n as u64;
-                                bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            if offset < frame_len {
+                                break;
                             }
+                            let payload_end = frame_len - 8;
+                            let sent_us = u64::from_le_bytes([
+                                buf[payload_end],
+                                buf[payload_end + 1],
+                                buf[payload_end + 2],
+                                buf[payload_end + 3],
+                                buf[payload_end + 4],
+                                buf[payload_end + 5],
+                                buf[payload_end + 6],
+                                buf[payload_end + 7],
+                            ]);
+                            let now_us = base.elapsed().as_micros() as u64;
+                            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                            let _ = tx.send(latency_ms);
+                            buf.copy_within(frame_len..offset, 0);
+                            offset -= frame_len;
                         }
                     }
-
-                    let _ = stream_write.shutdown();
+                } else {
+                    // Bulk byte sink: verify the deterministic pattern and
+                    // count verified bytes. The tag byte itself is excluded.
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset: u64 = 0;
+                    loop {
+                        let n = match stream_read.read(&mut buf).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let mut ok = true;
+                        for (j, &actual) in buf[..n].iter().enumerate() {
+                            let expected = ((offset + j as u64) % 251) as u8;
+                            if actual != expected {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            offset += n as u64;
+                            bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
                 }
+
+                let _ = stream_write.shutdown();
             }
-        },
-    )
+        }
+    })
     .await?;
     Ok((addr, rx, bulk_delivered))
 }
@@ -812,103 +823,98 @@ pub async fn spawn_mux_sized_latency_bulk_server(
 ) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        fec,
-        mss,
-        {
+    let addr = spawn_mux_over_rtp_server_with_mss(fec, mss, {
+        let tx = tx.clone();
+        let bulk_delivered = Arc::clone(&bulk_delivered);
+        move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             let bulk_delivered = Arc::clone(&bulk_delivered);
-            move |mut stream_read, mut stream_write| {
-                let tx = tx.clone();
-                let bulk_delivered = Arc::clone(&bulk_delivered);
-                async move {
-                    let mut tag = [0u8; 1];
-                    let n = match stream_read.read(&mut tag).await {
-                        Ok(n) => n,
-                        Err(_) => {
-                            let _ = stream_write.shutdown();
-                            return;
-                        }
-                    };
-                    if n == 0 {
+            async move {
+                let mut tag = [0u8; 1];
+                let n = match stream_read.read(&mut tag).await {
+                    Ok(n) => n,
+                    Err(_) => {
                         let _ = stream_write.shutdown();
                         return;
                     }
+                };
+                if n == 0 {
+                    let _ = stream_write.shutdown();
+                    return;
+                }
 
-                    if tag[0] == b'L' {
-                        let mut buf = vec![0u8; 64 * 1024];
-                        let mut offset = 0usize;
-                        loop {
-                            let n = match stream_read.read(&mut buf[offset..]).await {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-                            if n == 0 {
-                                break;
-                            }
-                            offset += n;
-                            loop {
-                                if offset < 4 {
-                                    break;
-                                }
-                                let frame_len = u32::from_le_bytes([
-                                    buf[0], buf[1], buf[2], buf[3],
-                                ]) as usize;
-                                if frame_len < 12 {
-                                    break;
-                                }
-                                if offset < frame_len {
-                                    break;
-                                }
-                                let payload_end = frame_len - 8;
-                                let sent_us = u64::from_le_bytes([
-                                    buf[payload_end],
-                                    buf[payload_end + 1],
-                                    buf[payload_end + 2],
-                                    buf[payload_end + 3],
-                                    buf[payload_end + 4],
-                                    buf[payload_end + 5],
-                                    buf[payload_end + 6],
-                                    buf[payload_end + 7],
-                                ]);
-                                let now_us = base.elapsed().as_micros() as u64;
-                                let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                                let _ = tx.send(latency_ms);
-                                buf.copy_within(frame_len..offset, 0);
-                                offset -= frame_len;
-                            }
+                if tag[0] == b'L' {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset = 0usize;
+                    loop {
+                        let n = match stream_read.read(&mut buf[offset..]).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 {
+                            break;
                         }
-                    } else {
-                        let mut buf = vec![0u8; 64 * 1024];
-                        let mut offset: u64 = 0;
+                        offset += n;
                         loop {
-                            let n = match stream_read.read(&mut buf).await {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-                            if n == 0 {
+                            if offset < 4 {
                                 break;
                             }
-                            let mut ok = true;
-                            for (j, &actual) in buf[..n].iter().enumerate() {
-                                let expected = ((offset + j as u64) % 251) as u8;
-                                if actual != expected {
-                                    ok = false;
-                                    break;
-                                }
+                            let frame_len =
+                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                            if frame_len < 12 {
+                                break;
                             }
-                            if ok {
-                                offset += n as u64;
-                                bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            if offset < frame_len {
+                                break;
                             }
+                            let payload_end = frame_len - 8;
+                            let sent_us = u64::from_le_bytes([
+                                buf[payload_end],
+                                buf[payload_end + 1],
+                                buf[payload_end + 2],
+                                buf[payload_end + 3],
+                                buf[payload_end + 4],
+                                buf[payload_end + 5],
+                                buf[payload_end + 6],
+                                buf[payload_end + 7],
+                            ]);
+                            let now_us = base.elapsed().as_micros() as u64;
+                            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                            let _ = tx.send(latency_ms);
+                            buf.copy_within(frame_len..offset, 0);
+                            offset -= frame_len;
                         }
                     }
-
-                    let _ = stream_write.shutdown();
+                } else {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset: u64 = 0;
+                    loop {
+                        let n = match stream_read.read(&mut buf).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let mut ok = true;
+                        for (j, &actual) in buf[..n].iter().enumerate() {
+                            let expected = ((offset + j as u64) % 251) as u8;
+                            if actual != expected {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            offset += n as u64;
+                            bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
                 }
+
+                let _ = stream_write.shutdown();
             }
-        },
-    )
+        }
+    })
     .await?;
     Ok((addr, rx, bulk_delivered))
 }
@@ -918,12 +924,13 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
     fec: bool,
     base: Instant,
     mss: usize,
-) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<f64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<f64>,
+)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        fec,
-        mss,
-        move |mut stream_read, mut stream_write| {
+    let addr =
+        spawn_mux_over_rtp_server_with_mss(fec, mss, move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             async move {
                 let mut buf = vec![0u8; 64 * 1024];
@@ -942,7 +949,8 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
                         if offset < 4 {
                             break;
                         }
-                        let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                        let frame_len =
+                            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
                         if frame_len < 12 {
                             // Invalid frame; drop the whole connection.
                             break;
@@ -970,9 +978,8 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
                 }
                 let _ = stream_write.shutdown();
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
     Ok((addr, rx))
 }
 
@@ -1196,46 +1203,42 @@ pub async fn spawn_mux_over_rtp_counting_sink_server(
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
     let progress = Arc::new(SinkProgress::new());
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        fec,
-        mss,
-        {
+    let addr = spawn_mux_over_rtp_server_with_mss(fec, mss, {
+        let progress = Arc::clone(&progress);
+        move |mut stream_read, mut stream_write| {
             let progress = Arc::clone(&progress);
-            move |mut stream_read, mut stream_write| {
-                let progress = Arc::clone(&progress);
-                async move {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset: u64 = 0;
-                    loop {
-                        match stream_read.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if progress.is_corrupt() {
-                                    continue;
-                                }
-                                let mut corrupt = false;
-                                for (j, &actual) in buf[..n].iter().enumerate() {
-                                    let expected = ((offset + j as u64) % 251) as u8;
-                                    if actual != expected {
-                                        corrupt = true;
-                                        break;
-                                    }
-                                }
-                                if corrupt {
-                                    progress.corrupt.store(true, Ordering::Relaxed);
-                                } else {
-                                    offset += n as u64;
-                                    progress.delivered.fetch_add(n as u64, Ordering::Relaxed);
+            async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut offset: u64 = 0;
+                loop {
+                    match stream_read.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if progress.is_corrupt() {
+                                continue;
+                            }
+                            let mut corrupt = false;
+                            for (j, &actual) in buf[..n].iter().enumerate() {
+                                let expected = ((offset + j as u64) % 251) as u8;
+                                if actual != expected {
+                                    corrupt = true;
+                                    break;
                                 }
                             }
-                            Err(_) => break,
+                            if corrupt {
+                                progress.corrupt.store(true, Ordering::Relaxed);
+                            } else {
+                                offset += n as u64;
+                                progress.delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            }
                         }
+                        Err(_) => break,
                     }
-                    let _ = stream_write.shutdown();
                 }
+                let _ = stream_write.shutdown();
             }
-        },
-    )
+        }
+    })
     .await?;
     Ok((addr, progress))
 }
@@ -1264,7 +1267,10 @@ pub fn print_median_worst(label: &str, bytes: usize, mut samples: Vec<Duration>)
 /// index. `sorted` must be sorted ascending and non-empty.
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     assert!(!sorted.is_empty(), "percentile called on empty samples");
-    assert!((0.0..=1.0).contains(&p), "percentile p must be in [0.0, 1.0]");
+    assert!(
+        (0.0..=1.0).contains(&p),
+        "percentile p must be in [0.0, 1.0]"
+    );
     let rank = ((sorted.len() as f64 - 1.0) * p).floor() as usize;
     sorted[rank.min(sorted.len() - 1)]
 }
@@ -1373,7 +1379,8 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                             let mut buf = vec![0u8; 64 * 1024];
                                             let mut offset = 0usize;
                                             loop {
-                                                let n = match reader.read(&mut buf[offset..]).await {
+                                                let n = match reader.read(&mut buf[offset..]).await
+                                                {
                                                     Ok(n) => n,
                                                     Err(_) => break,
                                                 };
@@ -1387,7 +1394,8 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                                     }
                                                     let frame_len = u32::from_le_bytes([
                                                         buf[0], buf[1], buf[2], buf[3],
-                                                    ]) as usize;
+                                                    ])
+                                                        as usize;
                                                     if frame_len < 12 {
                                                         break;
                                                     }
@@ -1406,7 +1414,9 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                                         buf[payload_end + 7],
                                                     ]);
                                                     let now_us = base.elapsed().as_micros() as u64;
-                                                    let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                                    let latency_ms = now_us.saturating_sub(sent_us)
+                                                        as f64
+                                                        / 1000.0;
                                                     let _ = tx.send(latency_ms);
                                                     buf.copy_within(frame_len..offset, 0);
                                                     offset -= frame_len;
@@ -1424,8 +1434,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                                             buf[..n].iter().enumerate()
                                                         {
                                                             let expected =
-                                                                ((offset + j as u64) % 251)
-                                                                    as u8;
+                                                                ((offset + j as u64) % 251) as u8;
                                                             if actual != expected {
                                                                 ok = false;
                                                                 break;
@@ -1528,9 +1537,7 @@ pub async fn spawn_dual_msg_channel_server(
                                 let _spawner = pair_spawner;
 
                                 let bulk = Arc::clone(&bulk);
-                                if let Ok((mut reader, writer, _class)) =
-                                    accepter.accept().await
-                                {
+                                if let Ok((mut reader, writer, _class)) = accepter.accept().await {
                                     tokio::spawn(async move {
                                         let _w = writer;
                                         let mut buf = vec![0u8; 64 * 1024];
@@ -1540,12 +1547,10 @@ pub async fn spawn_dual_msg_channel_server(
                                                 Ok(0) | Err(_) => break,
                                                 Ok(n) => {
                                                     let mut ok = true;
-                                                    for (j, &actual) in
-                                                        buf[..n].iter().enumerate()
+                                                    for (j, &actual) in buf[..n].iter().enumerate()
                                                     {
                                                         let expected =
-                                                            ((offset + j as u64) % 251)
-                                                                as u8;
+                                                            ((offset + j as u64) % 251) as u8;
                                                         if actual != expected {
                                                             ok = false;
                                                             break;
@@ -1553,10 +1558,7 @@ pub async fn spawn_dual_msg_channel_server(
                                                     }
                                                     if ok {
                                                         offset += n as u64;
-                                                        bulk.fetch_add(
-                                                            n as u64,
-                                                            Ordering::Relaxed,
-                                                        );
+                                                        bulk.fetch_add(n as u64, Ordering::Relaxed);
                                                     }
                                                 }
                                             }
@@ -1564,22 +1566,16 @@ pub async fn spawn_dual_msg_channel_server(
                                     });
                                 }
 
-                                let mut receiver =
-                                    mux::DualMessageReceiver::new(accepter, mode);
+                                let mut receiver = mux::DualMessageReceiver::new(accepter, mode);
                                 loop {
                                     match receiver.recv().await {
                                         Ok(Some(payload)) => {
                                             if payload.len() >= 12 {
                                                 let frame_len = u32::from_le_bytes([
-                                                    payload[0],
-                                                    payload[1],
-                                                    payload[2],
-                                                    payload[3],
+                                                    payload[0], payload[1], payload[2], payload[3],
                                                 ])
-                                                as usize;
-                                                if frame_len >= 12
-                                                    && payload.len() >= frame_len
-                                                {
+                                                    as usize;
+                                                if frame_len >= 12 && payload.len() >= frame_len {
                                                     let payload_end = frame_len - 8;
                                                     let sent_us = u64::from_le_bytes([
                                                         payload[payload_end],
@@ -1591,12 +1587,10 @@ pub async fn spawn_dual_msg_channel_server(
                                                         payload[payload_end + 6],
                                                         payload[payload_end + 7],
                                                     ]);
-                                                    let now_us =
-                                                        base.elapsed().as_micros() as u64;
-                                                    let latency_ms =
-                                                        now_us.saturating_sub(sent_us)
-                                                            as f64
-                                                            / 1000.0;
+                                                    let now_us = base.elapsed().as_micros() as u64;
+                                                    let latency_ms = now_us.saturating_sub(sent_us)
+                                                        as f64
+                                                        / 1000.0;
                                                     let _ = tx.send(latency_ms);
                                                 }
                                             }
@@ -1695,24 +1689,18 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
                                         }) => {
                                             let bulk = Arc::clone(&bulk);
                                             let tx = tx.clone();
-                                            tokio::spawn(
-                                                handle_latency_bulk_stream(
-                                                    reader, writer, base, bulk, tx,
-                                                ),
-                                            );
+                                            tokio::spawn(handle_latency_bulk_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
                                         }
                                         Ok(mux::AcceptedStream::Plain {
-                                            reader,
-                                            writer,
-                                            ..
+                                            reader, writer, ..
                                         }) => {
                                             let bulk = Arc::clone(&bulk);
                                             let tx = tx.clone();
-                                            tokio::spawn(
-                                                handle_latency_bulk_stream(
-                                                    reader, writer, base, bulk, tx,
-                                                ),
-                                            );
+                                            tokio::spawn(handle_latency_bulk_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
                                         }
                                         Err(_) => break,
                                     }
@@ -1757,8 +1745,7 @@ async fn handle_latency_bulk_stream<R: AsyncRead + Unpin + Send + 'static>(
                 if offset < 4 {
                     break;
                 }
-                let frame_len =
-                    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
                 if frame_len < 12 || offset < frame_len {
                     break;
                 }
@@ -1885,24 +1872,18 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
                                         }) => {
                                             let bulk = Arc::clone(&bulk);
                                             let tx = tx.clone();
-                                            tokio::spawn(
-                                                handle_gaming_stream(
-                                                    reader, writer, base, bulk, tx,
-                                                ),
-                                            );
+                                            tokio::spawn(handle_gaming_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
                                         }
                                         Ok(mux::AcceptedStream::Plain {
-                                            reader,
-                                            writer,
-                                            ..
+                                            reader, writer, ..
                                         }) => {
                                             let bulk = Arc::clone(&bulk);
                                             let tx = tx.clone();
-                                            tokio::spawn(
-                                                handle_gaming_stream(
-                                                    reader, writer, base, bulk, tx,
-                                                ),
-                                            );
+                                            tokio::spawn(handle_gaming_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
                                         }
                                         Err(_) => break,
                                     }
@@ -1956,8 +1937,7 @@ async fn handle_gaming_stream<R: AsyncRead + Unpin + Send + 'static>(
                 if offset < 4 {
                     break;
                 }
-                let frame_len =
-                    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
                 if frame_len < 12 || offset < frame_len {
                     break;
                 }
@@ -2014,108 +1994,102 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
 ) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        fec,
-        rtp::udp::NO_FEC_MSS,
-        {
+    let addr = spawn_mux_over_rtp_server_with_mss(fec, rtp::udp::NO_FEC_MSS, {
+        let tx = tx.clone();
+        let bulk_delivered = Arc::clone(&bulk_delivered);
+        move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             let bulk_delivered = Arc::clone(&bulk_delivered);
-            move |mut stream_read, mut stream_write| {
-                let tx = tx.clone();
-                let bulk_delivered = Arc::clone(&bulk_delivered);
-                async move {
-                    let mut tag = [0u8; 1];
-                    let n = match stream_read.read(&mut tag).await {
-                        Ok(n) => n,
-                        Err(_) => {
-                            let _ = stream_write.shutdown();
-                            return;
-                        }
-                    };
-                    if n == 0 {
+            async move {
+                let mut tag = [0u8; 1];
+                let n = match stream_read.read(&mut tag).await {
+                    Ok(n) => n,
+                    Err(_) => {
                         let _ = stream_write.shutdown();
                         return;
                     }
-                    if tag[0] == b'G' {
-                        const SYNC_BYTES: usize = 8 * 1024;
-                        let mut remaining = SYNC_BYTES;
-                        let mut buf = vec![0u8; 64 * 1024];
-                        while remaining > 0 {
-                            let to_read = remaining.min(buf.len());
-                            match stream_read.read(&mut buf[..to_read]).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(_n) => remaining -= _n,
-                            };
+                };
+                if n == 0 {
+                    let _ = stream_write.shutdown();
+                    return;
+                }
+                if tag[0] == b'G' {
+                    const SYNC_BYTES: usize = 8 * 1024;
+                    let mut remaining = SYNC_BYTES;
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while remaining > 0 {
+                        let to_read = remaining.min(buf.len());
+                        match stream_read.read(&mut buf[..to_read]).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_n) => remaining -= _n,
+                        };
+                    }
+                    let mut offset = 0usize;
+                    loop {
+                        let n = match stream_read.read(&mut buf[offset..]).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 {
+                            break;
                         }
-                        let mut offset = 0usize;
+                        offset += n;
                         loop {
-                            let n = match stream_read.read(&mut buf[offset..]).await {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-                            if n == 0 {
+                            if offset < 4 {
                                 break;
                             }
-                            offset += n;
-                            loop {
-                                if offset < 4 {
-                                    break;
-                                }
-                                let frame_len = u32::from_le_bytes([
-                                    buf[0], buf[1], buf[2], buf[3],
-                                ]) as usize;
-                                if frame_len < 12 || offset < frame_len {
-                                    break;
-                                }
-                                let payload_end = frame_len - 8;
-                                let sent_us = u64::from_le_bytes([
-                                    buf[payload_end],
-                                    buf[payload_end + 1],
-                                    buf[payload_end + 2],
-                                    buf[payload_end + 3],
-                                    buf[payload_end + 4],
-                                    buf[payload_end + 5],
-                                    buf[payload_end + 6],
-                                    buf[payload_end + 7],
-                                ]);
-                                let now_us = base.elapsed().as_micros() as u64;
-                                let latency_ms =
-                                    now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                                let _ = tx.send(latency_ms);
-                                buf.copy_within(frame_len..offset, 0);
-                                offset -= frame_len;
-                            }
-                        }
-                    } else {
-                        let mut buf = vec![0u8; 64 * 1024];
-                        let mut offset: u64 = 0;
-                        loop {
-                            let n = match stream_read.read(&mut buf).await {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            };
-                            if n == 0 {
+                            let frame_len =
+                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                            if frame_len < 12 || offset < frame_len {
                                 break;
                             }
-                            let mut ok = true;
-                            for (j, &actual) in buf[..n].iter().enumerate() {
-                                let expected = ((offset + j as u64) % 251) as u8;
-                                if actual != expected {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if ok {
-                                offset += n as u64;
-                                bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
-                            }
+                            let payload_end = frame_len - 8;
+                            let sent_us = u64::from_le_bytes([
+                                buf[payload_end],
+                                buf[payload_end + 1],
+                                buf[payload_end + 2],
+                                buf[payload_end + 3],
+                                buf[payload_end + 4],
+                                buf[payload_end + 5],
+                                buf[payload_end + 6],
+                                buf[payload_end + 7],
+                            ]);
+                            let now_us = base.elapsed().as_micros() as u64;
+                            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                            let _ = tx.send(latency_ms);
+                            buf.copy_within(frame_len..offset, 0);
+                            offset -= frame_len;
                         }
                     }
-                    let _ = stream_write.shutdown();
+                } else {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset: u64 = 0;
+                    loop {
+                        let n = match stream_read.read(&mut buf).await {
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let mut ok = true;
+                        for (j, &actual) in buf[..n].iter().enumerate() {
+                            let expected = ((offset + j as u64) % 251) as u8;
+                            if actual != expected {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            offset += n as u64;
+                            bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    }
                 }
+                let _ = stream_write.shutdown();
             }
-        },
-    )
+        }
+    })
     .await?;
     Ok((addr, rx, bulk_delivered))
 }
@@ -2132,7 +2106,11 @@ pub async fn dual_mux_client_connect(
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
 ) -> Result<
-    (mux::DualStreamOpener, mux::DualStreamAccepter, JoinSet<mux::MuxError>),
+    (
+        mux::DualStreamOpener,
+        mux::DualStreamAccepter,
+        JoinSet<mux::MuxError>,
+    ),
     mux::DualMuxError,
 > {
     let config = mux::MuxConfig {
@@ -2193,12 +2171,11 @@ impl SplitMix64 {
 // Frame‑delivery adapter
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use rtp::transmission::frame_delivery::FrameDelivery;
 use rtp::transmission::fec_tuning::FecTuning;
+use rtp::transmission::frame_delivery::FrameDelivery;
 
-type FrameSendFut = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<usize, std::io::ErrorKind>> + Send>,
->;
+type FrameSendFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, std::io::ErrorKind>> + Send>>;
 type FrameRecvFut = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, std::io::ErrorKind>> + Send>,
 >;
@@ -2234,12 +2211,16 @@ impl tokio::io::AsyncWrite for RtpFrameDeliveryWriter {
         if self.inflight.is_none() {
             let data = buf.to_vec();
             let socket = self.socket.clone();
-            self.inflight = Some((len, Box::pin(async move {
-                socket.lock().await.send_frame(&data).await
-            })));
+            self.inflight = Some((
+                len,
+                Box::pin(async move { socket.lock().await.send_frame(&data).await }),
+            ));
         }
         let (sent_len, fut) = self.inflight.as_mut().unwrap();
-        debug_assert_eq!(*sent_len, len, "caller changed buf across Pending poll_write");
+        debug_assert_eq!(
+            *sent_len, len,
+            "caller changed buf across Pending poll_write"
+        );
         let result = std::task::ready!(fut.as_mut().poll(cx));
         let sent_len = *sent_len;
         self.inflight = None;
@@ -2475,8 +2456,7 @@ pub async fn dual_mux_client_connect_with_lane_modes(
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
 
-    let Some((bulk_reader, mut bulk_writer)) =
-        connect_lane(bulk_proxy_addr, fec, bulk_frame).await
+    let Some((bulk_reader, mut bulk_writer)) = connect_lane(bulk_proxy_addr, fec, bulk_frame).await
     else {
         return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
             std::io::ErrorKind::ConnectionRefused,
@@ -2487,19 +2467,11 @@ pub async fn dual_mux_client_connect_with_lane_modes(
         .map_err(mux::DualMuxError::LaneHello)?;
 
     let mut int_spawner = JoinSet::new();
-    let (int_opener, int_accepter) = mux::spawn_mux_no_reconnection(
-        int_reader,
-        int_writer,
-        int_config,
-        &mut int_spawner,
-    );
+    let (int_opener, int_accepter) =
+        mux::spawn_mux_no_reconnection(int_reader, int_writer, int_config, &mut int_spawner);
     let mut bulk_spawner = JoinSet::new();
-    let (bulk_opener, bulk_accepter) = mux::spawn_mux_no_reconnection(
-        bulk_reader,
-        bulk_writer,
-        bulk_config,
-        &mut bulk_spawner,
-    );
+    let (bulk_opener, bulk_accepter) =
+        mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, bulk_config, &mut bulk_spawner);
 
     let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
         int_opener,
@@ -2517,9 +2489,10 @@ pub async fn dual_mux_client_connect_with_lane_modes(
 fn spawn_tagged_stream_sink(
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     mut writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
-    tx: mpsc::UnboundedSender<f64>,
+    tx: mpsc::UnboundedSender<(u8, f64)>,
     bulk: Arc<AtomicU64>,
     base: Instant,
+    is_interactive: bool,
 ) {
     tokio::spawn(async move {
         let mut tag = [0u8; 1];
@@ -2527,7 +2500,8 @@ fn spawn_tagged_stream_sink(
             let _ = writer.shutdown().await;
             return;
         }
-        if tag[0] == b'L' {
+        let is_latency = is_interactive || tag[0] != b'B';
+        if is_latency {
             let mut buf = vec![0u8; 64 * 1024];
             let mut offset = 0usize;
             loop {
@@ -2563,7 +2537,7 @@ fn spawn_tagged_stream_sink(
                     ]);
                     let now_us = base.elapsed().as_micros() as u64;
                     let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                    let _ = tx.send(latency_ms);
+                    let _ = tx.send((tag[0], latency_ms));
                     buf.copy_within(frame_len..offset, 0);
                     offset -= frame_len;
                 }
@@ -2605,7 +2579,7 @@ fn spawn_tagged_stream_sink(
 pub async fn spawn_dual_mux_frame_delivery_latency_bulk_server(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
     spawn_dual_mux_latency_bulk_server_with_config(
         fec,
         base,
@@ -2627,7 +2601,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_with_lane_modes(
     base: Instant,
     interactive_frame: bool,
     bulk_frame: bool,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
     let int_config = mux::MuxConfig {
         initiation: mux::Initiation::Server,
         heartbeat_interval: Duration::from_secs(5),
@@ -2647,7 +2621,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_config(
     fec: bool,
     base: Instant,
     config: mux::MuxConfig,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
     spawn_dual_mux_latency_bulk_server_with_per_lane_configs(fec, base, config.clone(), config)
         .await
 }
@@ -2657,10 +2631,10 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
     base: Instant,
     int_config: mux::MuxConfig,
     bulk_config: mux::MuxConfig,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
-    let (tx, rx) = mpsc::unbounded_channel::<f64>();
+    let (tx, rx) = mpsc::unbounded_channel::<(u8, f64)>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
 
     let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
@@ -2735,7 +2709,8 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                                             let mut buf = vec![0u8; 64 * 1024];
                                             let mut offset = 0usize;
                                             loop {
-                                                let n = match reader.read(&mut buf[offset..]).await {
+                                                let n = match reader.read(&mut buf[offset..]).await
+                                                {
                                                     Ok(n) => n,
                                                     Err(_) => break,
                                                 };
@@ -2749,7 +2724,8 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                                                     }
                                                     let frame_len = u32::from_le_bytes([
                                                         buf[0], buf[1], buf[2], buf[3],
-                                                    ]) as usize;
+                                                    ])
+                                                        as usize;
                                                     if frame_len < 12 {
                                                         break;
                                                     }
@@ -2767,13 +2743,11 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                                                         buf[payload_end + 6],
                                                         buf[payload_end + 7],
                                                     ]);
-                                                    let now_us =
-                                                        base.elapsed().as_micros() as u64;
-                                                    let latency_ms = now_us
-                                                        .saturating_sub(sent_us)
+                                                    let now_us = base.elapsed().as_micros() as u64;
+                                                    let latency_ms = now_us.saturating_sub(sent_us)
                                                         as f64
                                                         / 1000.0;
-                                                    let _ = tx.send(latency_ms);
+                                                    let _ = tx.send((tag[0], latency_ms));
                                                     buf.copy_within(frame_len..offset, 0);
                                                     offset -= frame_len;
                                                 }
@@ -2790,8 +2764,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                                                             buf[..n].iter().enumerate()
                                                         {
                                                             let expected =
-                                                                ((offset + j as u64) % 251)
-                                                                    as u8;
+                                                                ((offset + j as u64) % 251) as u8;
                                                             if actual != expected {
                                                                 ok = false;
                                                                 break;
@@ -2837,14 +2810,14 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
 ) -> std::io::Result<(
     std::net::SocketAddr,
     std::net::SocketAddr,
-    UnboundedReceiver<f64>,
+    UnboundedReceiver<(u8, f64)>,
     Arc<AtomicU64>,
 )> {
     let int_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let bulk_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let int_addr = int_listener.local_addr();
     let bulk_addr = bulk_listener.local_addr();
-    let (tx, rx) = mpsc::unbounded_channel::<f64>();
+    let (tx, rx) = mpsc::unbounded_channel::<(u8, f64)>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
     for (listener, lane_frame) in [
@@ -2885,13 +2858,11 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     }
     let bulk_for_main = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> =
-            HashMap::new();
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
         while let Some((accepted, config)) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            match mux::spawn_dual_mux_acceptor(reader, writer, config, Duration::from_secs(3))
-                .await
+            match mux::spawn_dual_mux_acceptor(reader, writer, config, Duration::from_secs(3)).await
             {
                 Ok((_class, nonce, pa)) => {
                     let entries = pending.entry(nonce).or_default();
@@ -2908,15 +2879,14 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
                             let tx = tx.clone();
                             tokio::spawn(async move {
                                 let _spawner = pair_spawner;
-                                while let Ok((reader, writer, _class)) =
-                                    accepter.accept().await
-                                {
+                                while let Ok((reader, writer, class)) = accepter.accept().await {
                                     spawn_tagged_stream_sink(
                                         reader,
                                         writer,
                                         tx.clone(),
                                         Arc::clone(&bulk),
                                         base,
+                                        class == mux::LaneClass::Interactive,
                                     );
                                 }
                             });
@@ -2938,8 +2908,8 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
 pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u8, f64)>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
@@ -3000,7 +2970,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                     let _ = writer.shutdown();
                     return;
                 }
-                if tag[0] == b'L' {
+                if tag[0] != b'B' {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset = 0usize;
                     loop {
@@ -3034,7 +3004,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            let _ = tx.send(latency_ms);
+                            let _ = tx.send((tag[0], latency_ms));
                             buf.copy_within(frame_len..offset, 0);
                             offset -= frame_len;
                         }
@@ -3069,4 +3039,3 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
 
     Ok((addr, rx, bulk_delivered))
 }
-

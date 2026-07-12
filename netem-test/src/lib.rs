@@ -339,6 +339,11 @@ pub struct NetemConfig {
     /// `limit` above the latency×rate (in packets) plus the intended bottleneck
     /// buffer. Kernel `sch_netem` defaults to 1000.
     pub limit: usize,
+    /// Maximum datagram size in bytes. Datagrams larger than this value are
+    /// deterministically dropped before any other impairment (loss, delay,
+    /// rate-limiting, etc.) and counted as `dropped`. `0` disables the filter
+    /// (all sizes pass).
+    pub max_datagram_size: usize,
 }
 
 impl Default for NetemConfig {
@@ -358,6 +363,7 @@ impl Default for NetemConfig {
             rate: 0,
             seed: 0xC0FF_EEBE_EFC0_FFEE,
             limit: 0,
+            max_datagram_size: 0,
         }
     }
 }
@@ -733,6 +739,13 @@ impl Runner {
 
     fn handle_datagram(&mut self, data: &[u8], _from: SocketAddr, now: Instant) {
         self.stats.inc(|s| &s.received);
+
+        // ── max datagram size filter ──────────────────────────────────
+        // Drop oversized datagrams before any other processing.
+        if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
+            self.stats.inc(|s| &s.dropped);
+            return;
+        }
 
         // ── blackout gate ────────────────────────────────────────────
         // Drop every incoming packet while the gate is closed. This runs after
@@ -1270,6 +1283,13 @@ struct DirectionRunner {
     fn handle_datagram(&mut self, data: &[u8], now: Instant) {
         self.stats.inc(|s| &s.received);
 
+        // ── max datagram size filter ──────────────────────────────────
+        // Drop oversized datagrams before any other processing.
+        if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
+            self.stats.inc(|s| &s.dropped);
+            return;
+        }
+
         // ── blackout gate ────────────────────────────────────────────
         if self.blackout.load(Ordering::Relaxed) {
             self.stats.inc(|s| &s.dropped);
@@ -1512,6 +1532,36 @@ mod tests {
         assert_eq!(c.duplicate, 0);
         assert_eq!(c.rate, 0);
         assert_eq!(c.limit, 0);
+        assert_eq!(c.max_datagram_size, 0);
+    }
+
+    #[test]
+    fn max_datagram_size_drops_only_oversized_datagrams() {
+        let mut config = NetemConfig::default();
+        config.max_datagram_size = 512;
+        let (mut runner, _sent) = one_packet_runner(
+            &[0u8; 100],
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
+            config.clone(),
+        );
+        // one_packet_runner already sent the initial packet: received = 1
+        // Oversized packet: dropped.
+        runner.handle_datagram(
+            &[0u8; 513],
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
+            Instant::now(),
+        );
+        // Small packet: enqueued.
+        runner.handle_datagram(
+            &[0u8; 512],
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
+            Instant::now(),
+        );
+        let s = runner.stats.snapshot();
+        assert_eq!(s.received, 3);
+        assert_eq!(s.dropped, 1);
+        // Two packets enqueued (not yet forwarded since drain isn't called).
+        assert_eq!(runner.queue.len(), 2);
     }
 
     /// In-memory transport that records sent payloads and can return them on

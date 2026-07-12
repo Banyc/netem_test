@@ -235,7 +235,7 @@ pub async fn run_hol_probe(
 
     let received = samples.len() as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = active_for.as_secs_f64();
+    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
     let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
 
     print_hol_summary(label, &summary);
@@ -1167,7 +1167,7 @@ async fn run_hol_probe_frame_delivery_shared(
 
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();
-    while let Ok(lat) = latencies.try_recv() {
+    while let Ok((_tag, lat)) = latencies.try_recv() {
         samples.push(lat);
     }
 
@@ -1270,7 +1270,7 @@ async fn run_hol_probe_dual_lane(
 
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();
-    while let Ok(lat) = latencies.try_recv() {
+    while let Ok((_tag, lat)) = latencies.try_recv() {
         samples.push(lat);
     }
 
@@ -1414,13 +1414,11 @@ async fn run_hol_probe_dual_lane_two_interactive(
     let mut samples = Vec::new();
     let mut samples_a = Vec::new();
     let mut samples_b = Vec::new();
-    while let Ok(lat) = latencies_all.try_recv() {
+    while let Ok((tag, lat)) = latencies_all.try_recv() {
         samples.push(lat);
-        // Tags A and B are stream identifiers; the latency channel merges all
-        // streams, so we split by comparing to the per-stream sent counts.
-        if samples_a.len() < sent_a as usize {
+        if tag == b'A' {
             samples_a.push(lat);
-        } else {
+        } else if tag == b'B' {
             samples_b.push(lat);
         }
     }
@@ -1533,8 +1531,8 @@ async fn run_frame_delivery_two_interactive(
     grace: Duration,
 ) -> (HolSummary, HolSummary, HolSummary) {
     let base = Instant::now();
-    let (server_addr, mut latencies) =
-        spawn_mux_msg_latency_sink(fec, base).await.unwrap();
+    let (server_addr, mut latencies, _bulk_counter) =
+        spawn_mux_frame_delivery_latency_bulk_server(fec, base).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
     let (reader, writer) =
@@ -1569,6 +1567,9 @@ async fn run_frame_delivery_two_interactive(
         }
     });
 
+    let _ = write_a.write_all(&[b'A']).await;
+    let _ = write_b.write_all(&[b'L']).await;
+
     let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
     let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
     let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
@@ -1580,11 +1581,11 @@ async fn run_frame_delivery_two_interactive(
     let mut samples = Vec::new();
     let mut samples_a = Vec::new();
     let mut samples_b = Vec::new();
-    while let Ok(lat) = latencies.try_recv() {
+    while let Ok((tag, lat)) = latencies.try_recv() {
         samples.push(lat);
-        if samples_a.len() < sent_a as usize {
+        if tag == b'A' {
             samples_a.push(lat);
-        } else {
+        } else if tag == b'L' {
             samples_b.push(lat);
         }
     }
@@ -2009,7 +2010,7 @@ async fn run_hol_probe_dual_lane_separate_listeners(
 
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();
-    while let Ok(lat) = latencies.try_recv() {
+    while let Ok((_tag, lat)) = latencies.try_recv() {
         samples.push(lat);
     }
 
