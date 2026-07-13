@@ -37,6 +37,32 @@ const MIN_BROKEN_PIPE_ELAPSED: Duration = Duration::from_secs(30);
 
 const MAX_REVERSE_TRAFFIC_SILENCE: Duration = Duration::from_secs(5);
 
+#[derive(Debug)]
+struct ReverseTrafficTracker {
+    last_forwarded: u64,
+    last_change: Instant,
+}
+
+impl ReverseTrafficTracker {
+    fn new(last_forwarded: u64, now: Instant) -> Self {
+        Self {
+            last_forwarded,
+            last_change: now,
+        }
+    }
+
+    fn observe(&mut self, forwarded: u64, now: Instant) {
+        if forwarded > self.last_forwarded {
+            self.last_forwarded = forwarded;
+            self.last_change = now;
+        }
+    }
+
+    fn silence_at(&self, now: Instant) -> Duration {
+        now.duration_since(self.last_change)
+    }
+}
+
 #[test]
 #[ignore]
 fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
@@ -115,7 +141,7 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
 
         let mut heartbeat_count = 0u64;
         let mut write_error: Option<std::io::ErrorKind> = None;
-        let mut last_s2c_change = Instant::now();
+        let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
 
         loop {
             if start.elapsed() >= MAX_DURATION {
@@ -126,10 +152,7 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
                 );
             }
 
-            let s2c_now = pair.stats_s2c().forwarded;
-            if s2c_now > s2c_before {
-                last_s2c_change = Instant::now();
-            }
+            reverse_traffic.observe(pair.stats_s2c().forwarded, Instant::now());
 
             let mut buf = Vec::with_capacity(MSG_BYTES + 12);
             buf.extend_from_slice(&((MSG_BYTES + 12) as u32).to_le_bytes());
@@ -214,20 +237,20 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
             "post-hole small-packet heartbeats must be forwarded c2s; forwarded={c2s_forwarded_post_hole}"
         );
 
-        let reverse_traffic = s2c_after.forwarded - s2c_before;
+        let reverse_traffic_packets = s2c_after.forwarded - s2c_before;
         assert!(
-            reverse_traffic > 0,
+            reverse_traffic_packets > 0,
             "s2c must have forwarded reverse ACK/SACK traffic; forwarded={}",
             s2c_after.forwarded,
         );
 
-        let reverse_silence = termination_time.duration_since(last_s2c_change);
+        let reverse_silence = reverse_traffic.silence_at(termination_time);
         assert!(
             reverse_silence <= MAX_REVERSE_TRAFFIC_SILENCE,
             "reverse ACK/SACK traffic stale for {:?} (> {:?}); last s2c change at {:?}",
             reverse_silence,
             MAX_REVERSE_TRAFFIC_SILENCE,
-            last_s2c_change,
+            reverse_traffic.last_change,
         );
 
         eprintln!(
@@ -238,4 +261,19 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
             reverse_silence,
         );
     });
+}
+
+#[test]
+fn reverse_traffic_recency_advances_only_on_new_packets() {
+    let t0 = Instant::now();
+    let mut tracker = ReverseTrafficTracker::new(7, t0);
+    tracker.observe(8, t0 + Duration::from_secs(1));
+    tracker.observe(8, t0 + Duration::from_secs(4));
+    assert_eq!(
+        tracker.silence_at(t0 + Duration::from_secs(5)),
+        Duration::from_secs(4),
+        "an unchanged counter must not refresh recency"
+    );
+    tracker.observe(9, t0 + Duration::from_secs(5));
+    assert_eq!(tracker.silence_at(t0 + Duration::from_secs(5)), Duration::ZERO);
 }
