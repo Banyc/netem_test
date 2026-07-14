@@ -263,9 +263,13 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
     });
 }
 
-#[tokio::test]
-#[ignore]
-async fn rtp_permanent_hole_liveness_smoke() {
+#[test]
+fn rtp_permanent_hole_liveness_smoke() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
     let base = Instant::now();
     let start = Instant::now();
 
@@ -448,6 +452,7 @@ async fn rtp_permanent_hole_liveness_smoke() {
         c2s_after.forwarded,
         s2c_after.forwarded,
     );
+    });
 }
 
 #[test]
