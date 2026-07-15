@@ -2338,12 +2338,14 @@ pub async fn rtp_frame_delivery_connect_with_mss(
     let connected = rtp::udp::connect_with_mss_fec_tuning_and_frame_delivery(
         "0.0.0.0:0",
         &proxy_client_addr.to_string(),
-        None,
-        false,
-        fec,
-        mss,
-        FecTuning::default(),
-        FrameDelivery::enabled(),
+        rtp::udp::ConnectConfig {
+            log_config: None,
+            handshake: false,
+            fec,
+            mss,
+            fec_tuning: FecTuning::default(),
+            frame_delivery: FrameDelivery::enabled(),
+        },
     )
     .await
     .unwrap();

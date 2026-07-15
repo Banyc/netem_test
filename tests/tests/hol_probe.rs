@@ -80,6 +80,27 @@ pub struct HolSummary {
     pub bulk_mibps: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TrafficConfig {
+    msg_bytes: usize,
+    cadence: Duration,
+    run_for: Duration,
+    grace: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DualLaneProbeConfig {
+    interactive_frame: bool,
+    bulk_frame: bool,
+    traffic: TrafficConfig,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameDeliveryProbeConfig {
+    fec: bool,
+    traffic: TrafficConfig,
+}
+
 /// Run one head-of-line-blocking probe.
 ///
 /// Spawns a mux-over-RTP server that accepts one RTP connection. The server
@@ -1312,22 +1333,28 @@ async fn run_hol_probe_dual_lane(
 /// Dual‑lane HOL probe with TWO interactive streams on the interactive
 /// lane (tagged `b'A'` / `b'B'`) plus one bulk stream on the bulk lane.
 /// Returns `(summary_a, summary_b, ` combined summary across both, `bulk_mibps)`.
-#[allow(clippy::too_many_arguments)]
 async fn run_hol_probe_dual_lane_two_interactive(
     label: &str,
-    interactive_frame: bool,
     int_c2s: NetemConfig,
     int_s2c: NetemConfig,
     bulk_c2s: NetemConfig,
     bulk_s2c: NetemConfig,
-    msg_bytes: usize,
-    cadence: Duration,
-    run_for: Duration,
-    grace: Duration,
+    config: DualLaneProbeConfig,
 ) -> (HolSummary, HolSummary, HolSummary, f64) {
+    let DualLaneProbeConfig {
+        interactive_frame,
+        bulk_frame,
+        traffic:
+            TrafficConfig {
+                msg_bytes,
+                cadence,
+                run_for,
+                grace,
+            },
+    } = config;
     let base = Instant::now();
     let (int_addr, bulk_addr, mut latencies_all, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server_two_listeners(false, base, interactive_frame, false)
+        spawn_dual_mux_latency_bulk_server_two_listeners(false, base, interactive_frame, bulk_frame)
             .await
             .unwrap();
 
@@ -1339,7 +1366,7 @@ async fn run_hol_probe_dual_lane_two_interactive(
         bulk_pair.client_addr(),
         false,
         interactive_frame,
-        false,
+        bulk_frame,
     )
     .await
     .unwrap();
@@ -1530,17 +1557,22 @@ async fn run_frame_delivery_solo_interactive(
 
 /// Two‑interactive baseline on a single frame‑delivery RTP connection:
 /// two tagged streams (b'A'/b'B'), no bulk contender.
-#[allow(clippy::too_many_arguments)]
 async fn run_frame_delivery_two_interactive(
     label: &str,
     c2s: NetemConfig,
     s2c: NetemConfig,
-    fec: bool,
-    msg_bytes: usize,
-    cadence: Duration,
-    run_for: Duration,
-    grace: Duration,
+    config: FrameDeliveryProbeConfig,
 ) -> (HolSummary, HolSummary, HolSummary) {
+    let FrameDeliveryProbeConfig {
+        fec,
+        traffic:
+            TrafficConfig {
+                msg_bytes,
+                cadence,
+                run_for,
+                grace,
+            },
+    } = config;
     let base = Instant::now();
     let (server_addr, mut latencies, _bulk_counter) =
         spawn_mux_frame_delivery_latency_bulk_server(fec, base)
@@ -1682,11 +1714,15 @@ async fn hol_rtt100_ge5_two_interactive_frame_delivery() {
             label,
             rtt100_ge5(31),
             rtt100_ge5(32),
-            false,
-            DEFAULT_MSG_BYTES,
-            DEFAULT_CADENCE,
-            DEFAULT_RUN_FOR,
-            DEFAULT_GRACE,
+            FrameDeliveryProbeConfig {
+                fec: false,
+                traffic: TrafficConfig {
+                    msg_bytes: DEFAULT_MSG_BYTES,
+                    cadence: DEFAULT_CADENCE,
+                    run_for: DEFAULT_RUN_FOR,
+                    grace: DEFAULT_GRACE,
+                },
+            },
         ),
     )
     .await;
@@ -1896,15 +1932,20 @@ async fn hol_rtt100_ge5_dual_lane_two_interactive_stock_diag() {
         label,
         run_hol_probe_dual_lane_two_interactive(
             label,
-            false,
             rtt100_ge5(121),
             rtt100_ge5(122),
             rtt100_ge5(123),
             rtt100_ge5(124),
-            DEFAULT_MSG_BYTES,
-            DEFAULT_CADENCE,
-            DEFAULT_RUN_FOR,
-            DEFAULT_GRACE,
+            DualLaneProbeConfig {
+                interactive_frame: false,
+                bulk_frame: false,
+                traffic: TrafficConfig {
+                    msg_bytes: DEFAULT_MSG_BYTES,
+                    cadence: DEFAULT_CADENCE,
+                    run_for: DEFAULT_RUN_FOR,
+                    grace: DEFAULT_GRACE,
+                },
+            },
         ),
     )
     .await;
@@ -1921,15 +1962,20 @@ async fn hol_rtt100_ge5_dual_lane_two_interactive_frame_diag() {
         label,
         run_hol_probe_dual_lane_two_interactive(
             label,
-            true,
             rtt100_ge5(131),
             rtt100_ge5(132),
             rtt100_ge5(133),
             rtt100_ge5(134),
-            DEFAULT_MSG_BYTES,
-            DEFAULT_CADENCE,
-            DEFAULT_RUN_FOR,
-            DEFAULT_GRACE,
+            DualLaneProbeConfig {
+                interactive_frame: true,
+                bulk_frame: false,
+                traffic: TrafficConfig {
+                    msg_bytes: DEFAULT_MSG_BYTES,
+                    cadence: DEFAULT_CADENCE,
+                    run_for: DEFAULT_RUN_FOR,
+                    grace: DEFAULT_GRACE,
+                },
+            },
         ),
     )
     .await;
@@ -1944,20 +1990,25 @@ async fn hol_rtt100_ge5_dual_lane_two_interactive_frame_diag() {
 /// on its dedicated listener, so the interactive listener can use
 /// frame‑delivery while the bulk listener uses stock byte‑stream — the
 /// server never has to guess the lane class before the mux lane‑hello.
-#[allow(clippy::too_many_arguments)]
 async fn run_hol_probe_dual_lane_separate_listeners(
     label: &str,
-    interactive_frame: bool,
-    bulk_frame: bool,
     int_c2s: NetemConfig,
     int_s2c: NetemConfig,
     bulk_c2s: NetemConfig,
     bulk_s2c: NetemConfig,
-    msg_bytes: usize,
-    cadence: Duration,
-    run_for: Duration,
-    grace: Duration,
+    config: DualLaneProbeConfig,
 ) -> HolSummary {
+    let DualLaneProbeConfig {
+        interactive_frame,
+        bulk_frame,
+        traffic:
+            TrafficConfig {
+                msg_bytes,
+                cadence,
+                run_for,
+                grace,
+            },
+    } = config;
     let base = Instant::now();
     let (int_addr, bulk_addr, mut latencies, bulk_counter) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
@@ -2059,16 +2110,20 @@ async fn dual_lane_asym_frame_delivers_and_tears_down() {
         label,
         run_hol_probe_dual_lane_separate_listeners(
             label,
-            true,
-            false,
             rtt100_ge5(141),
             rtt100_ge5(142),
             rtt100_ge5(143),
             rtt100_ge5(144),
-            DEFAULT_MSG_BYTES,
-            DEFAULT_CADENCE,
-            DEFAULT_RUN_FOR,
-            DEFAULT_GRACE,
+            DualLaneProbeConfig {
+                interactive_frame: true,
+                bulk_frame: false,
+                traffic: TrafficConfig {
+                    msg_bytes: DEFAULT_MSG_BYTES,
+                    cadence: DEFAULT_CADENCE,
+                    run_for: DEFAULT_RUN_FOR,
+                    grace: DEFAULT_GRACE,
+                },
+            },
         ),
     )
     .await;

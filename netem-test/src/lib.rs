@@ -1083,36 +1083,36 @@ impl NetemPair {
 
         // c2s: recv on client_sock, send on server_sock to server_addr; learn
         // the client's address from the first packet.
-        let c2s_runner = DirectionRunner::new(
-            c2s,
-            stats_c2s,
-            queue_len_c2s,
-            blackout_c2s,
-            Arc::clone(&stop),
-            Arc::clone(&client_sock),
-            Arc::clone(&server_sock),
-            Some(server_addr),
-            Arc::clone(&learned_client),
-            c2s_shared,
-        );
+        let c2s_runner = DirectionRunner::new(DirectionRunnerParams {
+            config: c2s,
+            stats: stats_c2s,
+            queue_len: queue_len_c2s,
+            blackout: blackout_c2s,
+            stop: Arc::clone(&stop),
+            recv: Arc::clone(&client_sock),
+            send: Arc::clone(&server_sock),
+            fixed_dst: Some(server_addr),
+            learned_dst: Arc::clone(&learned_client),
+            shared: c2s_shared,
+        });
         std::thread::Builder::new()
             .name("netem-c2s".into())
             .spawn(move || c2s_runner.run())?;
 
         // s2c: recv on server_sock, send on client_sock to the learned client
         // address.
-        let s2c_runner = DirectionRunner::new(
-            s2c,
-            stats_s2c,
-            queue_len_s2c,
-            blackout_s2c,
+        let s2c_runner = DirectionRunner::new(DirectionRunnerParams {
+            config: s2c,
+            stats: stats_s2c,
+            queue_len: queue_len_s2c,
+            blackout: blackout_s2c,
             stop,
-            server_sock,
-            client_sock,
-            None,
-            learned_client,
-            s2c_shared,
-        );
+            recv: server_sock,
+            send: client_sock,
+            fixed_dst: None,
+            learned_dst: learned_client,
+            shared: s2c_shared,
+        });
         std::thread::Builder::new()
             .name("netem-s2c".into())
             .spawn(move || s2c_runner.run())?;
@@ -1229,20 +1229,33 @@ struct DirectionRunner {
     seq: u64,
 }
 
+struct DirectionRunnerParams {
+    config: NetemConfig,
+    stats: Arc<AtomicStats>,
+    queue_len: Arc<AtomicU64>,
+    blackout: Arc<AtomicBool>,
+    stop: Arc<Mutex<bool>>,
+    recv: Arc<dyn UdpTransport>,
+    send: Arc<dyn UdpTransport>,
+    fixed_dst: Option<SocketAddr>,
+    learned_dst: Arc<Mutex<Option<SocketAddr>>>,
+    shared: Option<SharedShaper>,
+}
+
 impl DirectionRunner {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        config: NetemConfig,
-        stats: Arc<AtomicStats>,
-        queue_len: Arc<AtomicU64>,
-        blackout: Arc<AtomicBool>,
-        stop: Arc<Mutex<bool>>,
-        recv: Arc<dyn UdpTransport>,
-        send: Arc<dyn UdpTransport>,
-        fixed_dst: Option<SocketAddr>,
-        learned_dst: Arc<Mutex<Option<SocketAddr>>>,
-        shared: Option<SharedShaper>,
-    ) -> Self {
+    fn new(params: DirectionRunnerParams) -> Self {
+        let DirectionRunnerParams {
+            config,
+            stats,
+            queue_len,
+            blackout,
+            stop,
+            recv,
+            send,
+            fixed_dst,
+            learned_dst,
+            shared,
+        } = params;
         let rng = RndState::seed(config.seed);
         Self {
             delay_cor: CorRng::new(config.delay_corr),

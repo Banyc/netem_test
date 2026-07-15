@@ -296,13 +296,17 @@ fn rtp_permanent_hole_liveness_smoke() {
         let connected = rtp::udp::connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
             "0.0.0.0:0",
             &pair.client_addr().to_string(),
-            None,
-            false,
-            false,
-            rtp::udp::NO_FEC_MSS,
-            rtp::transmission::fec_tuning::FecTuning::default(),
-            rtp::transmission::frame_delivery::FrameDelivery::default(),
-            watchdog_tuning,
+            rtp::udp::WatchdogConnectConfig {
+                connection: rtp::udp::ConnectConfig {
+                    log_config: None,
+                    handshake: false,
+                    fec: false,
+                    mss: rtp::udp::NO_FEC_MSS,
+                    fec_tuning: rtp::transmission::fec_tuning::FecTuning::default(),
+                    frame_delivery: rtp::transmission::frame_delivery::FrameDelivery::default(),
+                },
+                watchdog: watchdog_tuning,
+            },
         )
         .await
         .unwrap();
