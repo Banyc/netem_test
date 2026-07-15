@@ -20,6 +20,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+fn serialization_delay(len: usize, rate_bps: u64) -> Option<Duration> {
+    (len as u64)
+        .saturating_mul(8)
+        .saturating_mul(1_000_000_000)
+        .checked_div(rate_bps)
+        .map(Duration::from_nanos)
+}
+
 // ───────────────────────────── seeded RNG ──────────────────────────────
 
 /// Kernel `struct rnd_state` – four 32-bit Tausworthe LFSR lanes.
@@ -476,7 +484,7 @@ impl SharedShaper {
     /// Bytes currently sitting in the shared serialization backlog as of `now`.
     pub fn backlog_bytes(&self, now: Instant) -> u64 {
         let state = self.0.lock().unwrap();
-        let backlog_ns = state.next_send.saturating_duration_since(now).as_nanos() as u128;
+        let backlog_ns = state.next_send.saturating_duration_since(now).as_nanos();
         (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64
     }
 
@@ -489,7 +497,7 @@ impl SharedShaper {
     /// add its own latency/jitter afterwards.
     pub fn schedule(&self, base: Instant, len: usize) -> Option<Instant> {
         let mut state = self.0.lock().unwrap();
-        let backlog_ns = state.next_send.saturating_duration_since(base).as_nanos() as u128;
+        let backlog_ns = state.next_send.saturating_duration_since(base).as_nanos();
         let backlog = (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64;
         if state.limit_bytes != 0 && backlog.saturating_add(len as u64) > state.limit_bytes {
             state.dropped += 1;
@@ -857,10 +865,7 @@ impl Runner {
             // scheduled send time) + packet_bits / rate_bps. Send-time
             // shaping only delays packets; it never drops them.
             if self.config.rate != 0 {
-                let packet_bits = (data.len() as u64).saturating_mul(8);
-                let serialize = Duration::from_nanos(
-                    packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
-                );
+                let serialize = serialization_delay(data.len(), self.config.rate).unwrap();
                 let earliest = base.max(self.next_send);
                 let t = earliest + serialize;
                 self.next_send = t;
@@ -928,6 +933,13 @@ pub struct NetemPair {
     stop: Arc<Mutex<bool>>,
 }
 
+struct NetemPairConfig {
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    c2s_shared: Option<SharedShaper>,
+    s2c_shared: Option<SharedShaper>,
+}
+
 impl NetemPair {
     /// Spawn a bidirectional proxy. Clients send to the returned
     /// [`NetemPair::client_addr`]; the proxy forwards to `server_addr` with
@@ -950,15 +962,17 @@ impl NetemPair {
         let client_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(client_bind)?);
         let server_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(server_bind)?);
         let client_addr = client_sock.local_addr()?;
-        Self::spawn_from_sockets_shared(
+        Self::spawn_from_sockets(
             server_addr,
-            c2s,
-            s2c,
             client_sock,
             server_sock,
             client_addr,
-            None,
-            None,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared: None,
+                s2c_shared: None,
+            },
         )
     }
 
@@ -1000,49 +1014,33 @@ impl NetemPair {
         let client_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(client_bind)?);
         let server_sock: Box<dyn UdpTransport> = Box::new(StdUdpTransport::bind(server_bind)?);
         let client_addr = client_sock.local_addr()?;
-        Self::spawn_from_sockets_shared(
+        Self::spawn_from_sockets(
             server_addr,
-            c2s,
-            s2c,
             client_sock,
             server_sock,
             client_addr,
-            c2s_shared,
-            s2c_shared,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared,
+                s2c_shared,
+            },
         )
     }
 
-    #[allow(dead_code)]
     fn spawn_from_sockets(
         server_addr: SocketAddr,
-        c2s: NetemConfig,
-        s2c: NetemConfig,
         client_sock: Box<dyn UdpTransport>,
         server_sock: Box<dyn UdpTransport>,
         client_addr: SocketAddr,
+        config: NetemPairConfig,
     ) -> io::Result<Self> {
-        Self::spawn_from_sockets_shared(
-            server_addr,
+        let NetemPairConfig {
             c2s,
             s2c,
-            client_sock,
-            server_sock,
-            client_addr,
-            None,
-            None,
-        )
-    }
-
-    fn spawn_from_sockets_shared(
-        server_addr: SocketAddr,
-        c2s: NetemConfig,
-        s2c: NetemConfig,
-        client_sock: Box<dyn UdpTransport>,
-        server_sock: Box<dyn UdpTransport>,
-        client_addr: SocketAddr,
-        c2s_shared: Option<SharedShaper>,
-        s2c_shared: Option<SharedShaper>,
-    ) -> io::Result<Self> {
+            c2s_shared,
+            s2c_shared,
+        } = config;
         if c2s_shared.is_some() {
             assert_eq!(
                 c2s.rate, 0,
@@ -1083,36 +1081,40 @@ impl NetemPair {
 
         // c2s: recv on client_sock, send on server_sock to server_addr; learn
         // the client's address from the first packet.
-        let c2s_runner = DirectionRunner::new(DirectionRunnerParams {
-            config: c2s,
-            stats: stats_c2s,
-            queue_len: queue_len_c2s,
-            blackout: blackout_c2s,
-            stop: Arc::clone(&stop),
-            recv: Arc::clone(&client_sock),
-            send: Arc::clone(&server_sock),
-            fixed_dst: Some(server_addr),
-            learned_dst: Arc::clone(&learned_client),
-            shared: c2s_shared,
-        });
+        let c2s_runner = DirectionRunner::new(
+            Arc::clone(&client_sock),
+            Arc::clone(&server_sock),
+            DirectionRunnerConfig {
+                netem: c2s,
+                stats: stats_c2s,
+                queue_len: queue_len_c2s,
+                blackout: blackout_c2s,
+                stop: Arc::clone(&stop),
+                fixed_dst: Some(server_addr),
+                learned_dst: Arc::clone(&learned_client),
+                shared: c2s_shared,
+            },
+        );
         std::thread::Builder::new()
             .name("netem-c2s".into())
             .spawn(move || c2s_runner.run())?;
 
         // s2c: recv on server_sock, send on client_sock to the learned client
         // address.
-        let s2c_runner = DirectionRunner::new(DirectionRunnerParams {
-            config: s2c,
-            stats: stats_s2c,
-            queue_len: queue_len_s2c,
-            blackout: blackout_s2c,
-            stop,
-            recv: server_sock,
-            send: client_sock,
-            fixed_dst: None,
-            learned_dst: learned_client,
-            shared: s2c_shared,
-        });
+        let s2c_runner = DirectionRunner::new(
+            server_sock,
+            client_sock,
+            DirectionRunnerConfig {
+                netem: s2c,
+                stats: stats_s2c,
+                queue_len: queue_len_s2c,
+                blackout: blackout_s2c,
+                stop,
+                fixed_dst: None,
+                learned_dst: learned_client,
+                shared: s2c_shared,
+            },
+        );
         std::thread::Builder::new()
             .name("netem-s2c".into())
             .spawn(move || s2c_runner.run())?;
@@ -1229,41 +1231,41 @@ struct DirectionRunner {
     seq: u64,
 }
 
-struct DirectionRunnerParams {
-    config: NetemConfig,
+struct DirectionRunnerConfig {
+    netem: NetemConfig,
     stats: Arc<AtomicStats>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
-    recv: Arc<dyn UdpTransport>,
-    send: Arc<dyn UdpTransport>,
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<Mutex<Option<SocketAddr>>>,
     shared: Option<SharedShaper>,
 }
 
 impl DirectionRunner {
-    fn new(params: DirectionRunnerParams) -> Self {
-        let DirectionRunnerParams {
-            config,
+    fn new(
+        recv: Arc<dyn UdpTransport>,
+        send: Arc<dyn UdpTransport>,
+        config: DirectionRunnerConfig,
+    ) -> Self {
+        let DirectionRunnerConfig {
+            netem,
             stats,
             queue_len,
             blackout,
             stop,
-            recv,
-            send,
             fixed_dst,
             learned_dst,
             shared,
-        } = params;
-        let rng = RndState::seed(config.seed);
+        } = config;
+        let rng = RndState::seed(netem.seed);
         Self {
-            delay_cor: CorRng::new(config.delay_corr),
-            loss_cor: CorRng::new(config.loss_corr),
-            dup_cor: CorRng::new(config.dup_corr),
-            reorder_cor: CorRng::new(config.reorder_corr),
+            delay_cor: CorRng::new(netem.delay_corr),
+            loss_cor: CorRng::new(netem.loss_corr),
+            dup_cor: CorRng::new(netem.dup_corr),
+            reorder_cor: CorRng::new(netem.reorder_corr),
             next_send: Instant::now(),
-            config,
+            config: netem,
             stats,
             queue_len,
             blackout,
@@ -1431,10 +1433,7 @@ impl DirectionRunner {
                 // scheduled send time) + packet_bits / rate_bps. Send-time
                 // shaping only delays packets; it never drops them.
                 if self.config.rate != 0 {
-                    let packet_bits = (data.len() as u64).saturating_mul(8);
-                    let serialize = Duration::from_nanos(
-                        packet_bits.saturating_mul(1_000_000_000) / self.config.rate,
-                    );
+                    let serialize = serialization_delay(data.len(), self.config.rate).unwrap();
                     let earliest = base.max(self.next_send);
                     let t = earliest + serialize;
                     self.next_send = t;
@@ -1573,8 +1572,10 @@ mod tests {
 
     #[test]
     fn max_datagram_size_drops_only_oversized_datagrams() {
-        let mut config = NetemConfig::default();
-        config.max_datagram_size = 512;
+        let config = NetemConfig {
+            max_datagram_size: 512,
+            ..Default::default()
+        };
         let (mut runner, _sent) = one_packet_runner(
             &[0u8; 100],
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
@@ -1690,9 +1691,11 @@ mod tests {
 
     #[test]
     fn limit_zero_is_unbounded() {
-        let mut config = NetemConfig::default();
-        config.latency = Duration::from_secs(1);
-        config.limit = 0;
+        let config = NetemConfig {
+            latency: Duration::from_secs(1),
+            limit: 0,
+            ..Default::default()
+        };
         let (mut runner, sent) = one_packet_runner(
             b"x",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
@@ -1714,9 +1717,11 @@ mod tests {
 
     #[test]
     fn limit_tail_drops_and_counts_overflow() {
-        let mut config = NetemConfig::default();
-        config.latency = Duration::from_secs(1);
-        config.limit = 4;
+        let config = NetemConfig {
+            latency: Duration::from_secs(1),
+            limit: 4,
+            ..Default::default()
+        };
         let (mut runner, sent) = one_packet_runner(
             b"x",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
@@ -1740,9 +1745,11 @@ mod tests {
 
     #[test]
     fn overflow_drops_do_not_advance_shaper_clock_or_reorder_slot() {
-        let mut config = NetemConfig::default();
-        config.rate = 8_000; // 1 byte per ms
-        config.limit = 2;
+        let config = NetemConfig {
+            rate: 8_000, // 1 byte per ms
+            limit: 2,
+            ..Default::default()
+        };
         // Fill queue to capacity.
         let (mut runner, sent) = one_packet_runner(
             b"a",
@@ -1770,9 +1777,11 @@ mod tests {
 
     #[test]
     fn limit_decisions_consume_no_prng_draws() {
-        let mut config = NetemConfig::default();
-        config.latency = Duration::from_secs(1);
-        config.limit = 1;
+        let config = NetemConfig {
+            latency: Duration::from_secs(1),
+            limit: 1,
+            ..Default::default()
+        };
         // Gap/reorder/reorder_corr are zero so no reorder draws happen anyway;
         // this test primarily exercises that tail-drop returns early.
         let (mut runner, sent) = one_packet_runner(
@@ -1795,10 +1804,12 @@ mod tests {
 
     #[test]
     fn blackout_gates_at_forward_time_and_toggles_instantly() {
-        let mut config = NetemConfig::default();
-        // Latency small enough that the first packet has drained by the time we
-        // inspect, while the second is gated.
-        config.latency = Duration::from_millis(1);
+        let config = NetemConfig {
+            // Latency small enough that the first packet has drained by the time we
+            // inspect, while the second is gated.
+            latency: Duration::from_millis(1),
+            ..Default::default()
+        };
         let (mut runner, sent) = one_packet_runner(
             b"before",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
@@ -1823,12 +1834,16 @@ mod tests {
     #[test]
     fn netem_pair_exposes_per_direction_queue_depth() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3000));
-        let mut c2s = NetemConfig::default();
-        c2s.latency = Duration::from_secs(1);
-        c2s.limit = 5;
-        let mut s2c = NetemConfig::default();
-        s2c.latency = Duration::from_millis(500);
-        s2c.limit = 2;
+        let c2s = NetemConfig {
+            latency: Duration::from_secs(1),
+            limit: 5,
+            ..Default::default()
+        };
+        let s2c = NetemConfig {
+            latency: Duration::from_millis(500),
+            limit: 2,
+            ..Default::default()
+        };
 
         let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
             std::net::Ipv4Addr::LOCALHOST,
@@ -1838,11 +1853,15 @@ mod tests {
         let client_addr = client_sock.local_addr().unwrap();
         let pair = NetemPair::spawn_from_sockets(
             server_addr,
-            c2s,
-            s2c,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
             Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
             client_addr,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared: None,
+                s2c_shared: None,
+            },
         )
         .unwrap();
 
@@ -1863,10 +1882,14 @@ mod tests {
     #[test]
     fn pair_blackout_toggles_at_runtime() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3100));
-        let mut c2s = NetemConfig::default();
-        c2s.latency = Duration::from_millis(2);
-        let mut s2c = NetemConfig::default();
-        s2c.latency = Duration::from_millis(2);
+        let c2s = NetemConfig {
+            latency: Duration::from_millis(2),
+            ..Default::default()
+        };
+        let s2c = NetemConfig {
+            latency: Duration::from_millis(2),
+            ..Default::default()
+        };
 
         let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
             std::net::Ipv4Addr::LOCALHOST,
@@ -1876,11 +1899,15 @@ mod tests {
         let client_addr = client_sock.local_addr().unwrap();
         let pair = NetemPair::spawn_from_sockets(
             server_addr,
-            c2s,
-            s2c,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
             Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
             client_addr,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared: None,
+                s2c_shared: None,
+            },
         )
         .unwrap();
 
@@ -2000,8 +2027,10 @@ mod tests {
     #[test]
     fn shared_shaper_overflow_counts_in_direction_stats() {
         let shared = SharedShaper::new(8_000, 80);
-        let mut c2s = NetemConfig::default();
-        c2s.rate = 0;
+        let c2s = NetemConfig {
+            rate: 0,
+            ..Default::default()
+        };
         let s2c = NetemConfig::default();
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6000));
         let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
@@ -2011,15 +2040,17 @@ mod tests {
         let server_sock = Arc::new(MockTransport::new(server_addr));
         let client_addr = client_sock.local_addr().unwrap();
         let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
-        let pair = NetemPair::spawn_from_sockets_shared(
+        let pair = NetemPair::spawn_from_sockets(
             server_addr,
-            c2s,
-            s2c,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
             Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
             client_addr,
-            Some(shared),
-            None,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared: Some(shared),
+                s2c_shared: None,
+            },
         )
         .unwrap();
 
@@ -2045,8 +2076,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "double-shape")]
     fn spawn_shared_panics_on_c2s_double_shape() {
-        let mut c2s = NetemConfig::default();
-        c2s.rate = 1_000_000;
+        let c2s = NetemConfig {
+            rate: 1_000_000,
+            ..Default::default()
+        };
         let server = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6100));
         let _ = NetemPair::spawn_shared(
             server,
@@ -2060,8 +2093,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "double-shape")]
     fn spawn_shared_panics_on_s2c_double_shape() {
-        let mut s2c = NetemConfig::default();
-        s2c.rate = 1_000_000;
+        let s2c = NetemConfig {
+            rate: 1_000_000,
+            ..Default::default()
+        };
         let server = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6200));
         let _ = NetemPair::spawn_shared(
             server,
@@ -2193,8 +2228,10 @@ mod tests {
     #[test]
     fn two_flows_queue_arrival_order_shared_bottleneck() {
         let shaper = SharedShaper::new(8_000_000, 0);
-        let mut c2s = NetemConfig::default();
-        c2s.rate = 0;
+        let c2s = NetemConfig {
+            rate: 0,
+            ..Default::default()
+        };
         let s2c = NetemConfig::default();
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6300));
         let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
@@ -2204,15 +2241,17 @@ mod tests {
         let server_sock = Arc::new(MockTransport::new(server_addr));
         let client_addr = client_sock.local_addr().unwrap();
 
-        let pair = NetemPair::spawn_from_sockets_shared(
+        let pair = NetemPair::spawn_from_sockets(
             server_addr,
-            c2s,
-            s2c,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
             Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
             client_addr,
-            Some(shaper.clone()),
-            None,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared: Some(shaper.clone()),
+                s2c_shared: None,
+            },
         )
         .unwrap();
 
@@ -2243,8 +2282,10 @@ mod tests {
     #[test]
     fn shared_bottleneck_overflow_counts_overflow_dropped() {
         let shaper = SharedShaper::new(8_000, 80);
-        let mut c2s = NetemConfig::default();
-        c2s.rate = 0;
+        let c2s = NetemConfig {
+            rate: 0,
+            ..Default::default()
+        };
         let s2c = NetemConfig::default();
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6400));
         let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
@@ -2254,15 +2295,17 @@ mod tests {
         let server_sock = Arc::new(MockTransport::new(server_addr));
         let client_addr = client_sock.local_addr().unwrap();
 
-        let pair = NetemPair::spawn_from_sockets_shared(
+        let pair = NetemPair::spawn_from_sockets(
             server_addr,
-            c2s,
-            s2c,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
             Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
             client_addr,
-            Some(shaper.clone()),
-            None,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared: Some(shaper.clone()),
+                s2c_shared: None,
+            },
         )
         .unwrap();
 

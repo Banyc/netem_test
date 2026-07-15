@@ -51,14 +51,11 @@ async fn spawn_mux_bulk_sink() -> std::io::Result<(std::net::SocketAddr, Arc<Ato
             let delivered_for_stream = Arc::clone(&delivered_for_server);
             async move {
                 let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    match stream_read.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            delivered_for_stream.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                        Err(_) => break,
+                while let Ok(n) = stream_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
                     }
+                    delivered_for_stream.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 let _ = stream_write.shutdown();
             }
@@ -97,10 +94,9 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     // moving and the writer does not stall.
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match stream_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        while let Ok(n) = stream_read.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
         }
     });

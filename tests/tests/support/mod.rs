@@ -740,11 +740,7 @@ pub async fn spawn_mux_latency_bulk_server(
                     // Timestamped latency frame parser.
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset = 0usize;
-                    loop {
-                        let n = match stream_read.read(&mut buf[offset..]).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
+                     while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
                         if n == 0 {
                             break;
                         }
@@ -784,11 +780,7 @@ pub async fn spawn_mux_latency_bulk_server(
                     // count verified bytes. The tag byte itself is excluded.
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset: u64 = 0;
-                    loop {
-                        let n = match stream_read.read(&mut buf).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
+                     while let Ok(n) = stream_read.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
@@ -846,11 +838,7 @@ pub async fn spawn_mux_sized_latency_bulk_server(
                 if tag[0] == b'L' {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset = 0usize;
-                    loop {
-                        let n = match stream_read.read(&mut buf[offset..]).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
+                     while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
                         if n == 0 {
                             break;
                         }
@@ -888,11 +876,7 @@ pub async fn spawn_mux_sized_latency_bulk_server(
                 } else {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset: u64 = 0;
-                    loop {
-                        let n = match stream_read.read(&mut buf).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
+                     while let Ok(n) = stream_read.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
@@ -935,11 +919,7 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
             async move {
                 let mut buf = vec![0u8; 64 * 1024];
                 let mut offset = 0usize;
-                loop {
-                    let n = match stream_read.read(&mut buf[offset..]).await {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
+                 while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
                     if n == 0 {
                         break;
                     }
@@ -1313,17 +1293,12 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
 
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
-        loop {
-            match listener_bg
-                .accept_without_handshake_with_mss(fec, mss)
-                .await
-            {
-                Ok(accepted) => {
-                    let _ = accept_tx.send(accepted);
-                }
-                Err(_) => break,
-            }
-        }
+         while let Ok(accepted) = listener_bg
+             .accept_without_handshake_with_mss(fec, mss)
+             .await
+         {
+             let _ = accept_tx.send(accepted);
+         }
     });
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
@@ -1347,118 +1322,110 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
             )
             .await;
 
-            match result {
-                Ok((_class, nonce, pa)) => {
-                    let entries = pending.entry(nonce).or_default();
-                    entries.push(pa);
-                    if entries.len() == 2 {
-                        let pa2 = entries.pop().unwrap();
-                        let pa1 = entries.pop().unwrap();
-                        pending.remove(&nonce);
+            if let Ok((_class, nonce, pa)) = result {
+                let entries = pending.entry(nonce).or_default();
+                entries.push(pa);
+                if entries.len() == 2 {
+                    let pa2 = entries.pop().unwrap();
+                    let pa1 = entries.pop().unwrap();
+                    pending.remove(&nonce);
 
-                        let mut pair_spawner = JoinSet::new();
-                        if let Ok((_opener, mut accepter)) =
-                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                        {
-                            let bulk = Arc::clone(&bulk_for_main);
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let _spawner = pair_spawner;
-                                while let Ok((mut reader, mut writer, _class)) =
-                                    accepter.accept().await
-                                {
-                                    let bulk = Arc::clone(&bulk);
-                                    let tx = tx.clone();
-                                    tokio::spawn(async move {
-                                        let mut tag = [0u8; 1];
-                                        if reader.read_exact(&mut tag).await.is_err() {
-                                            let _ = writer.shutdown();
-                                            return;
-                                        }
-                                        if tag[0] == b'L' {
-                                            let mut buf = vec![0u8; 64 * 1024];
-                                            let mut offset = 0usize;
+                    let mut pair_spawner = JoinSet::new();
+                    if let Ok((_opener, mut accepter)) =
+                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                    {
+                        let bulk = Arc::clone(&bulk_for_main);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let _spawner = pair_spawner;
+                            while let Ok((mut reader, mut writer, _class)) =
+                                accepter.accept().await
+                            {
+                                let bulk = Arc::clone(&bulk);
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let mut tag = [0u8; 1];
+                                    if reader.read_exact(&mut tag).await.is_err() {
+                                        let _ = writer.shutdown();
+                                        return;
+                                    }
+                                    if tag[0] == b'L' {
+                                        let mut buf = vec![0u8; 64 * 1024];
+                                        let mut offset = 0usize;
+                                         while let Ok(n) = reader.read(&mut buf[offset..]).await {
+                                            if n == 0 {
+                                                break;
+                                            }
+                                            offset += n;
                                             loop {
-                                                let n = match reader.read(&mut buf[offset..]).await
-                                                {
-                                                    Ok(n) => n,
-                                                    Err(_) => break,
-                                                };
-                                                if n == 0 {
+                                                if offset < 4 {
                                                     break;
                                                 }
-                                                offset += n;
-                                                loop {
-                                                    if offset < 4 {
-                                                        break;
-                                                    }
-                                                    let frame_len = u32::from_le_bytes([
-                                                        buf[0], buf[1], buf[2], buf[3],
-                                                    ])
-                                                        as usize;
-                                                    if frame_len < 12 {
-                                                        break;
-                                                    }
-                                                    if offset < frame_len {
-                                                        break;
-                                                    }
-                                                    let payload_end = frame_len - 8;
-                                                    let sent_us = u64::from_le_bytes([
-                                                        buf[payload_end],
-                                                        buf[payload_end + 1],
-                                                        buf[payload_end + 2],
-                                                        buf[payload_end + 3],
-                                                        buf[payload_end + 4],
-                                                        buf[payload_end + 5],
-                                                        buf[payload_end + 6],
-                                                        buf[payload_end + 7],
-                                                    ]);
-                                                    let now_us = base.elapsed().as_micros() as u64;
-                                                    let latency_ms = now_us.saturating_sub(sent_us)
-                                                        as f64
-                                                        / 1000.0;
-                                                    let _ = tx.send(latency_ms);
-                                                    buf.copy_within(frame_len..offset, 0);
-                                                    offset -= frame_len;
+                                                let frame_len = u32::from_le_bytes([
+                                                    buf[0], buf[1], buf[2], buf[3],
+                                                ])
+                                                    as usize;
+                                                if frame_len < 12 {
+                                                    break;
                                                 }
+                                                if offset < frame_len {
+                                                    break;
+                                                }
+                                                let payload_end = frame_len - 8;
+                                                let sent_us = u64::from_le_bytes([
+                                                    buf[payload_end],
+                                                    buf[payload_end + 1],
+                                                    buf[payload_end + 2],
+                                                    buf[payload_end + 3],
+                                                    buf[payload_end + 4],
+                                                    buf[payload_end + 5],
+                                                    buf[payload_end + 6],
+                                                    buf[payload_end + 7],
+                                                ]);
+                                                let now_us = base.elapsed().as_micros() as u64;
+                                                let latency_ms = now_us.saturating_sub(sent_us)
+                                                    as f64
+                                                    / 1000.0;
+                                                let _ = tx.send(latency_ms);
+                                                buf.copy_within(frame_len..offset, 0);
+                                                offset -= frame_len;
                                             }
-                                        } else {
-                                            let mut buf = vec![0u8; 64 * 1024];
-                                            let mut offset: u64 = 0;
-                                            loop {
-                                                match reader.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => break,
-                                                    Ok(n) => {
-                                                        let mut ok = true;
-                                                        for (j, &actual) in
-                                                            buf[..n].iter().enumerate()
-                                                        {
-                                                            let expected =
-                                                                ((offset + j as u64) % 251) as u8;
-                                                            if actual != expected {
-                                                                ok = false;
-                                                                break;
-                                                            }
+                                        }
+                                    } else {
+                                        let mut buf = vec![0u8; 64 * 1024];
+                                        let mut offset: u64 = 0;
+                                        loop {
+                                            match reader.read(&mut buf).await {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(n) => {
+                                                    let mut ok = true;
+                                                    for (j, &actual) in
+                                                        buf[..n].iter().enumerate()
+                                                    {
+                                                        let expected =
+                                                            ((offset + j as u64) % 251) as u8;
+                                                        if actual != expected {
+                                                            ok = false;
+                                                            break;
                                                         }
-                                                        if ok {
-                                                            offset += n as u64;
-                                                            bulk.fetch_add(
-                                                                n as u64,
-                                                                Ordering::Relaxed,
-                                                            );
-                                                        }
+                                                    }
+                                                    if ok {
+                                                        offset += n as u64;
+                                                        bulk.fetch_add(
+                                                            n as u64,
+                                                            Ordering::Relaxed,
+                                                        );
                                                     }
                                                 }
                                             }
                                         }
-                                        let _ = writer.shutdown();
-                                    });
-                                }
-                            });
-                        }
+                                    }
+                                    let _ = writer.shutdown();
+                                });
+                            }
+                        });
                     }
                 }
-                Err(_) => {}
             }
         }
     });
@@ -1484,17 +1451,12 @@ pub async fn spawn_dual_msg_channel_server(
 
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
-        loop {
-            match listener_bg
-                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
-                .await
-            {
-                Ok(accepted) => {
-                    let _ = accept_tx.send(accepted);
-                }
-                Err(_) => break,
-            }
-        }
+         while let Ok(accepted) = listener_bg
+             .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+             .await
+         {
+             let _ = accept_tx.send(accepted);
+         }
     });
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
@@ -1518,92 +1480,89 @@ pub async fn spawn_dual_msg_channel_server(
             )
             .await;
 
-            match result {
-                Ok((_class, nonce, pa)) => {
-                    let entries = pending.entry(nonce).or_default();
-                    entries.push(pa);
-                    if entries.len() == 2 {
-                        let pa2 = entries.pop().unwrap();
-                        let pa1 = entries.pop().unwrap();
-                        pending.remove(&nonce);
+            if let Ok((_class, nonce, pa)) = result {
+                let entries = pending.entry(nonce).or_default();
+                entries.push(pa);
+                if entries.len() == 2 {
+                    let pa2 = entries.pop().unwrap();
+                    let pa1 = entries.pop().unwrap();
+                    pending.remove(&nonce);
 
-                        let mut pair_spawner = JoinSet::new();
-                        if let Ok((_opener, mut accepter)) =
-                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                        {
-                            let bulk = Arc::clone(&bulk_for_main);
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let _spawner = pair_spawner;
+                    let mut pair_spawner = JoinSet::new();
+                    if let Ok((_opener, mut accepter)) =
+                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                    {
+                        let bulk = Arc::clone(&bulk_for_main);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let _spawner = pair_spawner;
 
-                                let bulk = Arc::clone(&bulk);
-                                if let Ok((mut reader, writer, _class)) = accepter.accept().await {
-                                    tokio::spawn(async move {
-                                        let _w = writer;
-                                        let mut buf = vec![0u8; 64 * 1024];
-                                        let mut offset: u64 = 0;
-                                        loop {
-                                            match reader.read(&mut buf).await {
-                                                Ok(0) | Err(_) => break,
-                                                Ok(n) => {
-                                                    let mut ok = true;
-                                                    for (j, &actual) in buf[..n].iter().enumerate()
-                                                    {
-                                                        let expected =
-                                                            ((offset + j as u64) % 251) as u8;
-                                                        if actual != expected {
-                                                            ok = false;
-                                                            break;
-                                                        }
+                            let bulk = Arc::clone(&bulk);
+                            if let Ok((mut reader, writer, _class)) = accepter.accept().await {
+                                tokio::spawn(async move {
+                                    let _w = writer;
+                                    let mut buf = vec![0u8; 64 * 1024];
+                                    let mut offset: u64 = 0;
+                                    loop {
+                                        match reader.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                let mut ok = true;
+                                                for (j, &actual) in buf[..n].iter().enumerate()
+                                                {
+                                                    let expected =
+                                                        ((offset + j as u64) % 251) as u8;
+                                                    if actual != expected {
+                                                        ok = false;
+                                                        break;
                                                     }
-                                                    if ok {
-                                                        offset += n as u64;
-                                                        bulk.fetch_add(n as u64, Ordering::Relaxed);
-                                                    }
+                                                }
+                                                if ok {
+                                                    offset += n as u64;
+                                                    bulk.fetch_add(n as u64, Ordering::Relaxed);
                                                 }
                                             }
                                         }
-                                    });
-                                }
-
-                                let mut receiver = mux::DualMessageReceiver::new(accepter, mode);
-                                loop {
-                                    match receiver.recv().await {
-                                        Ok(Some(payload)) => {
-                                            if payload.len() >= 12 {
-                                                let frame_len = u32::from_le_bytes([
-                                                    payload[0], payload[1], payload[2], payload[3],
-                                                ])
-                                                    as usize;
-                                                if frame_len >= 12 && payload.len() >= frame_len {
-                                                    let payload_end = frame_len - 8;
-                                                    let sent_us = u64::from_le_bytes([
-                                                        payload[payload_end],
-                                                        payload[payload_end + 1],
-                                                        payload[payload_end + 2],
-                                                        payload[payload_end + 3],
-                                                        payload[payload_end + 4],
-                                                        payload[payload_end + 5],
-                                                        payload[payload_end + 6],
-                                                        payload[payload_end + 7],
-                                                    ]);
-                                                    let now_us = base.elapsed().as_micros() as u64;
-                                                    let latency_ms = now_us.saturating_sub(sent_us)
-                                                        as f64
-                                                        / 1000.0;
-                                                    let _ = tx.send(latency_ms);
-                                                }
-                                            }
-                                        }
-                                        Ok(None) => break,
-                                        Err(_) => break,
                                     }
+                                });
+                            }
+
+                            let mut receiver = mux::DualMessageReceiver::new(accepter, mode);
+                            loop {
+                                match receiver.recv().await {
+                                    Ok(Some(payload)) => {
+                                        if payload.len() >= 12 {
+                                            let frame_len = u32::from_le_bytes([
+                                                payload[0], payload[1], payload[2], payload[3],
+                                            ])
+                                                as usize;
+                                            if frame_len >= 12 && payload.len() >= frame_len {
+                                                let payload_end = frame_len - 8;
+                                                let sent_us = u64::from_le_bytes([
+                                                    payload[payload_end],
+                                                    payload[payload_end + 1],
+                                                    payload[payload_end + 2],
+                                                    payload[payload_end + 3],
+                                                    payload[payload_end + 4],
+                                                    payload[payload_end + 5],
+                                                    payload[payload_end + 6],
+                                                    payload[payload_end + 7],
+                                                ]);
+                                                let now_us = base.elapsed().as_micros() as u64;
+                                                let latency_ms = now_us.saturating_sub(sent_us)
+                                                    as f64
+                                                    / 1000.0;
+                                                let _ = tx.send(latency_ms);
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(_) => break,
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
                 }
-                Err(_) => {}
             }
         }
     });
@@ -1628,17 +1587,12 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
 
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
-        loop {
-            match listener_bg
-                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
-                .await
-            {
-                Ok(accepted) => {
-                    let _ = accept_tx.send(accepted);
-                }
-                Err(_) => break,
-            }
-        }
+         while let Ok(accepted) = listener_bg
+             .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+             .await
+         {
+             let _ = accept_tx.send(accepted);
+         }
     });
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
@@ -1662,54 +1616,51 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
             )
             .await;
 
-            match result {
-                Ok((_class, nonce, pa)) => {
-                    let entries = pending.entry(nonce).or_default();
-                    entries.push(pa);
-                    if entries.len() == 2 {
-                        let pa2 = entries.pop().unwrap();
-                        let pa1 = entries.pop().unwrap();
-                        pending.remove(&nonce);
+            if let Ok((_class, nonce, pa)) = result {
+                let entries = pending.entry(nonce).or_default();
+                entries.push(pa);
+                if entries.len() == 2 {
+                    let pa2 = entries.pop().unwrap();
+                    let pa1 = entries.pop().unwrap();
+                    pending.remove(&nonce);
 
-                        let mut pair_spawner = JoinSet::new();
-                        if let Ok((_opener, accepter)) =
-                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                        {
-                            let bulk = Arc::clone(&bulk_for_main);
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let _spawner = pair_spawner;
-                                let mut mac = accepter.into_migrating_capable();
-                                loop {
-                                    match mac.accept().await {
-                                        Ok(mux::AcceptedStream::Migrating {
-                                            reader,
-                                            writer,
-                                            ..
-                                        }) => {
-                                            let bulk = Arc::clone(&bulk);
-                                            let tx = tx.clone();
-                                            tokio::spawn(handle_latency_bulk_stream(
-                                                reader, writer, base, bulk, tx,
-                                            ));
-                                        }
-                                        Ok(mux::AcceptedStream::Plain {
-                                            reader, writer, ..
-                                        }) => {
-                                            let bulk = Arc::clone(&bulk);
-                                            let tx = tx.clone();
-                                            tokio::spawn(handle_latency_bulk_stream(
-                                                reader, writer, base, bulk, tx,
-                                            ));
-                                        }
-                                        Err(_) => break,
+                    let mut pair_spawner = JoinSet::new();
+                    if let Ok((_opener, accepter)) =
+                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                    {
+                        let bulk = Arc::clone(&bulk_for_main);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let _spawner = pair_spawner;
+                            let mut mac = accepter.into_migrating_capable();
+                            loop {
+                                match mac.accept().await {
+                                    Ok(mux::AcceptedStream::Migrating {
+                                        reader,
+                                        writer,
+                                        ..
+                                    }) => {
+                                        let bulk = Arc::clone(&bulk);
+                                        let tx = tx.clone();
+                                        tokio::spawn(handle_latency_bulk_stream(
+                                            reader, writer, base, bulk, tx,
+                                        ));
                                     }
+                                    Ok(mux::AcceptedStream::Plain {
+                                        reader, writer, ..
+                                    }) => {
+                                        let bulk = Arc::clone(&bulk);
+                                        let tx = tx.clone();
+                                        tokio::spawn(handle_latency_bulk_stream(
+                                            reader, writer, base, bulk, tx,
+                                        ));
+                                    }
+                                    Err(_) => break,
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
                 }
-                Err(_) => {}
             }
         }
     });
@@ -1732,11 +1683,7 @@ async fn handle_latency_bulk_stream<R: AsyncRead + Unpin + Send + 'static>(
     if tag[0] == b'L' {
         let mut buf = vec![0u8; 64 * 1024];
         let mut offset = 0usize;
-        loop {
-            let n = match reader.read(&mut buf[offset..]).await {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+         while let Ok(n) = reader.read(&mut buf[offset..]).await {
             if n == 0 {
                 break;
             }
@@ -1811,17 +1758,12 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
 
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
-        loop {
-            match listener_bg
-                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
-                .await
-            {
-                Ok(accepted) => {
-                    let _ = accept_tx.send(accepted);
-                }
-                Err(_) => break,
-            }
-        }
+         while let Ok(accepted) = listener_bg
+             .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+             .await
+         {
+             let _ = accept_tx.send(accepted);
+         }
     });
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
@@ -1845,54 +1787,51 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
             )
             .await;
 
-            match result {
-                Ok((_class, nonce, pa)) => {
-                    let entries = pending.entry(nonce).or_default();
-                    entries.push(pa);
-                    if entries.len() == 2 {
-                        let pa2 = entries.pop().unwrap();
-                        let pa1 = entries.pop().unwrap();
-                        pending.remove(&nonce);
+            if let Ok((_class, nonce, pa)) = result {
+                let entries = pending.entry(nonce).or_default();
+                entries.push(pa);
+                if entries.len() == 2 {
+                    let pa2 = entries.pop().unwrap();
+                    let pa1 = entries.pop().unwrap();
+                    pending.remove(&nonce);
 
-                        let mut pair_spawner = JoinSet::new();
-                        if let Ok((_opener, accepter)) =
-                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                        {
-                            let bulk = Arc::clone(&bulk_for_main);
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let _spawner = pair_spawner;
-                                let mut mac = accepter.into_migrating_capable();
-                                loop {
-                                    match mac.accept().await {
-                                        Ok(mux::AcceptedStream::Migrating {
-                                            reader,
-                                            writer,
-                                            ..
-                                        }) => {
-                                            let bulk = Arc::clone(&bulk);
-                                            let tx = tx.clone();
-                                            tokio::spawn(handle_gaming_stream(
-                                                reader, writer, base, bulk, tx,
-                                            ));
-                                        }
-                                        Ok(mux::AcceptedStream::Plain {
-                                            reader, writer, ..
-                                        }) => {
-                                            let bulk = Arc::clone(&bulk);
-                                            let tx = tx.clone();
-                                            tokio::spawn(handle_gaming_stream(
-                                                reader, writer, base, bulk, tx,
-                                            ));
-                                        }
-                                        Err(_) => break,
+                    let mut pair_spawner = JoinSet::new();
+                    if let Ok((_opener, accepter)) =
+                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                    {
+                        let bulk = Arc::clone(&bulk_for_main);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let _spawner = pair_spawner;
+                            let mut mac = accepter.into_migrating_capable();
+                            loop {
+                                match mac.accept().await {
+                                    Ok(mux::AcceptedStream::Migrating {
+                                        reader,
+                                        writer,
+                                        ..
+                                    }) => {
+                                        let bulk = Arc::clone(&bulk);
+                                        let tx = tx.clone();
+                                        tokio::spawn(handle_gaming_stream(
+                                            reader, writer, base, bulk, tx,
+                                        ));
                                     }
+                                    Ok(mux::AcceptedStream::Plain {
+                                        reader, writer, ..
+                                    }) => {
+                                        let bulk = Arc::clone(&bulk);
+                                        let tx = tx.clone();
+                                        tokio::spawn(handle_gaming_stream(
+                                            reader, writer, base, bulk, tx,
+                                        ));
+                                    }
+                                    Err(_) => break,
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
                 }
-                Err(_) => {}
             }
         }
     });
@@ -1924,11 +1863,7 @@ async fn handle_gaming_stream<R: AsyncRead + Unpin + Send + 'static>(
             };
         }
         let mut offset = 0usize;
-        loop {
-            let n = match reader.read(&mut buf[offset..]).await {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+         while let Ok(n) = reader.read(&mut buf[offset..]).await {
             if n == 0 {
                 break;
             }
@@ -2025,11 +1960,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
                         };
                     }
                     let mut offset = 0usize;
-                    loop {
-                        let n = match stream_read.read(&mut buf[offset..]).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
+                     while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
                         if n == 0 {
                             break;
                         }
@@ -2064,11 +1995,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
                 } else {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset: u64 = 0;
-                    loop {
-                        let n = match stream_read.read(&mut buf).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
+                     while let Ok(n) = stream_read.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
@@ -2506,11 +2433,7 @@ fn spawn_tagged_stream_sink(
         if is_latency {
             let mut buf = vec![0u8; 64 * 1024];
             let mut offset = 0usize;
-            loop {
-                let n = match reader.read(&mut buf[offset..]).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
+             while let Ok(n) = reader.read(&mut buf[offset..]).await {
                 if n == 0 {
                     break;
                 }
@@ -2659,17 +2582,12 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
 
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
-        loop {
-            match listener_bg
-                .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
-                .await
-            {
-                Ok(accepted) => {
-                    let _ = accept_tx.send(accepted);
-                }
-                Err(_) => break,
-            }
-        }
+         while let Ok(accepted) = listener_bg
+             .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+             .await
+         {
+             let _ = accept_tx.send(accepted);
+         }
     });
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
@@ -2689,124 +2607,116 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
             )
             .await;
 
-            match result {
-                Ok((class, nonce, pa)) => {
-                    let cfg = match class {
-                        mux::LaneClass::Interactive => int_config.clone(),
-                        mux::LaneClass::Bulk => bulk_config.clone(),
-                    };
-                    let entries = pending.entry(nonce).or_default();
-                    entries.push((pa, cfg));
-                    if entries.len() == 2 {
-                        let (pa2, cfg2) = entries.pop().unwrap();
-                        let (pa1, cfg1) = entries.pop().unwrap();
-                        pending.remove(&nonce);
+            if let Ok((class, nonce, pa)) = result {
+                let cfg = match class {
+                    mux::LaneClass::Interactive => int_config.clone(),
+                    mux::LaneClass::Bulk => bulk_config.clone(),
+                };
+                let entries = pending.entry(nonce).or_default();
+                entries.push((pa, cfg));
+                if entries.len() == 2 {
+                    let (pa2, cfg2) = entries.pop().unwrap();
+                    let (pa1, cfg1) = entries.pop().unwrap();
+                    pending.remove(&nonce);
 
-                        let mut pair_spawner = JoinSet::new();
-                        if let Ok((_opener, mut accepter)) =
-                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                        {
-                            let bulk = Arc::clone(&bulk_for_main);
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let _spawner = pair_spawner;
-                                let _cfg1 = cfg1;
-                                let _cfg2 = cfg2;
-                                while let Ok((mut reader, mut writer, _class)) =
-                                    accepter.accept().await
-                                {
-                                    let bulk = Arc::clone(&bulk);
-                                    let tx = tx.clone();
-                                    tokio::spawn(async move {
-                                        let mut tag = [0u8; 1];
-                                        if reader.read_exact(&mut tag).await.is_err() {
-                                            let _ = writer.shutdown();
-                                            return;
-                                        }
-                                        if tag[0] == b'L' {
-                                            let mut buf = vec![0u8; 64 * 1024];
-                                            let mut offset = 0usize;
+                    let mut pair_spawner = JoinSet::new();
+                    if let Ok((_opener, mut accepter)) =
+                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                    {
+                        let bulk = Arc::clone(&bulk_for_main);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let _spawner = pair_spawner;
+                            let _cfg1 = cfg1;
+                            let _cfg2 = cfg2;
+                            while let Ok((mut reader, mut writer, _class)) =
+                                accepter.accept().await
+                            {
+                                let bulk = Arc::clone(&bulk);
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let mut tag = [0u8; 1];
+                                    if reader.read_exact(&mut tag).await.is_err() {
+                                        let _ = writer.shutdown();
+                                        return;
+                                    }
+                                    if tag[0] == b'L' {
+                                        let mut buf = vec![0u8; 64 * 1024];
+                                        let mut offset = 0usize;
+                                         while let Ok(n) = reader.read(&mut buf[offset..]).await {
+                                            if n == 0 {
+                                                break;
+                                            }
+                                            offset += n;
                                             loop {
-                                                let n = match reader.read(&mut buf[offset..]).await
-                                                {
-                                                    Ok(n) => n,
-                                                    Err(_) => break,
-                                                };
-                                                if n == 0 {
+                                                if offset < 4 {
                                                     break;
                                                 }
-                                                offset += n;
-                                                loop {
-                                                    if offset < 4 {
-                                                        break;
-                                                    }
-                                                    let frame_len = u32::from_le_bytes([
-                                                        buf[0], buf[1], buf[2], buf[3],
-                                                    ])
-                                                        as usize;
-                                                    if frame_len < 12 {
-                                                        break;
-                                                    }
-                                                    if offset < frame_len {
-                                                        break;
-                                                    }
-                                                    let payload_end = frame_len - 8;
-                                                    let sent_us = u64::from_le_bytes([
-                                                        buf[payload_end],
-                                                        buf[payload_end + 1],
-                                                        buf[payload_end + 2],
-                                                        buf[payload_end + 3],
-                                                        buf[payload_end + 4],
-                                                        buf[payload_end + 5],
-                                                        buf[payload_end + 6],
-                                                        buf[payload_end + 7],
-                                                    ]);
-                                                    let now_us = base.elapsed().as_micros() as u64;
-                                                    let latency_ms = now_us.saturating_sub(sent_us)
-                                                        as f64
-                                                        / 1000.0;
-                                                    let _ = tx.send((tag[0], latency_ms));
-                                                    buf.copy_within(frame_len..offset, 0);
-                                                    offset -= frame_len;
+                                                let frame_len = u32::from_le_bytes([
+                                                    buf[0], buf[1], buf[2], buf[3],
+                                                ])
+                                                    as usize;
+                                                if frame_len < 12 {
+                                                    break;
                                                 }
+                                                if offset < frame_len {
+                                                    break;
+                                                }
+                                                let payload_end = frame_len - 8;
+                                                let sent_us = u64::from_le_bytes([
+                                                    buf[payload_end],
+                                                    buf[payload_end + 1],
+                                                    buf[payload_end + 2],
+                                                    buf[payload_end + 3],
+                                                    buf[payload_end + 4],
+                                                    buf[payload_end + 5],
+                                                    buf[payload_end + 6],
+                                                    buf[payload_end + 7],
+                                                ]);
+                                                let now_us = base.elapsed().as_micros() as u64;
+                                                let latency_ms = now_us.saturating_sub(sent_us)
+                                                    as f64
+                                                    / 1000.0;
+                                                let _ = tx.send((tag[0], latency_ms));
+                                                buf.copy_within(frame_len..offset, 0);
+                                                offset -= frame_len;
                                             }
-                                        } else {
-                                            let mut buf = vec![0u8; 64 * 1024];
-                                            let mut offset: u64 = 0;
-                                            loop {
-                                                match reader.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => break,
-                                                    Ok(n) => {
-                                                        let mut ok = true;
-                                                        for (j, &actual) in
-                                                            buf[..n].iter().enumerate()
-                                                        {
-                                                            let expected =
-                                                                ((offset + j as u64) % 251) as u8;
-                                                            if actual != expected {
-                                                                ok = false;
-                                                                break;
-                                                            }
+                                        }
+                                    } else {
+                                        let mut buf = vec![0u8; 64 * 1024];
+                                        let mut offset: u64 = 0;
+                                        loop {
+                                            match reader.read(&mut buf).await {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(n) => {
+                                                    let mut ok = true;
+                                                    for (j, &actual) in
+                                                        buf[..n].iter().enumerate()
+                                                    {
+                                                        let expected =
+                                                            ((offset + j as u64) % 251) as u8;
+                                                        if actual != expected {
+                                                            ok = false;
+                                                            break;
                                                         }
-                                                        if ok {
-                                                            offset += n as u64;
-                                                            bulk.fetch_add(
-                                                                n as u64,
-                                                                Ordering::Relaxed,
-                                                            );
-                                                        }
+                                                    }
+                                                    if ok {
+                                                        offset += n as u64;
+                                                        bulk.fetch_add(
+                                                            n as u64,
+                                                            Ordering::Relaxed,
+                                                        );
                                                     }
                                                 }
                                             }
                                         }
-                                        let _ = writer.shutdown();
-                                    });
-                                }
-                            });
-                        }
+                                    }
+                                    let _ = writer.shutdown();
+                                });
+                            }
+                        });
                     }
                 }
-                Err(_) => {}
             }
         }
     });
@@ -2880,38 +2790,34 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
         while let Some((accepted, config)) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            match mux::spawn_dual_mux_acceptor(reader, writer, config, Duration::from_secs(3)).await
-            {
-                Ok((_class, nonce, pa)) => {
-                    let entries = pending.entry(nonce).or_default();
-                    entries.push(pa);
-                    if entries.len() == 2 {
-                        let pa2 = entries.pop().unwrap();
-                        let pa1 = entries.pop().unwrap();
-                        pending.remove(&nonce);
-                        let mut pair_spawner = JoinSet::new();
-                        if let Ok((_opener, mut accepter)) =
-                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                        {
-                            let bulk = Arc::clone(&bulk_for_main);
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let _spawner = pair_spawner;
-                                while let Ok((reader, writer, class)) = accepter.accept().await {
-                                    spawn_tagged_stream_sink(
-                                        reader,
-                                        writer,
-                                        tx.clone(),
-                                        Arc::clone(&bulk),
-                                        base,
-                                        class == mux::LaneClass::Interactive,
-                                    );
-                                }
-                            });
-                        }
+            if let Ok((_class, nonce, pa)) = mux::spawn_dual_mux_acceptor(reader, writer, config, Duration::from_secs(3)).await {
+                let entries = pending.entry(nonce).or_default();
+                entries.push(pa);
+                if entries.len() == 2 {
+                    let pa2 = entries.pop().unwrap();
+                    let pa1 = entries.pop().unwrap();
+                    pending.remove(&nonce);
+                    let mut pair_spawner = JoinSet::new();
+                    if let Ok((_opener, mut accepter)) =
+                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                    {
+                        let bulk = Arc::clone(&bulk_for_main);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let _spawner = pair_spawner;
+                            while let Ok((reader, writer, class)) = accepter.accept().await {
+                                spawn_tagged_stream_sink(
+                                    reader,
+                                    writer,
+                                    tx.clone(),
+                                    Arc::clone(&bulk),
+                                    base,
+                                    class == mux::LaneClass::Interactive,
+                                );
+                            }
+                        });
                     }
                 }
-                Err(_) => {}
             }
         }
     });
@@ -2995,11 +2901,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                 if tag[0] != b'B' {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset = 0usize;
-                    loop {
-                        let n = match reader.read(&mut buf[offset..]).await {
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
+                     while let Ok(n) = reader.read(&mut buf[offset..]).await {
                         if n == 0 {
                             break;
                         }

@@ -77,7 +77,7 @@ async fn rtp_bulk_goodput_burst_loss_retains_ninety_percent_of_random() {
     let mut ratios = Vec::with_capacity(BULK_REPETITIONS);
     for rep in 0..BULK_REPETITIONS {
         let seed_offset = rep * 100;
-        let (burst_delivered, random_delivered, burst_pair, random_pair) = if rep % 2 == 0 {
+        let (burst_delivered, random_delivered, burst_pair, random_pair) = if rep.is_multiple_of(2) {
             let burst = run_rtp_sink_upload(
                 burst_loss_link(
                     BURST_LOSS_PCT,

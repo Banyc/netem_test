@@ -78,19 +78,17 @@ async fn contested_rep(
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match ping_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        while let Ok(n) = ping_read.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
         }
     });
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match bulk_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        while let Ok(n) = bulk_read.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
         }
     });
@@ -160,7 +158,7 @@ async fn send_tagged_pings(
     cadence: Duration,
     run_for: Duration,
 ) -> u64 {
-    if write.write_all(&[b'L']).await.is_err() {
+    if write.write_all(b"L").await.is_err() {
         return 0;
     }
     support::send_timestamped_messages(write, base, msg_bytes, cadence, run_for).await
@@ -172,7 +170,7 @@ async fn run_mux_bulk_stream(
     payload: Arc<Vec<u8>>,
     active_for: Duration,
 ) -> u64 {
-    if write.write_all(&[b'B']).await.is_err() {
+    if write.write_all(b"B").await.is_err() {
         return 0;
     }
     let start = Instant::now();
@@ -242,15 +240,14 @@ fn print_contested_rep(label: &str, r: &ContestedRepResult, rep: usize, rate_bps
         q_max = q_max,
         bulk = bulk_mibps,
     );
-    if let Some(rate) = rate_bps {
-        if rate > 0 {
+    if let Some(rate) = rate_bps
+        && rate > 0 {
             let serialization_ms_per_pkt = 1400.0 * 8.0 * 1000.0 / rate as f64;
             eprintln!(
                 "[contested {label} rep={rep}] attribution: q_mean x {serialization_ms_per_pkt:.2} ms/pkt = {:.1} ms vs p50 {p50:.1} ms",
                 q_mean as f64 * serialization_ms_per_pkt,
             );
         }
-    }
 }
 
 /// Run `contested_rep` three times with seeds `100 + 10*rep`, print the

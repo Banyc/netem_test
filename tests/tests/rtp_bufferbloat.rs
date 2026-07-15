@@ -102,10 +102,9 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     let mut read = connected.read.into_async_read();
     let _reader = tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        while let Ok(n) = read.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
         }
     });

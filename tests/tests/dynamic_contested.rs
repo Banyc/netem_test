@@ -181,7 +181,7 @@ async fn run_latency_flow(
     let mut sent = 0u64;
     let start = Instant::now();
     while start.elapsed() < run_for {
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
+        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
             msg_rng.uniform_usize(4 * 1024, 64 * 1024)
         } else {
             SMALL_MSG_BYTES
@@ -250,10 +250,9 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match _lat_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                _ => {}
+        while let Ok(n) = _lat_read.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
         }
     });
@@ -277,10 +276,9 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     };
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match bulk_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                _ => {}
+        while let Ok(n) = bulk_read.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
         }
     });
@@ -613,7 +611,7 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
 
     while start.elapsed() < run_for {
         sent += 1;
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
+        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
             msg_rng.uniform_usize(4 * 1024, 64 * 1024)
         } else {
             SMALL_MSG_BYTES
@@ -746,7 +744,7 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
 
     while start.elapsed() < run_for {
         sent += 1;
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
+        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
             msg_rng.uniform_usize(4 * 1024, 64 * 1024)
         } else {
             SMALL_MSG_BYTES
@@ -878,7 +876,7 @@ async fn dyn_dual_msg_channel_rep(
     let start = Instant::now();
 
     while start.elapsed() < run_for {
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
+        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
             msg_rng.uniform_usize(4 * 1024, 64 * 1024)
         } else {
             SMALL_MSG_BYTES
@@ -1124,22 +1122,15 @@ async fn run_game_sync_client(
         let mut iters = 0u32;
         while start.elapsed() < run_for {
             let frame = make_latency_frame(SMALL_MSG_BYTES, base);
-            match tokio::time::timeout(Duration::from_secs(5), auto_writer.write_all(&frame)).await
-            {
-                Ok(Ok(())) => {
-                    sent += 1;
-                    match tokio::time::timeout(Duration::from_secs(5), lat_rx.recv()).await {
-                        Ok(Some(lat)) => {
-                            if phase2_start.elapsed().as_secs() < GAMING_TRANSITION_SECS {
-                                transition_latencies.push(lat);
-                            } else {
-                                steady_latencies.push(lat);
-                            }
-                        }
-                        _ => {}
+            if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(5), auto_writer.write_all(&frame)).await {
+                sent += 1;
+                if let Ok(Some(lat)) = tokio::time::timeout(Duration::from_secs(5), lat_rx.recv()).await {
+                    if phase2_start.elapsed().as_secs() < GAMING_TRANSITION_SECS {
+                        transition_latencies.push(lat);
+                    } else {
+                        steady_latencies.push(lat);
                     }
                 }
-                _ => {}
             }
             iters += 1;
             tokio::time::sleep(LATENCY_CADENCE).await;
@@ -1289,10 +1280,9 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
         let (mut bulk_read, _) = opener.open().await.unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8 * 1024];
-            loop {
-                match bulk_read.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    _ => {}
+            while let Ok(n) = bulk_read.read(&mut buf).await {
+                if n == 0 {
+                    break;
                 }
             }
         });
@@ -1312,10 +1302,9 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let (mut _game_read, mut game_write) = opener.open().await.unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match _game_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                _ => {}
+        while let Ok(n) = _game_read.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
         }
     });
@@ -1331,7 +1320,7 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     if game_write.write_all(&sync_buf).await.is_err() {
         let _ = game_write.shutdown();
         bulk_stop.store(true, Ordering::Relaxed);
-        let _ = bulk_handle;
+        drop(bulk_handle);
         return GamingResult {
             transition_latencies,
             steady_latencies,
@@ -1363,7 +1352,7 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
 
     let _ = game_write.shutdown();
     bulk_stop.store(true, Ordering::Relaxed);
-    let _ = bulk_handle;
+    drop(bulk_handle);
     let received = (transition_latencies.len() + steady_latencies.len()) as u64;
     GamingResult {
         transition_latencies,
@@ -1410,7 +1399,7 @@ async fn run_migrating_latency_flow(
     let mut sent = 0u64;
     let start = Instant::now();
     while start.elapsed() < run_for {
-        let msg_size = if msg_rng.next_u64() % BURST_RATIO == 0 {
+        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
             msg_rng.uniform_usize(4 * 1024, 64 * 1024)
         } else {
             SMALL_MSG_BYTES
