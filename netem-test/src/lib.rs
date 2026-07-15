@@ -864,8 +864,7 @@ impl Runner {
             // Schedule after max(now + configured_delay, previous
             // scheduled send time) + packet_bits / rate_bps. Send-time
             // shaping only delays packets; it never drops them.
-            if self.config.rate != 0 {
-                let serialize = serialization_delay(data.len(), self.config.rate).unwrap();
+            if let Some(serialize) = serialization_delay(data.len(), self.config.rate) {
                 let earliest = base.max(self.next_send);
                 let t = earliest + serialize;
                 self.next_send = t;
@@ -1432,8 +1431,7 @@ impl DirectionRunner {
                 // Schedule after max(now + configured_delay, previous
                 // scheduled send time) + packet_bits / rate_bps. Send-time
                 // shaping only delays packets; it never drops them.
-                if self.config.rate != 0 {
-                    let serialize = serialization_delay(data.len(), self.config.rate).unwrap();
+                if let Some(serialize) = serialization_delay(data.len(), self.config.rate) {
                     let earliest = base.max(self.next_send);
                     let t = earliest + serialize;
                     self.next_send = t;

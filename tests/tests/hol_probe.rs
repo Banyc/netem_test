@@ -118,7 +118,7 @@ struct FrameDeliveryProbeConfig {
 /// optionally contested by a bulk flow depending on `bulk`. A `BULK_RAMP`
 /// interval at the start lets the solo baseline establish before the bulk
 /// flow begins.
-pub(crate) async fn run_hol_probe(
+async fn run_hol_probe(
     label: &str,
     c2s: NetemConfig,
     s2c: NetemConfig,
@@ -1181,19 +1181,15 @@ async fn run_hol_probe_frame_delivery_shared(
     label: &str,
     c2s: NetemConfig,
     s2c: NetemConfig,
-    config: HolProbeConfig,
+    fec: bool,
+    traffic: TrafficConfig,
 ) -> HolSummary {
-    let HolProbeConfig {
-        fec,
-        traffic:
-            TrafficConfig {
-                msg_bytes,
-                cadence,
-                run_for,
-                grace,
-            },
-        ..
-    } = config;
+    let TrafficConfig {
+        msg_bytes,
+        cadence,
+        run_for,
+        grace,
+    } = traffic;
     let base = Instant::now();
     let (server_addr, mut latencies, mux_bulk_counter) =
         spawn_mux_frame_delivery_latency_bulk_server(fec, base)
@@ -1269,24 +1265,23 @@ async fn run_hol_probe_frame_delivery_shared(
 /// separate listeners so each lane's accept method is fixed at accept time.
 async fn run_hol_probe_dual_lane(
     label: &str,
-    frames: (bool, bool),
     int_c2s: NetemConfig,
     int_s2c: NetemConfig,
     bulk_c2s: NetemConfig,
     bulk_s2c: NetemConfig,
-    config: HolProbeConfig,
+    config: DualLaneProbeConfig,
 ) -> HolSummary {
-    let (interactive_frame, bulk_frame) = frames;
-    let HolProbeConfig {
-        traffic:
-            TrafficConfig {
-                msg_bytes,
-                cadence,
-                run_for,
-                grace,
-            },
-        ..
+    let DualLaneProbeConfig {
+        interactive_frame,
+        bulk_frame,
+        traffic,
     } = config;
+    let TrafficConfig {
+        msg_bytes,
+        cadence,
+        run_for,
+        grace,
+    } = traffic;
     let base = Instant::now();
     let (int_addr, bulk_addr, mut latencies, bulk_counter) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
@@ -1664,15 +1659,12 @@ async fn hol_rtt100_ge5_shared_frame_delivery() {
             label,
             rtt100_ge5(21),
             rtt100_ge5(22),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
-                traffic: TrafficConfig {
-                    msg_bytes: DEFAULT_MSG_BYTES,
-                    cadence: DEFAULT_CADENCE,
-                    run_for: DEFAULT_RUN_FOR,
-                    grace: DEFAULT_GRACE,
-                },
+            false,
+            TrafficConfig {
+                msg_bytes: DEFAULT_MSG_BYTES,
+                cadence: DEFAULT_CADENCE,
+                run_for: DEFAULT_RUN_FOR,
+                grace: DEFAULT_GRACE,
             },
         ),
     )
@@ -1746,15 +1738,12 @@ async fn hol_rtt100_clean_shared_frame_delivery_diag() {
             label,
             rtt100_clean(41),
             rtt100_clean(42),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
-                traffic: TrafficConfig {
-                    msg_bytes: DEFAULT_MSG_BYTES,
-                    cadence: DEFAULT_CADENCE,
-                    run_for: DEFAULT_RUN_FOR,
-                    grace: DEFAULT_GRACE,
-                },
+            false,
+            TrafficConfig {
+                msg_bytes: DEFAULT_MSG_BYTES,
+                cadence: DEFAULT_CADENCE,
+                run_for: DEFAULT_RUN_FOR,
+                grace: DEFAULT_GRACE,
             },
         ),
     )
@@ -1773,15 +1762,12 @@ async fn hol_rtt100_ge1_shared_frame_delivery_diag() {
             label,
             rtt100_ge1_loss1(51),
             rtt100_ge1_loss1(52),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
-                traffic: TrafficConfig {
-                    msg_bytes: DEFAULT_MSG_BYTES,
-                    cadence: DEFAULT_CADENCE,
-                    run_for: DEFAULT_RUN_FOR,
-                    grace: DEFAULT_GRACE,
-                },
+            false,
+            TrafficConfig {
+                msg_bytes: DEFAULT_MSG_BYTES,
+                cadence: DEFAULT_CADENCE,
+                run_for: DEFAULT_RUN_FOR,
+                grace: DEFAULT_GRACE,
             },
         ),
     )
@@ -1800,15 +1786,12 @@ async fn hol_hostile_shared_frame_delivery_diag() {
             label,
             hostile_real_link_seeded(61),
             hostile_real_link_seeded(62),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
-                traffic: TrafficConfig {
-                    msg_bytes: DEFAULT_MSG_BYTES,
-                    cadence: Duration::from_millis(200),
-                    run_for: DEFAULT_RUN_FOR,
-                    grace: DEFAULT_GRACE,
-                },
+            false,
+            TrafficConfig {
+                msg_bytes: DEFAULT_MSG_BYTES,
+                cadence: Duration::from_millis(200),
+                run_for: DEFAULT_RUN_FOR,
+                grace: DEFAULT_GRACE,
             },
         ),
     )
@@ -1827,15 +1810,12 @@ async fn hol_cap400_shared_frame_delivery_diag() {
             label,
             cap400(71),
             cap400(72),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
-                traffic: TrafficConfig {
-                    msg_bytes: DEFAULT_MSG_BYTES,
-                    cadence: DEFAULT_CADENCE,
-                    run_for: DEFAULT_RUN_FOR,
-                    grace: DEFAULT_GRACE,
-                },
+            false,
+            TrafficConfig {
+                msg_bytes: DEFAULT_MSG_BYTES,
+                cadence: DEFAULT_CADENCE,
+                run_for: DEFAULT_RUN_FOR,
+                grace: DEFAULT_GRACE,
             },
         ),
     )
@@ -1854,14 +1834,13 @@ async fn hol_rtt100_ge5_shared_dual_lane() {
         label,
         run_hol_probe_dual_lane(
             label,
-            (false, false),
             rtt100_ge5(91),
             rtt100_ge5(92),
             rtt100_ge5(93),
             rtt100_ge5(94),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
+            DualLaneProbeConfig {
+                interactive_frame: false,
+                bulk_frame: false,
                 traffic: TrafficConfig {
                     msg_bytes: DEFAULT_MSG_BYTES,
                     cadence: DEFAULT_CADENCE,
@@ -1890,14 +1869,13 @@ async fn hol_rtt100_ge5_shared_dual_lane_frame_delivery() {
         label,
         run_hol_probe_dual_lane(
             label,
-            (true, true),
             rtt100_ge5(101),
             rtt100_ge5(102),
             rtt100_ge5(103),
             rtt100_ge5(104),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
+            DualLaneProbeConfig {
+                interactive_frame: true,
+                bulk_frame: true,
                 traffic: TrafficConfig {
                     msg_bytes: DEFAULT_MSG_BYTES,
                     cadence: DEFAULT_CADENCE,
@@ -1926,14 +1904,13 @@ async fn hol_rtt100_ge5_shared_dual_lane_asym_frame_diag() {
         label,
         run_hol_probe_dual_lane(
             label,
-            (true, false),
             rtt100_ge5(111),
             rtt100_ge5(112),
             rtt100_ge5(113),
             rtt100_ge5(114),
-            HolProbeConfig {
-                bulk: BulkMode::Shared,
-                fec: false,
+            DualLaneProbeConfig {
+                interactive_frame: true,
+                bulk_frame: false,
                 traffic: TrafficConfig {
                     msg_bytes: DEFAULT_MSG_BYTES,
                     cadence: DEFAULT_CADENCE,
