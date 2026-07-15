@@ -2579,7 +2579,11 @@ fn spawn_tagged_stream_sink(
 pub async fn spawn_dual_mux_frame_delivery_latency_bulk_server(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    UnboundedReceiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
     spawn_dual_mux_latency_bulk_server_with_config(
         fec,
         base,
@@ -2601,7 +2605,11 @@ pub async fn spawn_dual_mux_latency_bulk_server_with_lane_modes(
     base: Instant,
     interactive_frame: bool,
     bulk_frame: bool,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    UnboundedReceiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
     let int_config = mux::MuxConfig {
         initiation: mux::Initiation::Server,
         heartbeat_interval: Duration::from_secs(5),
@@ -2621,7 +2629,11 @@ async fn spawn_dual_mux_latency_bulk_server_with_config(
     fec: bool,
     base: Instant,
     config: mux::MuxConfig,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    UnboundedReceiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
     spawn_dual_mux_latency_bulk_server_with_per_lane_configs(fec, base, config.clone(), config)
         .await
 }
@@ -2631,7 +2643,11 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
     base: Instant,
     int_config: mux::MuxConfig,
     bulk_config: mux::MuxConfig,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    UnboundedReceiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::unbounded_channel::<(u8, f64)>();
@@ -2908,7 +2924,11 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
 pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<(u8, f64)>, Arc<AtomicU64>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    UnboundedReceiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u8, f64)>();
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);

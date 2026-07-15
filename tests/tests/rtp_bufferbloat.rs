@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use netem_test::{NetemConfig, NetemPair};
 use support::{
     combined_stats, cyclic_payload, percentile, print_perf, send_timestamped_messages,
-    spawn_rtp_bulk_upload_with_mss, spawn_rtp_byte_sink_server_with_mss, spawn_rtp_msg_latency_sink,
-    with_timeout,
+    spawn_rtp_bulk_upload_with_mss, spawn_rtp_byte_sink_server_with_mss,
+    spawn_rtp_msg_latency_sink, with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -87,8 +87,8 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     });
 
     // Sparse latency sender on a separate connection through the same pair.
-    let latency_pair = NetemPair::spawn(latency_addr, bufferbloat_link(4), bufferbloat_link(5))
-        .unwrap();
+    let latency_pair =
+        NetemPair::spawn(latency_addr, bufferbloat_link(4), bufferbloat_link(5)).unwrap();
     let connected = rtp::udp::connect_without_handshake_with_mss(
         "0.0.0.0:0",
         &latency_pair.client_addr().to_string(),
@@ -180,11 +180,10 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p50 = percentile(&samples, 0.50);
         let p99 = percentile(&samples, 0.99);
-        eprintln!("[rtp_bufferbloat] pings sent={ping_sent} received={received} p50={p50:.1} ms p99={p99:.1} ms");
-        // Floor: p50 ping latency should stay under ~0.8× the max queue build-up.
-        assert!(
-            p50 <= 800.0,
-            "bufferbloat ping p50 {p50:.1} ms > 800 ms"
+        eprintln!(
+            "[rtp_bufferbloat] pings sent={ping_sent} received={received} p50={p50:.1} ms p99={p99:.1} ms"
         );
+        // Floor: p50 ping latency should stay under ~0.8× the max queue build-up.
+        assert!(p50 <= 800.0, "bufferbloat ping p50 {p50:.1} ms > 800 ms");
     }
 }

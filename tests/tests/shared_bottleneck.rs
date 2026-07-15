@@ -326,7 +326,10 @@ async fn shared_bneck_late_joiner_fairness() {
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
     let _handle_a = spawn_bulk_flow(
-        pair_a.client_addr(), Arc::clone(&payload), total_run, Arc::clone(&bulk_stop),
+        pair_a.client_addr(),
+        Arc::clone(&payload),
+        total_run,
+        Arc::clone(&bulk_stop),
     );
     tokio::time::sleep(b_join).await;
     let _handle_b = spawn_bulk_flow(

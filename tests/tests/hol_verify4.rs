@@ -22,9 +22,8 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::{
-    burst_loss_link, cyclic_payload, mux_client_connect,
-    spawn_mux_over_rtp_server_with_mss, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server,
-    with_timeout,
+    burst_loss_link, cyclic_payload, mux_client_connect, spawn_mux_over_rtp_server_with_mss,
+    spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -129,7 +128,8 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 
     let total = delivered.load(Ordering::Relaxed);
     let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
-    let mibps_window = delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
+    let mibps_window =
+        delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
     eprintln!(
         "[v4 {label}] delivered={total}B (at-window={delivered_at_window}B) \
          elapsed={elapsed:?} bulk={mibps:.3} MiB/s bulk-window={mibps_window:.3} MiB/s",
@@ -168,7 +168,8 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 
     let total = delivered.load(Ordering::Relaxed);
     let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
-    let mibps_window = delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
+    let mibps_window =
+        delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
     eprintln!(
         "[v4 {label}] delivered={total}B (at-window={delivered_at_window}B) \
          elapsed={elapsed:?} bulk={mibps:.3} MiB/s bulk-window={mibps_window:.3} MiB/s",

@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::{
-    hostile_real_link, mux_client_connect, percentile,
-    spawn_mux_latency_bulk_server, with_timeout,
+    hostile_real_link, mux_client_connect, percentile, spawn_mux_latency_bulk_server, with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -270,188 +270,185 @@ fn rtp_permanent_hole_liveness_smoke() {
         .build()
         .unwrap();
     rt.block_on(async {
-    let base = Instant::now();
-    let start = Instant::now();
+        let base = Instant::now();
+        let start = Instant::now();
 
-    let (server_addr, mut latency_rx) =
-        spawn_rtp_msg_latency_sink(false, base).await.unwrap();
+        let (server_addr, mut latency_rx) = spawn_rtp_msg_latency_sink(false, base).await.unwrap();
 
-    let c2s = NetemConfig {
-        max_datagram_size: MAX_DATAGRAM,
-        latency: OWD,
-        ..NetemConfig::default()
-    };
-    let s2c = NetemConfig {
-        latency: OWD,
-        ..NetemConfig::default()
-    };
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+        let c2s = NetemConfig {
+            max_datagram_size: MAX_DATAGRAM,
+            latency: OWD,
+            ..NetemConfig::default()
+        };
+        let s2c = NetemConfig {
+            latency: OWD,
+            ..NetemConfig::default()
+        };
+        let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-    let watchdog_tuning = rtp::transmission::watchdog_tuning::WatchdogTuning::new(
-        1,
-        Duration::from_millis(1500),
-        Duration::from_millis(1500),
-        Duration::from_secs(3),
-    );
+        let watchdog_tuning = rtp::transmission::watchdog_tuning::WatchdogTuning::new(
+            1,
+            Duration::from_millis(1500),
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        );
 
-    let connected = rtp::udp::connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
-        "0.0.0.0:0",
-        &pair.client_addr().to_string(),
-        None,
-        false,
-        false,
-        rtp::udp::NO_FEC_MSS,
-        rtp::transmission::fec_tuning::FecTuning::default(),
-        rtp::transmission::frame_delivery::FrameDelivery::default(),
-        watchdog_tuning,
-    )
-    .await
-    .unwrap();
+        let connected = rtp::udp::connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
+            "0.0.0.0:0",
+            &pair.client_addr().to_string(),
+            None,
+            false,
+            false,
+            rtp::udp::NO_FEC_MSS,
+            rtp::transmission::fec_tuning::FecTuning::default(),
+            rtp::transmission::frame_delivery::FrameDelivery::default(),
+            watchdog_tuning,
+        )
+        .await
+        .unwrap();
 
-    let mut read = connected.read.into_async_read();
-    let mut write = connected.write.into_async_write();
+        let mut read = connected.read.into_async_read();
+        let mut write = connected.write.into_async_write();
 
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = read.read(&mut buf).await;
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let sent = send_timestamped_messages(
+            &mut write,
+            base,
+            MSG_BYTES,
+            MSG_INTERVAL,
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(sent > 0, "initial handshake message must be delivered");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut pre_hole_frames = 0u64;
+        while latency_rx.try_recv().is_ok() {
+            pre_hole_frames += 1;
+        }
+        assert!(
+            pre_hole_frames > 0,
+            "server must have received the initial handshake frame"
+        );
+
+        let hole_payload = support::payload(1024);
+        let _ = write.write_all(&hole_payload).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let s2c_before = pair.stats_s2c().forwarded;
+        let c2s_before = pair.stats_c2s();
+
+        let mut post_hole_writes = 0u64;
+        let mut write_error: Option<std::io::ErrorKind> = None;
+        let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
+
+        let max_duration = Duration::from_secs(5);
+        let post_hole_interval = Duration::from_millis(100);
+        let msg = support::payload(MSG_BYTES);
+
         loop {
-            let n = read.read(&mut buf).await;
-            match n {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
-
-    let sent = send_timestamped_messages(
-        &mut write,
-        base,
-        MSG_BYTES,
-        MSG_INTERVAL,
-        Duration::from_millis(500),
-    )
-    .await;
-    assert!(sent > 0, "initial handshake message must be delivered");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let mut pre_hole_frames = 0u64;
-    while latency_rx.try_recv().is_ok() {
-        pre_hole_frames += 1;
-    }
-    assert!(
-        pre_hole_frames > 0,
-        "server must have received the initial handshake frame"
-    );
-
-    let hole_payload = support::payload(1024);
-    let _ = write.write_all(&hole_payload).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let s2c_before = pair.stats_s2c().forwarded;
-    let c2s_before = pair.stats_c2s();
-
-    let mut post_hole_writes = 0u64;
-    let mut write_error: Option<std::io::ErrorKind> = None;
-    let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
-
-    let max_duration = Duration::from_secs(5);
-    let post_hole_interval = Duration::from_millis(100);
-    let msg = support::payload(MSG_BYTES);
-
-    loop {
-        if start.elapsed() >= max_duration {
-            panic!(
-                "Connection stayed alive >{:?} without cumulative progress; \
+            if start.elapsed() >= max_duration {
+                panic!(
+                    "Connection stayed alive >{:?} without cumulative progress; \
                  delivered {} post-hole writes",
-                max_duration, post_hole_writes,
-            );
+                    max_duration, post_hole_writes,
+                );
+            }
+
+            reverse_traffic.observe(pair.stats_s2c().forwarded, Instant::now());
+
+            let res = tokio::time::timeout(Duration::from_secs(2), write.write_all(&msg)).await;
+            match res {
+                Ok(Ok(())) => {
+                    post_hole_writes += 1;
+                    tokio::time::sleep(post_hole_interval).await;
+                }
+                Ok(Err(e)) => {
+                    write_error = Some(e.kind());
+                    eprintln!(
+                        "[rtp_liveness_smoke] write failed with {:?} after {} post-hole writes",
+                        e.kind(),
+                        post_hole_writes,
+                    );
+                    break;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[rtp_liveness_smoke] write timed out after {} post-hole writes",
+                        post_hole_writes,
+                    );
+                    break;
+                }
+            }
         }
 
-        reverse_traffic.observe(pair.stats_s2c().forwarded, Instant::now());
+        let c2s_after = pair.stats_c2s();
+        let s2c_after = pair.stats_s2c();
 
-        let res = tokio::time::timeout(Duration::from_secs(2), write.write_all(&msg)).await;
-        match res {
-            Ok(Ok(())) => {
-                post_hole_writes += 1;
-                tokio::time::sleep(post_hole_interval).await;
-            }
-            Ok(Err(e)) => {
-                write_error = Some(e.kind());
-                eprintln!(
-                    "[rtp_liveness_smoke] write failed with {:?} after {} post-hole writes",
-                    e.kind(),
-                    post_hole_writes,
-                );
-                break;
-            }
-            Err(_) => {
-                eprintln!(
-                    "[rtp_liveness_smoke] write timed out after {} post-hole writes",
-                    post_hole_writes,
-                );
-                break;
-            }
+        pair.stop();
+
+        let elapsed = start.elapsed();
+
+        let mut server_frames = 0u64;
+        while latency_rx.try_recv().is_ok() {
+            server_frames += 1;
         }
-    }
-
-    let c2s_after = pair.stats_c2s();
-    let s2c_after = pair.stats_s2c();
-
-    pair.stop();
-
-    let elapsed = start.elapsed();
-
-    let mut server_frames = 0u64;
-    while latency_rx.try_recv().is_ok() {
-        server_frames += 1;
-    }
-    eprintln!(
-        "[rtp_liveness_smoke] elapsed={elapsed:?} post_hole_writes={post_hole_writes} \
+        eprintln!(
+            "[rtp_liveness_smoke] elapsed={elapsed:?} post_hole_writes={post_hole_writes} \
          server_frames={server_frames} (pre_hole={pre_hole_frames})"
-    );
+        );
 
-    assert_eq!(
-        write_error,
-        Some(std::io::ErrorKind::BrokenPipe),
-        "must exit with BrokenPipe, got {:?}",
-        write_error,
-    );
+        assert_eq!(
+            write_error,
+            Some(std::io::ErrorKind::BrokenPipe),
+            "must exit with BrokenPipe, got {:?}",
+            write_error,
+        );
 
-    assert!(
-        elapsed <= max_duration,
-        "BrokenPipe too late ({elapsed:?}); expected within {:?}",
-        max_duration,
-    );
+        assert!(
+            elapsed <= max_duration,
+            "BrokenPipe too late ({elapsed:?}); expected within {:?}",
+            max_duration,
+        );
 
-    assert!(
-        post_hole_writes >= 5,
-        "too few post-hole writes: {post_hole_writes} < 5"
-    );
+        assert!(
+            post_hole_writes >= 5,
+            "too few post-hole writes: {post_hole_writes} < 5"
+        );
 
-    assert!(
-        pre_hole_frames + server_frames >= 1,
-        "server should have observed at least one delivered frame"
-    );
+        assert!(
+            pre_hole_frames + server_frames >= 1,
+            "server should have observed at least one delivered frame"
+        );
 
-    let oversized_drops = c2s_after.dropped - c2s_before.dropped;
-    assert!(
-        oversized_drops > 0,
-        "c2s must have dropped at least one oversized datagram; dropped={}",
-        c2s_after.dropped,
-    );
+        let oversized_drops = c2s_after.dropped - c2s_before.dropped;
+        assert!(
+            oversized_drops > 0,
+            "c2s must have dropped at least one oversized datagram; dropped={}",
+            c2s_after.dropped,
+        );
 
-    let reverse_traffic_packets = s2c_after.forwarded - s2c_before;
-    assert!(
-        reverse_traffic_packets > 0,
-        "s2c must have forwarded reverse ACK/SACK traffic; forwarded={}",
-        s2c_after.forwarded,
-    );
+        let reverse_traffic_packets = s2c_after.forwarded - s2c_before;
+        assert!(
+            reverse_traffic_packets > 0,
+            "s2c must have forwarded reverse ACK/SACK traffic; forwarded={}",
+            s2c_after.forwarded,
+        );
 
-    eprintln!(
-        "[rtp_liveness_smoke] c2s dropped={} forwarded={} | s2c forwarded={}",
-        c2s_after.dropped,
-        c2s_after.forwarded,
-        s2c_after.forwarded,
-    );
+        eprintln!(
+            "[rtp_liveness_smoke] c2s dropped={} forwarded={} | s2c forwarded={}",
+            c2s_after.dropped, c2s_after.forwarded, s2c_after.forwarded,
+        );
     });
 }
 
@@ -467,5 +464,8 @@ fn reverse_traffic_recency_advances_only_on_new_packets() {
         "an unchanged counter must not refresh recency"
     );
     tracker.observe(9, t0 + Duration::from_secs(5));
-    assert_eq!(tracker.silence_at(t0 + Duration::from_secs(5)), Duration::ZERO);
+    assert_eq!(
+        tracker.silence_at(t0 + Duration::from_secs(5)),
+        Duration::ZERO
+    );
 }

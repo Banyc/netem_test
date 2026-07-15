@@ -22,17 +22,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use mux::{
-    DeliveryMode, DualMessageSender, LaneClass, MigratingStreamWriter,
-};
+use mux::{DeliveryMode, DualMessageSender, LaneClass, MigratingStreamWriter};
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::{
-    cyclic_payload, dual_mux_client_connect, mux_client_connect, percentile,
+    SplitMix64, cyclic_payload, dual_mux_client_connect, mux_client_connect, percentile,
     spawn_dual_msg_channel_server, spawn_dual_mux_gaming_latency_bulk_server,
-    spawn_dual_mux_latency_bulk_server,
-    spawn_dual_mux_migrating_latency_bulk_server,
-    spawn_mux_gaming_latency_bulk_server, spawn_mux_latency_bulk_server, SplitMix64,
-    with_timeout,
+    spawn_dual_mux_latency_bulk_server, spawn_dual_mux_migrating_latency_bulk_server,
+    spawn_mux_gaming_latency_bulk_server, spawn_mux_latency_bulk_server, with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -124,8 +120,14 @@ fn make_latency_frame(msg_size: usize, base: Instant) -> Vec<u8> {
 }
 
 fn summarize(label: &str, results: &[DynTrafficResult]) {
-    let mut all_small: Vec<f64> = results.iter().flat_map(|r| r.small_latencies.clone()).collect();
-    let mut all_burst: Vec<f64> = results.iter().flat_map(|r| r.burst_latencies.clone()).collect();
+    let mut all_small: Vec<f64> = results
+        .iter()
+        .flat_map(|r| r.small_latencies.clone())
+        .collect();
+    let mut all_burst: Vec<f64> = results
+        .iter()
+        .flat_map(|r| r.burst_latencies.clone())
+        .collect();
     all_small.sort_by(|a, b| a.partial_cmp(b).unwrap());
     all_burst.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -148,7 +150,10 @@ fn summarize(label: &str, results: &[DynTrafficResult]) {
         delivery,
     );
 
-    assert!(delivery > 0.80, "[dyn {label}] delivery too low: {delivery:.3}");
+    assert!(
+        delivery > 0.80,
+        "[dyn {label}] delivery too low: {delivery:.3}"
+    );
     assert!(
         percentile_opt(&all_small, 0.50) > 0.0,
         "[dyn {label}] p50 must be positive finite"
@@ -214,10 +219,7 @@ async fn run_latency_flow(
 // Arm A: single-mux baseline
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn dyn_single_mux_rep(
-    seed_base: u64,
-    run_secs: u64,
-) -> DynTrafficResult {
+async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
@@ -226,14 +228,8 @@ async fn dyn_single_mux_rep(
         spawn_mux_latency_bulk_server(false, base).await.unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
-    let pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
+    let pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
 
     let connected = rtp::udp::connect_without_handshake_with_mss(
         "0.0.0.0:0",
@@ -254,7 +250,12 @@ async fn dyn_single_mux_rep(
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop { match _lat_read.read(&mut buf).await { Ok(0) | Err(_) => break, _ => {} } }
+        loop {
+            match _lat_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                _ => {}
+            }
+        }
     });
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
@@ -276,7 +277,12 @@ async fn dyn_single_mux_rep(
     };
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop { match bulk_read.read(&mut buf).await { Ok(0) | Err(_) => break, _ => {} } }
+        loop {
+            match bulk_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                _ => {}
+            }
+        }
     });
 
     let (small, burst, sent) =
@@ -287,7 +293,13 @@ async fn dyn_single_mux_rep(
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let received = (small.len() + burst.len()) as u64;
 
-    DynTrafficResult { small_latencies: small, burst_latencies: burst, sent, received, bulk_bytes }
+    DynTrafficResult {
+        small_latencies: small,
+        burst_latencies: burst,
+        sent,
+        received,
+        bulk_bytes,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -312,16 +324,14 @@ async fn dyn_single_mux() {
 // Arm B: dual-lane, sticky auto, first write small → interactive
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn dyn_dual_auto_small_first_rep(
-    seed_base: u64,
-    run_secs: u64,
-) -> DynTrafficResult {
+async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
 
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
+        .await
+        .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -332,21 +342,12 @@ async fn dyn_dual_auto_small_first_rep(
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
@@ -374,8 +375,15 @@ async fn dyn_dual_auto_small_first_rep(
     tokio::time::sleep(BULK_RAMP).await;
 
     let (auto_reader, mut auto_writer) = opener.open_auto();
-    let (small, burst, sent) =
-        run_latency_flow(base, seed_base, run_for, &mut auto_writer, &mut lat_rx, false).await;
+    let (small, burst, sent) = run_latency_flow(
+        base,
+        seed_base,
+        run_for,
+        &mut auto_writer,
+        &mut lat_rx,
+        false,
+    )
+    .await;
     let _ = auto_writer.shutdown();
     drop(auto_reader);
     bulk_stop.store(true, Ordering::Relaxed);
@@ -383,7 +391,13 @@ async fn dyn_dual_auto_small_first_rep(
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let received = (small.len() + burst.len()) as u64;
 
-    DynTrafficResult { small_latencies: small, burst_latencies: burst, sent, received, bulk_bytes }
+    DynTrafficResult {
+        small_latencies: small,
+        burst_latencies: burst,
+        sent,
+        received,
+        bulk_bytes,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -408,16 +422,14 @@ async fn dyn_dual_auto_small_first() {
 // Arm C: dual-lane, sticky auto, first write forced burst → bulk
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn dyn_dual_auto_big_first_rep(
-    seed_base: u64,
-    run_secs: u64,
-) -> DynTrafficResult {
+async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
 
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
+        .await
+        .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -428,21 +440,12 @@ async fn dyn_dual_auto_big_first_rep(
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
@@ -477,22 +480,30 @@ async fn dyn_dual_auto_big_first_rep(
     let mut first_buf = Vec::with_capacity(LATENCY_TAG.len() + first_frame.len());
     first_buf.extend_from_slice(LATENCY_TAG);
     first_buf.extend_from_slice(&first_frame);
-    if auto_writer.write_all(&first_buf).await.is_err()
-    {
+    if auto_writer.write_all(&first_buf).await.is_err() {
         let _ = auto_writer.shutdown();
         drop(auto_reader);
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
         return DynTrafficResult {
-            small_latencies: vec![], burst_latencies: vec![],
-            sent: 0, received: 0,
+            small_latencies: vec![],
+            burst_latencies: vec![],
+            sent: 0,
+            received: 0,
             bulk_bytes: bulk_counter.load(Ordering::Relaxed),
         };
     }
     if let Some(lat) = lat_rx.recv().await {
         let rest_run = run_for.saturating_sub(base.elapsed());
-        let (small, mut burst, mut sent) =
-            run_latency_flow(base, seed_base, rest_run, &mut auto_writer, &mut lat_rx, true).await;
+        let (small, mut burst, mut sent) = run_latency_flow(
+            base,
+            seed_base,
+            rest_run,
+            &mut auto_writer,
+            &mut lat_rx,
+            true,
+        )
+        .await;
         burst.insert(0, lat);
         sent += 1;
         let _ = auto_writer.shutdown();
@@ -501,8 +512,10 @@ async fn dyn_dual_auto_big_first_rep(
         let _ = bulk_handle.await;
         let received = (small.len() + burst.len()) as u64;
         return DynTrafficResult {
-            small_latencies: small, burst_latencies: burst,
-            sent, received,
+            small_latencies: small,
+            burst_latencies: burst,
+            sent,
+            received,
             bulk_bytes: bulk_counter.load(Ordering::Relaxed),
         };
     }
@@ -512,8 +525,10 @@ async fn dyn_dual_auto_big_first_rep(
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
     DynTrafficResult {
-        small_latencies: vec![], burst_latencies: vec![],
-        sent: 1, received: 0,
+        small_latencies: vec![],
+        burst_latencies: vec![],
+        sent: 1,
+        received: 0,
         bulk_bytes: bulk_counter.load(Ordering::Relaxed),
     }
 }
@@ -540,16 +555,14 @@ async fn dyn_dual_auto_big_first() {
 // Arm D: dual-lane, fresh open_auto stream per message
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn dyn_dual_auto_per_message_rep(
-    seed_base: u64,
-    run_secs: u64,
-) -> DynTrafficResult {
+async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
 
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
+        .await
+        .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -560,21 +573,12 @@ async fn dyn_dual_auto_per_message_rep(
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
@@ -619,8 +623,7 @@ async fn dyn_dual_auto_per_message_rep(
 
         let (reader, mut writer) = opener.open_auto();
         let write_buf = [LATENCY_TAG, &frame[..]].concat();
-        if writer.write_all(&write_buf).await.is_err()
-        {
+        if writer.write_all(&write_buf).await.is_err() {
             break;
         }
         let _ = writer.shutdown();
@@ -645,7 +648,13 @@ async fn dyn_dual_auto_per_message_rep(
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
-    DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
+    DynTrafficResult {
+        small_latencies,
+        burst_latencies,
+        sent,
+        received,
+        bulk_bytes,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -670,16 +679,14 @@ async fn dyn_dual_auto_per_message() {
 // Arm E: dual-lane, explicit LaneClass::Interactive hint
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn dyn_dual_hint_static_rep(
-    seed_base: u64,
-    run_secs: u64,
-) -> DynTrafficResult {
+async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
 
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(false, base).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
+        .await
+        .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -690,21 +697,12 @@ async fn dyn_dual_hint_static_rep(
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
@@ -731,9 +729,14 @@ async fn dyn_dual_hint_static_rep(
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let (int_reader, mut int_writer) =
-        opener.open(LaneClass::Interactive).await.expect("open interactive");
-    int_writer.write_all(LATENCY_TAG).await.expect("write latency tag");
+    let (int_reader, mut int_writer) = opener
+        .open(LaneClass::Interactive)
+        .await
+        .expect("open interactive");
+    int_writer
+        .write_all(LATENCY_TAG)
+        .await
+        .expect("write latency tag");
 
     let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
     let mut small_latencies = Vec::new();
@@ -783,7 +786,13 @@ async fn dyn_dual_hint_static_rep(
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
-    DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
+    DynTrafficResult {
+        small_latencies,
+        burst_latencies,
+        sent,
+        received,
+        bulk_bytes,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -817,8 +826,9 @@ async fn dyn_dual_msg_channel_rep(
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
 
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_msg_channel_server(false, base, mode).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_msg_channel_server(false, base, mode)
+        .await
+        .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -829,21 +839,12 @@ async fn dyn_dual_msg_channel_rep(
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
@@ -909,7 +910,13 @@ async fn dyn_dual_msg_channel_rep(
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
-    DynTrafficResult { small_latencies, burst_latencies, sent, received, bulk_bytes }
+    DynTrafficResult {
+        small_latencies,
+        burst_latencies,
+        sent,
+        received,
+        bulk_bytes,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -965,10 +972,14 @@ struct GamingResult {
 }
 
 fn summarize_gaming(label: &str, results: &[GamingResult]) {
-    let mut trans: Vec<f64> =
-        results.iter().flat_map(|r| r.transition_latencies.clone()).collect();
-    let mut steady: Vec<f64> =
-        results.iter().flat_map(|r| r.steady_latencies.clone()).collect();
+    let mut trans: Vec<f64> = results
+        .iter()
+        .flat_map(|r| r.transition_latencies.clone())
+        .collect();
+    let mut steady: Vec<f64> = results
+        .iter()
+        .flat_map(|r| r.steady_latencies.clone())
+        .collect();
     trans.sort_by(|a, b| a.partial_cmp(b).unwrap());
     steady.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -1055,17 +1066,19 @@ async fn run_game_sync_client(
 
     if migrating {
         let logical_id = seed_base;
-        let mut game_writer = opener
-            .open_migrating(logical_id, LaneClass::Interactive);
+        let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
         if game_writer.write_all(&sync_buf).await.is_err() {
             let _ = game_writer.shutdown();
             return GamingResult {
-                transition_latencies, steady_latencies,
-                sent, received: 0,
+                transition_latencies,
+                steady_latencies,
+                sent,
+                received: 0,
                 bulk_bytes: 0,
             };
         }
-        let bulk_handle = spawn_bulk_pump(bulk_opener, Arc::clone(&payload), Arc::clone(&bulk_stop));
+        let bulk_handle =
+            spawn_bulk_pump(bulk_opener, Arc::clone(&payload), Arc::clone(&bulk_stop));
         tokio::time::sleep(BULK_RAMP).await;
         let start = Instant::now();
         let phase2_start = Instant::now();
@@ -1096,23 +1109,22 @@ async fn run_game_sync_client(
             let _ = auto_writer.shutdown();
             drop(auto_reader);
             return GamingResult {
-                transition_latencies, steady_latencies,
-                sent, received: 0,
+                transition_latencies,
+                steady_latencies,
+                sent,
+                received: 0,
                 bulk_bytes: 0,
             };
         }
-        let bulk_handle = spawn_bulk_pump(bulk_opener, Arc::clone(&payload), Arc::clone(&bulk_stop));
+        let bulk_handle =
+            spawn_bulk_pump(bulk_opener, Arc::clone(&payload), Arc::clone(&bulk_stop));
         tokio::time::sleep(BULK_RAMP).await;
         let start = Instant::now();
         let phase2_start = Instant::now();
         let mut iters = 0u32;
         while start.elapsed() < run_for {
             let frame = make_latency_frame(SMALL_MSG_BYTES, base);
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                auto_writer.write_all(&frame),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(5), auto_writer.write_all(&frame)).await
             {
                 Ok(Ok(())) => {
                     sent += 1;
@@ -1140,14 +1152,22 @@ async fn run_game_sync_client(
     }
 
     let received = (transition_latencies.len() + steady_latencies.len()) as u64;
-    GamingResult { transition_latencies, steady_latencies, sent, received, bulk_bytes: 0 }
+    GamingResult {
+        transition_latencies,
+        steady_latencies,
+        sent,
+        received,
+        bulk_bytes: 0,
+    }
 }
 
 async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult {
     let (c2s, s2c) = bottleneck_config(200 + seed_base, RATE_BPS);
     let base = Instant::now();
     let (server_addr, lat_rx, bulk_counter) =
-        spawn_dual_mux_gaming_latency_bulk_server(false, base).await.unwrap();
+        spawn_dual_mux_gaming_latency_bulk_server(false, base)
+            .await
+            .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -1158,23 +1178,13 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-    let mut result =
-        run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false).await;
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
+    let mut result = run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false).await;
     result.bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     result
 }
@@ -1201,7 +1211,9 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
     let (c2s, s2c) = bottleneck_config(300 + seed_base, RATE_BPS);
     let base = Instant::now();
     let (server_addr, lat_rx, bulk_counter) =
-        spawn_dual_mux_gaming_latency_bulk_server(false, base).await.unwrap();
+        spawn_dual_mux_gaming_latency_bulk_server(false, base)
+            .await
+            .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -1212,23 +1224,13 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-    let mut result =
-        run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, true).await;
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
+    let mut result = run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, true).await;
     result.bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     result
 }
@@ -1256,18 +1258,13 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let (c2s, s2c) = bottleneck_config(400 + seed_base, RATE_BPS);
     let base = Instant::now();
 
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_mux_gaming_latency_bulk_server(false, base).await.unwrap();
+    let (server_addr, mut lat_rx, bulk_counter) = spawn_mux_gaming_latency_bulk_server(false, base)
+        .await
+        .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
-    let pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
+    let pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
 
     let connected = rtp::udp::connect_without_handshake_with_mss(
         "0.0.0.0:0",
@@ -1292,7 +1289,12 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
         let (mut bulk_read, _) = opener.open().await.unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8 * 1024];
-            loop { match bulk_read.read(&mut buf).await { Ok(0) | Err(_) => break, _ => {} } }
+            loop {
+                match bulk_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    _ => {}
+                }
+            }
         });
         tokio::spawn(async move {
             let _ = bulk_write.write_all(BULK_TAG).await;
@@ -1310,7 +1312,12 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let (mut _game_read, mut game_write) = opener.open().await.unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
-        loop { match _game_read.read(&mut buf).await { Ok(0) | Err(_) => break, _ => {} } }
+        loop {
+            match _game_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                _ => {}
+            }
+        }
     });
 
     let mut sync_buf = Vec::with_capacity(GAMING_TAG.len() + GAMING_SYNC_BYTES);
@@ -1326,8 +1333,10 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle;
         return GamingResult {
-            transition_latencies, steady_latencies,
-            sent, received: 0,
+            transition_latencies,
+            steady_latencies,
+            sent,
+            received: 0,
             bulk_bytes: bulk_counter.load(Ordering::Relaxed),
         };
     }
@@ -1444,7 +1453,9 @@ async fn dyn_dual_auto_small_first_migrating_rep(
     let base = Instant::now();
 
     let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_migrating_latency_bulk_server(false, base).await.unwrap();
+        spawn_dual_mux_migrating_latency_bulk_server(false, base)
+            .await
+            .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -1455,21 +1466,12 @@ async fn dyn_dual_auto_small_first_migrating_rep(
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
@@ -1497,10 +1499,14 @@ async fn dyn_dual_auto_small_first_migrating_rep(
     tokio::time::sleep(BULK_RAMP).await;
 
     let logical_id = 1000 + seed_base;
-    let mut game_writer =
-        opener.open_migrating(logical_id, LaneClass::Interactive);
+    let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
     let (small, burst, sent) = run_migrating_latency_flow(
-        base, seed_base, run_for, &mut game_writer, &mut lat_rx, false,
+        base,
+        seed_base,
+        run_for,
+        &mut game_writer,
+        &mut lat_rx,
+        false,
     )
     .await;
     let _ = game_writer.shutdown();
@@ -1509,7 +1515,13 @@ async fn dyn_dual_auto_small_first_migrating_rep(
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let received = (small.len() + burst.len()) as u64;
 
-    DynTrafficResult { small_latencies: small, burst_latencies: burst, sent, received, bulk_bytes }
+    DynTrafficResult {
+        small_latencies: small,
+        burst_latencies: burst,
+        sent,
+        received,
+        bulk_bytes,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1530,16 +1542,15 @@ async fn dyn_dual_auto_small_first_migrating() {
     summarize("dual_auto_small_first_migrating (B-mig)", &results);
 }
 
-async fn dyn_dual_auto_big_first_migrating_rep(
-    seed_base: u64,
-    run_secs: u64,
-) -> DynTrafficResult {
+async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(600 + seed_base, RATE_BPS);
     let base = Instant::now();
 
     let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_migrating_latency_bulk_server(false, base).await.unwrap();
+        spawn_dual_mux_migrating_latency_bulk_server(false, base)
+            .await
+            .unwrap();
     let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
     let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
@@ -1550,21 +1561,12 @@ async fn dyn_dual_auto_big_first_migrating_rep(
         Some(s2c_shaper.clone()),
     )
     .unwrap();
-    let bulk_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s,
-        s2c,
-        Some(c2s_shaper),
-        Some(s2c_shaper),
-    )
-    .unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
+    let bulk_pair =
+        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
+    let (opener, _accepter, _spawner) =
+        dual_mux_client_connect(int_pair.client_addr(), bulk_pair.client_addr(), false)
+            .await
+            .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
@@ -1592,8 +1594,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(
     tokio::time::sleep(BULK_RAMP).await;
 
     let logical_id = 2000 + seed_base;
-    let mut game_writer =
-        opener.open_migrating(logical_id, LaneClass::Interactive);
+    let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
 
     let first_size: usize = 4 * 1024;
     let first_frame = make_latency_frame(first_size, base);
@@ -1615,7 +1616,12 @@ async fn dyn_dual_auto_big_first_migrating_rep(
     if let Some(lat) = lat_rx.recv().await {
         let rest_run = run_for.saturating_sub(base.elapsed());
         let (small, mut burst, mut sent) = run_migrating_latency_flow(
-            base, seed_base, rest_run, &mut game_writer, &mut lat_rx, true,
+            base,
+            seed_base,
+            rest_run,
+            &mut game_writer,
+            &mut lat_rx,
+            true,
         )
         .await;
         burst.insert(0, lat);

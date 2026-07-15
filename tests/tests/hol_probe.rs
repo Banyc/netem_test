@@ -9,21 +9,16 @@
 //! cargo test --release --test hol_probe -- --ignored --nocapture --test-threads=1
 //! ```
 
-use std::sync::{
-    Arc,
-    atomic::Ordering,
-};
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::{
     combined_stats, cyclic_payload, dual_mux_client_connect_with_lane_modes, gilbert_elliott_loss,
-    mux_client_connect, percentile, rtp_frame_delivery_connect,
-    send_timestamped_messages,
-    spawn_dual_mux_latency_bulk_server_two_listeners,
-    spawn_mux_frame_delivery_latency_bulk_server, spawn_mux_latency_bulk_server,
-    spawn_mux_msg_latency_sink, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server,
-    with_timeout,
+    mux_client_connect, percentile, rtp_frame_delivery_connect, send_timestamped_messages,
+    spawn_dual_mux_latency_bulk_server_two_listeners, spawn_mux_frame_delivery_latency_bulk_server,
+    spawn_mux_latency_bulk_server, spawn_mux_msg_latency_sink, spawn_rtp_bulk_upload,
+    spawn_rtp_byte_sink_server, with_timeout,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -551,7 +546,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
         assert!(summary.p50 <= 250.0, "p50 {:.1} ms > 250 ms", summary.p50);
         assert!(summary.p99 <= 800.0, "p99 {:.1} ms > 800 ms", summary.p99);
@@ -572,7 +568,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
         assert!(summary.p50 <= 250.0, "p50 {:.1} ms > 250 ms", summary.p50);
         assert!(summary.p99 <= 800.0, "p99 {:.1} ms > 800 ms", summary.p99);
@@ -593,7 +590,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
         assert!(summary.p50 <= 250.0, "p50 {:.1} ms > 250 ms", summary.p50);
         assert!(summary.p99 <= 800.0, "p99 {:.1} ms > 800 ms", summary.p99);
@@ -616,7 +614,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -635,7 +634,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -654,7 +654,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -675,7 +676,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -694,7 +696,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -713,7 +716,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -732,7 +736,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -751,7 +756,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -772,7 +778,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -791,7 +798,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -810,7 +818,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -831,7 +840,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
         assert!(summary.p50 <= 100.0, "p50 {:.1} ms > 100 ms", summary.p50);
         assert!(summary.p99 <= 400.0, "p99 {:.1} ms > 400 ms", summary.p99);
@@ -852,7 +862,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
         assert!(summary.p50 <= 500.0, "p50 {:.1} ms > 500 ms", summary.p50);
         assert!(summary.p99 <= 1200.0, "p99 {:.1} ms > 1200 ms", summary.p99);
@@ -913,7 +924,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -932,7 +944,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -951,7 +964,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -970,7 +984,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -989,7 +1004,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -1008,7 +1024,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.95,
-            "delivery {:.3} < 0.95", summary.delivery_pct
+            "delivery {:.3} < 0.95",
+            summary.delivery_pct
         );
     }
 );
@@ -1053,7 +1070,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.80,
-            "delivery {:.3} < 0.80", summary.delivery_pct
+            "delivery {:.3} < 0.80",
+            summary.delivery_pct
         );
     }
 );
@@ -1072,7 +1090,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.80,
-            "delivery {:.3} < 0.80", summary.delivery_pct
+            "delivery {:.3} < 0.80",
+            summary.delivery_pct
         );
     }
 );
@@ -1091,7 +1110,8 @@ hol_test!(
     |summary: &HolSummary| {
         assert!(
             summary.delivery_pct >= 0.80,
-            "delivery {:.3} < 0.80", summary.delivery_pct
+            "delivery {:.3} < 0.80",
+            summary.delivery_pct
         );
     }
 );
@@ -1116,20 +1136,20 @@ async fn run_hol_probe_frame_delivery_shared(
 ) -> HolSummary {
     let base = Instant::now();
     let (server_addr, mut latencies, mux_bulk_counter) =
-        spawn_mux_frame_delivery_latency_bulk_server(fec, base).await.unwrap();
+        spawn_mux_frame_delivery_latency_bulk_server(fec, base)
+            .await
+            .unwrap();
 
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-    let (reader, writer) =
-        rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let (reader, writer) = rtp_frame_delivery_connect(pair.client_addr(), fec).await;
     let config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: true,
     };
     let mut spawner = tokio::task::JoinSet::new();
-    let (opener, _accepter) =
-        mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+    let (opener, _accepter) = mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
 
     let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
     tokio::spawn(async move {
@@ -1261,8 +1281,7 @@ async fn run_hol_probe_dual_lane(
             }
         }
     });
-    let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)
-        .await;
+    let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
     let _ = rr_write.shutdown();
 
     bulk_stop.store(true, Ordering::Relaxed);
@@ -1308,14 +1327,9 @@ async fn run_hol_probe_dual_lane_two_interactive(
 ) -> (HolSummary, HolSummary, HolSummary, f64) {
     let base = Instant::now();
     let (int_addr, bulk_addr, mut latencies_all, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server_two_listeners(
-            false,
-            base,
-            interactive_frame,
-            false,
-        )
-        .await
-        .unwrap();
+        spawn_dual_mux_latency_bulk_server_two_listeners(false, base, interactive_frame, false)
+            .await
+            .unwrap();
 
     let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
@@ -1474,20 +1488,17 @@ async fn run_frame_delivery_solo_interactive(
     grace: Duration,
 ) -> HolSummary {
     let base = Instant::now();
-    let (server_addr, mut latencies) =
-        spawn_mux_msg_latency_sink(fec, base).await.unwrap();
+    let (server_addr, mut latencies) = spawn_mux_msg_latency_sink(fec, base).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-    let (reader, writer) =
-        rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let (reader, writer) = rtp_frame_delivery_connect(pair.client_addr(), fec).await;
     let config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: true,
     };
     let mut spawner = tokio::task::JoinSet::new();
-    let (opener, _accepter) =
-        mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+    let (opener, _accepter) = mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
 
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
     tokio::spawn(async move {
@@ -1532,19 +1543,19 @@ async fn run_frame_delivery_two_interactive(
 ) -> (HolSummary, HolSummary, HolSummary) {
     let base = Instant::now();
     let (server_addr, mut latencies, _bulk_counter) =
-        spawn_mux_frame_delivery_latency_bulk_server(fec, base).await.unwrap();
+        spawn_mux_frame_delivery_latency_bulk_server(fec, base)
+            .await
+            .unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-    let (reader, writer) =
-        rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let (reader, writer) = rtp_frame_delivery_connect(pair.client_addr(), fec).await;
     let config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: true,
     };
     let mut spawner = tokio::task::JoinSet::new();
-    let (opener, _accepter) =
-        mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+    let (opener, _accepter) = mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
 
     let (mut read_a, mut write_a) = opener.open().await.unwrap();
     let (mut read_b, mut write_b) = opener.open().await.unwrap();
@@ -1590,8 +1601,13 @@ async fn run_frame_delivery_two_interactive(
         }
     }
 
-    let combined =
-        summarize(samples.clone(), sent_a + sent_b, samples.len() as u64, 0, 0.0);
+    let combined = summarize(
+        samples.clone(),
+        sent_a + sent_b,
+        samples.len() as u64,
+        0,
+        0.0,
+    );
     let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
     let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
 
@@ -2001,8 +2017,7 @@ async fn run_hol_probe_dual_lane_separate_listeners(
             }
         }
     });
-    let sent =
-        run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
+    let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
     let _ = rr_write.shutdown();
 
     bulk_stop.store(true, Ordering::Relaxed);

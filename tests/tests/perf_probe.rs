@@ -13,7 +13,6 @@
 use std::time::{Duration, Instant};
 
 use netem_test::NetemPair;
-use tokio::io::AsyncWriteExt;
 use support::{
     clean, combined_stats, mux_client_connect, mux_send_payload, mux_timed_echo_round_trip,
     payload, print_median_worst, print_perf, rtp_connect, rtp_connect_with_mss, rtp_echo_payload,
@@ -22,6 +21,7 @@ use support::{
     spawn_mux_over_rtp_sink_server_with_mss, spawn_rtp_echo_server, spawn_rtp_echo_server_with_mss,
     with_timeout,
 };
+use tokio::io::AsyncWriteExt;
 
 mod support;
 
@@ -74,7 +74,10 @@ async fn probe_rtp_echo_4mib_direct() {
 
     pair.stop();
     let stats = combined_stats(&pair);
-    assert!(stats.forwarded > 0, "proxy should forward packets, got {stats:?}");
+    assert!(
+        stats.forwarded > 0,
+        "proxy should forward packets, got {stats:?}"
+    );
 }
 
 /// Raw `rtp` 4 MiB echo through a `NetemPair` using the loopback-sized MSS.
@@ -102,15 +105,14 @@ async fn probe_rtp_echo_4mib_mss8k() {
         samples.push(elapsed);
     }
 
-    print_median_worst(
-        "rtp 4MiB 8KiB-MSS echo (one-way bytes)",
-        BULK,
-        samples,
-    );
+    print_median_worst("rtp 4MiB 8KiB-MSS echo (one-way bytes)", BULK, samples);
 
     pair.stop();
     let stats = combined_stats(&pair);
-    assert!(stats.forwarded > 0, "proxy should forward packets, got {stats:?}");
+    assert!(
+        stats.forwarded > 0,
+        "proxy should forward packets, got {stats:?}"
+    );
 }
 
 /// `mux`-over-`rtp` 4 MiB sink upload, default MSS.
@@ -150,7 +152,10 @@ async fn probe_mux_sink_4mib_direct() {
 
         pair.stop();
         let stats = combined_stats(&pair);
-        assert!(stats.forwarded > 0, "proxy should forward packets, got {stats:?}");
+        assert!(
+            stats.forwarded > 0,
+            "proxy should forward packets, got {stats:?}"
+        );
     }
 
     print_median_worst("mux sink 4MiB direct", BULK, samples);
@@ -191,7 +196,10 @@ async fn probe_mux_sink_4mib_mss8k() {
 
         pair.stop();
         let stats = combined_stats(&pair);
-        assert!(stats.forwarded > 0, "proxy should forward packets, got {stats:?}");
+        assert!(
+            stats.forwarded > 0,
+            "proxy should forward packets, got {stats:?}"
+        );
     }
 
     print_median_worst("mux sink 4MiB 8KiB-MSS", BULK, samples);
@@ -227,14 +235,13 @@ async fn probe_mux_echo_1mib_direct() {
 
         pair.stop();
         let stats = combined_stats(&pair);
-        assert!(stats.forwarded > 0, "proxy should forward packets, got {stats:?}");
+        assert!(
+            stats.forwarded > 0,
+            "proxy should forward packets, got {stats:?}"
+        );
     }
 
-    print_median_worst(
-        "mux echo 1MiB direct (one-way bytes)",
-        1024 * 1024,
-        samples,
-    );
+    print_median_worst("mux echo 1MiB direct (one-way bytes)", 1024 * 1024, samples);
 }
 
 /// `mux`-over-`rtp` 1 MiB echo round-trip using the loopback-sized MSS.
@@ -268,7 +275,10 @@ async fn probe_mux_echo_1mib_mss8k() {
 
         pair.stop();
         let stats = combined_stats(&pair);
-        assert!(stats.forwarded > 0, "proxy should forward packets, got {stats:?}");
+        assert!(
+            stats.forwarded > 0,
+            "proxy should forward packets, got {stats:?}"
+        );
     }
 
     print_median_worst(
@@ -293,7 +303,12 @@ async fn probe_hostile_goodput_30s() {
     let (server_addr, progress) = spawn_mux_over_rtp_counting_sink_server(false, LOOPBACK_MSS)
         .await
         .unwrap();
-    let pair = NetemPair::spawn(server_addr, support::hostile_real_link(), support::hostile_real_link()).unwrap();
+    let pair = NetemPair::spawn(
+        server_addr,
+        support::hostile_real_link(),
+        support::hostile_real_link(),
+    )
+    .unwrap();
     let pair_ref = &pair;
     let (read, write) = rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
     let (opener, _spawner) = mux_client_connect(read, write);
@@ -353,4 +368,3 @@ async fn probe_hostile_goodput_30s() {
     // Keep the stream read half alive until after the delivered snapshot.
     let _ = stream_read;
 }
-

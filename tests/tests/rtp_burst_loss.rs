@@ -72,42 +72,77 @@ const RANDOM_LOSS_PCT: f64 = 5.0;
 #[ignore]
 async fn rtp_bulk_goodput_burst_loss_retains_ninety_percent_of_random() {
     let window = Duration::from_secs(BULK_WINDOW_S);
-    let data: &'static [u8] =
-        Box::leak(cyclic_payload(256 * 1024 * 1024).into_boxed_slice());
+    let data: &'static [u8] = Box::leak(cyclic_payload(256 * 1024 * 1024).into_boxed_slice());
 
     let mut ratios = Vec::with_capacity(BULK_REPETITIONS);
     for rep in 0..BULK_REPETITIONS {
         let seed_offset = rep * 100;
         let (burst_delivered, random_delivered, burst_pair, random_pair) = if rep % 2 == 0 {
             let burst = run_rtp_sink_upload(
-                burst_loss_link(BURST_LOSS_PCT, BURST_LOSS_MEAN_LEN, OWD, (11 + seed_offset) as u64),
-                burst_loss_link(BURST_LOSS_PCT, BURST_LOSS_MEAN_LEN, OWD, (22 + seed_offset) as u64),
-                data, window,
-            ).await;
+                burst_loss_link(
+                    BURST_LOSS_PCT,
+                    BURST_LOSS_MEAN_LEN,
+                    OWD,
+                    (11 + seed_offset) as u64,
+                ),
+                burst_loss_link(
+                    BURST_LOSS_PCT,
+                    BURST_LOSS_MEAN_LEN,
+                    OWD,
+                    (22 + seed_offset) as u64,
+                ),
+                data,
+                window,
+            )
+            .await;
             let random = run_rtp_sink_upload(
                 random_loss_link(RANDOM_LOSS_PCT, OWD, (33 + seed_offset) as u64),
                 random_loss_link(RANDOM_LOSS_PCT, OWD, (44 + seed_offset) as u64),
-                data, window,
-            ).await;
+                data,
+                window,
+            )
+            .await;
             (burst.1, random.1, burst.0, random.0)
         } else {
             let random = run_rtp_sink_upload(
                 random_loss_link(RANDOM_LOSS_PCT, OWD, (33 + seed_offset) as u64),
                 random_loss_link(RANDOM_LOSS_PCT, OWD, (44 + seed_offset) as u64),
-                data, window,
-            ).await;
+                data,
+                window,
+            )
+            .await;
             let burst = run_rtp_sink_upload(
-                burst_loss_link(BURST_LOSS_PCT, BURST_LOSS_MEAN_LEN, OWD, (11 + seed_offset) as u64),
-                burst_loss_link(BURST_LOSS_PCT, BURST_LOSS_MEAN_LEN, OWD, (22 + seed_offset) as u64),
-                data, window,
-            ).await;
+                burst_loss_link(
+                    BURST_LOSS_PCT,
+                    BURST_LOSS_MEAN_LEN,
+                    OWD,
+                    (11 + seed_offset) as u64,
+                ),
+                burst_loss_link(
+                    BURST_LOSS_PCT,
+                    BURST_LOSS_MEAN_LEN,
+                    OWD,
+                    (22 + seed_offset) as u64,
+                ),
+                data,
+                window,
+            )
+            .await;
             (burst.1, random.1, burst.0, random.0)
         };
 
         let burst_goodput = burst_delivered as f64 / (1024.0 * 1024.0) / BULK_WINDOW_S as f64;
         let random_goodput = random_delivered as f64 / (1024.0 * 1024.0) / BULK_WINDOW_S as f64;
-        print_perf(&format!("rtp bulk goodput burst rep {rep}"), burst_delivered as usize, window);
-        print_perf(&format!("rtp bulk goodput random rep {rep}"), random_delivered as usize, window);
+        print_perf(
+            &format!("rtp bulk goodput burst rep {rep}"),
+            burst_delivered as usize,
+            window,
+        );
+        print_perf(
+            &format!("rtp bulk goodput random rep {rep}"),
+            random_delivered as usize,
+            window,
+        );
 
         assert!(
             random_goodput >= RANDOM_GOODPUT_STALL_FLOOR_MIB_S,
@@ -128,7 +163,9 @@ async fn rtp_bulk_goodput_burst_loss_retains_ninety_percent_of_random() {
     }
     ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median_ratio = ratios[BULK_REPETITIONS / 2];
-    eprintln!("[rtp_burst_loss] median burst/random ratio (N={BULK_REPETITIONS}) = {median_ratio:.3}");
+    eprintln!(
+        "[rtp_burst_loss] median burst/random ratio (N={BULK_REPETITIONS}) = {median_ratio:.3}"
+    );
     assert!(
         median_ratio >= MIN_BURST_VS_RANDOM_RATIO,
         "median burst/random ratio {median_ratio:.3} < {MIN_BURST_VS_RANDOM_RATIO}"
