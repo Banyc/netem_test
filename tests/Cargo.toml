@@ -8,6 +8,7 @@ license.workspace = true
 netem-test = { path = "../netem-test" }
 rtp = { path = "../../rtp" }
 mux = { path = "../../mux" }
+rtp_mux = { path = "../../rtp_mux" }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [lib]
