@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::{
     combined_stats, cyclic_payload, dual_mux_client_connect_with_lane_modes, gilbert_elliott_loss,
-    mux_client_connect, percentile, rtp_frame_delivery_connect, send_timestamped_messages,
-    spawn_dual_mux_latency_bulk_server_two_listeners, spawn_mux_frame_delivery_latency_bulk_server,
-    spawn_mux_latency_bulk_server, spawn_rtp_bulk_upload,
-    spawn_rtp_byte_sink_server, with_timeout,
+    mux_client_connect, percentile, rtp_frame_delivery_connect, rtp_mux_connector,
+    send_timestamped_messages, spawn_dual_mux_latency_bulk_server_two_listeners,
+    spawn_mux_frame_delivery_latency_bulk_server, spawn_mux_latency_bulk_server, spawn_rtp_bulk_upload,
+    spawn_rtp_byte_sink_server, spawn_rtp_mux_latency_bulk_server, with_timeout,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod support;
 
@@ -279,9 +279,9 @@ async fn run_hol_probe(
     summary
 }
 
-/// Send timestamped `b'L'` frames through a mux stream write half.
+/// Send timestamped `b'L'` frames through a byte-stream write half.
 async fn run_mux_interactive_stream(
-    write: &mut mux::StreamWriter,
+    write: &mut (impl AsyncWrite + Unpin),
     base: Instant,
     msg_bytes: usize,
     cadence: Duration,
@@ -293,9 +293,9 @@ async fn run_mux_interactive_stream(
     send_timestamped_messages(write, base, msg_bytes, cadence, run_for).await
 }
 
-/// Send a deterministic `b'B'` bulk stream through a mux stream write half.
+/// Send a deterministic `b'B'` bulk stream through a byte-stream write half.
 async fn run_mux_bulk_stream(
-    write: &mut mux::StreamWriter,
+    write: &mut (impl AsyncWrite + Unpin),
     payload: Arc<Vec<u8>>,
     active_for: Duration,
 ) -> u64 {
@@ -1256,13 +1256,95 @@ async fn run_hol_probe_frame_delivery_shared(
     summary
 }
 
+/// Run an HOL probe through production `rtp_mux`.  Both lanes use
+/// frame‑delivery RTP; the connector routes the interactive stream through
+/// the interactive lane and the bulk stream through the bulk lane.
+async fn run_hol_probe_rtp_mux(
+    label: &str,
+    int_c2s: NetemConfig,
+    int_s2c: NetemConfig,
+    bulk_c2s: NetemConfig,
+    bulk_s2c: NetemConfig,
+    traffic: TrafficConfig,
+) -> HolSummary {
+    let TrafficConfig {
+        msg_bytes,
+        cadence,
+        run_for,
+        grace,
+    } = traffic;
+    let base = Instant::now();
+    let (int_addr, bulk_addr, mut latencies, bulk_counter) =
+        spawn_rtp_mux_latency_bulk_server(false, base).await.unwrap();
+    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+    let connector = Arc::new(rtp_mux_connector(bulk_pair.client_addr(), false));
+    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bulk_handle = {
+        let connector = Arc::clone(&connector);
+        let payload = Arc::clone(&payload);
+        let stop = Arc::clone(&bulk_stop);
+        let int_proxy_addr = int_pair.client_addr();
+        tokio::spawn(async move {
+            let mut stream = match connector
+                .connect_stream_with_lane(int_proxy_addr, mux::LaneClass::Bulk)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(_) => return,
+            };
+            if stream.write_all(b"B").await.is_err() {
+                return;
+            }
+            let mut offset = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                match stream.write(&payload[offset..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => offset = (offset + n) % payload.len(),
+                }
+            }
+            let _ = stream.shutdown().await;
+        })
+    };
+    tokio::time::sleep(BULK_RAMP).await;
+    let mut stream = connector
+        .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
+        .await
+        .unwrap();
+    let sent = run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for).await;
+    let _ = stream.shutdown().await;
+    bulk_stop.store(true, Ordering::Relaxed);
+    let _ = bulk_handle.await;
+    tokio::time::sleep(grace).await;
+    let mut samples = Vec::new();
+    while let Ok((_tag, latency)) = latencies.try_recv() {
+        samples.push(latency);
+    }
+    let received = samples.len() as u64;
+    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
+    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+    print_hol_summary(label, &summary);
+    eprintln!(
+        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+        combined_stats(&int_pair),
+        combined_stats(&bulk_pair)
+    );
+    int_pair.stop();
+    bulk_pair.stop();
+    summary
+}
+
 /// Run an HOL probe on a dual-lane setup: two independent RTP connections
 /// (one per lane), each with its own [`NetemPair`].  `interactive_frame` /
 /// `bulk_frame` control per-lane frame‑delivery.
 ///
 /// The interactive stream rides the interactive lane; the bulk stream rides
-/// the bulk lane.  When either lane requests frame‑delivery the server uses
-/// separate listeners so each lane's accept method is fixed at accept time.
+/// the bulk lane.  When both lanes request frame‑delivery the probe routes
+/// through the production [`rtp_mux`] composition via
+/// [`run_hol_probe_rtp_mux`]; asymmetric lane‑mode diagnostics continue
+/// through the lower‑level dual‑mux helpers.
 async fn run_hol_probe_dual_lane(
     label: &str,
     int_c2s: NetemConfig,
@@ -1271,6 +1353,17 @@ async fn run_hol_probe_dual_lane(
     bulk_s2c: NetemConfig,
     config: DualLaneProbeConfig,
 ) -> HolSummary {
+    if config.interactive_frame && config.bulk_frame {
+        return run_hol_probe_rtp_mux(
+            label,
+            int_c2s,
+            int_s2c,
+            bulk_c2s,
+            bulk_s2c,
+            config.traffic,
+        )
+        .await;
+    }
     let DualLaneProbeConfig {
         interactive_frame,
         bulk_frame,
@@ -1292,10 +1385,8 @@ async fn run_hol_probe_dual_lane(
         )
         .await
         .unwrap();
-
     let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
-
     let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -1305,7 +1396,6 @@ async fn run_hol_probe_dual_lane(
     )
     .await
     .unwrap();
-
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let bulk_opener = opener.clone();
@@ -1328,9 +1418,7 @@ async fn run_hol_probe_dual_lane(
             let _ = w.shutdown();
         })
     };
-
     tokio::time::sleep(BULK_RAMP).await;
-
     let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
@@ -1342,21 +1430,17 @@ async fn run_hol_probe_dual_lane(
     });
     let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
     let _ = rr_write.shutdown();
-
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
-
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();
     while let Ok((_tag, lat)) = latencies.try_recv() {
         samples.push(lat);
     }
-
     let received = samples.len() as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
     let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
-
     print_hol_summary(label, &summary);
     eprintln!(
         "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",

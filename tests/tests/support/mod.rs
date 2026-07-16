@@ -1256,6 +1256,67 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// rtp_mux helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Spawn an rtp_mux server with interactive and bulk listeners. Accepted
+/// streams are classified by lane class: interactive-lane streams are treated
+/// as timestamped latency streams; bulk-lane streams are treated as
+/// deterministic byte sinks.
+pub async fn spawn_rtp_mux_latency_bulk_server(
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    UnboundedReceiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
+    let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0", fec).await?;
+    let interactive_addr = server.listener().local_addr();
+    let bulk_addr = server.bulk_listener().local_addr();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+    let bulk_for_server = Arc::clone(&bulk_delivered);
+    tokio::spawn(async move {
+        let _ = server
+            .serve(move |stream| {
+                let source_lane = stream.source_lane();
+                let (reader, writer) = tokio::io::split(stream);
+                spawn_tagged_stream_sink(
+                    reader,
+                    writer,
+                    tx.clone(),
+                    Arc::clone(&bulk_for_server),
+                    base,
+                    source_lane == mux::LaneClass::Interactive,
+                );
+            })
+            .await;
+    });
+    Ok((interactive_addr, bulk_addr, rx, bulk_delivered))
+}
+
+/// Build an [`rtp_mux::RtpMuxConnector`] that routes bulk lane traffic to
+/// `bulk_proxy_addr`.
+pub fn rtp_mux_connector(
+    bulk_proxy_addr: std::net::SocketAddr,
+    fec: bool,
+) -> rtp_mux::RtpMuxConnector {
+    let bind: rtp_mux::BindSelector = Arc::new(|addr| match addr {
+        std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+        std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+    });
+    let bulk_addr: rtp_mux::BulkAddrSelector =
+        Arc::new(move |_| Ok(bulk_proxy_addr));
+    rtp_mux::RtpMuxConnector::with_config(rtp_mux::RtpMuxConnectorConfig {
+        bind,
+        bulk_addr,
+        fec,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Dual‑mux helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
