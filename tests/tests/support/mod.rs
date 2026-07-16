@@ -2101,151 +2101,8 @@ impl SplitMix64 {
 use rtp::transmission::fec_tuning::FecTuning;
 use rtp::transmission::frame_delivery::FrameDelivery;
 
-type FrameSendFut =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, std::io::ErrorKind>> + Send>>;
-type FrameRecvFut = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, std::io::ErrorKind>> + Send>,
->;
-
-/// AsyncWrite adapter over [`rtp::socket::WriteSocket`] that guarantees
-/// ONE mux frame = ONE rtp frame.  Each `poll_write` sends the *whole*
-/// incoming buffer as a single RTP frame by polling a boxed future that
-/// calls [`WriteSocket::send_frame`] directly (no background task / channel),
-/// so latency measurement is tied to the actual RTP I/O path.
-pub struct RtpFrameDeliveryWriter {
-    socket: std::sync::Arc<tokio::sync::Mutex<rtp::socket::WriteSocket>>,
-    inflight: Option<(usize, FrameSendFut)>,
-}
-
-impl RtpFrameDeliveryWriter {
-    fn new(socket: rtp::socket::WriteSocket) -> Self {
-        Self {
-            socket: std::sync::Arc::new(tokio::sync::Mutex::new(socket)),
-            inflight: None,
-        }
-    }
-}
-
-impl std::marker::Unpin for RtpFrameDeliveryWriter {}
-
-impl tokio::io::AsyncWrite for RtpFrameDeliveryWriter {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let len = buf.len();
-        if self.inflight.is_none() {
-            let data = buf.to_vec();
-            let socket = self.socket.clone();
-            self.inflight = Some((
-                len,
-                Box::pin(async move { socket.lock().await.send_frame(&data).await }),
-            ));
-        }
-        let (sent_len, fut) = self.inflight.as_mut().unwrap();
-        debug_assert_eq!(
-            *sent_len, len,
-            "caller changed buf across Pending poll_write"
-        );
-        let result = std::task::ready!(fut.as_mut().poll(cx));
-        let sent_len = *sent_len;
-        self.inflight = None;
-        match result {
-            Ok(n) if n == sent_len => std::task::Poll::Ready(Ok(n)),
-            Ok(_) => std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "RtpFrameDeliveryWriter: partial rtp frame send",
-            ))),
-            Err(e) => std::task::Poll::Ready(Err(std::io::Error::from(e))),
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-/// AsyncRead adapter over [`rtp::socket::ReadSocket`] that yields each
-/// delivered RTP frame's bytes in RTP delivery order.  In frame-delivery
-/// mode every `recv_frame()` call returns one complete frame (possibly out
-/// of order across mux frames when holes exist); this adapter buffers one
-/// frame at a time and drains it through [`tokio::io::AsyncRead`].
-///
-/// `recv_frame()` is polled directly inside `poll_read` (no background
-/// task / channel), so latency measurement is tied to the actual RTP I/O
-/// path.
-pub struct RtpFrameReader {
-    socket: std::sync::Arc<rtp::socket::ReadSocket>,
-    inflight: Option<FrameRecvFut>,
-    buf: Vec<u8>,
-    pos: usize,
-    eof: bool,
-}
-
-impl RtpFrameReader {
-    fn new(socket: rtp::socket::ReadSocket) -> Self {
-        Self {
-            socket: std::sync::Arc::new(socket),
-            inflight: None,
-            buf: Vec::new(),
-            pos: 0,
-            eof: false,
-        }
-    }
-}
-
-impl std::marker::Unpin for RtpFrameReader {}
-
-impl tokio::io::AsyncRead for RtpFrameReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        target: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        if self.eof {
-            return std::task::Poll::Ready(Ok(()));
-        }
-        if self.pos < self.buf.len() {
-            let remain = self.buf.len() - self.pos;
-            let n = remain.min(target.remaining());
-            target.put_slice(&self.buf[self.pos..self.pos + n]);
-            self.pos += n;
-            return std::task::Poll::Ready(Ok(()));
-        }
-        if self.inflight.is_none() {
-            let socket = self.socket.clone();
-            self.inflight = Some(Box::pin(async move { socket.recv_frame().await }));
-        }
-        let result = std::task::ready!(self.inflight.as_mut().unwrap().as_mut().poll(cx));
-        self.inflight = None;
-        match result {
-            Ok(Some(frame)) => {
-                self.buf = frame;
-                self.pos = 0;
-                let n = self.buf.len().min(target.remaining());
-                target.put_slice(&self.buf[..n]);
-                self.pos = n;
-                std::task::Poll::Ready(Ok(()))
-            }
-            Ok(None) => {
-                self.eof = true;
-                std::task::Poll::Ready(Ok(()))
-            }
-            Err(e) => std::task::Poll::Ready(Err(std::io::Error::from(e))),
-        }
-    }
-}
+pub type RtpFrameReader = rtp::socket::FrameReader;
+pub type RtpFrameDeliveryWriter = rtp::socket::FrameWriter;
 
 /// Connect an rtp client using frame delivery.  Returns the frame-preserving
 /// reader and writer adapters that guarantee one-mux-frame-per-one-rtp-frame.
@@ -2253,7 +2110,8 @@ pub async fn rtp_frame_delivery_connect(
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
-    rtp_frame_delivery_connect_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
+    rtp_frame_delivery_connect_with_mss_config(proxy_client_addr, fec, rtp::udp::MssConfig::Default)
+        .await
 }
 
 /// Connect an rtp client using frame delivery with a custom MSS.
@@ -2262,24 +2120,33 @@ pub async fn rtp_frame_delivery_connect_with_mss(
     fec: bool,
     mss: usize,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
-    let connected = rtp::udp::connect_with_mss_fec_tuning_and_frame_delivery(
+    rtp_frame_delivery_connect_with_mss_config(
+        proxy_client_addr,
+        fec,
+        rtp::udp::MssConfig::Custom(mss),
+    )
+    .await
+}
+
+async fn rtp_frame_delivery_connect_with_mss_config(
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: rtp::udp::MssConfig,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    let connected = rtp::udp::FrameDeliveryIo::connect(
         "0.0.0.0:0",
         &proxy_client_addr.to_string(),
-        rtp::udp::ConnectConfig {
+        rtp::udp::FrameDeliveryConnectConfig {
             log_config: None,
             handshake: false,
             fec,
             mss,
             fec_tuning: FecTuning::default(),
-            frame_delivery: FrameDelivery::enabled(),
         },
     )
     .await
     .unwrap();
-    (
-        RtpFrameReader::new(connected.read),
-        RtpFrameDeliveryWriter::new(connected.write),
-    )
+    (connected.read, connected.write)
 }
 
 /// Connect a dual-mux client with frame reassembly enabled on both lanes.
