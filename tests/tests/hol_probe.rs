@@ -9,7 +9,10 @@
 //! cargo test --release --test hol_probe -- --ignored --nocapture --test-threads=1
 //! ```
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
@@ -308,6 +311,33 @@ async fn run_mux_bulk_stream(
     let mut offset = 0usize;
     let mut written = 0u64;
     while start.elapsed() < active_for {
+        match write.write(&payload[offset..]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                offset = (offset + n) % payload.len();
+                written += n as u64;
+            }
+            Err(_) => break,
+        }
+    }
+    written
+}
+
+async fn run_delayed_mux_bulk_stream(
+    write: &mut (impl AsyncWrite + Unpin),
+    payload: Arc<Vec<u8>>,
+    delay: Duration,
+    active_for: Duration,
+    stop: &AtomicBool,
+) -> u64 {
+    tokio::time::sleep(delay).await;
+    if stop.load(Ordering::Relaxed) || write.write_all(b"B").await.is_err() {
+        return 0;
+    }
+    let start = Instant::now();
+    let mut offset = 0usize;
+    let mut written = 0u64;
+    while start.elapsed() < active_for && !stop.load(Ordering::Relaxed) {
         match write.write(&payload[offset..]).await {
             Ok(0) => break,
             Ok(n) => {
@@ -1278,7 +1308,8 @@ async fn run_hol_probe_rtp_mux(
     let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
     let connector = Arc::new(rtp_mux_connector(bulk_pair.client_addr(), false));
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_for = run_for - BULK_RAMP;
+    let bulk_stop = Arc::new(AtomicBool::new(false));
     let bulk_handle = {
         let connector = Arc::clone(&connector);
         let payload = Arc::clone(&payload);
@@ -1292,20 +1323,11 @@ async fn run_hol_probe_rtp_mux(
                 Ok(stream) => stream,
                 Err(_) => return,
             };
-            if stream.write_all(b"B").await.is_err() {
-                return;
-            }
-            let mut offset = 0usize;
-            while !stop.load(Ordering::Relaxed) {
-                match stream.write(&payload[offset..]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % payload.len(),
-                }
-            }
+            let _ = run_delayed_mux_bulk_stream(&mut stream, payload, BULK_RAMP, active_for, &stop)
+                .await;
             let _ = stream.shutdown().await;
         })
     };
-    tokio::time::sleep(BULK_RAMP).await;
     let mut stream = connector
         .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
         .await
@@ -1321,7 +1343,7 @@ async fn run_hol_probe_rtp_mux(
     }
     let received = samples.len() as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
+    let bulk_secs = active_for.as_secs_f64();
     let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
     print_hol_summary(label, &summary);
     eprintln!(
@@ -1388,7 +1410,8 @@ async fn run_hol_probe_dual_lane(
     .await
     .unwrap();
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_for = run_for - BULK_RAMP;
+    let bulk_stop = Arc::new(AtomicBool::new(false));
     let bulk_opener = opener.clone();
     let bulk_handle = {
         let payload = Arc::clone(&payload);
@@ -1398,18 +1421,11 @@ async fn run_hol_probe_dual_lane(
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let _ = w.write_all(b"B").await;
-            let mut offset = 0usize;
-            while !stop.load(Ordering::Relaxed) {
-                match w.write(&payload[offset..]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % payload.len(),
-                }
-            }
+            let _ =
+                run_delayed_mux_bulk_stream(&mut w, payload, BULK_RAMP, active_for, &stop).await;
             let _ = w.shutdown();
         })
     };
-    tokio::time::sleep(BULK_RAMP).await;
     let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
@@ -1430,7 +1446,7 @@ async fn run_hol_probe_dual_lane(
     }
     let received = samples.len() as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
+    let bulk_secs = active_for.as_secs_f64();
     let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
     print_hol_summary(label, &summary);
     eprintln!(
@@ -1490,7 +1506,8 @@ async fn run_hol_probe_dual_lane_two_interactive(
     .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_for = run_for - BULK_RAMP;
+    let bulk_stop = Arc::new(AtomicBool::new(false));
     let bulk_opener = opener.clone();
     let bulk_handle = {
         let payload = Arc::clone(&payload);
@@ -1500,14 +1517,8 @@ async fn run_hol_probe_dual_lane_two_interactive(
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let _ = w.write_all(b"B").await;
-            let mut offset = 0usize;
-            while !stop.load(Ordering::Relaxed) {
-                match w.write(&payload[offset..]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % payload.len(),
-                }
-            }
+            let _ =
+                run_delayed_mux_bulk_stream(&mut w, payload, BULK_RAMP, active_for, &stop).await;
             let _ = w.shutdown();
         })
     };
@@ -1530,8 +1541,6 @@ async fn run_hol_probe_dual_lane_two_interactive(
             }
         }
     });
-
-    tokio::time::sleep(BULK_RAMP).await;
 
     if write_a.write_all(b"A").await.is_err() {
         let _ = write_a.shutdown();
@@ -1557,7 +1566,6 @@ async fn run_hol_probe_dual_lane_two_interactive(
             0.0,
         );
     }
-
     let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
     let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
     let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
@@ -1580,7 +1588,6 @@ async fn run_hol_probe_dual_lane_two_interactive(
         }
     }
 
-    let active_for = run_for - BULK_RAMP;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     let bulk_secs = active_for.as_secs_f64();
     let bulk_mibps = if bulk_secs > 0.0 {
@@ -2105,7 +2112,8 @@ async fn run_hol_probe_dual_lane_separate_listeners(
     .unwrap();
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let bulk_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_for = run_for - BULK_RAMP;
+    let bulk_stop = Arc::new(AtomicBool::new(false));
     let bulk_opener = opener.clone();
     let bulk_handle = {
         let payload = Arc::clone(&payload);
@@ -2115,19 +2123,11 @@ async fn run_hol_probe_dual_lane_separate_listeners(
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let _ = w.write_all(b"B").await;
-            let mut offset = 0usize;
-            while !stop.load(Ordering::Relaxed) {
-                match w.write(&payload[offset..]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => offset = (offset + n) % payload.len(),
-                }
-            }
+            let _ =
+                run_delayed_mux_bulk_stream(&mut w, payload, BULK_RAMP, active_for, &stop).await;
             let _ = w.shutdown();
         })
     };
-
-    tokio::time::sleep(BULK_RAMP).await;
 
     let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
     tokio::spawn(async move {
@@ -2152,7 +2152,7 @@ async fn run_hol_probe_dual_lane_separate_listeners(
 
     let received = samples.len() as u64;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
+    let bulk_secs = active_for.as_secs_f64();
     let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
 
     print_hol_summary(label, &summary);
