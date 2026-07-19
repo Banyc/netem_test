@@ -1122,9 +1122,13 @@ async fn run_game_sync_client(
         let mut iters = 0u32;
         while start.elapsed() < run_for {
             let frame = make_latency_frame(SMALL_MSG_BYTES, base);
-            if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(5), auto_writer.write_all(&frame)).await {
+            if let Ok(Ok(())) =
+                tokio::time::timeout(Duration::from_secs(5), auto_writer.write_all(&frame)).await
+            {
                 sent += 1;
-                if let Ok(Some(lat)) = tokio::time::timeout(Duration::from_secs(5), lat_rx.recv()).await {
+                if let Ok(Some(lat)) =
+                    tokio::time::timeout(Duration::from_secs(5), lat_rx.recv()).await
+                {
                     if phase2_start.elapsed().as_secs() < GAMING_TRANSITION_SECS {
                         transition_latencies.push(lat);
                     } else {

@@ -241,13 +241,14 @@ fn print_contested_rep(label: &str, r: &ContestedRepResult, rep: usize, rate_bps
         bulk = bulk_mibps,
     );
     if let Some(rate) = rate_bps
-        && rate > 0 {
-            let serialization_ms_per_pkt = 1400.0 * 8.0 * 1000.0 / rate as f64;
-            eprintln!(
-                "[contested {label} rep={rep}] attribution: q_mean x {serialization_ms_per_pkt:.2} ms/pkt = {:.1} ms vs p50 {p50:.1} ms",
-                q_mean as f64 * serialization_ms_per_pkt,
-            );
-        }
+        && rate > 0
+    {
+        let serialization_ms_per_pkt = 1400.0 * 8.0 * 1000.0 / rate as f64;
+        eprintln!(
+            "[contested {label} rep={rep}] attribution: q_mean x {serialization_ms_per_pkt:.2} ms/pkt = {:.1} ms vs p50 {p50:.1} ms",
+            q_mean as f64 * serialization_ms_per_pkt,
+        );
+    }
 }
 
 /// Run `contested_rep` three times with seeds `100 + 10*rep`, print the
