@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dist;
+
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io;

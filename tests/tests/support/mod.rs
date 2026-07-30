@@ -1312,6 +1312,7 @@ pub fn rtp_mux_connector(
         bind,
         bulk_addr,
         fec,
+        response_migration: false,
     })
 }
 
@@ -1696,6 +1697,9 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
                                             reader, writer, base, bulk, tx,
                                         ));
                                     }
+                                    Ok(mux::AcceptedStream::MigratingDuplex { .. }) => {
+                                        unreachable!("duplex accept mode is not used here")
+                                    }
                                     Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
                                         let bulk = Arc::clone(&bulk);
                                         let tx = tx.clone();
@@ -1862,6 +1866,9 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
                                         tokio::spawn(handle_gaming_stream(
                                             reader, writer, base, bulk, tx,
                                         ));
+                                    }
+                                    Ok(mux::AcceptedStream::MigratingDuplex { .. }) => {
+                                        unreachable!("duplex accept mode is not used here")
                                     }
                                     Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
                                         let bulk = Arc::clone(&bulk);

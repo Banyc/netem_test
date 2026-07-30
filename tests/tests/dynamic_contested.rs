@@ -150,6 +150,15 @@ fn summarize(label: &str, results: &[DynTrafficResult]) {
         delivery,
     );
 
+    let arms = [
+        ("small", all_small.as_slice()),
+        ("burst", all_burst.as_slice()),
+    ];
+    if let Ok(path) = netem_test::dist::dump_csv(&format!("dyn_{label}"), &arms) {
+        eprintln!("[dyn {label}] samples: {}", path.display());
+    }
+    eprintln!("{}", netem_test::dist::ab_report(label, "ms", &arms));
+
     assert!(
         delivery > 0.80,
         "[dyn {label}] delivery too low: {delivery:.3}"
@@ -1001,6 +1010,15 @@ fn summarize_gaming(label: &str, results: &[GamingResult]) {
         bulk_total as f64 / (1024.0 * 1024.0) / bulk_secs,
         delivery,
     );
+
+    let arms = [
+        ("steady", steady.as_slice()),
+        ("transition", trans.as_slice()),
+    ];
+    if let Ok(path) = netem_test::dist::dump_csv(&format!("gaming_{label}"), &arms) {
+        eprintln!("[gaming {label}] samples: {}", path.display());
+    }
+    eprintln!("{}", netem_test::dist::ab_report(label, "ms", &arms));
 
     // Gaming arms: the sticky variant is expected to have very poor
     // delivery (deltas pinned to the congested bulk lane).  Require only
