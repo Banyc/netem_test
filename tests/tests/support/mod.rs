@@ -1297,8 +1297,6 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     Ok((interactive_addr, bulk_addr, rx, bulk_delivered))
 }
 
-/// Build an [`rtp_mux::RtpMuxConnector`] that routes bulk lane traffic to
-/// `bulk_proxy_addr`.
 pub fn rtp_mux_connector(
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
@@ -1312,7 +1310,10 @@ pub fn rtp_mux_connector(
         bind,
         bulk_addr,
         fec,
-        response_migration: false,
+        explorer: rtp_mux::ExplorerConfig {
+            enabled: false,
+            ..rtp_mux::ExplorerConfig::default()
+        },
     })
 }
 
@@ -2240,12 +2241,6 @@ pub async fn dual_mux_client_connect_frame_reassembly(
     Ok((opener, accepter, spawner))
 }
 
-/// Connect a dual-mux client with per-lane mode flags.
-///
-/// `interactive_frame` enables frame-reassembly on the interactive lane;
-/// `bulk_frame` enables frame-reassembly on the bulk lane.  When a lane's
-/// flag is true its RTP connection uses frame delivery; when false the
-/// stock byte-stream RTP connection is used.
 pub async fn dual_mux_client_connect_with_lane_modes(
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
@@ -2270,10 +2265,8 @@ pub async fn dual_mux_client_connect_with_lane_modes(
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: bulk_frame,
     };
-
     type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
     type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
-
     async fn connect_lane(
         addr: std::net::SocketAddr,
         fec: bool,
@@ -2287,11 +2280,9 @@ pub async fn dual_mux_client_connect_with_lane_modes(
             Some((Box::new(r), Box::new(w)))
         }
     }
-
     let mut super_spawner = JoinSet::new();
-
     let nonce = mux::PairingNonce::generate();
-
+    let group = mux::GroupToken::generate();
     let Some((int_reader, mut int_writer)) =
         connect_lane(int_proxy_addr, fec, interactive_frame).await
     else {
@@ -2299,27 +2290,24 @@ pub async fn dual_mux_client_connect_with_lane_modes(
             std::io::ErrorKind::ConnectionRefused,
         )));
     };
-    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce)
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
-
     let Some((bulk_reader, mut bulk_writer)) = connect_lane(bulk_proxy_addr, fec, bulk_frame).await
     else {
         return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
             std::io::ErrorKind::ConnectionRefused,
         )));
     };
-    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce)
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
-
     let mut int_spawner = JoinSet::new();
     let (int_opener, int_accepter) =
         mux::spawn_mux_no_reconnection(int_reader, int_writer, int_config, &mut int_spawner);
     let mut bulk_spawner = JoinSet::new();
     let (bulk_opener, bulk_accepter) =
         mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, bulk_config, &mut bulk_spawner);
-
     let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
         int_opener,
         int_accepter,
@@ -2329,7 +2317,6 @@ pub async fn dual_mux_client_connect_with_lane_modes(
         bulk_spawner,
         &mut super_spawner,
     );
-
     Ok((opener, accepter, super_spawner))
 }
 
@@ -2876,4 +2863,85 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     });
 
     Ok((addr, rx, bulk_delivered))
+}
+
+pub struct NetemFan {
+    addr: std::net::SocketAddr,
+    stop: Arc<AtomicBool>,
+}
+
+impl NetemFan {
+    pub fn spawn(
+        server_addr: std::net::SocketAddr,
+        config: impl Fn() -> (NetemConfig, NetemConfig) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        use std::net::UdpSocket;
+        let front = UdpSocket::bind("127.0.0.1:0")?;
+        front.set_read_timeout(Some(Duration::from_millis(5)))?;
+        let addr = front.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_front = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("netem-fan".into())
+            .spawn(move || {
+                let front = Arc::new(front);
+                let mut flows: HashMap<std::net::SocketAddr, UdpSocket> = HashMap::new();
+                let mut pairs: Vec<NetemPair> = Vec::new();
+                let mut buf = [0u8; 65535];
+                while !stop_front.load(Ordering::Relaxed) {
+                    match front.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            let sock = flows.entry(from).or_insert_with(|| {
+                                let (c2s, s2c) = config();
+                                let pair = NetemPair::spawn(server_addr, c2s, s2c)
+                                    .expect("spawn per-flow NetemPair");
+                                let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+                                sock.connect(pair.client_addr()).unwrap();
+                                sock.set_read_timeout(Some(Duration::from_millis(5)))
+                                    .unwrap();
+                                let back = sock.try_clone().unwrap();
+                                let front = Arc::clone(&front);
+                                let stop = Arc::clone(&stop_front);
+                                std::thread::Builder::new()
+                                    .name("netem-fan-flow".into())
+                                    .spawn(move || {
+                                        let mut buf = [0u8; 65535];
+                                        while !stop.load(Ordering::Relaxed) {
+                                            match back.recv(&mut buf) {
+                                                Ok(n) => {
+                                                    let _ = front.send_to(&buf[..n], from);
+                                                }
+                                                Err(e)
+                                                    if e.kind()
+                                                        == std::io::ErrorKind::WouldBlock
+                                                        || e.kind()
+                                                            == std::io::ErrorKind::TimedOut => {}
+                                                Err(_) => break,
+                                            }
+                                        }
+                                    })
+                                    .unwrap();
+                                pairs.push(pair);
+                                sock
+                            });
+                            let _ = sock.send(&buf[..n]);
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => break,
+                    }
+                }
+                for pair in &pairs {
+                    pair.stop();
+                }
+            })?;
+        Ok(Self { addr, stop })
+    }
+    pub fn client_addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }

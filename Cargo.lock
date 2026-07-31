@@ -759,6 +759,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tokio_udp",
  "tracing",
 ]
 

@@ -2,26 +2,14 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use netem_test::{NetemConfig, NetemPair};
 use rtp_mux::{
-    BindSelector, BulkAddrSelector, LaneClass, RtpMuxConnector, RtpMuxConnectorConfig, RtpMuxServer,
+    BindSelector, BulkAddrSelector, ExplorerConfig, LaneClass, RtpMuxConnector,
+    RtpMuxConnectorConfig, RtpMuxServer,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
-use support::{clean, combined_stats, payload, with_timeout};
 
-fn connector_with(bulk_proxy_addr: SocketAddr, response_migration: bool) -> RtpMuxConnector {
-    let bind: BindSelector = Arc::new(|addr| match addr {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-        SocketAddr::V6(_) => "[::1]:0".parse().unwrap(),
-    });
-    let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
-    RtpMuxConnector::with_config(RtpMuxConnectorConfig {
-        bind,
-        bulk_addr,
-        fec: false,
-        response_migration,
-    })
-}
+use support::{NetemFan, clean, combined_stats, payload, with_timeout};
 
 async fn spawn_echo_server() -> io::Result<(
     SocketAddr,
@@ -57,7 +45,10 @@ fn connector(bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
         bind,
         bulk_addr,
         fec: false,
-        response_migration: false,
+        explorer: ExplorerConfig {
+            enabled: false,
+            ..ExplorerConfig::default()
+        },
     })
 }
 
@@ -129,10 +120,8 @@ const PING_LEN: usize = 8;
 const PING_INTERVAL: Duration = Duration::from_millis(40);
 const CMD_DOWNLOAD: u8 = b'D';
 const CMD_PING: u8 = b'P';
-async fn spawn_cmd_server(response_migration: bool) -> io::Result<(SocketAddr, SocketAddr)> {
-    let server = RtpMuxServer::bind("127.0.0.1:0", false)
-        .await?
-        .with_response_migration(response_migration);
+async fn spawn_cmd_server() -> io::Result<(SocketAddr, SocketAddr)> {
+    let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     tokio::spawn(async move {
@@ -153,6 +142,21 @@ async fn spawn_cmd_server(response_migration: bool) -> io::Result<(SocketAddr, S
                                     return;
                                 }
                                 sent += chunk.len();
+                            }
+                            let _ = writer.shutdown().await;
+                        }
+                        CMD_UPLOAD => {
+                            let mut buf = vec![0u8; 64 * 1024];
+                            let mut total = 0usize;
+                            while total < UPLOAD_LEN {
+                                match reader.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => total += n,
+                                }
+                            }
+                            if total == UPLOAD_LEN {
+                                let _ = writer.write_all(&[1u8]).await;
+                                let _ = writer.flush().await;
                             }
                             let _ = writer.shutdown().await;
                         }
@@ -190,12 +194,12 @@ struct ResponseArm {
     download_secs: f64,
     bulk_lane_wire_pkts: u64,
 }
-async fn run_response_arm(response_migration: bool) -> ResponseArm {
-    let (interactive_server, bulk_server) = spawn_cmd_server(response_migration).await.unwrap();
+async fn run_response_arm() -> ResponseArm {
+    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
     let interactive_pair =
         NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
-    let connector = connector_with(bulk_pair.client_addr(), response_migration);
+    let connector = connector(bulk_pair.client_addr());
     let mut ping = connector
         .connect_stream(interactive_pair.client_addr())
         .await
@@ -240,65 +244,6 @@ async fn run_response_arm(response_migration: bool) -> ResponseArm {
         download_secs,
         bulk_lane_wire_pkts,
     }
-}
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn rtp_mux_response_migration_pinned_vs_migrating() {
-    let (pinned, migrating) =
-        with_timeout(Duration::from_secs(180), "response migration A/B", async {
-            let pinned = run_response_arm(false).await;
-            let migrating = run_response_arm(true).await;
-            (pinned, migrating)
-        })
-        .await;
-    for (label, arm) in [("pinned", &pinned), ("migrating", &migrating)] {
-        eprintln!(
-            "[resp-mig {label}] download {} B in {:.1}s ({:.2} MiB/s) pings={} bulk_lane_wire={} pkts",
-            arm.downloaded,
-            arm.download_secs,
-            arm.downloaded as f64 / (1024.0 * 1024.0) / arm.download_secs,
-            arm.ping_rtts_ms.len(),
-            arm.bulk_lane_wire_pkts
-        );
-        assert_eq!(arm.downloaded, DOWNLOAD_LEN, "[{label}] download truncated");
-        assert!(
-            arm.ping_rtts_ms.len() >= 20,
-            "[{label}] too few ping samples"
-        );
-    }
-    let arms = [
-        ("pinned", pinned.ping_rtts_ms.as_slice()),
-        ("migrating", migrating.ping_rtts_ms.as_slice()),
-    ];
-    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_response_migration", &arms) {
-        eprintln!("[resp-mig] samples: {}", path.display());
-    }
-    eprintln!(
-        "{}",
-        netem_test::dist::ab_report("response migration ping RTT", "ms", &arms)
-    );
-    assert!(
-        migrating.bulk_lane_wire_pkts > 2000,
-        "migrating arm should carry the download on the bulk lane (saw {} pkts)",
-        migrating.bulk_lane_wire_pkts
-    );
-    assert!(
-        pinned.bulk_lane_wire_pkts < 1000,
-        "pinned arm should keep the download off the bulk lane (saw {} pkts)",
-        pinned.bulk_lane_wire_pkts
-    );
-    let mut p = pinned.ping_rtts_ms.clone();
-    let mut m = migrating.ping_rtts_ms.clone();
-    p.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    m.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let (p90_pinned, p90_migrating) = (
-        netem_test::dist::percentile(&p, 0.90),
-        netem_test::dist::percentile(&m, 0.90),
-    );
-    assert!(
-        p90_migrating < p90_pinned * 0.8,
-        "response migration should cut p90 ping RTT: pinned={p90_pinned:.1}ms migrating={p90_migrating:.1}ms"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -357,4 +302,528 @@ async fn rtp_mux_survives_independent_impaired_lanes() {
     assert!(combined_stats(&bulk_pair).forwarded > 0);
     interactive_pair.stop();
     bulk_pair.stop();
+}
+
+const CMD_UPLOAD: u8 = b'U';
+
+const UPLOAD_LEN: usize = 8 * 1024 * 1024;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rtp_mux_response_migration_offloads_download() {
+    let arm = with_timeout(
+        Duration::from_secs(120),
+        "response migration",
+        run_response_arm(),
+    )
+    .await;
+    eprintln!(
+        "[resp-mig] download {} B in {:.1}s ({:.2} MiB/s) pings={} bulk_lane_wire={} pkts",
+        arm.downloaded,
+        arm.download_secs,
+        arm.downloaded as f64 / (1024.0 * 1024.0) / arm.download_secs,
+        arm.ping_rtts_ms.len(),
+        arm.bulk_lane_wire_pkts
+    );
+    assert_eq!(arm.downloaded, DOWNLOAD_LEN, "download truncated");
+    assert!(arm.ping_rtts_ms.len() >= 20, "too few ping samples");
+    let arms = [("migrating", arm.ping_rtts_ms.as_slice())];
+    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_response_migration", &arms) {
+        eprintln!("[resp-mig] samples: {}", path.display());
+    }
+    eprintln!(
+        "{}",
+        netem_test::dist::ab_report("response migration ping RTT", "ms", &arms)
+    );
+    assert!(
+        arm.bulk_lane_wire_pkts > 2000,
+        "the download should ride the bulk lane (saw {} pkts)",
+        arm.bulk_lane_wire_pkts
+    );
+    let mut m = arm.ping_rtts_ms.clone();
+    m.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p90 = netem_test::dist::percentile(&m, 0.90);
+    assert!(
+        p90 < 65.0,
+        "pings must stay clear of the download: p90={p90:.1}ms"
+    );
+}
+
+struct BidirArm {
+    ping_rtts_ms: Vec<f64>,
+    downloaded: usize,
+    uploaded_ok: bool,
+    bulk_lane_wire_pkts: u64,
+}
+
+async fn run_bidir_arm() -> BidirArm {
+    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
+    let interactive_pair =
+        NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
+    let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
+    let connector = connector(bulk_pair.client_addr());
+    let mut ping = connector
+        .connect_stream(interactive_pair.client_addr())
+        .await
+        .unwrap();
+    ping.write_all(&[CMD_PING]).await.unwrap();
+    let mut download = connector
+        .connect_stream(interactive_pair.client_addr())
+        .await
+        .unwrap();
+    let download_task = tokio::spawn(async move {
+        download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        loop {
+            match download.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
+        total
+    });
+    let mut upload = connector
+        .connect_stream(interactive_pair.client_addr())
+        .await
+        .unwrap();
+    let upload_task = tokio::spawn(async move {
+        upload.write_all(&[CMD_UPLOAD]).await.unwrap();
+        let chunk = vec![0xC5u8; 64 * 1024];
+        let mut sent = 0usize;
+        while sent < UPLOAD_LEN {
+            if upload.write_all(&chunk).await.is_err() {
+                return false;
+            }
+            sent += chunk.len();
+        }
+        if upload.flush().await.is_err() {
+            return false;
+        }
+        let mut ack = [0u8; 1];
+        upload.read_exact(&mut ack).await.is_ok() && ack[0] == 1
+    });
+    let mut rtts = Vec::new();
+    let mut seq = 0u64;
+    let mut buf = [0u8; PING_LEN];
+    while !(download_task.is_finished() && upload_task.is_finished()) {
+        seq += 1;
+        let sent = std::time::Instant::now();
+        ping.write_all(&seq.to_le_bytes()).await.unwrap();
+        ping.read_exact(&mut buf).await.unwrap();
+        assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
+        rtts.push(sent.elapsed().as_secs_f64() * 1e3);
+        tokio::time::sleep(PING_INTERVAL).await;
+    }
+    let downloaded = download_task.await.unwrap();
+    let uploaded_ok = upload_task.await.unwrap();
+    let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
+    interactive_pair.stop();
+    bulk_pair.stop();
+    BidirArm {
+        ping_rtts_ms: rtts,
+        downloaded,
+        uploaded_ok,
+        bulk_lane_wire_pkts,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rtp_mux_bidirectional_contention_offloads_both_transfers() {
+    let arm = with_timeout(
+        Duration::from_secs(180),
+        "bidirectional contention",
+        run_bidir_arm(),
+    )
+    .await;
+    eprintln!(
+        "[bidir] download {} B upload_ok={} pings={} bulk_lane_wire={} pkts",
+        arm.downloaded,
+        arm.uploaded_ok,
+        arm.ping_rtts_ms.len(),
+        arm.bulk_lane_wire_pkts,
+    );
+    assert_eq!(arm.downloaded, DOWNLOAD_LEN, "download truncated");
+    assert!(arm.uploaded_ok, "upload not fully acked");
+    assert!(arm.ping_rtts_ms.len() >= 20, "too few ping samples");
+    let arms = [("migrating", arm.ping_rtts_ms.as_slice())];
+    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_bidirectional_contention", &arms) {
+        eprintln!("[bidir] samples: {}", path.display());
+    }
+    eprintln!(
+        "{}",
+        netem_test::dist::ab_report("bidirectional contention ping RTT", "ms", &arms)
+    );
+    assert!(
+        arm.bulk_lane_wire_pkts > 12_000,
+        "BOTH transfers should ride the bulk lane (saw {} pkts)",
+        arm.bulk_lane_wire_pkts,
+    );
+    let mut m = arm.ping_rtts_ms.clone();
+    m.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p90 = netem_test::dist::percentile(&m, 0.90);
+    assert!(
+        p90 < 80.0,
+        "pings must stay clear of both transfers: p90={p90:.1}ms"
+    );
+}
+
+struct RecycleArm {
+    ping_rtts_ms: Vec<f64>,
+    downloaded: usize,
+    download_clean: bool,
+    download_secs: f64,
+    old_session_died: bool,
+    session_replaced: bool,
+}
+
+async fn run_recycle_arm() -> RecycleArm {
+    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
+    let interactive_fan =
+        NetemFan::spawn(interactive_server, || (contended_lane(), contended_lane())).unwrap();
+    let bulk_fan = NetemFan::spawn(bulk_server, || (contended_lane(), contended_lane())).unwrap();
+    let connector = connector(bulk_fan.client_addr());
+    let addr = interactive_fan.client_addr();
+    let mut ping = connector.connect_stream(addr).await.unwrap();
+    ping.write_all(&[CMD_PING]).await.unwrap();
+    let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut download = connector.connect_stream(addr).await.unwrap();
+    let download_task = tokio::spawn({
+        let gauge = Arc::clone(&downloaded_gauge);
+        async move {
+            let started = std::time::Instant::now();
+            download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0usize;
+            let mut clean = true;
+            loop {
+                match download.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        clean &= buf[..n].iter().all(|b| *b == 0xCD);
+                        total += n;
+                        gauge.store(total, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            (total, clean, started.elapsed().as_secs_f64())
+        }
+    });
+    let old_probe = connector.probe_session(addr).expect("session must exist");
+    let mut rtts = Vec::new();
+    let mut seq = 0u64;
+    let mut buf = [0u8; PING_LEN];
+    let mut recycled = false;
+    while !download_task.is_finished() {
+        seq += 1;
+        let sent = std::time::Instant::now();
+        ping.write_all(&seq.to_le_bytes()).await.unwrap();
+        ping.read_exact(&mut buf).await.unwrap();
+        assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
+        rtts.push(sent.elapsed().as_secs_f64() * 1e3);
+        if !recycled
+            && downloaded_gauge.load(std::sync::atomic::Ordering::Relaxed) > 2 * 1024 * 1024
+        {
+            recycled = true;
+            connector.reset_addr(addr);
+        }
+        tokio::time::sleep(PING_INTERVAL).await;
+    }
+    let (downloaded, download_clean, download_secs) = download_task.await.unwrap();
+    let session_replaced = connector
+        .probe_session(addr)
+        .is_some_and(|probe| probe.id() != old_probe.id());
+    let mut old_session_died = false;
+    for _ in 0..100 {
+        if !old_probe.is_alive() {
+            old_session_died = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    interactive_fan.stop();
+    bulk_fan.stop();
+    RecycleArm {
+        ping_rtts_ms: rtts,
+        downloaded,
+        download_clean,
+        download_secs,
+        old_session_died,
+        session_replaced,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rtp_mux_recycle_migrates_live_streams() {
+    let arm = with_timeout(
+        Duration::from_secs(120),
+        "recycle migration",
+        run_recycle_arm(),
+    )
+    .await;
+    eprintln!(
+        "[recycle-mig] download {} B in {:.1}s ({:.2} MiB/s) pings={} replaced={} old_died={}",
+        arm.downloaded,
+        arm.download_secs,
+        arm.downloaded as f64 / (1024.0 * 1024.0) / arm.download_secs,
+        arm.ping_rtts_ms.len(),
+        arm.session_replaced,
+        arm.old_session_died,
+    );
+    let arms = [("migrating", arm.ping_rtts_ms.as_slice())];
+    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_recycle_migration", &arms) {
+        eprintln!("[recycle-mig] samples: {}", path.display());
+    }
+    assert_eq!(arm.downloaded, DOWNLOAD_LEN, "download truncated");
+    assert!(arm.download_clean, "download corrupted");
+    assert!(
+        arm.session_replaced,
+        "recycle did not install a fresh session"
+    );
+    assert!(arm.old_session_died, "old session never released");
+    assert!(
+        arm.download_secs < 20.0,
+        "download took {:.1}s - successor-deadline stall suspected",
+        arm.download_secs
+    );
+    assert!(arm.ping_rtts_ms.len() >= 20, "too few ping samples");
+    let mut m = arm.ping_rtts_ms.clone();
+    m.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p90 = netem_test::dist::percentile(&m, 0.90);
+    assert!(
+        p90 < 80.0,
+        "pings must stay clean across the recycle: p90={p90:.1}ms"
+    );
+}
+
+fn explorer_slow_lane(seed: u64) -> NetemConfig {
+    NetemConfig {
+        latency: Duration::from_millis(40),
+        rate: 16_000_000,
+        limit: 120,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
+fn explorer_fast_lane(seed: u64) -> NetemConfig {
+    NetemConfig {
+        latency: Duration::from_millis(5),
+        rate: 16_000_000,
+        limit: 120,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
+struct ExplorerArm {
+    pre_rtts_ms: Vec<f64>,
+    post_rtts_ms: Vec<f64>,
+    downloaded: usize,
+    download_clean: bool,
+    download_secs: f64,
+    session_replaced: bool,
+    session_port: u16,
+    fast_candidate_port: u16,
+    noop_survived: bool,
+}
+
+async fn run_explorer_arm() -> ExplorerArm {
+    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
+    let interactive_flows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let interactive_fan = NetemFan::spawn(interactive_server, {
+        let flows = Arc::clone(&interactive_flows);
+        move || {
+            let index = flows.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let seed = 900 + index as u64;
+            if index == 1 {
+                (explorer_fast_lane(seed), explorer_fast_lane(seed))
+            } else {
+                (explorer_slow_lane(seed), explorer_slow_lane(seed))
+            }
+        }
+    })
+    .unwrap();
+    let bulk_fan = NetemFan::spawn(bulk_server, || {
+        (explorer_slow_lane(950), explorer_slow_lane(951))
+    })
+    .unwrap();
+    let bind: BindSelector = Arc::new(|addr| match addr {
+        SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+        SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+    });
+    let bulk_proxy_addr = bulk_fan.client_addr();
+    let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
+    let connector = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
+        bind,
+        bulk_addr,
+        fec: false,
+        explorer: ExplorerConfig {
+            enabled: true,
+            probe_mean_interval: Duration::from_millis(250),
+            rotation_period: Duration::from_secs(60),
+            ..ExplorerConfig::default()
+        },
+    });
+    let addr = interactive_fan.client_addr();
+    let mut ping = connector.connect_stream(addr).await.unwrap();
+    ping.write_all(&[CMD_PING]).await.unwrap();
+    let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut download = connector.connect_stream(addr).await.unwrap();
+    let download_task = tokio::spawn({
+        let gauge = Arc::clone(&downloaded_gauge);
+        async move {
+            let started = std::time::Instant::now();
+            download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0usize;
+            let mut clean = true;
+            loop {
+                match download.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        clean &= buf[..n].iter().all(|b| *b == 0xCD);
+                        total += n;
+                        gauge.store(total, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            (total, clean, started.elapsed().as_secs_f64())
+        }
+    });
+    let old_probe = connector.probe_session(addr).expect("session must exist");
+    let mut pre_rtts = Vec::new();
+    let mut post_rtts = Vec::new();
+    let mut seq = 0u64;
+    let mut buf = [0u8; PING_LEN];
+    let mut fast_candidate_port: Option<u16> = None;
+    while !download_task.is_finished() {
+        seq += 1;
+        let sent = std::time::Instant::now();
+        ping.write_all(&seq.to_le_bytes()).await.unwrap();
+        ping.read_exact(&mut buf).await.unwrap();
+        assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
+        let rtt = sent.elapsed().as_secs_f64() * 1e3;
+        if fast_candidate_port.is_some() {
+            post_rtts.push(rtt);
+        } else {
+            pre_rtts.push(rtt);
+        }
+        if fast_candidate_port.is_none()
+            && downloaded_gauge.load(std::sync::atomic::Ordering::Relaxed) > 2 * 1024 * 1024
+        {
+            let report = connector.explorer_report(addr).await.unwrap();
+            let fast = report.candidates.iter().find(|candidate| {
+                candidate.alive
+                    && candidate
+                        .rtt
+                        .is_some_and(|rtt| rtt < Duration::from_millis(40))
+            });
+            let active_probed = report.active.is_some_and(|active| active.alive);
+            if let (Some(fast), true) = (fast, active_probed) {
+                fast_candidate_port = Some(fast.local_addr.unwrap().port());
+                connector.reoptimize(addr);
+            }
+        }
+        tokio::time::sleep(PING_INTERVAL).await;
+    }
+    let (downloaded, download_clean, download_secs) = download_task.await.unwrap();
+    let fast_candidate_port =
+        fast_candidate_port.expect("explorer never converged on the fast tuple");
+    let session_replaced = connector
+        .probe_session(addr)
+        .is_some_and(|probe| probe.id() != old_probe.id());
+    let fresh = connector.connect_stream(addr).await.unwrap();
+    let session_port = fresh.addr().local_addr.port();
+    drop(fresh);
+    let migrated_probe = connector.probe_session(addr).expect("migrated session");
+    connector.reoptimize(addr);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let noop_survived = connector
+        .probe_session(addr)
+        .is_some_and(|probe| probe.id() == migrated_probe.id());
+    interactive_fan.stop();
+    bulk_fan.stop();
+    ExplorerArm {
+        pre_rtts_ms: pre_rtts,
+        post_rtts_ms: post_rtts,
+        downloaded,
+        download_clean,
+        download_secs,
+        session_replaced,
+        session_port,
+        fast_candidate_port,
+        noop_survived,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rtp_mux_explorer_relays_onto_better_path() {
+    let arm = with_timeout(
+        Duration::from_secs(120),
+        "explorer re-lay",
+        run_explorer_arm(),
+    )
+    .await;
+    let p = |mut v: Vec<f64>, q| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        netem_test::dist::percentile(&v, q)
+    };
+    eprintln!(
+        "[explorer] download {} B in {:.1}s pings pre={} post={} pre_p50={:.1}ms post_p50={:.1}ms post_p90={:.1}ms port {} == {}",
+        arm.downloaded,
+        arm.download_secs,
+        arm.pre_rtts_ms.len(),
+        arm.post_rtts_ms.len(),
+        p(arm.pre_rtts_ms.clone(), 0.50),
+        p(arm.post_rtts_ms.clone(), 0.50),
+        p(arm.post_rtts_ms.clone(), 0.90),
+        arm.session_port,
+        arm.fast_candidate_port,
+    );
+    let arms = [
+        ("pre_relay", arm.pre_rtts_ms.as_slice()),
+        ("post_relay", arm.post_rtts_ms.as_slice()),
+    ];
+    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_explorer_relay", &arms) {
+        eprintln!("[explorer] samples: {}", path.display());
+    }
+    eprintln!(
+        "{}",
+        netem_test::dist::ab_report("explorer re-lay ping RTT", "ms", &arms)
+    );
+    assert_eq!(arm.downloaded, DOWNLOAD_LEN, "download truncated");
+    assert!(arm.download_clean, "download corrupted");
+    assert!(arm.session_replaced, "reoptimize never re-laid the session");
+    assert_eq!(
+        arm.session_port, arm.fast_candidate_port,
+        "the session was not laid on the surrendered candidate's tuple"
+    );
+    assert!(
+        arm.download_secs < 20.0,
+        "download took {:.1}s - successor-deadline stall suspected",
+        arm.download_secs
+    );
+    assert!(
+        arm.post_rtts_ms.len() >= 20,
+        "too few post-migration ping samples"
+    );
+    let pre_p50 = p(arm.pre_rtts_ms.clone(), 0.50);
+    let post_p50 = p(arm.post_rtts_ms.clone(), 0.50);
+    let post_p90 = p(arm.post_rtts_ms.clone(), 0.90);
+    assert!(
+        post_p90 < 80.0,
+        "pings must ride the fast tuple after the re-lay: p90={post_p90:.1}ms"
+    );
+    assert!(
+        post_p50 < pre_p50,
+        "migration must actually improve the interactive path ({pre_p50:.1}ms -> {post_p50:.1}ms)"
+    );
+    assert!(
+        arm.noop_survived,
+        "reoptimize on the best tuple must be a no-op"
+    );
 }
