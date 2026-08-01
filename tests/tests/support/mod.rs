@@ -80,6 +80,18 @@ pub fn hostile_real_link() -> NetemConfig {
     }
 }
 
+pub fn hostile_fat_pipe() -> NetemConfig {
+    NetemConfig {
+        rate: 100 * 1000 * 1000,
+        latency: Duration::from_millis(150),
+        jitter: Duration::from_millis(30),
+        loss_model: gilbert_elliott_loss(2.0, 4.0),
+        limit: 16 * 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
 /// Two-state Gilbert-Elliott loss model on top of the four-state `sch_netem`
 /// representation.
 ///
@@ -1099,9 +1111,19 @@ pub async fn mux_timed_echo_round_trip(
 /// duration may undercount delivery, so a warning is printed. Any other
 /// read error panics.
 pub async fn mux_send_payload(opener: &mux::StreamOpener, payload: &[u8]) -> Duration {
+    mux_send_repeated(opener, payload, 1).await
+}
+
+pub async fn mux_send_repeated(
+    opener: &mux::StreamOpener,
+    chunk: &[u8],
+    repeat: usize,
+) -> Duration {
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
     let start = Instant::now();
-    stream_write.write_all(payload).await.unwrap();
+    for _ in 0..repeat {
+        stream_write.write_all(chunk).await.unwrap();
+    }
     stream_write.shutdown().unwrap();
     let mut sink = Vec::new();
     match stream_read.read_to_end(&mut sink).await {

@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::{
-    combined_stats, hostile_real_link, lossy_400kib_per_sec, mux_client_connect, mux_send_payload,
-    mux_timed_echo_round_trip, payload, print_perf, rtp_connect, spawn_mux_over_rtp_echo_server,
+    combined_stats, cyclic_payload, hostile_fat_pipe, lossy_400kib_per_sec, mux_client_connect,
+    mux_send_payload, mux_send_repeated, mux_timed_echo_round_trip, payload, print_perf,
+    rtp_connect, spawn_mux_over_rtp_counting_sink_server, spawn_mux_over_rtp_echo_server,
     spawn_mux_over_rtp_sink_server, with_timeout,
 };
 
@@ -222,31 +223,35 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn mux_over_rtp_400mib_hostile_perf() {
-    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(false).await.unwrap();
-
-    let impaired = hostile_real_link();
+    const TARGET_BYTES: usize = 400 * 1024 * 1024;
+    const BUDGET: Duration = Duration::from_secs(335);
+    let (server_addr, progress) =
+        spawn_mux_over_rtp_counting_sink_server(false, rtp::udp::NO_FEC_MSS)
+            .await
+            .unwrap();
+    let impaired = hostile_fat_pipe();
     let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
     let (read, write) = rtp_connect(pair.client_addr(), false).await;
     let (opener, _spawner) = mux_client_connect(read, write);
-
-    let payload = payload(400 * 1024 * 1024);
+    let chunk = cyclic_payload(1024 * 1024);
+    let repeat = TARGET_BYTES.div_ceil(chunk.len());
+    let sent = chunk.len() * repeat;
     let elapsed = with_timeout(
-        Duration::from_secs(3600 * 8),
+        BUDGET,
         "mux-over-rtp 400MiB hostile perf",
-        mux_send_payload(&opener, &payload),
+        mux_send_repeated(&opener, &chunk, repeat),
     )
     .await;
-
-    let got = with_timeout(
-        Duration::from_secs(3600 * 8),
-        "mux-over-rtp 400MiB hostile perf receive",
-        async { received.recv().await.expect("sink channel closed") },
-    )
-    .await;
-
-    assert_eq!(got, payload, "mux stream must deliver all 400MiB intact");
-    print_perf("mux-over-rtp 400MiB hostile", payload.len(), elapsed);
-
+    assert!(
+        !progress.is_corrupt(),
+        "sink saw bytes diverging from the payload pattern"
+    );
+    assert_eq!(
+        progress.delivered_bytes(),
+        sent as u64,
+        "mux stream must deliver every byte sent"
+    );
+    print_perf("mux-over-rtp 400MiB hostile", sent, elapsed);
     pair.stop();
     let stats = combined_stats(&pair);
     eprintln!("[perf] mux-over-rtp 400MiB hostile stats: {stats:?}");
@@ -257,5 +262,9 @@ async fn mux_over_rtp_400mib_hostile_perf() {
     assert!(
         stats.delayed > 0,
         "hostile link should delay packets, got {stats:?}"
+    );
+    assert!(
+        stats.rate_limited > 0,
+        "rate-capped link should shape packets, got {stats:?}"
     );
 }

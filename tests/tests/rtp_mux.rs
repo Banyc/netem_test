@@ -723,7 +723,7 @@ async fn run_explorer_arm() -> ExplorerArm {
             });
             let active_probed = report.active.is_some_and(|active| active.alive);
             if let (Some(fast), true) = (fast, active_probed) {
-                fast_candidate_port = Some(fast.local_addr.unwrap().port());
+                fast_candidate_port = Some(fast.local_addr.port());
                 connector.reoptimize(addr);
             }
         }

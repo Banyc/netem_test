@@ -673,6 +673,18 @@ impl NetemLink {
 
 // ───────────────────────────── runner ───────────────────────────────────
 
+fn sample_delay(config: &NetemConfig, rng: &mut RndState, delay_cor: &mut CorRng) -> Duration {
+    if config.jitter.is_zero() {
+        return config.latency;
+    }
+    let rnd = delay_cor.next(rng);
+    let sigma = config.jitter.as_nanos().min(i32::MAX as u128) as u64;
+    let spread = u64::from(rnd) % (2 * sigma);
+    let delta = (spread as i64) - (sigma as i64);
+    let ns = config.latency.as_nanos() as i64 + delta;
+    Duration::from_nanos(ns as u64)
+}
+
 struct Runner {
     config: NetemConfig,
     server_addr: SocketAddr,
@@ -809,20 +821,7 @@ impl Runner {
     /// Compute the per-packet delay via `tabledist` (uniform spread when no
     /// distribution table, matching the kernel's default branch).
     fn sample_delay(&mut self) -> Duration {
-        if self.config.jitter.is_zero() {
-            return self.config.latency;
-        }
-        let rnd = self.delay_cor.next(&mut self.rng);
-        let sigma = self.config.jitter.as_nanos() as u64;
-        // uniform in [mu - sigma, mu + sigma]
-        let spread = rnd % (2 * sigma as u32);
-        let delta = (spread as i64) - (sigma as i64);
-        let ns = self.config.latency.as_nanos() as i64 + delta;
-        if ns < 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(ns as u64)
-        }
+        sample_delay(&self.config, &mut self.rng, &mut self.delay_cor)
     }
 
     fn enqueue(&mut self, data: &[u8], now: Instant) {
@@ -1361,19 +1360,7 @@ impl DirectionRunner {
     }
 
     fn sample_delay(&mut self) -> Duration {
-        if self.config.jitter.is_zero() {
-            return self.config.latency;
-        }
-        let rnd = self.delay_cor.next(&mut self.rng);
-        let sigma = self.config.jitter.as_nanos() as u64;
-        let spread = rnd % (2 * sigma as u32);
-        let delta = (spread as i64) - (sigma as i64);
-        let ns = self.config.latency.as_nanos() as i64 + delta;
-        if ns < 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(ns as u64)
-        }
+        sample_delay(&self.config, &mut self.rng, &mut self.delay_cor)
     }
 
     fn enqueue(&mut self, data: &[u8], now: Instant) {
@@ -1513,6 +1500,50 @@ mod tests {
             }
         }
         assert!(diffs > 60);
+    }
+
+    #[test]
+    fn large_jitter_still_jitters() {
+        for secs in [2, 3, 4, 5, 10] {
+            let config = NetemConfig {
+                latency: Duration::from_millis(300),
+                jitter: Duration::from_secs(secs),
+                ..NetemConfig::default()
+            };
+            let mut rng = RndState::seed(config.seed);
+            let mut cor = CorRng::new(config.delay_corr);
+            let mut nonzero = 0;
+            for _ in 0..256 {
+                if sample_delay(&config, &mut rng, &mut cor) != config.latency {
+                    nonzero += 1;
+                }
+            }
+            assert!(
+                nonzero > 0,
+                "{secs}s jitter beyond the clamp ceiling should still jitter"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_clamp_jitter_is_untouched_by_the_ceiling() {
+        let config = NetemConfig {
+            latency: Duration::from_millis(300),
+            jitter: Duration::from_millis(500),
+            ..NetemConfig::default()
+        };
+        let mut rng = RndState::seed(config.seed);
+        let mut cor = CorRng::new(config.delay_corr);
+        let sigma = config.jitter.as_nanos() as i64;
+        let mu = config.latency.as_nanos() as i64;
+        for _ in 0..256 {
+            let ns = sample_delay(&config, &mut rng, &mut cor).as_nanos() as i64;
+            assert!(
+                (mu - sigma..=mu + sigma).contains(&ns),
+                "delay ns {} escaped [mu - sigma, mu + sigma]",
+                ns
+            );
+        }
     }
 
     #[test]
