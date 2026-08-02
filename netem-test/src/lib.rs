@@ -682,7 +682,11 @@ fn sample_delay(config: &NetemConfig, rng: &mut RndState, delay_cor: &mut CorRng
     let spread = u64::from(rnd) % (2 * sigma);
     let delta = (spread as i64) - (sigma as i64);
     let ns = config.latency.as_nanos() as i64 + delta;
-    Duration::from_nanos(ns as u64)
+    if ns < 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(ns as u64)
+    }
 }
 
 struct Runner {
@@ -1514,13 +1518,13 @@ mod tests {
             let mut cor = CorRng::new(config.delay_corr);
             let mut nonzero = 0;
             for _ in 0..256 {
-                if sample_delay(&config, &mut rng, &mut cor) != config.latency {
+                if !sample_delay(&config, &mut rng, &mut cor).is_zero() {
                     nonzero += 1;
                 }
             }
             assert!(
                 nonzero > 0,
-                "{secs}s jitter beyond the clamp ceiling should still jitter"
+                "{secs} s of jitter produced 256 consecutive zero delays - the sigma truncation collapsed the spread window below the subtracted jitter"
             );
         }
     }
@@ -1540,8 +1544,7 @@ mod tests {
             let ns = sample_delay(&config, &mut rng, &mut cor).as_nanos() as i64;
             assert!(
                 (mu - sigma..=mu + sigma).contains(&ns),
-                "delay ns {} escaped [mu - sigma, mu + sigma]",
-                ns
+                "delay {ns} ns escaped [mu-sigma, mu+sigma]"
             );
         }
     }
