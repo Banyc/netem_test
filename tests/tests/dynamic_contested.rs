@@ -24,12 +24,16 @@ use std::time::{Duration, Instant};
 
 use mux::{DeliveryMode, DualMessageSender, LaneClass, MigratingStreamWriter};
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
-use support::{
-    SplitMix64, cyclic_payload, dual_mux_client_connect, mux_client_connect, percentile,
-    spawn_dual_msg_channel_server, spawn_dual_mux_gaming_latency_bulk_server,
-    spawn_dual_mux_latency_bulk_server, spawn_dual_mux_migrating_latency_bulk_server,
-    spawn_mux_gaming_latency_bulk_server, spawn_mux_latency_bulk_server, with_timeout,
+use support::dual::{
+    dual_mux_client_connect, spawn_dual_msg_channel_server,
+    spawn_dual_mux_gaming_latency_bulk_server, spawn_dual_mux_latency_bulk_server,
+    spawn_dual_mux_migrating_latency_bulk_server,
 };
+use support::mux::{mux_client_connect, spawn_mux_gaming_latency_bulk_server, spawn_mux_latency_bulk_server};
+use support::payload::{cyclic_payload, with_timeout};
+use support::prng::SplitMix64;
+use support::stats::percentile;
+use support::contested::{DynTrafficResult, dyn_run_secs, summarize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -40,13 +44,6 @@ const LATENCY_CADENCE: Duration = Duration::from_millis(25);
 const SMALL_MSG_BYTES: usize = 200;
 const BURST_RATIO: u64 = 16;
 const RATE_BPS: u64 = 400 * 1024 * 8;
-
-fn dyn_run_secs() -> u64 {
-    std::env::var("DYN_RUN_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(15)
-}
 
 fn dyn_reps() -> usize {
     std::env::var("DYN_REPS")
@@ -96,14 +93,6 @@ const GAMING_REP_TIMEOUT: Duration = Duration::from_secs(30);
 // Results and helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-struct DynTrafficResult {
-    small_latencies: Vec<f64>,
-    burst_latencies: Vec<f64>,
-    sent: u64,
-    received: u64,
-    bulk_bytes: u64,
-}
-
 const LATENCY_TAG: &[u8] = b"L";
 const BULK_TAG: &[u8] = b"B";
 
@@ -117,63 +106,6 @@ fn make_latency_frame(msg_size: usize, base: Instant) -> Vec<u8> {
     frame.resize(4 + payload_bytes, b'X');
     frame.extend_from_slice(&sent_us.to_le_bytes());
     frame
-}
-
-fn summarize(label: &str, results: &[DynTrafficResult]) {
-    let mut all_small: Vec<f64> = results
-        .iter()
-        .flat_map(|r| r.small_latencies.clone())
-        .collect();
-    let mut all_burst: Vec<f64> = results
-        .iter()
-        .flat_map(|r| r.burst_latencies.clone())
-        .collect();
-    all_small.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    all_burst.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    let delivery = if results.iter().map(|r| r.sent).sum::<u64>() == 0 {
-        0.0
-    } else {
-        results.iter().map(|r| r.received).sum::<u64>() as f64
-            / results.iter().map(|r| r.sent).sum::<u64>() as f64
-    };
-    let bulk_total: u64 = results.iter().map(|r| r.bulk_bytes).sum();
-    let bulk_secs = results.len() as f64 * dyn_run_secs() as f64;
-
-    eprintln!(
-        "[dyn {label}] small p50/p90/p99={:.0}/{:.0}/{:.0} ms  burst_p50={:.0} ms  bulk={:.3} MiB/s  delivery={:.3}",
-        percentile_opt(&all_small, 0.50),
-        percentile_opt(&all_small, 0.90),
-        percentile_opt(&all_small, 0.99),
-        percentile_opt(&all_burst, 0.50),
-        bulk_total as f64 / (1024.0 * 1024.0) / bulk_secs,
-        delivery,
-    );
-
-    let arms = [
-        ("small", all_small.as_slice()),
-        ("burst", all_burst.as_slice()),
-    ];
-    if let Ok(path) = netem_test::dist::dump_csv(&format!("dyn_{label}"), &arms) {
-        eprintln!("[dyn {label}] samples: {}", path.display());
-    }
-    eprintln!("{}", netem_test::dist::ab_report(label, "ms", &arms));
-
-    assert!(
-        delivery > 0.80,
-        "[dyn {label}] delivery too low: {delivery:.3}"
-    );
-    assert!(
-        percentile_opt(&all_small, 0.50) > 0.0,
-        "[dyn {label}] p50 must be positive finite"
-    );
-}
-
-fn percentile_opt(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return f64::NAN;
-    }
-    percentile(sorted, p)
 }
 
 async fn run_latency_flow(
@@ -1001,12 +933,12 @@ fn summarize_gaming(label: &str, results: &[GamingResult]) {
 
     eprintln!(
         "[gaming {label}] trans p50/p90/p99={:.0}/{:.0}/{:.0} ms  steady p50/p90/p99={:.0}/{:.0}/{:.0} ms  bulk={:.3} MiB/s  delivery={:.3}",
-        percentile_opt(&trans, 0.50),
-        percentile_opt(&trans, 0.90),
-        percentile_opt(&trans, 0.99),
-        percentile_opt(&steady, 0.50),
-        percentile_opt(&steady, 0.90),
-        percentile_opt(&steady, 0.99),
+        percentile(&trans, 0.50),
+        percentile(&trans, 0.90),
+        percentile(&trans, 0.99),
+        percentile(&steady, 0.50),
+        percentile(&steady, 0.90),
+        percentile(&steady, 0.99),
         bulk_total as f64 / (1024.0 * 1024.0) / bulk_secs,
         delivery,
     );
@@ -1030,7 +962,7 @@ fn summarize_gaming(label: &str, results: &[GamingResult]) {
     );
     if !steady.is_empty() {
         assert!(
-            percentile_opt(&steady, 0.50) > 0.0,
+            percentile(&steady, 0.50) > 0.0,
             "[gaming {label}] steady p50 must be positive finite"
         );
     }

@@ -16,14 +16,19 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
-use support::{
-    combined_stats, cyclic_payload, dual_mux_client_connect_with_lane_modes, gilbert_elliott_loss,
-    mux_client_connect, percentile, rtp_frame_delivery_connect, rtp_mux_connector,
-    send_timestamped_messages, spawn_dual_mux_latency_bulk_server_two_listeners,
-    spawn_mux_frame_delivery_latency_bulk_server, spawn_mux_latency_bulk_server,
-    spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, spawn_rtp_mux_latency_bulk_server,
-    with_timeout,
+use support::dual::{
+    dual_mux_client_connect_with_lane_modes, spawn_dual_mux_latency_bulk_server_two_listeners,
 };
+use support::frame::rtp_frame_delivery_connect;
+use support::mux::{
+    mux_client_connect, send_timestamped_messages, spawn_mux_frame_delivery_latency_bulk_server,
+    spawn_mux_latency_bulk_server,
+};
+use support::payload::{cyclic_payload, with_timeout};
+use support::presets::gilbert_elliott_loss;
+use support::rtp::{spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server};
+use support::rtp_mux::{rtp_mux_connector, spawn_rtp_mux_latency_bulk_server};
+use support::stats::{HolSummary, combined_stats, summarize};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod support;
@@ -53,35 +58,6 @@ pub enum BulkMode {
     Split(Box<(NetemConfig, NetemConfig)>),
     /// Two NetemPairs sharing one [`SharedShaper`] per direction.
     SplitSharedBneck(SharedShaper, SharedShaper),
-}
-
-/// Summary returned by [`run_hol_probe`].
-#[derive(Clone, Debug, Default)]
-pub struct HolSummary {
-    /// Interactive messages sent.
-    pub sent: u64,
-    /// Interactive messages received.
-    pub received: u64,
-    /// `received / sent`.
-    pub delivery_pct: f64,
-    /// Median one-way latency in ms.
-    pub p50: f64,
-    /// 90th percentile one-way latency in ms.
-    pub p90: f64,
-    /// 99th percentile one-way latency in ms.
-    pub p99: f64,
-    /// Maximum one-way latency in ms.
-    pub max: f64,
-    /// Fraction of samples > 250 ms.
-    pub over250_pct: f64,
-    /// Fraction of samples > 1000 ms.
-    pub over1000_pct: f64,
-    /// Number of contiguous episodes with latency > 250 ms.
-    pub episodes: u64,
-    /// Longest contiguous run of samples > 250 ms.
-    pub max_run: u64,
-    /// Bulk goodput in MiB/s (0 if no bulk flow).
-    pub bulk_mibps: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -378,91 +354,6 @@ async fn run_rtp_bulk_flow(
     written
 }
 
-/// Compute a [`HolSummary`] from raw latency samples.
-fn summarize(
-    mut samples: Vec<f64>,
-    sent: u64,
-    received: u64,
-    bulk_bytes: u64,
-    bulk_secs: f64,
-) -> HolSummary {
-    let n = samples.len();
-    let (episodes, max_run) = {
-        let mut episodes = 0u64;
-        let mut max_run = 0u64;
-        let mut current = 0u64;
-        let mut in_run = false;
-        for &x in &samples {
-            if x > 250.0 {
-                if !in_run {
-                    episodes += 1;
-                    in_run = true;
-                }
-                current += 1;
-            } else {
-                in_run = false;
-                max_run = max_run.max(current);
-                current = 0;
-            }
-        }
-        max_run = max_run.max(current);
-        (episodes, max_run)
-    };
-
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let delivery_pct = if sent == 0 {
-        0.0
-    } else {
-        received as f64 / sent as f64
-    };
-    let p50 = if n > 0 {
-        percentile(&samples, 0.50)
-    } else {
-        0.0
-    };
-    let p90 = if n > 0 {
-        percentile(&samples, 0.90)
-    } else {
-        0.0
-    };
-    let p99 = if n > 0 {
-        percentile(&samples, 0.99)
-    } else {
-        0.0
-    };
-    let max = samples.last().copied().unwrap_or(0.0);
-    let over250 = if n > 0 {
-        samples.iter().filter(|&&x| x > 250.0).count() as f64 / n as f64
-    } else {
-        0.0
-    };
-    let over1000 = if n > 0 {
-        samples.iter().filter(|&&x| x > 1000.0).count() as f64 / n as f64
-    } else {
-        0.0
-    };
-    let bulk_mibps = if bulk_secs > 0.0 {
-        bulk_bytes as f64 / (1024.0 * 1024.0) / bulk_secs
-    } else {
-        0.0
-    };
-
-    HolSummary {
-        sent,
-        received,
-        delivery_pct,
-        p50,
-        p90,
-        p99,
-        max,
-        over250_pct: over250,
-        over1000_pct: over1000,
-        episodes,
-        max_run,
-        bulk_mibps,
-    }
-}
-
 fn print_hol_summary(label: &str, s: &HolSummary) {
     eprintln!(
         "[hol {label}] sent={sent} recv={recv} delivery={del:.3} p50={p50:.1} p90={p90:.1} p99={p99:.1} max={max:.1} over250={o25:.3} over1000={o1k:.3} episodes={ep} max_run={mr} bulk={bulk:.3} MiB/s",
@@ -541,7 +432,7 @@ fn rtt40_ge1_loss1(seed: u64) -> NetemConfig {
 }
 
 fn hostile_real_link_seeded(seed: u64) -> NetemConfig {
-    let mut c = support::hostile_real_link();
+    let mut c = support::presets::hostile_real_link();
     c.seed = seed;
     c
 }

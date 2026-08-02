@@ -9,7 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
 
-use support::{NetemFan, clean, combined_stats, payload, with_timeout};
+use support::fan::NetemFan;
+use support::payload::{payload, with_timeout};
+use support::presets::clean;
+use support::stats::combined_stats;
 
 async fn spawn_echo_server() -> io::Result<(
     SocketAddr,

@@ -13,12 +13,15 @@
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::{
-    combined_stats, cyclic_payload, hostile_fat_pipe, lossy_400kib_per_sec, mux_client_connect,
-    mux_send_payload, mux_send_repeated, mux_timed_echo_round_trip, payload, print_perf,
-    rtp_connect, spawn_mux_over_rtp_counting_sink_server, spawn_mux_over_rtp_echo_server,
-    spawn_mux_over_rtp_sink_server, with_timeout,
+use support::mux::{
+    mux_client_connect, mux_send_payload, mux_send_repeated, mux_timed_echo_round_trip,
+    spawn_mux_over_rtp_counting_sink_server, spawn_mux_over_rtp_echo_server,
+    spawn_mux_over_rtp_sink_server,
 };
+use support::payload::{cyclic_payload, payload, with_timeout};
+use support::presets::{hostile_fat_pipe, lossy_400kib_per_sec};
+use support::rtp::rtp_connect;
+use support::stats::{combined_stats, print_perf};
 
 mod support;
 

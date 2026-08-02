@@ -21,10 +21,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::{
-    burst_loss_link, cyclic_payload, mux_client_connect, spawn_mux_over_rtp_server_with_mss,
-    spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, with_timeout,
-};
+use support::mux::{mux_client_connect, spawn_mux_over_rtp_server_with_mss};
+use support::payload::{cyclic_payload, with_timeout};
+use support::presets::burst_loss_link;
+use support::rtp::{spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;

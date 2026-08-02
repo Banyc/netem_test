@@ -12,11 +12,11 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::{
-    burst_loss_link, cyclic_payload, mux_client_connect, percentile, print_perf, random_loss_link,
-    send_timestamped_messages, spawn_mux_msg_latency_sink, spawn_rtp_bulk_upload_with_mss,
-    spawn_rtp_byte_sink_server_with_mss, with_timeout,
-};
+use support::mux::{mux_client_connect, send_timestamped_messages, spawn_mux_msg_latency_sink};
+use support::payload::{cyclic_payload, with_timeout};
+use support::presets::{burst_loss_link, random_loss_link};
+use support::rtp::{spawn_rtp_bulk_upload_with_mss, spawn_rtp_byte_sink_server_with_mss};
+use support::stats::{percentile, print_perf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;

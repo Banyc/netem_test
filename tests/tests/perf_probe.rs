@@ -13,14 +13,19 @@
 use std::time::{Duration, Instant};
 
 use netem_test::NetemPair;
-use support::{
-    clean, combined_stats, mux_client_connect, mux_send_payload, mux_timed_echo_round_trip,
-    payload, print_median_worst, print_perf, rtp_connect, rtp_connect_with_mss, rtp_echo_payload,
+use support::mux::{
+    mux_client_connect, mux_send_payload, mux_timed_echo_round_trip,
     spawn_mux_over_rtp_counting_sink_server, spawn_mux_over_rtp_echo_server,
     spawn_mux_over_rtp_echo_server_with_mss, spawn_mux_over_rtp_sink_server,
-    spawn_mux_over_rtp_sink_server_with_mss, spawn_rtp_echo_server, spawn_rtp_echo_server_with_mss,
-    with_timeout,
+    spawn_mux_over_rtp_sink_server_with_mss,
 };
+use support::payload::{payload, with_timeout};
+use support::presets::clean;
+use support::rtp::{
+    rtp_connect, rtp_connect_with_mss, rtp_echo_payload, spawn_rtp_echo_server,
+    spawn_rtp_echo_server_with_mss,
+};
+use support::stats::{combined_stats, print_median_worst, print_perf};
 use tokio::io::AsyncWriteExt;
 
 mod support;
@@ -305,8 +310,8 @@ async fn probe_hostile_goodput_30s() {
         .unwrap();
     let pair = NetemPair::spawn(
         server_addr,
-        support::hostile_real_link(),
-        support::hostile_real_link(),
+        support::presets::hostile_real_link(),
+        support::presets::hostile_real_link(),
     )
     .unwrap();
     let pair_ref = &pair;

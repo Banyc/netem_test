@@ -17,11 +17,11 @@
 use std::time::Duration;
 
 use netem_test::NetemPair;
-use support::{
-    clean, combined_stats, mild_loss, mux_client_connect, mux_echo_round_trip, payload,
-    rtp_connect, rtp_echo_payload, spawn_mux_over_rtp_echo_server, spawn_rtp_echo_server,
-    with_timeout,
-};
+use support::mux::{mux_client_connect, mux_echo_round_trip, spawn_mux_over_rtp_echo_server};
+use support::payload::{payload, with_timeout};
+use support::presets::{clean, mild_loss};
+use support::rtp::{rtp_connect, rtp_echo_payload, spawn_rtp_echo_server};
+use support::stats::combined_stats;
 
 mod support;
 

@@ -14,10 +14,10 @@
 use std::time::Duration;
 
 use netem_test::NetemPair;
-use support::{
-    clean, combined_stats, mild_loss, payload, rtp_connect_with_mss,
-    spawn_rtp_echo_server_with_mss, with_timeout,
-};
+use support::payload::{payload, with_timeout};
+use support::presets::{clean, mild_loss};
+use support::rtp::{rtp_connect_with_mss, spawn_rtp_echo_server_with_mss};
+use support::stats::combined_stats;
 
 mod support;
 
@@ -36,7 +36,7 @@ async fn rtp_small_mss_clean_link_delivers_data() {
     let got = with_timeout(
         Duration::from_secs(10),
         "rtp small-mss clean echo",
-        support::rtp_echo_payload(read, write, payload),
+        support::rtp::rtp_echo_payload(read, write, payload),
     )
     .await;
 
@@ -63,7 +63,7 @@ async fn rtp_tiny_mss_survives_mild_loss() {
     let got = with_timeout(
         Duration::from_secs(60),
         "rtp tiny-mss lossy 100KiB echo",
-        support::rtp_echo_payload(read, write, &payload),
+        support::rtp::rtp_echo_payload(read, write, &payload),
     )
     .await;
 
@@ -92,7 +92,7 @@ async fn rtp_custom_mss_clean_link_delivers_200kib() {
     let got = with_timeout(
         Duration::from_secs(30),
         "rtp custom-mss clean 200KiB echo",
-        support::rtp_echo_payload(read, write, &payload),
+        support::rtp::rtp_echo_payload(read, write, &payload),
     )
     .await;
 

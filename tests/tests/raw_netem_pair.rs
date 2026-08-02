@@ -14,7 +14,9 @@
 use std::time::Duration;
 
 use netem_test::NetemPair;
-use support::{clean, combined_stats, latency, with_timeout};
+use support::payload::with_timeout;
+use support::presets::{clean, latency};
+use support::stats::combined_stats;
 use tokio::net::UdpSocket;
 
 mod support;

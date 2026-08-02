@@ -14,180 +14,28 @@
 
 pub mod dist;
 
+mod loss;
+mod queue;
+mod rng;
+mod shaper;
+
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-fn serialization_delay(len: usize, rate_bps: u64) -> Option<Duration> {
-    (len as u64)
-        .saturating_mul(8)
-        .saturating_mul(1_000_000_000)
-        .checked_div(rate_bps)
-        .map(Duration::from_nanos)
-}
+use loss::FourState;
+use queue::Queued;
+use rng::CorRng;
+use shaper::{sample_delay, serialization_delay};
 
-// ───────────────────────────── seeded RNG ──────────────────────────────
-
-/// Kernel `struct rnd_state` – four 32-bit Tausworthe LFSR lanes.
-#[derive(Clone, Copy, Debug)]
-pub struct RndState {
-    s1: u32,
-    s2: u32,
-    s3: u32,
-    s4: u32,
-}
-
-impl RndState {
-    /// `prandom_seed_state` from `linux/prandom.h`.
-    pub fn seed(seed: u64) -> Self {
-        #[inline]
-        fn seed_lane(x: u32, m: u32) -> u32 {
-            if x < m { x + m } else { x }
-        }
-        let i = ((seed >> 32) ^ (seed << 10) ^ seed) as u32;
-        Self {
-            s1: seed_lane(i, 2),
-            s2: seed_lane(i, 8),
-            s3: seed_lane(i, 16),
-            s4: seed_lane(i, 128),
-        }
-    }
-
-    /// `prandom_u32_state` from `lib/random32.c` – four Tausworthe steps.
-    #[inline]
-    pub fn next_u32(&mut self) -> u32 {
-        #[inline]
-        fn tauswortho(s: &mut u32, a: u32, b: u32, c: u32, d: u32) {
-            *s = ((*s & c) << d) ^ (((*s << a) ^ *s) >> b);
-        }
-        tauswortho(&mut self.s1, 6, 13, 4_294_967_294, 18);
-        tauswortho(&mut self.s2, 2, 27, 4_294_967_288, 2);
-        tauswortho(&mut self.s3, 13, 21, 4_294_967_280, 7);
-        tauswortho(&mut self.s4, 3, 12, 4_294_967_168, 13);
-        self.s1 ^ self.s2 ^ self.s3 ^ self.s4
-    }
-}
-
-/// Correlated random source – `struct crndstate` in `sch_netem.c`.
-#[derive(Clone, Copy, Debug)]
-struct CorRng {
-    last: u32,
-    rho: u32,
-}
-
-impl CorRng {
-    const fn new(rho: u32) -> Self {
-        Self { last: 0, rho }
-    }
-
-    /// `get_crandom`: next value depends on last; `rho` is scaled to avoid
-    /// floating point.
-    fn next(&mut self, rng: &mut RndState) -> u32 {
-        if self.rho == 0 {
-            return rng.next_u32();
-        }
-        let value = rng.next_u32();
-        let rho = self.rho as u64 + 1;
-        let answer = (value as u64 * ((1u64 << 32) - rho) + self.last as u64 * rho) >> 32;
-        self.last = answer as u32;
-        answer as u32
-    }
-}
-
-// ───────────────────────────── loss models ─────────────────────────────
-
-/// Probability parameters for the four-state Gilbert-Elliot-style loss model
-/// used by `sch_netem` (the "GI model"). All probabilities are in `u32`
-/// units where `u32::MAX == 1.0` to match the kernel's `p13`/`p31`/…
-/// representation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct FourStateLoss {
-    /// p13 – from gap-Tx to isolated-loss-in-gap.
-    pub p13: u32,
-    /// p31 – from burst-loss back to gap-Tx.
-    pub p31: u32,
-    /// p32 – from burst-loss to burst-Tx.
-    pub p32: u32,
-    /// p14 – from gap-Tx to burst-loss.
-    pub p14: u32,
-    /// p23 – from burst-Tx to burst-loss.
-    pub p23: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum FourState {
-    #[default]
-    TxInGap = 1,
-    TxInBurst = 2,
-    LostInGap = 3,
-    LostInBurst = 4,
-}
-
-/// Which loss model to apply.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LossModel {
-    /// Independent per-packet loss with correlation, `loss` field of
-    /// [`NetemConfig`] is the threshold.
-    #[default]
-    Random,
-    /// Four-state Markov chain ([`FourStateLoss`]).
-    FourState(FourStateLoss),
-}
-
-impl LossModel {
-    /// Decide whether a packet is lost. Faithfully reproduces
-    /// `loss_4state` and the `CLG_RANDOM` branch of `loss_event` in
-    /// `sch_netem.c`.
-    fn loss(
-        &self,
-        clg: &mut FourState,
-        loss_cor: &mut CorRng,
-        rng: &mut RndState,
-        loss: u32,
-    ) -> bool {
-        match self {
-            LossModel::Random => loss != 0 && loss >= loss_cor.next(rng),
-            LossModel::FourState(p) => {
-                let rnd = rng.next_u32();
-                match clg {
-                    FourState::TxInGap => {
-                        if rnd < p.p14 {
-                            *clg = FourState::LostInGap;
-                            return true;
-                        } else if rnd < p.p13.saturating_add(p.p14) {
-                            *clg = FourState::LostInBurst;
-                            return true;
-                        }
-                    }
-                    FourState::TxInBurst => {
-                        if rnd < p.p23 {
-                            *clg = FourState::LostInBurst;
-                            return true;
-                        }
-                    }
-                    FourState::LostInBurst => {
-                        if rnd < p.p32 {
-                            *clg = FourState::TxInBurst;
-                        } else if rnd < p.p31.saturating_add(p.p32) {
-                            *clg = FourState::TxInGap;
-                        } else {
-                            *clg = FourState::LostInBurst;
-                            return true;
-                        }
-                    }
-                    FourState::LostInGap => {
-                        *clg = FourState::TxInGap;
-                    }
-                }
-                false
-            }
-        }
-    }
-}
+pub use loss::{FourStateLoss, LossModel};
+pub use rng::RndState;
+pub use shaper::SharedShaper;
 
 // ──────────────────────────── UDP transport ────────────────────────────
 
@@ -435,120 +283,6 @@ pub struct Snapshot {
     pub queue_len: usize,
 }
 
-// ───────────────────────────── shared shaper ───────────────────────────
-
-/// Multi-flow shared-bottleneck serialization clock.
-///
-/// Several [`NetemPair`] directions can share one [`SharedShaper`] so that
-/// N flows contend for a single link rate instead of each flow getting its
-/// own independent cap. Per-packet propagation delay, loss, jitter, and the
-/// per-direction queue limit stay with each [`DirectionRunner`]; only the
-/// send-time serialization clock and the optional shared tail-drop buffer are
-/// shared.
-#[derive(Clone, Debug)]
-pub struct SharedShaper(Arc<Mutex<ShaperState>>);
-
-#[derive(Debug)]
-struct ShaperState {
-    /// Shared rate in bits per second.
-    rate: u64,
-    /// Shared tail-drop buffer in bytes. `0` means unbounded.
-    limit_bytes: u64,
-    /// Earliest time the next packet may leave the shared bottleneck.
-    next_send: Instant,
-    /// Packets dropped because they exceeded `limit_bytes`.
-    dropped: u64,
-}
-
-impl SharedShaper {
-    /// Create a shared shaper. `rate_bps` must be greater than zero.
-    /// `limit_bytes` is the shared tail-drop buffer; use `0` for unbounded.
-    pub fn new(rate_bps: u64, limit_bytes: u64) -> Self {
-        assert!(rate_bps > 0, "SharedShaper rate must be greater than zero");
-        Self(Arc::new(Mutex::new(ShaperState {
-            rate: rate_bps,
-            limit_bytes,
-            next_send: Instant::now(),
-            dropped: 0,
-        })))
-    }
-
-    /// Current configured rate in bits per second.
-    pub fn rate_bps(&self) -> u64 {
-        self.0.lock().unwrap().rate
-    }
-
-    /// Number of packets tail-dropped by the shared shaper.
-    pub fn dropped(&self) -> u64 {
-        self.0.lock().unwrap().dropped
-    }
-
-    /// Bytes currently sitting in the shared serialization backlog as of `now`.
-    pub fn backlog_bytes(&self, now: Instant) -> u64 {
-        let state = self.0.lock().unwrap();
-        let backlog_ns = state.next_send.saturating_duration_since(now).as_nanos();
-        (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64
-    }
-
-    /// Schedule a packet of `len` bytes arriving at `base` through the shared
-    /// bottleneck.
-    ///
-    /// Returns `Some(exit_time)` if the packet is accepted, or `None` if it is
-    /// tail-dropped because `limit_bytes` would be exceeded. The returned
-    /// exit time does *not* include per-flow propagation delay; the caller must
-    /// add its own latency/jitter afterwards.
-    pub fn schedule(&self, base: Instant, len: usize) -> Option<Instant> {
-        let mut state = self.0.lock().unwrap();
-        let backlog_ns = state.next_send.saturating_duration_since(base).as_nanos();
-        let backlog = (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64;
-        if state.limit_bytes != 0 && backlog.saturating_add(len as u64) > state.limit_bytes {
-            state.dropped += 1;
-            return None;
-        }
-        let packet_bits = (len as u64).saturating_mul(8);
-        let serialize_ns = (packet_bits as u128).saturating_mul(1_000_000_000) / state.rate as u128;
-        let t = base.max(state.next_send) + Duration::from_nanos(serialize_ns as u64);
-        state.next_send = t;
-        Some(t)
-    }
-}
-
-// ───────────────────────────── queued packet ───────────────────────────
-
-#[derive(Clone)]
-struct Queued {
-    time_to_send: Instant,
-    /// Monotonic insertion sequence used as a tiebreaker so the min-heap
-    /// preserves FIFO order among packets with equal `time_to_send`. Without
-    /// this, `BinaryHeap` returns equal-timestamp packets in arbitrary order,
-    /// which reorders the byte stream and trips the reliable layer.
-    seq: u64,
-    data: Vec<u8>,
-    dst: SocketAddr,
-}
-
-impl PartialEq for Queued {
-    fn eq(&self, other: &Self) -> bool {
-        (self.time_to_send, self.seq) == (other.time_to_send, other.seq)
-    }
-}
-
-impl Eq for Queued {}
-
-impl PartialOrd for Queued {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Queued {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.time_to_send
-            .cmp(&other.time_to_send)
-            .then(self.seq.cmp(&other.seq))
-    }
-}
-
 // ───────────────────────────── the link ─────────────────────────────────
 
 /// A running emulated link. Dropping the handle does *not* stop the proxy
@@ -671,32 +405,25 @@ impl NetemLink {
     }
 }
 
-// ───────────────────────────── runner ───────────────────────────────────
+// ───────────────────────────── pipeline & runner ────────────────────────
 
-fn sample_delay(config: &NetemConfig, rng: &mut RndState, delay_cor: &mut CorRng) -> Duration {
-    if config.jitter.is_zero() {
-        return config.latency;
-    }
-    let rnd = delay_cor.next(rng);
-    let sigma = config.jitter.as_nanos().min(i32::MAX as u128) as u64;
-    let spread = u64::from(rnd) % (2 * sigma);
-    let delta = (spread as i64) - (sigma as i64);
-    let ns = config.latency.as_nanos() as i64 + delta;
-    if ns < 0 {
-        Duration::ZERO
-    } else {
-        Duration::from_nanos(ns as u64)
-    }
-}
-
-struct Runner {
+/// Shared per-direction impairment pipeline.
+///
+/// Both [`Runner`] and [`DirectionRunner`] drive a single [`Pipeline`]: it
+/// owns the PRNG state, loss model, delay heap, and the per-direction
+/// send-time shaper clock, and applies duplication / loss / reorder / delay /
+/// rate shaping to each incoming datagram. The two runner flavours differ only
+/// in where datagrams come from and go to (a fixed server address vs. a
+/// learned client address, with an optional shared-bottleneck shaper).
+struct Pipeline {
     config: NetemConfig,
-    server_addr: SocketAddr,
     stats: Arc<AtomicStats>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
-    transport: Box<dyn UdpTransport>,
+    /// Optional shared-bottleneck shaper. When set, it replaces the per-
+    /// direction `config.rate` serialization clock.
+    shared: Option<SharedShaper>,
     rng: RndState,
     delay_cor: CorRng,
     loss_cor: CorRng,
@@ -711,15 +438,14 @@ struct Runner {
     seq: u64,
 }
 
-impl Runner {
+impl Pipeline {
     fn new(
         config: NetemConfig,
-        server_addr: SocketAddr,
         stats: Arc<AtomicStats>,
         queue_len: Arc<AtomicU64>,
         blackout: Arc<AtomicBool>,
         stop: Arc<Mutex<bool>>,
-        transport: Box<dyn UdpTransport>,
+        shared: Option<SharedShaper>,
     ) -> Self {
         let rng = RndState::seed(config.seed);
         Self {
@@ -729,12 +455,11 @@ impl Runner {
             reorder_cor: CorRng::new(config.reorder_corr),
             next_send: Instant::now(),
             config,
-            server_addr,
             stats,
             queue_len,
             blackout,
             stop,
-            transport,
+            shared,
             rng,
             clg: FourState::default(),
             queue: BinaryHeap::new(),
@@ -743,37 +468,11 @@ impl Runner {
         }
     }
 
-    fn run(mut self) {
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            if *self.stop.lock().unwrap() {
-                break;
-            }
-            // Drain ready packets first so latency is honoured.
-            self.drain_ready(Instant::now());
-
-            // Block briefly on recv so we don't spin. Use the explicit
-            // timeout API so the receive deadline is decoupled from the
-            // transport's default read timeout and can be asserted by tests.
-            match self
-                .transport
-                .recv_from_timeout(&mut buf, Duration::from_millis(5))
-            {
-                Ok((n, from)) => {
-                    self.handle_datagram(&buf[..n], from, Instant::now());
-                }
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    // keep draining
-                }
-                Err(_) => break,
-            }
-        }
+    fn should_stop(&self) -> bool {
+        *self.stop.lock().unwrap()
     }
 
-    fn handle_datagram(&mut self, data: &[u8], _from: SocketAddr, now: Instant) {
+    fn handle_datagram(&mut self, data: &[u8], now: Instant, dst: Option<SocketAddr>) {
         self.stats.inc(|s| &s.received);
 
         // ── max datagram size filter ──────────────────────────────────
@@ -818,7 +517,7 @@ impl Runner {
         // ── rate limit (send-time shaping) ──────────────────────────────
         // netem rate delays packets by serialization time, never drops them.
         for _ in 0..count {
-            self.enqueue(data, now);
+            self.enqueue(data, now, dst);
         }
     }
 
@@ -828,7 +527,7 @@ impl Runner {
         sample_delay(&self.config, &mut self.rng, &mut self.delay_cor)
     }
 
-    fn enqueue(&mut self, data: &[u8], now: Instant) {
+    fn enqueue(&mut self, data: &[u8], now: Instant, dst: Option<SocketAddr>) {
         // ── queue limit (tail-drop) ──────────────────────────────────
         // Check before the reorder/schedule logic so a tail-dropped packet
         // consumes no PRNG draw, never advances next_send, and leaves the
@@ -863,31 +562,55 @@ impl Runner {
             if !delay.is_zero() {
                 self.stats.inc(|s| &s.delayed);
             }
-            let base = now + delay;
 
-            // ── rate shaping (normal branch only) ─────────────────────
-            // Schedule after max(now + configured_delay, previous
-            // scheduled send time) + packet_bits / rate_bps. Send-time
-            // shaping only delays packets; it never drops them.
-            if let Some(serialize) = serialization_delay(data.len(), self.config.rate) {
-                let earliest = base.max(self.next_send);
-                let t = earliest + serialize;
-                self.next_send = t;
-                if t != base {
-                    self.stats.inc(|s| &s.rate_limited);
+            // ── shared bottleneck (normal branch only) ──────────────────
+            // Shape at packet arrival time, then add per-flow propagation
+            // delay. This avoids the latency×rate phantom buffer headroom
+            // that the kernel's delay-first order would give long-RTT flows.
+            if let Some(shared) = &self.shared {
+                match shared.schedule(now, data.len()) {
+                    Some(t) => {
+                        if t != now {
+                            self.stats.inc(|s| &s.rate_limited);
+                        }
+                        t + delay
+                    }
+                    None => {
+                        self.stats.inc(|s| &s.overflow_dropped);
+                        return;
+                    }
                 }
-                t
             } else {
-                base
+                let base = now + delay;
+
+                // ── rate shaping (normal branch only) ───────────────────
+                // Schedule after max(now + configured_delay, previous
+                // scheduled send time) + packet_bits / rate_bps. Send-time
+                // shaping only delays packets; it never drops them.
+                if let Some(serialize) = serialization_delay(data.len(), self.config.rate) {
+                    let earliest = base.max(self.next_send);
+                    let t = earliest + serialize;
+                    self.next_send = t;
+                    if t != base {
+                        self.stats.inc(|s| &s.rate_limited);
+                    }
+                    t
+                } else {
+                    base
+                }
             }
         };
 
-        // keep queue sorted by time_to_send (simple insertion)
+        let Some(dst) = dst else {
+            // No known destination yet (s2c before the first client packet).
+            return;
+        };
+
         let item = Queued {
             time_to_send,
             seq: self.seq,
             data: data.to_vec(),
-            dst: self.server_addr,
+            dst,
         };
         self.seq = self.seq.wrapping_add(1);
         self.queue.push(Reverse(item));
@@ -895,7 +618,7 @@ impl Runner {
             .store(self.queue.len() as u64, Ordering::Relaxed);
     }
 
-    fn drain_ready(&mut self, now: Instant) {
+    fn drain_ready(&mut self, now: Instant, send: &dyn UdpTransport) {
         loop {
             let ready = self
                 .queue
@@ -908,10 +631,89 @@ impl Runner {
             let Reverse(Queued { data, dst, .. }) = self.queue.pop().unwrap();
             self.queue_len
                 .store(self.queue.len() as u64, Ordering::Relaxed);
-            if self.transport.send_to(&data, dst).is_ok() {
+            if send.send_to(&data, dst).is_ok() {
                 self.stats.inc(|s| &s.forwarded);
             }
         }
+    }
+}
+
+struct Runner {
+    server_addr: SocketAddr,
+    transport: Box<dyn UdpTransport>,
+    pipeline: Pipeline,
+}
+
+impl Deref for Runner {
+    type Target = Pipeline;
+    fn deref(&self) -> &Self::Target {
+        &self.pipeline
+    }
+}
+
+impl DerefMut for Runner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pipeline
+    }
+}
+
+impl Runner {
+    fn new(
+        config: NetemConfig,
+        server_addr: SocketAddr,
+        stats: Arc<AtomicStats>,
+        queue_len: Arc<AtomicU64>,
+        blackout: Arc<AtomicBool>,
+        stop: Arc<Mutex<bool>>,
+        transport: Box<dyn UdpTransport>,
+    ) -> Self {
+        Self {
+            server_addr,
+            transport,
+            pipeline: Pipeline::new(config, stats, queue_len, blackout, stop, None),
+        }
+    }
+
+    fn run(mut self) {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            // Drain ready packets first so latency is honoured.
+            self.pipeline.drain_ready(Instant::now(), &*self.transport);
+
+            // Block briefly on recv so we don't spin. Use the explicit
+            // timeout API so the receive deadline is decoupled from the
+            // transport's default read timeout and can be asserted by tests.
+            match self
+                .transport
+                .recv_from_timeout(&mut buf, Duration::from_millis(5))
+            {
+                Ok((n, _from)) => {
+                    self.pipeline
+                        .handle_datagram(&buf[..n], Instant::now(), Some(self.server_addr));
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn handle_datagram(&mut self, data: &[u8], _from: SocketAddr, now: Instant) {
+        self.pipeline
+            .handle_datagram(data, now, Some(self.server_addr));
+    }
+
+    #[cfg(test)]
+    fn drain_ready(&mut self, now: Instant) {
+        self.pipeline.drain_ready(now, &*self.transport);
     }
 }
 
@@ -1207,32 +1009,13 @@ impl NetemPair {
 // ─────────────────────── per-direction runner ────────────────────────────
 
 struct DirectionRunner {
-    config: NetemConfig,
-    stats: Arc<AtomicStats>,
-    queue_len: Arc<AtomicU64>,
-    blackout: Arc<AtomicBool>,
-    stop: Arc<Mutex<bool>>,
     recv: Arc<dyn UdpTransport>,
     send: Arc<dyn UdpTransport>,
     /// Fixed destination (the real server for c2s). When `None`, the runner
     /// uses the learned client address (`learned_dst`).
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<Mutex<Option<SocketAddr>>>,
-    /// Optional shared-bottleneck shaper. When set, it replaces the per-
-    /// direction `config.rate` serialization clock.
-    shared: Option<SharedShaper>,
-    rng: RndState,
-    delay_cor: CorRng,
-    loss_cor: CorRng,
-    dup_cor: CorRng,
-    reorder_cor: CorRng,
-    clg: FourState,
-    /// Earliest time the next packet may be serialized (send-time shaper).
-    /// Tracks the per-direction serialization backlog for rate limiting.
-    next_send: Instant,
-    queue: BinaryHeap<Reverse<Queued>>,
-    reorder_counter: u32,
-    seq: u64,
+    pipeline: Pipeline,
 }
 
 struct DirectionRunnerConfig {
@@ -1262,38 +1045,22 @@ impl DirectionRunner {
             learned_dst,
             shared,
         } = config;
-        let rng = RndState::seed(netem.seed);
         Self {
-            delay_cor: CorRng::new(netem.delay_corr),
-            loss_cor: CorRng::new(netem.loss_corr),
-            dup_cor: CorRng::new(netem.dup_corr),
-            reorder_cor: CorRng::new(netem.reorder_corr),
-            next_send: Instant::now(),
-            config: netem,
-            stats,
-            queue_len,
-            blackout,
-            stop,
             recv,
             send,
             fixed_dst,
             learned_dst,
-            shared,
-            rng,
-            clg: FourState::default(),
-            queue: BinaryHeap::new(),
-            reorder_counter: 0,
-            seq: 0,
+            pipeline: Pipeline::new(netem, stats, queue_len, blackout, stop, shared),
         }
     }
 
     fn run(mut self) {
         let mut buf = [0u8; 64 * 1024];
         loop {
-            if *self.stop.lock().unwrap() {
+            if self.pipeline.should_stop() {
                 break;
             }
-            self.drain_ready(Instant::now());
+            self.pipeline.drain_ready(Instant::now(), &*self.send);
 
             // Use the explicit timeout API so the receive deadline is
             // decoupled from the transport's default read timeout.
@@ -1307,7 +1074,8 @@ impl DirectionRunner {
                     if self.fixed_dst.is_some() {
                         *self.learned_dst.lock().unwrap() = Some(from);
                     }
-                    self.handle_datagram(&buf[..n], Instant::now());
+                    let dst = self.fixed_dst.or_else(|| *self.learned_dst.lock().unwrap());
+                    self.pipeline.handle_datagram(&buf[..n], Instant::now(), dst);
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -1316,161 +1084,6 @@ impl DirectionRunner {
                     // keep draining
                 }
                 Err(_) => break,
-            }
-        }
-    }
-
-    fn handle_datagram(&mut self, data: &[u8], now: Instant) {
-        self.stats.inc(|s| &s.received);
-
-        // ── max datagram size filter ──────────────────────────────────
-        // Drop oversized datagrams before any other processing.
-        if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
-            self.stats.inc(|s| &s.dropped);
-            return;
-        }
-
-        // ── blackout gate ────────────────────────────────────────────
-        if self.blackout.load(Ordering::Relaxed) {
-            self.stats.inc(|s| &s.dropped);
-            return;
-        }
-
-        let mut count = 1u32;
-        if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
-            count += 1;
-            self.stats.inc(|s| &s.duplicated);
-        }
-
-        if self.config.loss_model.loss(
-            &mut self.clg,
-            &mut self.loss_cor,
-            &mut self.rng,
-            self.config.loss,
-        ) {
-            self.stats.inc(|s| &s.dropped);
-            count = count.saturating_sub(1);
-        }
-
-        if count == 0 {
-            return;
-        }
-
-        // ── rate limit (send-time shaping) ──────────────────────────────
-        // netem rate delays packets by serialization time, never drops them.
-        for _ in 0..count {
-            self.enqueue(data, now);
-        }
-    }
-
-    fn sample_delay(&mut self) -> Duration {
-        sample_delay(&self.config, &mut self.rng, &mut self.delay_cor)
-    }
-
-    fn enqueue(&mut self, data: &[u8], now: Instant) {
-        // ── queue limit (tail-drop) ──────────────────────────────────
-        if self.config.limit != 0 && self.queue.len() >= self.config.limit {
-            self.stats.inc(|s| &s.overflow_dropped);
-            return;
-        }
-
-        // ── reorder ──────────────────────────────────────────────────
-        // Reorder only when gap != 0 and only after the reorder counter
-        // reaches gap - 1; use "reorder >= random" like sch_netem.
-        //
-        // Mirrors the Linux `sch_netem` branch structure: the normal
-        // branch applies delay and (optionally) rate shaping, while the
-        // reorder branch schedules the packet for immediate send (`now`)
-        // and resets the reorder counter — rate shaping is *not* applied
-        // to reordered packets, so they always jump ahead of the shaped
-        // tail.
-        let reorder = self.config.gap != 0
-            && self.reorder_counter >= self.config.gap - 1
-            && self.config.reorder >= self.reorder_cor.next(&mut self.rng);
-
-        let time_to_send = if reorder {
-            self.reorder_counter = 0;
-            self.stats.inc(|s| &s.reordered);
-            // Reordered packet is scheduled immediately; no rate shaping.
-            now
-        } else {
-            let delay = self.sample_delay();
-            self.reorder_counter = self.reorder_counter.wrapping_add(1);
-            if !delay.is_zero() {
-                self.stats.inc(|s| &s.delayed);
-            }
-
-            // ── shared bottleneck (normal branch only) ──────────────────
-            // Shape at packet arrival time, then add per-flow propagation
-            // delay. This avoids the latency×rate phantom buffer headroom
-            // that the kernel's delay-first order would give long-RTT flows.
-            if let Some(shared) = &self.shared {
-                match shared.schedule(now, data.len()) {
-                    Some(t) => {
-                        if t != now {
-                            self.stats.inc(|s| &s.rate_limited);
-                        }
-                        t + delay
-                    }
-                    None => {
-                        self.stats.inc(|s| &s.overflow_dropped);
-                        return;
-                    }
-                }
-            } else {
-                let base = now + delay;
-
-                // ── rate shaping (normal branch only) ───────────────────
-                // Schedule after max(now + configured_delay, previous
-                // scheduled send time) + packet_bits / rate_bps. Send-time
-                // shaping only delays packets; it never drops them.
-                if let Some(serialize) = serialization_delay(data.len(), self.config.rate) {
-                    let earliest = base.max(self.next_send);
-                    let t = earliest + serialize;
-                    self.next_send = t;
-                    if t != base {
-                        self.stats.inc(|s| &s.rate_limited);
-                    }
-                    t
-                } else {
-                    base
-                }
-            }
-        };
-
-        let dst = self.fixed_dst.or_else(|| *self.learned_dst.lock().unwrap());
-        let Some(dst) = dst else {
-            // No known destination yet (s2c before the first client packet).
-            return;
-        };
-
-        let item = Queued {
-            time_to_send,
-            seq: self.seq,
-            data: data.to_vec(),
-            dst,
-        };
-        self.seq = self.seq.wrapping_add(1);
-        self.queue.push(Reverse(item));
-        self.queue_len
-            .store(self.queue.len() as u64, Ordering::Relaxed);
-    }
-
-    fn drain_ready(&mut self, now: Instant) {
-        loop {
-            let ready = self
-                .queue
-                .peek()
-                .map(|q| q.0.time_to_send <= now)
-                .unwrap_or(false);
-            if !ready {
-                break;
-            }
-            let Reverse(Queued { data, dst, .. }) = self.queue.pop().unwrap();
-            self.queue_len
-                .store(self.queue.len() as u64, Ordering::Relaxed);
-            if self.send.send_to(&data, dst).is_ok() {
-                self.stats.inc(|s| &s.forwarded);
             }
         }
     }

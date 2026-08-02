@@ -16,7 +16,8 @@
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::{send_timestamped_messages, spawn_rtp_msg_latency_sink};
+use support::mux::send_timestamped_messages;
+use support::rtp::spawn_rtp_msg_latency_sink;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -132,7 +133,7 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
             "server must have received the initial handshake frame"
         );
 
-        let hole_payload = support::payload(1024);
+        let hole_payload = support::payload::payload(1024);
         let _ = write.write_all(&hole_payload).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -156,7 +157,7 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
 
             let mut buf = Vec::with_capacity(MSG_BYTES + 12);
             buf.extend_from_slice(&((MSG_BYTES + 12) as u32).to_le_bytes());
-            buf.extend_from_slice(&support::payload(MSG_BYTES));
+            buf.extend_from_slice(&support::payload::payload(MSG_BYTES));
             buf.extend_from_slice(&base.elapsed().as_micros().to_le_bytes());
 
             let res = tokio::time::timeout(Duration::from_secs(2), write.write_all(&buf)).await;
@@ -345,7 +346,7 @@ fn rtp_permanent_hole_liveness_smoke() {
             "server must have received the initial handshake frame"
         );
 
-        let hole_payload = support::payload(1024);
+        let hole_payload = support::payload::payload(1024);
         let _ = write.write_all(&hole_payload).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -358,7 +359,7 @@ fn rtp_permanent_hole_liveness_smoke() {
 
         let max_duration = Duration::from_secs(5);
         let post_hole_interval = Duration::from_millis(100);
-        let msg = support::payload(MSG_BYTES);
+        let msg = support::payload::payload(MSG_BYTES);
 
         loop {
             if start.elapsed() >= max_duration {

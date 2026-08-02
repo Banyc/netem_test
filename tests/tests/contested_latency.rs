@@ -15,9 +15,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::{
-    hostile_real_link, mux_client_connect, percentile, spawn_mux_latency_bulk_server, with_timeout,
-};
+use support::mux::{mux_client_connect, spawn_mux_latency_bulk_server};
+use support::payload::with_timeout;
+use support::presets::hostile_real_link;
+use support::stats::percentile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -94,7 +95,7 @@ async fn contested_rep(
     });
 
     // Bulk payload: 64 MiB cyclic buffer, enough to keep any cap busy.
-    let payload = Arc::new(support::cyclic_payload(64 * 1024 * 1024));
+    let payload = Arc::new(support::payload::cyclic_payload(64 * 1024 * 1024));
 
     // Start queue-length sampler on the LOADED pair.
     let stop_sampler = Arc::new(AtomicBool::new(false));
@@ -161,7 +162,7 @@ async fn send_tagged_pings(
     if write.write_all(b"L").await.is_err() {
         return 0;
     }
-    support::send_timestamped_messages(write, base, msg_bytes, cadence, run_for).await
+    support::mux::send_timestamped_messages(write, base, msg_bytes, cadence, run_for).await
 }
 
 /// Send a deterministic `b'B'` bulk stream through a mux stream write half.
