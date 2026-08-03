@@ -5,4 +5,4 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-dfsql = { git = "https://github.com/Banyc/dfsql", tag = "v0.16.0", default-features = false }
+dfsql = { git = "https://github.com/Banyc/dfsql", tag = "v0.17.0", default-features = false }
