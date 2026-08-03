@@ -65,7 +65,7 @@ impl ReverseTrafficTracker {
 }
 
 #[test]
-#[ignore]
+#[ignore = "runs up to MAX_DURATION (65s) end-to-end; keep out of normal test builds (see module header)"]
 fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -265,6 +265,7 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
 }
 
 #[test]
+#[ignore = "runs up to MAX_DURATION (65s) end-to-end; keep out of normal test builds (see module header)"]
 fn rtp_permanent_hole_liveness_smoke() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
