@@ -172,12 +172,15 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
 
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &pair.client_addr().to_string(),
-        None,
-        false,
-        rtp::udp::NO_FEC_MSS,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec: false,
+            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await
     .unwrap();
@@ -1211,12 +1214,15 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
 
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &pair.client_addr().to_string(),
-        None,
-        false,
-        rtp::udp::NO_FEC_MSS,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec: false,
+            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await
     .unwrap();

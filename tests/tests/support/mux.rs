@@ -47,7 +47,7 @@ where
         let listener = Arc::clone(&listener);
         async move {
             // First (and only) rtp connection.
-            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
+            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -62,7 +62,7 @@ where
                 async move {
                     loop {
                         if listener
-                            .accept_without_handshake_with_mss(fec, mss)
+                            .accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() })
                             .await
                             .is_err()
                         {
@@ -797,12 +797,13 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     let bulk_delivered_for_server = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
         let accepted = match listener_accept
-            .accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
-                rtp::udp::NO_FEC_MSS,
-                FecTuning::default(),
-                fd,
-            )
+                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                fec_tuning: FecTuning::default(),
+                frame_delivery: fd,
+                ..rtp::udp::AcceptConfig::default()
+            })
             .await
         {
             Ok(a) => a,
@@ -813,12 +814,13 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
             async move {
                 loop {
                     if listener
-                        .accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+                        .accept_without_handshake_with(rtp::udp::AcceptConfig {
                             fec,
-                            rtp::udp::NO_FEC_MSS,
-                            FecTuning::default(),
-                            fd,
-                        )
+                            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                            fec_tuning: FecTuning::default(),
+                            frame_delivery: fd,
+                            ..rtp::udp::AcceptConfig::default()
+                        })
                         .await
                         .is_err()
                     {

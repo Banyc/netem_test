@@ -158,12 +158,15 @@ async fn run_hol_probe(
     };
 
     // Connect the interactive mux client.
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &interactive_pair.client_addr().to_string(),
-        None,
-        fec,
-        rtp::udp::NO_FEC_MSS,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec,
+            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await
     .unwrap();

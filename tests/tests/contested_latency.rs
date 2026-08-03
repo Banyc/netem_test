@@ -59,12 +59,15 @@ async fn contested_rep(
         spawn_mux_latency_bulk_server(fec, base).await.unwrap();
     let pair = Arc::new(NetemPair::spawn(server_addr, c2s, s2c).unwrap());
 
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &pair.client_addr().to_string(),
-        None,
-        fec,
-        rtp::udp::NO_FEC_MSS,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec,
+            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await
     .unwrap();

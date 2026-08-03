@@ -53,7 +53,11 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
         while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with_mss(fec, mss)
+            .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                fec,
+                mss: rtp::udp::MssConfig::Custom(mss),
+                ..rtp::udp::AcceptConfig::default()
+            })
             .await
         {
             let _ = accept_tx.send(accepted);
@@ -205,7 +209,16 @@ pub async fn spawn_dual_msg_channel_server(
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
         while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+
+                    fec,
+
+                    mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+
+                    ..rtp::udp::AcceptConfig::default()
+
+                })
             .await
         {
             let _ = accept_tx.send(accepted);
@@ -339,7 +352,16 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
         while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+
+                    fec,
+
+                    mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+
+                    ..rtp::udp::AcceptConfig::default()
+
+                })
             .await
         {
             let _ = accept_tx.send(accepted);
@@ -509,7 +531,16 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
         while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+
+                    fec,
+
+                    mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+
+                    ..rtp::udp::AcceptConfig::default()
+
+                })
             .await
         {
             let _ = accept_tx.send(accepted);
@@ -919,7 +950,16 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
     let listener_bg = Arc::clone(&listener);
     tokio::spawn(async move {
         while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with_mss(fec, rtp::udp::NO_FEC_MSS)
+
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+
+                    fec,
+
+                    mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+
+                    ..rtp::udp::AcceptConfig::default()
+
+                })
             .await
         {
             let _ = accept_tx.send(accepted);
@@ -1096,12 +1136,13 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
                     FrameDelivery::default()
                 };
                 match listener
-                    .accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+                    .accept_without_handshake_with(rtp::udp::AcceptConfig {
                         fec,
-                        rtp::udp::NO_FEC_MSS,
-                        FecTuning::default(),
-                        fd,
-                    )
+                        mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                        fec_tuning: FecTuning::default(),
+                        frame_delivery: fd,
+                        ..rtp::udp::AcceptConfig::default()
+                    })
                     .await
                 {
                     Ok(accepted) => {

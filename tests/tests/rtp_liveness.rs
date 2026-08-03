@@ -91,12 +91,14 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
         };
         let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-        let connected = rtp::udp::connect_without_handshake_with_mss(
+        let connected = rtp::udp::connect_with(
             "0.0.0.0:0",
             &pair.client_addr().to_string(),
-            None,
-            false,
-            rtp::udp::NO_FEC_MSS,
+            rtp::udp::ConnectConfig {
+                handshake: false,
+                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                ..rtp::udp::ConnectConfig::default()
+            },
         )
         .await
         .unwrap();
@@ -297,19 +299,14 @@ fn rtp_permanent_hole_liveness_smoke() {
             Duration::from_secs(3),
         );
 
-        let connected = rtp::udp::connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
+        let connected = rtp::udp::connect_with(
             "0.0.0.0:0",
             &pair.client_addr().to_string(),
-            rtp::udp::WatchdogConnectConfig {
-                connection: rtp::udp::ConnectConfig {
-                    log_config: None,
-                    handshake: false,
-                    fec: false,
-                    mss: rtp::udp::NO_FEC_MSS,
-                    fec_tuning: rtp::transmission::fec_tuning::FecTuning::default(),
-                    frame_delivery: rtp::transmission::frame_delivery::FrameDelivery::default(),
-                },
-                watchdog: watchdog_tuning,
+            rtp::udp::ConnectConfig {
+                handshake: false,
+                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                watchdog: Some(watchdog_tuning),
+                ..rtp::udp::ConnectConfig::default()
             },
         )
         .await

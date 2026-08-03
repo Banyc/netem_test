@@ -88,12 +88,14 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     // Sparse latency sender on a separate connection through the same pair.
     let latency_pair =
         NetemPair::spawn(latency_addr, bufferbloat_link(4), bufferbloat_link(5)).unwrap();
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &latency_pair.client_addr().to_string(),
-        None,
-        false,
-        MSS,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            mss: rtp::udp::MssConfig::Custom(MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await
     .unwrap();

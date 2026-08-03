@@ -231,12 +231,14 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     )
     .unwrap();
 
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &pair.client_addr().to_string(),
-        None,
-        false,
-        MSS,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            mss: rtp::udp::MssConfig::Custom(MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await
     .unwrap();

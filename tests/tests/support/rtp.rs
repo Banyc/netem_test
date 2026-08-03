@@ -21,7 +21,7 @@ pub async fn spawn_rtp_echo_server_with_mss(
     let addr = listener.local_addr();
     tokio::spawn(async move {
         loop {
-            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
+            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -67,8 +67,9 @@ pub async fn rtp_connect(
 
 /// Connect an `rtp` client with a custom MSS.
 ///
-/// `mss` is passed to [`rtp::udp::connect_without_handshake_with_mss`];
-/// `proxy_client_addr` should be [`NetemPair::client_addr`].
+/// `mss` is passed to [`rtp::udp::connect_with`] via a custom
+/// [`rtp::udp::MssConfig`]; `proxy_client_addr` should be
+/// [`NetemPair::client_addr`].
 pub async fn rtp_connect_with_mss(
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
@@ -77,12 +78,15 @@ pub async fn rtp_connect_with_mss(
     impl AsyncRead + Unpin + Send,
     impl AsyncWrite + Unpin + Send,
 ) {
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &proxy_client_addr.to_string(),
-        None,
-        fec,
-        mss,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec,
+            mss: rtp::udp::MssConfig::Custom(mss),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await
     .unwrap();
@@ -139,7 +143,7 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
     tokio::spawn({
         let listener = Arc::clone(&listener);
         async move {
-            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
+            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -150,7 +154,7 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
             tokio::spawn(async move {
                 loop {
                     if listener
-                        .accept_without_handshake_with_mss(fec, mss)
+                        .accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() })
                         .await
                         .is_err()
                     {
@@ -229,7 +233,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
     tokio::spawn({
         let listener = Arc::clone(&listener);
         async move {
-            let accepted = match listener.accept_without_handshake_with_mss(fec, mss).await {
+            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -237,7 +241,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
             tokio::spawn(async move {
                 loop {
                     if listener
-                        .accept_without_handshake_with_mss(fec, mss)
+                        .accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() })
                         .await
                         .is_err()
                     {
@@ -316,12 +320,15 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<rtp::socket::WriteStream> {
-    let connected = rtp::udp::connect_without_handshake_with_mss(
+    let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &proxy_client_addr.to_string(),
-        None,
-        fec,
-        mss,
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec,
+            mss: rtp::udp::MssConfig::Custom(mss),
+            ..rtp::udp::ConnectConfig::default()
+        },
     )
     .await?;
     let mut read = connected.read.into_async_read();
