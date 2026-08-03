@@ -158,6 +158,43 @@ impl UdpTransport for StdUdpTransport {
     }
 }
 
+/// Injectable monotonic clock for deterministic tests.
+///
+/// Time-sensitive paths in [`Pipeline`] (delay-heap readiness, rate shaping,
+/// shared-bottleneck serialization) read the current instant through the
+/// [`Clock::now`] seam. When a runner is constructed without a clock it falls
+/// back to the wall clock (`Instant::now`); tests install a [`Clock`] and call
+/// [`Clock::advance`] to move emulated time forward directly instead of
+/// sleeping on `thread::sleep`, keeping the unit tests deterministic and fast.
+#[derive(Clone, Debug)]
+struct Clock {
+    /// Real instant corresponding to emulated time `0`.
+    base: Instant,
+    /// Emulated nanoseconds elapsed since `base`.
+    nanos: Arc<AtomicU64>,
+}
+
+impl Clock {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            nanos: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Current emulated instant.
+    fn now(&self) -> Instant {
+        self.base + Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    /// Advance emulated time forward by `d`.
+    fn advance(&self, d: Duration) {
+        self.nanos.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 // ──────────────────────────── config & stats ───────────────────────────
 
 /// Configuration for one emulated direction.
@@ -348,15 +385,16 @@ impl NetemLink {
             stop: Arc::clone(&stop),
         };
 
-        let runner = Runner::new(
-            config,
+        let runner = Runner::new(RunnerConfig {
+            netem: config,
             server_addr,
             stats,
             queue_len,
             blackout,
             stop,
             transport,
-        );
+            clock: None,
+        });
         std::thread::Builder::new()
             .name("netem-link".into())
             .spawn(move || runner.run())?;
@@ -433,6 +471,9 @@ struct Pipeline {
     /// Earliest time the next packet may be serialized (send-time shaper).
     /// Tracks the per-direction serialization backlog for rate limiting.
     next_send: Instant,
+    /// Injectable clock; when set, all time reads go through it so tests can
+    /// drive emulated time deterministically instead of sleeping.
+    clock: Option<Clock>,
     queue: BinaryHeap<Reverse<Queued>>,
     reorder_counter: u32,
     seq: u64,
@@ -446,14 +487,19 @@ impl Pipeline {
         blackout: Arc<AtomicBool>,
         stop: Arc<Mutex<bool>>,
         shared: Option<SharedShaper>,
+        clock: Option<Clock>,
     ) -> Self {
         let rng = RndState::seed(config.seed);
+        let next_send = match &clock {
+            Some(c) => c.now(),
+            None => Instant::now(),
+        };
         Self {
             delay_cor: CorRng::new(config.delay_corr),
             loss_cor: CorRng::new(config.loss_corr),
             dup_cor: CorRng::new(config.dup_corr),
             reorder_cor: CorRng::new(config.reorder_corr),
-            next_send: Instant::now(),
+            next_send,
             config,
             stats,
             queue_len,
@@ -462,9 +508,19 @@ impl Pipeline {
             shared,
             rng,
             clg: FourState::default(),
+            clock,
             queue: BinaryHeap::new(),
             reorder_counter: 0,
             seq: 0,
+        }
+    }
+
+    /// Current emulated time: the injected [`Clock`] when present, else the
+    /// wall clock.
+    fn now(&self) -> Instant {
+        match &self.clock {
+            Some(c) => c.now(),
+            None => Instant::now(),
         }
     }
 
@@ -644,6 +700,17 @@ struct Runner {
     pipeline: Pipeline,
 }
 
+struct RunnerConfig {
+    netem: NetemConfig,
+    server_addr: SocketAddr,
+    stats: Arc<AtomicStats>,
+    queue_len: Arc<AtomicU64>,
+    blackout: Arc<AtomicBool>,
+    stop: Arc<Mutex<bool>>,
+    transport: Box<dyn UdpTransport>,
+    clock: Option<Clock>,
+}
+
 impl Deref for Runner {
     type Target = Pipeline;
     fn deref(&self) -> &Self::Target {
@@ -658,19 +725,21 @@ impl DerefMut for Runner {
 }
 
 impl Runner {
-    fn new(
-        config: NetemConfig,
-        server_addr: SocketAddr,
-        stats: Arc<AtomicStats>,
-        queue_len: Arc<AtomicU64>,
-        blackout: Arc<AtomicBool>,
-        stop: Arc<Mutex<bool>>,
-        transport: Box<dyn UdpTransport>,
-    ) -> Self {
+    fn new(config: RunnerConfig) -> Self {
+        let RunnerConfig {
+            netem,
+            server_addr,
+            stats,
+            queue_len,
+            blackout,
+            stop,
+            transport,
+            clock,
+        } = config;
         Self {
             server_addr,
             transport,
-            pipeline: Pipeline::new(config, stats, queue_len, blackout, stop, None),
+            pipeline: Pipeline::new(netem, stats, queue_len, blackout, stop, None, clock),
         }
     }
 
@@ -681,7 +750,7 @@ impl Runner {
                 break;
             }
             // Drain ready packets first so latency is honoured.
-            self.pipeline.drain_ready(Instant::now(), &*self.transport);
+            self.pipeline.drain_ready(self.pipeline.now(), &*self.transport);
 
             // Block briefly on recv so we don't spin. Use the explicit
             // timeout API so the receive deadline is decoupled from the
@@ -692,7 +761,7 @@ impl Runner {
             {
                 Ok((n, _from)) => {
                     self.pipeline
-                        .handle_datagram(&buf[..n], Instant::now(), Some(self.server_addr));
+                        .handle_datagram(&buf[..n], self.pipeline.now(), Some(self.server_addr));
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -744,6 +813,7 @@ struct NetemPairConfig {
     s2c: NetemConfig,
     c2s_shared: Option<SharedShaper>,
     s2c_shared: Option<SharedShaper>,
+    clock: Option<Clock>,
 }
 
 impl NetemPair {
@@ -778,6 +848,7 @@ impl NetemPair {
                 s2c,
                 c2s_shared: None,
                 s2c_shared: None,
+                clock: None,
             },
         )
     }
@@ -830,6 +901,7 @@ impl NetemPair {
                 s2c,
                 c2s_shared,
                 s2c_shared,
+                clock: None,
             },
         )
     }
@@ -846,6 +918,7 @@ impl NetemPair {
             s2c,
             c2s_shared,
             s2c_shared,
+            clock,
         } = config;
         if c2s_shared.is_some() {
             assert_eq!(
@@ -899,6 +972,7 @@ impl NetemPair {
                 fixed_dst: Some(server_addr),
                 learned_dst: Arc::clone(&learned_client),
                 shared: c2s_shared,
+                clock: clock.clone(),
             },
         );
         std::thread::Builder::new()
@@ -919,6 +993,7 @@ impl NetemPair {
                 fixed_dst: None,
                 learned_dst: learned_client,
                 shared: s2c_shared,
+                clock,
             },
         );
         std::thread::Builder::new()
@@ -1027,6 +1102,7 @@ struct DirectionRunnerConfig {
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<Mutex<Option<SocketAddr>>>,
     shared: Option<SharedShaper>,
+    clock: Option<Clock>,
 }
 
 impl DirectionRunner {
@@ -1044,13 +1120,14 @@ impl DirectionRunner {
             fixed_dst,
             learned_dst,
             shared,
+            clock,
         } = config;
         Self {
             recv,
             send,
             fixed_dst,
             learned_dst,
-            pipeline: Pipeline::new(netem, stats, queue_len, blackout, stop, shared),
+            pipeline: Pipeline::new(netem, stats, queue_len, blackout, stop, shared, clock),
         }
     }
 
@@ -1060,7 +1137,7 @@ impl DirectionRunner {
             if self.pipeline.should_stop() {
                 break;
             }
-            self.pipeline.drain_ready(Instant::now(), &*self.send);
+            self.pipeline.drain_ready(self.pipeline.now(), &*self.send);
 
             // Use the explicit timeout API so the receive deadline is
             // decoupled from the transport's default read timeout.
@@ -1075,7 +1152,7 @@ impl DirectionRunner {
                         *self.learned_dst.lock().unwrap() = Some(from);
                     }
                     let dst = self.fixed_dst.or_else(|| *self.learned_dst.lock().unwrap());
-                    self.pipeline.handle_datagram(&buf[..n], Instant::now(), dst);
+                    self.pipeline.handle_datagram(&buf[..n], self.pipeline.now(), dst);
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -1250,11 +1327,14 @@ mod tests {
 
     /// In-memory transport that records sent payloads and can return them on
     /// `recv_from`. Used to drive [`Runner`] deterministically in unit tests.
+    /// It also owns an injectable [`Clock`] so tests can advance emulated time
+    /// directly instead of `thread::sleep`.
     #[derive(Debug)]
     struct MockTransport {
         recv: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
         sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
         local_addr: SocketAddr,
+        clock: Clock,
     }
 
     impl MockTransport {
@@ -1263,7 +1343,21 @@ mod tests {
                 recv: Mutex::new(VecDeque::new()),
                 sent: Mutex::new(Vec::new()),
                 local_addr,
+                clock: Clock::new(),
             }
+        }
+
+        fn with_clock(local_addr: SocketAddr, clock: Clock) -> Self {
+            Self {
+                recv: Mutex::new(VecDeque::new()),
+                sent: Mutex::new(Vec::new()),
+                local_addr,
+                clock,
+            }
+        }
+
+        fn clock(&self) -> Clock {
+            self.clock.clone()
         }
 
         fn push_recv(&self, data: Vec<u8>, from: SocketAddr) {
@@ -1308,19 +1402,23 @@ mod tests {
         }
     }
 
-    /// Build a [`Runner`] directly and expose it via `handle_datagram` / `drain_ready`.
+    /// Build a [`Runner`] directly and expose it via `handle_datagram` /
+    /// `drain_ready`. The runner's clock is owned by the returned mock so
+    /// tests can advance emulated time through it.
     fn mock_runner(config: NetemConfig) -> (Runner, Arc<MockTransport>) {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
         let captured = Arc::new(MockTransport::new(server_addr));
-        let runner = Runner::new(
-            config,
+        let clock = captured.clock();
+        let runner = Runner::new(RunnerConfig {
+            netem: config,
             server_addr,
-            Arc::new(AtomicStats::default()),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(false)),
-            Box::new(Arc::clone(&captured) as Arc<dyn UdpTransport>),
-        );
+            stats: Arc::new(AtomicStats::default()),
+            queue_len: Arc::new(AtomicU64::new(0)),
+            blackout: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(Mutex::new(false)),
+            transport: Box::new(Arc::clone(&captured) as Arc<dyn UdpTransport>),
+            clock: Some(clock),
+        });
         (runner, captured)
     }
 
@@ -1332,8 +1430,25 @@ mod tests {
         config: NetemConfig,
     ) -> (Runner, Arc<MockTransport>) {
         let (mut runner, sent) = mock_runner(config);
-        runner.handle_datagram(data, from, Instant::now());
+        runner.handle_datagram(data, from, sent.clock().now());
         (runner, sent)
+    }
+
+    /// Wait for a condition that the runner threads make true, bounded by a
+    /// wall-clock deadline so a wedged runner fails the test instead of
+    /// hanging. Only used to absorb thread-scheduling latency after the
+    /// runner has consumed a `push_recv`; emulated time itself is driven by
+    /// advancing the shared [`Clock`].
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -1462,14 +1577,16 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             config.clone(),
         );
+        let clock = sent.clock();
         runner.blackout.store(true, Ordering::Relaxed);
         runner.handle_datagram(
             b"after",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
-            Instant::now(),
+            clock.now(),
         );
-        std::thread::sleep(Duration::from_millis(20));
-        runner.drain_ready(Instant::now());
+        // Advance past the 1 ms latency so the first packet drains.
+        clock.advance(Duration::from_millis(20));
+        runner.drain_ready(clock.now());
         let s = runner.stats.snapshot();
         assert_eq!(s.received, 2);
         assert_eq!(s.dropped, 1);
@@ -1492,11 +1609,12 @@ mod tests {
             ..Default::default()
         };
 
-        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
-            std::net::Ipv4Addr::LOCALHOST,
-            4001,
-        ))));
-        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let clock = Clock::new();
+        let client_sock = Arc::new(MockTransport::with_clock(
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 4001)),
+            clock.clone(),
+        ));
+        let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
         let pair = NetemPair::spawn_from_sockets(
             server_addr,
@@ -1508,6 +1626,7 @@ mod tests {
                 s2c,
                 c2s_shared: None,
                 s2c_shared: None,
+                clock: Some(clock),
             },
         )
         .unwrap();
@@ -1519,8 +1638,11 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5000)),
             );
         }
-        // Give the runner thread a moment to pick them up.
-        std::thread::sleep(Duration::from_millis(50));
+        // The runner ingests them at clock time 0 behind the 1 s latency; they
+        // stay queued because we never advance the clock.
+        wait_until("c2s runner to receive all 3 packets", || {
+            pair.stats_c2s().received == 3
+        });
         assert_eq!(pair.queue_len_c2s(), 3);
         assert_eq!(pair.queue_len_s2c(), 0);
         pair.stop();
@@ -1538,11 +1660,12 @@ mod tests {
             ..Default::default()
         };
 
-        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
-            std::net::Ipv4Addr::LOCALHOST,
-            4002,
-        ))));
-        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let clock = Clock::new();
+        let client_sock = Arc::new(MockTransport::with_clock(
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 4002)),
+            clock.clone(),
+        ));
+        let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
         let pair = NetemPair::spawn_from_sockets(
             server_addr,
@@ -1554,6 +1677,7 @@ mod tests {
                 s2c,
                 c2s_shared: None,
                 s2c_shared: None,
+                clock: Some(clock.clone()),
             },
         )
         .unwrap();
@@ -1563,8 +1687,9 @@ mod tests {
             vec![1],
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)),
         );
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(pair.stats_c2s().forwarded >= 1);
+        wait_until("first packet received", || pair.stats_c2s().received >= 1);
+        clock.advance(Duration::from_millis(5));
+        wait_until("first packet forwarded", || pair.stats_c2s().forwarded >= 1);
 
         // Enable blackout and send more packets.
         pair.set_blackout_c2s(true);
@@ -1576,7 +1701,7 @@ mod tests {
             vec![3],
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)),
         );
-        std::thread::sleep(Duration::from_millis(50));
+        wait_until("gated packets received", || pair.stats_c2s().received == 3);
         let gated = pair.stats_c2s();
         assert_eq!(gated.received, 3);
         assert_eq!(gated.dropped, 2);
@@ -1587,7 +1712,9 @@ mod tests {
             vec![4],
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)),
         );
-        std::thread::sleep(Duration::from_millis(50));
+        wait_until("final packet received", || pair.stats_c2s().received == 4);
+        clock.advance(Duration::from_millis(5));
+        wait_until("final packet forwarded", || pair.stats_c2s().forwarded >= 2);
         let final_stats = pair.stats_c2s();
         assert!(final_stats.forwarded >= 2);
         assert_eq!(final_stats.received, 4);
@@ -1680,11 +1807,12 @@ mod tests {
         };
         let s2c = NetemConfig::default();
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6000));
-        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
-            std::net::Ipv4Addr::LOCALHOST,
-            6001,
-        ))));
-        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let clock = Clock::new();
+        let client_sock = Arc::new(MockTransport::with_clock(
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6001)),
+            clock.clone(),
+        ));
+        let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
         let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
         let pair = NetemPair::spawn_from_sockets(
@@ -1697,6 +1825,7 @@ mod tests {
                 s2c,
                 c2s_shared: Some(shared),
                 s2c_shared: None,
+                clock: Some(clock.clone()),
             },
         )
         .unwrap();
@@ -1707,7 +1836,14 @@ mod tests {
         client_sock.push_recv(vec![1u8; 60], from);
         // 30 B while the 60 B packet is still draining: 60 + 30 > 80 B: drop.
         client_sock.push_recv(vec![2u8; 30], from);
-        std::thread::sleep(Duration::from_millis(150));
+        // Wait for the runner to ingest all three at clock time 0, so the
+        // overflow decisions happen against the fresh 80 B shared buffer.
+        wait_until("c2s runner to receive all 3 packets", || {
+            pair.stats_c2s().received == 3
+        });
+        // Advance past the 60 ms serialization so the 60 B packet drains.
+        clock.advance(Duration::from_millis(150));
+        wait_until("60 B packet forwarded", || pair.stats_c2s().forwarded == 1);
         pair.stop();
 
         let stats = pair.stats_c2s();
@@ -1814,7 +1950,10 @@ mod tests {
         for _ in 0..packets_per_flow {
             client_a.send_to(&payload_a, pair_a.client_addr()).unwrap();
             client_b.send_to(&payload_b, pair_b.client_addr()).unwrap();
-            // Pace sends to avoid kernel local-LAN drop.
+            // Pace sends to avoid kernel local-LAN drop. This test drives real
+            // OS sockets (no MockTransport), so there is no injectable clock:
+            // the wall-clock sleep both paces the loop and lets the shared
+            // shaper's real-time serialization clock run.
             std::thread::sleep(Duration::from_micros(200));
         }
 
@@ -1881,11 +2020,12 @@ mod tests {
         };
         let s2c = NetemConfig::default();
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6300));
-        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
-            std::net::Ipv4Addr::LOCALHOST,
-            6301,
-        ))));
-        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let clock = Clock::new();
+        let client_sock = Arc::new(MockTransport::with_clock(
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6301)),
+            clock.clone(),
+        ));
+        let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
 
         let pair = NetemPair::spawn_from_sockets(
@@ -1898,6 +2038,7 @@ mod tests {
                 s2c,
                 c2s_shared: Some(shaper.clone()),
                 s2c_shared: None,
+                clock: Some(clock.clone()),
             },
         )
         .unwrap();
@@ -1912,7 +2053,16 @@ mod tests {
         client_sock.push_recv(vec![0xBB, 0x02], from_b);
         client_sock.push_recv(vec![0xAA, 0x03], from_a);
 
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait for the runner to ingest all five at clock time 0 so the shared
+        // bottleneck sees them in arrival order, then advance well past the
+        // ~10 µs it takes to serialize five 2-byte packets at 8 Mbps.
+        wait_until("c2s runner to receive all 5 packets", || {
+            pair.stats_c2s().received == 5
+        });
+        clock.advance(Duration::from_millis(5));
+        wait_until("all 5 packets forwarded", || {
+            server_sock.sent.lock().unwrap().len() == 5
+        });
         pair.stop();
 
         let sent = server_sock.sent.lock().unwrap();
@@ -1935,11 +2085,12 @@ mod tests {
         };
         let s2c = NetemConfig::default();
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6400));
-        let client_sock = Arc::new(MockTransport::new(SocketAddr::V4(SocketAddrV4::new(
-            std::net::Ipv4Addr::LOCALHOST,
-            6401,
-        ))));
-        let server_sock = Arc::new(MockTransport::new(server_addr));
+        let clock = Clock::new();
+        let client_sock = Arc::new(MockTransport::with_clock(
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6401)),
+            clock.clone(),
+        ));
+        let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
 
         let pair = NetemPair::spawn_from_sockets(
@@ -1952,6 +2103,7 @@ mod tests {
                 s2c,
                 c2s_shared: Some(shaper.clone()),
                 s2c_shared: None,
+                clock: Some(clock.clone()),
             },
         )
         .unwrap();
@@ -1962,7 +2114,14 @@ mod tests {
         client_sock.push_recv(vec![0u8; 50], from);
         client_sock.push_recv(vec![0u8; 40], from);
 
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait for the runner to ingest both at clock time 0 so the 40 B packet
+        // overflows against the fresh 80 B shared buffer; then advance past the
+        // 50 ms it takes to serialize the 50 B packet.
+        wait_until("c2s runner to receive both packets", || {
+            pair.stats_c2s().received == 2
+        });
+        clock.advance(Duration::from_millis(100));
+        wait_until("50 B packet forwarded", || pair.stats_c2s().forwarded == 1);
         pair.stop();
 
         let stats = pair.stats_c2s();
