@@ -24,7 +24,7 @@ mod support;
 /// the netem proxy — a 400 KiB byte stream must arrive intact despite ~5%
 /// loss in both directions.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp loss-recovery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_survives_mild_loss_400kib() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 

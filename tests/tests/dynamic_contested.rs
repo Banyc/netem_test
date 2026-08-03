@@ -242,7 +242,7 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_single_mux() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -340,7 +340,7 @@ async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTraf
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_auto_small_first() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -473,7 +473,7 @@ async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTraffi
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_auto_big_first() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -597,7 +597,7 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_auto_per_message() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -735,7 +735,7 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_hint_static() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -859,7 +859,7 @@ async fn dyn_dual_msg_channel_rep(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_msg_channel() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -877,7 +877,7 @@ async fn dyn_dual_msg_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_msg_channel_ordered() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -1135,7 +1135,7 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_game_sync_sticky() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -1181,7 +1181,7 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_game_sync_migrating() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -1318,7 +1318,7 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_game_sync_single_mux() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -1468,7 +1468,7 @@ async fn dyn_dual_auto_small_first_migrating_rep(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_auto_small_first_migrating() {
     let reps = dyn_reps();
     let mut results = Vec::new();
@@ -1595,7 +1595,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "dynamic-packet-size latency/bulk battery; slow real-time scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dyn_dual_auto_big_first_migrating() {
     let reps = dyn_reps();
     let mut results = Vec::new();

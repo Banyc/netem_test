@@ -470,7 +470,7 @@ macro_rules! hol_test {
         $gates:expr
     ) => {
         #[tokio::test(flavor = "multi_thread")]
-        #[ignore]
+        #[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
         async fn $name() {
             let summary = with_timeout(
                 $timeout,
@@ -841,7 +841,7 @@ hol_test!(
 // ────────────────────────────── cap400 shared-bottleneck report-only ──────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_cap400_loss1_split_shared() {
     let label = "cap400 loss1 split-shared";
     let rate_bps = 400 * 1024 * 8;
@@ -1005,7 +1005,7 @@ hol_test!(
 // ────────────────────────────── FEC mitigation row ────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_cap400_fec_solo() {
     let label = "cap400 FEC solo";
     let _summary = with_timeout(
@@ -1615,7 +1615,7 @@ async fn run_frame_delivery_two_interactive(
 // ───── single‑connection frame‑delivery ─────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_shared_frame_delivery() {
     let label = "rtt100 GE5 shared frame-delivery";
     let summary = with_timeout(
@@ -1653,7 +1653,7 @@ async fn hol_rtt100_ge5_shared_frame_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_two_interactive_frame_delivery() {
     let label = "rtt100 GE5 two-interactive frame-delivery";
     let (summary_a, summary_b, combined) = with_timeout(
@@ -1694,7 +1694,7 @@ async fn hol_rtt100_ge5_two_interactive_frame_delivery() {
 // ───── diagnostics: frame‑delivery shared on various link profiles ─────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_clean_shared_frame_delivery_diag() {
     let label = "rtt100 clean shared frame-delivery diag";
     let summary = with_timeout(
@@ -1718,7 +1718,7 @@ async fn hol_rtt100_clean_shared_frame_delivery_diag() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge1_shared_frame_delivery_diag() {
     let label = "rtt100 GE1 shared frame-delivery diag";
     let summary = with_timeout(
@@ -1742,7 +1742,7 @@ async fn hol_rtt100_ge1_shared_frame_delivery_diag() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_hostile_shared_frame_delivery_diag() {
     let label = "hostile shared frame-delivery diag";
     let summary = with_timeout(
@@ -1766,7 +1766,7 @@ async fn hol_hostile_shared_frame_delivery_diag() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_cap400_shared_frame_delivery_diag() {
     let label = "cap400 shared frame-delivery diag";
     let summary = with_timeout(
@@ -1792,7 +1792,7 @@ async fn hol_cap400_shared_frame_delivery_diag() {
 // ───── dual‑lane: stock lanes ─────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_shared_dual_lane() {
     let label = "rtt100 GE5 shared dual-lane";
     let summary = with_timeout(
@@ -1827,7 +1827,7 @@ async fn hol_rtt100_ge5_shared_dual_lane() {
 // ───── dual‑lane: both lanes frame‑delivery ─────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_shared_dual_lane_frame_delivery() {
     let label = "rtt100 GE5 shared dual-lane frame-delivery";
     let summary = with_timeout(
@@ -1862,7 +1862,7 @@ async fn hol_rtt100_ge5_shared_dual_lane_frame_delivery() {
 // ───── asymmetric: interactive frame, bulk stock ─────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_shared_dual_lane_asym_frame_diag() {
     let label = "rtt100 GE5 shared dual-lane asym frame diag";
     let summary = with_timeout(
@@ -1893,7 +1893,7 @@ async fn hol_rtt100_ge5_shared_dual_lane_asym_frame_diag() {
 // ───── two‑interactive intra‑lane isolation ─────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_dual_lane_two_interactive_stock_diag() {
     let label = "rtt100 GE5 dual-lane two-interactive stock";
     let (summary_a, summary_b, _combined, _bulk) = with_timeout(
@@ -1923,7 +1923,7 @@ async fn hol_rtt100_ge5_dual_lane_two_interactive_stock_diag() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn hol_rtt100_ge5_dual_lane_two_interactive_frame_diag() {
     let label = "rtt100 GE5 dual-lane two-interactive frame";
     let (summary_a, summary_b, _combined, _bulk) = with_timeout(
@@ -2063,7 +2063,7 @@ async fn run_hol_probe_dual_lane_separate_listeners(
 /// loss the probe must deliver messages and tear down cleanly without
 /// wedging the runtime.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn dual_lane_asym_frame_delivers_and_tears_down() {
     let label = "asym separate-listener frame teardown";
     let summary = with_timeout(

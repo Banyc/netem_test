@@ -6,8 +6,10 @@
 //! stay alive indefinitely even though periodic small heartbeat frames and
 //! ACK/SACK traffic continue to flow.
 //!
-//! This test is `#[ignore]`-d by default so it does not lengthen normal builds.
-//! Run it with:
+//! The two end-to-end tests below are `#[ignore]`-d by default so they do not
+//! lengthen normal builds; `reverse_traffic_recency_advances_only_on_new_packets`
+//! is a fast pure unit test and runs in normal builds.
+//! Run the end-to-end tests with:
 //!
 //! ```sh
 //! cargo test -p tests --test rtp_liveness rtp_fresh_sacks -- --ignored --exact --nocapture

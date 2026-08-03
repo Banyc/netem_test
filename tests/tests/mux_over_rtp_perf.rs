@@ -31,7 +31,7 @@ mod support;
 /// heuristic. `stats.rate_limited > 0` is deterministic (every non-reordered
 /// forwarded packet increments it when `rate != 0`), so this is not flaky.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_lossy_perf_smoke() {
     let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
 
@@ -70,7 +70,7 @@ async fn mux_over_rtp_lossy_perf_smoke() {
 /// throughput with `--nocapture`. The rate is `400 * 1024 * 8` bits/s plus
 /// small loss/latency/jitter so the link is contended but not hopeless.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_400kib_lossy_contended_perf() {
     let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(false).await.unwrap();
 
@@ -121,7 +121,7 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
 /// are sent to a read-only sink through the same `rtp` connection and the
 /// same proxy; the small payload must arrive within 5 s of the start.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_small_stream_while_bulk_perf() {
     let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(false).await.unwrap();
 
@@ -224,7 +224,7 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
 ///     mux_over_rtp_400mib_hostile_perf -- --ignored --nocapture --test-threads=1
 /// ```
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_400mib_hostile_perf() {
     const TARGET_BYTES: usize = 400 * 1024 * 1024;
     const BUDGET: Duration = Duration::from_secs(335);

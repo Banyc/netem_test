@@ -22,7 +22,7 @@ mod support;
 
 /// `rtp` should deliver a byte stream reliably over a *clean* netem link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_data() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 
@@ -48,7 +48,7 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 /// `rtp` should deliver a 400 KiB deterministic payload intact over a clean
 /// link. This is the clean baseline for the perf scenarios.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_400kib() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 
@@ -78,7 +78,7 @@ async fn rtp_over_netem_clean_link_delivers_400kib() {
 /// should take at least the configured one-way delay (the round trip crosses
 /// both directions, so roughly `2 * latency`).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_latency_is_observable() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 

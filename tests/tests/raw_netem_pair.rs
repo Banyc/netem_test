@@ -24,7 +24,7 @@ mod support;
 /// Sanity check: raw UDP echo through the bidirectional proxy works on a
 /// clean link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "raw bidirectional UDP echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn netem_pair_raw_udp_echo_clean_link() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
@@ -59,7 +59,7 @@ async fn netem_pair_raw_udp_echo_clean_link() {
 /// take at least the configured one-way delay (the round trip crosses both
 /// directions, so roughly `2 * latency`).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "raw bidirectional UDP echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn netem_pair_raw_udp_latency_is_observable() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();

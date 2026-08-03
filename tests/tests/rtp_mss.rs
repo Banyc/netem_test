@@ -24,7 +24,7 @@ mod support;
 /// A small non-default MSS (512 bytes) should still deliver a small payload
 /// over a clean netem link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_small_mss_clean_link_delivers_data() {
     let mss = 512;
     let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
@@ -51,7 +51,7 @@ async fn rtp_small_mss_clean_link_delivers_data() {
 /// A very small MSS (256 bytes) should recover from mild loss on a 100 KiB
 /// transfer, exercising many more segments than the default MSS.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_tiny_mss_survives_mild_loss() {
     let mss = 256;
     let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
@@ -80,7 +80,7 @@ async fn rtp_tiny_mss_survives_mild_loss() {
 /// A custom MSS (1024 bytes) mid-way between tiny and default should deliver
 /// a 200 KiB payload intact over a clean link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_custom_mss_clean_link_delivers_200kib() {
     let mss = 1024;
     let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();

@@ -69,7 +69,7 @@ const RANDOM_LOSS_PCT: f64 = 5.0;
 /// at least `MIN_BURST_VS_RANDOM_RATIO` (i.e. burst loss is not catastrophically
 /// worse than random loss).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "burst-loss goodput/tail-latency regression; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_bulk_goodput_burst_loss_retains_ninety_percent_of_random() {
     let window = Duration::from_secs(BULK_WINDOW_S);
     let data: &'static [u8] = Box::leak(cyclic_payload(256 * 1024 * 1024).into_boxed_slice());
@@ -220,7 +220,7 @@ async fn run_rtp_sink_upload(
 /// * p50 <= 300 ms
 /// * p99 <= 2500 ms
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "burst-loss goodput/tail-latency regression; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     let base = Instant::now();
     let (server_addr, mut latencies) = spawn_mux_msg_latency_sink(false, base).await.unwrap();

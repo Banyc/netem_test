@@ -52,7 +52,7 @@ const MAX_QUEUE_FLOOR: usize = 256;
 /// * goodput >= 35% of capacity
 /// * overflow_dropped == 0 (the limit is sized above the in-flight bound)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "bufferbloat regression; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     let capacity_bps: f64 = 10_000_000.0;
     let capacity_mib_s: f64 = capacity_bps / 8.0 / (1024.0 * 1024.0);

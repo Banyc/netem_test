@@ -54,7 +54,7 @@ const HOSTILE_GOODPUT_FLOOR_MIB_S: f64 = 0.5;
 /// The server is reused across the five iterations; each iteration opens a
 /// fresh RTP connection through the same `NetemPair`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_direct() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
@@ -87,7 +87,7 @@ async fn probe_rtp_echo_4mib_direct() {
 
 /// Raw `rtp` 4 MiB echo through a `NetemPair` using the loopback-sized MSS.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_mss8k() {
     let server_addr = spawn_rtp_echo_server_with_mss(false, LOOPBACK_MSS)
         .await
@@ -127,7 +127,7 @@ async fn probe_rtp_echo_4mib_mss8k() {
 /// mux server is spawned for each iteration because the mux server only handles
 /// its first accepted RTP connection.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_mux_sink_4mib_direct() {
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
@@ -168,7 +168,7 @@ async fn probe_mux_sink_4mib_direct() {
 
 /// `mux`-over-`rtp` 4 MiB sink upload using the loopback-sized MSS.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_mux_sink_4mib_mss8k() {
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
@@ -217,7 +217,7 @@ async fn probe_mux_sink_4mib_mss8k() {
 /// pressure once the mux ACK path stalls, so a failure here documents the
 /// upstream `rtp` limitation rather than a defect in this probe.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_mux_echo_1mib_direct() {
     let data = payload(1024 * 1024);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
@@ -255,7 +255,7 @@ async fn probe_mux_echo_1mib_direct() {
 /// `rtp`'s broken-pipe heuristic once the mux ACK path stalls under bulk
 /// echo pressure.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_mux_echo_1mib_mss8k() {
     let data = payload(1024 * 1024);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
@@ -300,7 +300,7 @@ async fn probe_mux_echo_1mib_mss8k() {
 /// sink verifies every byte in-flight and is snapshotted while the transfer is
 /// still mid-flight, so a reversed measurement order cannot inflate goodput.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_hostile_goodput_30s() {
     const WINDOW: f64 = 30.0;
     const HOSTILE_BULK: usize = 128 * 1024 * 1024;

@@ -187,7 +187,7 @@ fn clean_link(owd: Duration, seed: u64) -> NetemConfig {
 /// `v4` bulk lane over Gilbert-Elliott 5% burst loss vs raw `rtp` on the same
 /// seeded link (c2s seed 33, s2c seed 44).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn v4_ge5_muxbulk() {
     with_timeout(
         Duration::from_secs(120),
@@ -202,7 +202,7 @@ async fn v4_ge5_muxbulk() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn v4_ge5_rawbulk() {
     with_timeout(
         Duration::from_secs(120),
@@ -219,7 +219,7 @@ async fn v4_ge5_rawbulk() {
 /// `v4` bulk lane on a clean 50 ms RTT link vs raw `rtp` on the same seeded
 /// link (c2s seed 11, s2c seed 22).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn v4_clean_muxbulk() {
     with_timeout(
         Duration::from_secs(120),
@@ -234,7 +234,7 @@ async fn v4_clean_muxbulk() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn v4_clean_rawbulk() {
     with_timeout(
         Duration::from_secs(120),

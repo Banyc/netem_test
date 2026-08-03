@@ -100,7 +100,7 @@ fn burst_exact(
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_passes_traffic_unimpaired() {
     let (recv, server) = recv_socket();
     let link = NetemLink::spawn(server, NetemConfig::default()).unwrap();
@@ -116,7 +116,7 @@ fn netem_passes_traffic_unimpaired() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_drops_all_with_max_random_loss() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
@@ -133,7 +133,7 @@ fn netem_drops_all_with_max_random_loss() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_four_state_loss_drops_some() {
     let (recv, server) = recv_socket();
     // p14 = ~25% chance from gap-Tx to isolated loss, p31 = max so any burst
@@ -159,7 +159,7 @@ fn netem_four_state_loss_drops_some() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_delay_adds_latency() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
@@ -184,7 +184,7 @@ fn netem_delay_adds_latency() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_duplicate_produces_extra_packets() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
@@ -203,7 +203,7 @@ fn netem_duplicate_produces_extra_packets() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_rate_limit_throttles_burst() {
     let (recv, server) = recv_socket();
     // 8 kbit/s. Each 8-byte payload = 64 bits, so serialization time is
@@ -255,7 +255,7 @@ fn netem_rate_limit_throttles_burst() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_reorder_with_rate_jumps_ahead() {
     // Reorder + rate together: a reordered packet must be scheduled at `now`
     // and must NOT be rate-shaped, so it is delivered ahead of the shaped
@@ -319,7 +319,7 @@ fn netem_reorder_with_rate_jumps_ahead() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_snapshot_reports_queue_and_stats() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {

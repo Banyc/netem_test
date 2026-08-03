@@ -303,7 +303,7 @@ async fn run_scenario(
 // ────────────────────────────── scenarios ───────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "contested-latency scenario; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn contested_capped_clean() {
     let (p50, p99, delivery) = with_timeout(
         Duration::from_secs(120),
@@ -339,7 +339,7 @@ async fn contested_capped_clean() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "contested-latency scenario; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn contested_capped_jitter_loss() {
     let (_p50, _p99, _delivery) = with_timeout(
         Duration::from_secs(180),
@@ -377,7 +377,7 @@ async fn contested_capped_jitter_loss() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "contested-latency scenario; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn contested_hostile() {
     let (_p50, _p99, _delivery) = with_timeout(
         Duration::from_secs(300),

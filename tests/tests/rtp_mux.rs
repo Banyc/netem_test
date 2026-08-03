@@ -75,7 +75,7 @@ async fn echo_round_trip(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams() {
     let (interactive_server, bulk_server, mut accepted_lanes) = spawn_echo_server().await.unwrap();
     let interactive_pair = NetemPair::spawn(interactive_server, clean(), clean()).unwrap();
@@ -250,7 +250,7 @@ async fn run_response_arm() -> ResponseArm {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_survives_independent_impaired_lanes() {
     let (interactive_server, bulk_server, _accepted_lanes) = spawn_echo_server().await.unwrap();
     let interactive_impairment = NetemConfig {
@@ -312,7 +312,7 @@ const CMD_UPLOAD: u8 = b'U';
 const UPLOAD_LEN: usize = 8 * 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_response_migration_offloads_download() {
     let arm = with_timeout(
         Duration::from_secs(120),
@@ -432,7 +432,7 @@ async fn run_bidir_arm() -> BidirArm {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_bidirectional_contention_offloads_both_transfers() {
     let arm = with_timeout(
         Duration::from_secs(180),
@@ -558,7 +558,7 @@ async fn run_recycle_arm() -> RecycleArm {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_recycle_migrates_live_streams() {
     let arm = with_timeout(
         Duration::from_secs(120),
@@ -763,7 +763,7 @@ async fn run_explorer_arm() -> ExplorerArm {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_explorer_relays_onto_better_path() {
     let arm = with_timeout(
         Duration::from_secs(120),

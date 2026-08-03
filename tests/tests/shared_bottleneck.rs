@@ -261,7 +261,7 @@ async fn rr_under_bulk_ab(
 
 /// 10 Mbps / 128 KiB shared bottleneck: rr echo under a competing bulk flow.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "probes contested latency and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_rr_under_bulk_10mbps() {
     let _ = tokio::time::timeout(
         Duration::from_secs(180),
@@ -272,7 +272,7 @@ async fn shared_bneck_rr_under_bulk_10mbps() {
 
 /// 2 Mbps / 64 KiB shared bottleneck: rr echo under a competing bulk flow.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "probes contested latency and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_rr_under_bulk_2mbps() {
     let _ = tokio::time::timeout(
         Duration::from_secs(180),
@@ -291,7 +291,7 @@ async fn shared_bneck_rr_under_bulk_2mbps() {
 /// TIGHTEN: once `rtp` CC fairness lands, assert `starve_max < 6` bins and a
 /// tight convergence time for the slower flow.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "probes contested latency and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_late_joiner_fairness() {
     let rate_bps = 10_000_000u64;
     let limit_bytes = 128 * 1024u64;
