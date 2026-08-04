@@ -35,7 +35,7 @@ pub fn bufferbloat_link(seed: u64) -> NetemConfig {
     NetemConfig {
         latency: Duration::from_millis(20),
         rate: 10_000_000, // 10 Mbit/s
-        limit: 256,
+        queue_limit_pkts: 256,
         seed,
         ..NetemConfig::default()
     }

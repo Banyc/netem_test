@@ -3,10 +3,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use netem_test::{NetemPair, Stats};
+use netem_test::{Counters, NetemPair};
 
 /// Combined stats across both directions of a [`NetemPair`].
-pub fn combined_stats(pair: &NetemPair) -> Stats {
+pub fn combined_stats(pair: &NetemPair) -> Counters {
     pair.stats()
 }
 

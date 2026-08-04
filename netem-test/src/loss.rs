@@ -6,7 +6,7 @@ use crate::rng::{CorRng, RndState};
 /// used by `sch_netem` (the "GI model"). All probabilities are in `u32`
 /// units where `u32::MAX == 1.0` to match the kernel's `p13`/`p31`/…
 /// representation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct FourStateLoss {
     /// p13 – from gap-Tx to isolated-loss-in-gap.
     pub p13: u32,
@@ -21,7 +21,7 @@ pub struct FourStateLoss {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum FourState {
+pub(crate) enum FourStateState {
     #[default]
     TxInGap = 1,
     TxInBurst = 2,
@@ -30,7 +30,7 @@ pub(crate) enum FourState {
 }
 
 /// Which loss model to apply.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LossModel {
     /// Independent per-packet loss with correlation, `loss` field of
     /// [`NetemConfig`] is the threshold.
@@ -46,7 +46,7 @@ impl LossModel {
     /// `sch_netem.c`.
     pub(crate) fn loss(
         &self,
-        clg: &mut FourState,
+        state: &mut FourStateState,
         loss_cor: &mut CorRng,
         rng: &mut RndState,
         loss: u32,
@@ -55,34 +55,34 @@ impl LossModel {
             LossModel::Random => loss != 0 && loss >= loss_cor.next(rng),
             LossModel::FourState(p) => {
                 let rnd = rng.next_u32();
-                match clg {
-                    FourState::TxInGap => {
+                match state {
+                    FourStateState::TxInGap => {
                         if rnd < p.p14 {
-                            *clg = FourState::LostInGap;
+                            *state = FourStateState::LostInGap;
                             return true;
                         } else if rnd < p.p13.saturating_add(p.p14) {
-                            *clg = FourState::LostInBurst;
+                            *state = FourStateState::LostInBurst;
                             return true;
                         }
                     }
-                    FourState::TxInBurst => {
+                    FourStateState::TxInBurst => {
                         if rnd < p.p23 {
-                            *clg = FourState::LostInBurst;
+                            *state = FourStateState::LostInBurst;
                             return true;
                         }
                     }
-                    FourState::LostInBurst => {
+                    FourStateState::LostInBurst => {
                         if rnd < p.p32 {
-                            *clg = FourState::TxInBurst;
+                            *state = FourStateState::TxInBurst;
                         } else if rnd < p.p31.saturating_add(p.p32) {
-                            *clg = FourState::TxInGap;
+                            *state = FourStateState::TxInGap;
                         } else {
-                            *clg = FourState::LostInBurst;
+                            *state = FourStateState::LostInBurst;
                             return true;
                         }
                     }
-                    FourState::LostInGap => {
-                        *clg = FourState::TxInGap;
+                    FourStateState::LostInGap => {
+                        *state = FourStateState::TxInGap;
                     }
                 }
                 false

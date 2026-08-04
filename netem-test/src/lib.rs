@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-pub mod dist;
+pub mod report;
 
 mod loss;
 mod queue;
@@ -28,14 +28,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use loss::FourState;
+use loss::FourStateState;
 use queue::Queued;
 use rng::CorRng;
 use shaper::{sample_delay, serialization_delay};
 
 pub use loss::{FourStateLoss, LossModel};
 pub use rng::RndState;
-pub use shaper::SharedShaper;
+pub use shaper::BottleneckShaper;
 
 // ──────────────────────────── UDP transport ────────────────────────────
 
@@ -160,7 +160,7 @@ impl UdpTransport for StdUdpTransport {
 
 /// Injectable monotonic clock for deterministic tests.
 ///
-/// Time-sensitive paths in [`Pipeline`] (delay-heap readiness, rate shaping,
+/// Time-sensitive paths in [`NetemState`] (delay-heap readiness, rate shaping,
 /// shared-bottleneck serialization) read the current instant through the
 /// [`Clock::now`] seam. When a runner is constructed without a clock it falls
 /// back to the wall clock (`Instant::now`); tests install a [`Clock`] and call
@@ -195,14 +195,14 @@ impl Clock {
     }
 }
 
-// ──────────────────────────── config & stats ───────────────────────────
+// ──────────────────────────── config & counters ─────────────────────────
 
 /// Configuration for one emulated direction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NetemConfig {
     /// Fixed delay added to every packet.
     pub latency: Duration,
-    /// Jitter ±; `tabledist` uniform spread when no distribution table.
+    /// Jitter ±; applied as a uniform spread around `latency`.
     pub jitter: Duration,
     /// Correlation of delay samples (0..=u32::MAX).
     pub delay_corr: u32,
@@ -220,20 +220,23 @@ pub struct NetemConfig {
     pub reorder: u32,
     /// Correlation of reorder decisions.
     pub reorder_corr: u32,
-    /// Gap for the reorder counter (`gap` in sch_netem).
-    pub gap: u32,
+    /// Gap for the reorder counter (`gap` in sch_netem), in packets.
+    #[serde(alias = "gap")]
+    pub reorder_gap_pkts: u32,
     /// Loss model.
     pub loss_model: LossModel,
     /// Rate limit in bits/s; `0` disables rate-limiting.
     pub rate: u64,
     /// PRNG seed for deterministic behaviour.
     pub seed: u64,
-    /// sch_netem-style packet queue `limit`. `0` means unbounded legacy
-    /// behaviour. When non-zero, it bounds the whole delay heap including
-    /// latency/jitter-held in-flight packets, so latency×rate configs must size
-    /// `limit` above the latency×rate (in packets) plus the intended bottleneck
-    /// buffer. Kernel `sch_netem` defaults to 1000.
-    pub limit: usize,
+    /// sch_netem-style packet queue limit in packets. `0` means unbounded
+    /// legacy behaviour. When non-zero, it bounds the whole delay heap
+    /// including latency/jitter-held in-flight packets, so latency×rate
+    /// configs must size `queue_limit_pkts` above the latency×rate (in
+    /// packets) plus the intended bottleneck buffer. Kernel `sch_netem`
+    /// defaults to 1000.
+    #[serde(alias = "limit")]
+    pub queue_limit_pkts: usize,
     /// Maximum datagram size in bytes. Datagrams larger than this value are
     /// deterministically dropped before any other impairment (loss, delay,
     /// rate-limiting, etc.) and counted as `dropped`. `0` disables the filter
@@ -253,11 +256,11 @@ impl Default for NetemConfig {
             dup_corr: 0,
             reorder: 0,
             reorder_corr: 0,
-            gap: 0,
+            reorder_gap_pkts: 0,
             loss_model: LossModel::default(),
             rate: 0,
             seed: 0xC0FF_EEBE_EFC0_FFEE,
-            limit: 0,
+            queue_limit_pkts: 0,
             max_datagram_size: 0,
         }
     }
@@ -266,7 +269,7 @@ impl Default for NetemConfig {
 /// Live impairment counters – mirrors `struct tc_netem_xstats` plus the
 /// separate overflow-drop counter required by the packet queue limit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Stats {
+pub struct Counters {
     pub delayed: u64,
     pub dropped: u64,
     pub duplicated: u64,
@@ -278,11 +281,11 @@ pub struct Stats {
     pub overflow_dropped: u64,
 }
 
-/// Atomic backing store for [`Stats`] so the runner thread can update counters
-/// without taking a lock. `snapshot()` produces a plain `Stats` for the
-/// public API.
+/// Atomic backing store for [`Counters`] so the runner thread can update
+/// counters without taking a lock. `snapshot()` produces a plain `Counters`
+/// for the public API.
 #[derive(Default)]
-struct AtomicStats {
+struct AtomicCounters {
     delayed: AtomicU64,
     dropped: AtomicU64,
     duplicated: AtomicU64,
@@ -293,14 +296,14 @@ struct AtomicStats {
     overflow_dropped: AtomicU64,
 }
 
-impl AtomicStats {
+impl AtomicCounters {
     #[inline]
-    fn inc(&self, f: impl Fn(&AtomicStats) -> &AtomicU64) {
+    fn inc(&self, f: impl Fn(&AtomicCounters) -> &AtomicU64) {
         f(self).fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> Stats {
-        Stats {
+    fn snapshot(&self) -> Counters {
+        Counters {
             delayed: self.delayed.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             duplicated: self.duplicated.load(Ordering::Relaxed),
@@ -315,8 +318,8 @@ impl AtomicStats {
 
 /// Read-only snapshot of a link's state at a point in time.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Snapshot {
-    pub stats: Stats,
+pub struct CountersSnapshot {
+    pub stats: Counters,
     pub queue_len: usize,
 }
 
@@ -327,7 +330,7 @@ pub struct Snapshot {
 pub struct NetemLink {
     client_addr: SocketAddr,
     server_addr: SocketAddr,
-    stats: Arc<AtomicStats>,
+    stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
@@ -371,7 +374,7 @@ impl NetemLink {
         transport: Box<dyn UdpTransport>,
     ) -> io::Result<Self> {
         let client_addr = transport.local_addr()?;
-        let stats = Arc::new(AtomicStats::default());
+        let stats = Arc::new(AtomicCounters::default());
         let queue_len = Arc::new(AtomicU64::new(0));
         let blackout = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(Mutex::new(false));
@@ -385,7 +388,7 @@ impl NetemLink {
             stop: Arc::clone(&stop),
         };
 
-        let runner = Runner::new(RunnerConfig {
+        let runner = LinkRunner::new(RunnerConfig {
             netem: config,
             server_addr,
             stats,
@@ -413,7 +416,7 @@ impl NetemLink {
     }
 
     /// Current impairment counters.
-    pub fn stats(&self) -> Stats {
+    pub fn stats(&self) -> Counters {
         self.stats.snapshot()
     }
 
@@ -423,13 +426,14 @@ impl NetemLink {
     }
 
     /// Atomic snapshot.
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
+    pub fn snapshot(&self) -> CountersSnapshot {
+        CountersSnapshot {
             stats: self.stats(),
             queue_len: self.queue_len(),
         }
     }
 
+    /// Total drop gate.
     /// Enable or disable the 100% loss blackout gate. Packets already queued
     /// continue to drain; newly received packets are counted as dropped while
     /// the gate is closed.
@@ -443,34 +447,34 @@ impl NetemLink {
     }
 }
 
-// ───────────────────────────── pipeline & runner ────────────────────────
+// ───────────────────────────── state & runner ─────────────────────────
 
-/// Shared per-direction impairment pipeline.
+/// Shared per-direction impairment pipeline (state bag).
 ///
-/// Both [`Runner`] and [`DirectionRunner`] drive a single [`Pipeline`]: it
+/// Both [`LinkRunner`] and [`SharedLinkRunner`] drive a single [`NetemState`]: it
 /// owns the PRNG state, loss model, delay heap, and the per-direction
 /// send-time shaper clock, and applies duplication / loss / reorder / delay /
 /// rate shaping to each incoming datagram. The two runner flavours differ only
 /// in where datagrams come from and go to (a fixed server address vs. a
 /// learned client address, with an optional shared-bottleneck shaper).
-struct Pipeline {
+struct NetemState {
     config: NetemConfig,
-    stats: Arc<AtomicStats>,
+    stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
     /// Optional shared-bottleneck shaper. When set, it replaces the per-
     /// direction `config.rate` serialization clock.
-    shared: Option<SharedShaper>,
+    shared: Option<BottleneckShaper>,
     rng: RndState,
     delay_cor: CorRng,
     loss_cor: CorRng,
     dup_cor: CorRng,
     reorder_cor: CorRng,
-    clg: FourState,
+    state: FourStateState,
     /// Earliest time the next packet may be serialized (send-time shaper).
     /// Tracks the per-direction serialization backlog for rate limiting.
-    next_send: Instant,
+    link_free_at: Instant,
     /// Injectable clock; when set, all time reads go through it so tests can
     /// drive emulated time deterministically instead of sleeping.
     clock: Option<Clock>,
@@ -479,18 +483,18 @@ struct Pipeline {
     seq: u64,
 }
 
-impl Pipeline {
+impl NetemState {
     fn new(
         config: NetemConfig,
-        stats: Arc<AtomicStats>,
+        stats: Arc<AtomicCounters>,
         queue_len: Arc<AtomicU64>,
         blackout: Arc<AtomicBool>,
         stop: Arc<Mutex<bool>>,
-        shared: Option<SharedShaper>,
+        shared: Option<BottleneckShaper>,
         clock: Option<Clock>,
     ) -> Self {
         let rng = RndState::seed(config.seed);
-        let next_send = match &clock {
+        let link_free_at = match &clock {
             Some(c) => c.now(),
             None => Instant::now(),
         };
@@ -499,7 +503,7 @@ impl Pipeline {
             loss_cor: CorRng::new(config.loss_corr),
             dup_cor: CorRng::new(config.dup_corr),
             reorder_cor: CorRng::new(config.reorder_corr),
-            next_send,
+            link_free_at,
             config,
             stats,
             queue_len,
@@ -507,7 +511,7 @@ impl Pipeline {
             stop,
             shared,
             rng,
-            clg: FourState::default(),
+            state: FourStateState::default(),
             clock,
             queue: BinaryHeap::new(),
             reorder_counter: 0,
@@ -540,8 +544,8 @@ impl Pipeline {
 
         // ── blackout gate ────────────────────────────────────────────
         // Drop every incoming packet while the gate is closed. This runs after
-        // the packet is counted as received so Stats.received includes gated
-        // packets and Stats.dropped counts them.
+        // the packet is counted as received so Counters.received includes gated
+        // packets and Counters.dropped counts them.
         if self.blackout.load(Ordering::Relaxed) {
             self.stats.inc(|s| &s.dropped);
             return;
@@ -556,7 +560,7 @@ impl Pipeline {
 
         // ── loss ─────────────────────────────────────────────────────
         if self.config.loss_model.loss(
-            &mut self.clg,
+            &mut self.state,
             &mut self.loss_cor,
             &mut self.rng,
             self.config.loss,
@@ -577,8 +581,8 @@ impl Pipeline {
         }
     }
 
-    /// Compute the per-packet delay via `tabledist` (uniform spread when no
-    /// distribution table, matching the kernel's default branch).
+    /// Compute the per-packet delay (uniform spread around `latency` when
+    /// jitter is non-zero, matching the kernel's default branch).
     fn sample_delay(&mut self) -> Duration {
         sample_delay(&self.config, &mut self.rng, &mut self.delay_cor)
     }
@@ -586,16 +590,17 @@ impl Pipeline {
     fn enqueue(&mut self, data: &[u8], now: Instant, dst: Option<SocketAddr>) {
         // ── queue limit (tail-drop) ──────────────────────────────────
         // Check before the reorder/schedule logic so a tail-dropped packet
-        // consumes no PRNG draw, never advances next_send, and leaves the
+        // consumes no PRNG draw, never advances link_free_at, and leaves the
         // reorder_counter untouched.
-        if self.config.limit != 0 && self.queue.len() >= self.config.limit {
+        if self.config.queue_limit_pkts != 0 && self.queue.len() >= self.config.queue_limit_pkts {
             self.stats.inc(|s| &s.overflow_dropped);
             return;
         }
 
         // ── reorder ──────────────────────────────────────────────────
-        // Reorder only when gap != 0 and only after the reorder counter
-        // reaches gap - 1; use "reorder >= random" like sch_netem.
+        // Reorder only when reorder_gap_pkts != 0 and only after the reorder
+        // counter reaches reorder_gap_pkts - 1; use "reorder >= random" like
+        // sch_netem.
         //
         // Mirrors the Linux `sch_netem` branch structure: the normal
         // branch applies delay and (optionally) rate shaping, while the
@@ -603,8 +608,8 @@ impl Pipeline {
         // and resets the reorder counter — rate shaping is *not* applied
         // to reordered packets, so they always jump ahead of the shaped
         // tail.
-        let reorder = self.config.gap != 0
-            && self.reorder_counter >= self.config.gap - 1
+        let reorder = self.config.reorder_gap_pkts != 0
+            && self.reorder_counter >= self.config.reorder_gap_pkts - 1
             && self.config.reorder >= self.reorder_cor.next(&mut self.rng);
 
         let time_to_send = if reorder {
@@ -644,9 +649,9 @@ impl Pipeline {
                 // scheduled send time) + packet_bits / rate_bps. Send-time
                 // shaping only delays packets; it never drops them.
                 if let Some(serialize) = serialization_delay(data.len(), self.config.rate) {
-                    let earliest = base.max(self.next_send);
+                    let earliest = base.max(self.link_free_at);
                     let t = earliest + serialize;
-                    self.next_send = t;
+                    self.link_free_at = t;
                     if t != base {
                         self.stats.inc(|s| &s.rate_limited);
                     }
@@ -694,16 +699,16 @@ impl Pipeline {
     }
 }
 
-struct Runner {
+struct LinkRunner {
     server_addr: SocketAddr,
     transport: Box<dyn UdpTransport>,
-    pipeline: Pipeline,
+    pipeline: NetemState,
 }
 
 struct RunnerConfig {
     netem: NetemConfig,
     server_addr: SocketAddr,
-    stats: Arc<AtomicStats>,
+    stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
@@ -711,20 +716,20 @@ struct RunnerConfig {
     clock: Option<Clock>,
 }
 
-impl Deref for Runner {
-    type Target = Pipeline;
+impl Deref for LinkRunner {
+    type Target = NetemState;
     fn deref(&self) -> &Self::Target {
         &self.pipeline
     }
 }
 
-impl DerefMut for Runner {
+impl DerefMut for LinkRunner {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.pipeline
     }
 }
 
-impl Runner {
+impl LinkRunner {
     fn new(config: RunnerConfig) -> Self {
         let RunnerConfig {
             netem,
@@ -739,7 +744,7 @@ impl Runner {
         Self {
             server_addr,
             transport,
-            pipeline: Pipeline::new(netem, stats, queue_len, blackout, stop, None, clock),
+            pipeline: NetemState::new(netem, stats, queue_len, blackout, stop, None, clock),
         }
     }
 
@@ -803,8 +808,8 @@ impl Runner {
 pub struct NetemPair {
     client_addr: SocketAddr,
     server_addr: SocketAddr,
-    stats_c2s: Arc<AtomicStats>,
-    stats_s2c: Arc<AtomicStats>,
+    stats_c2s: Arc<AtomicCounters>,
+    stats_s2c: Arc<AtomicCounters>,
     queue_len_c2s: Arc<AtomicU64>,
     queue_len_s2c: Arc<AtomicU64>,
     blackout_c2s: Arc<AtomicBool>,
@@ -815,8 +820,8 @@ pub struct NetemPair {
 struct NetemPairConfig {
     c2s: NetemConfig,
     s2c: NetemConfig,
-    c2s_shared: Option<SharedShaper>,
-    s2c_shared: Option<SharedShaper>,
+    c2s_shared: Option<BottleneckShaper>,
+    s2c_shared: Option<BottleneckShaper>,
     clock: Option<Clock>,
 }
 
@@ -860,15 +865,15 @@ impl NetemPair {
     /// Spawn a bidirectional proxy with optional shared shapers.
     ///
     /// This is the same as [`NetemPair::spawn`], but a direction can be given a
-    /// [`SharedShaper`] so that multiple flows contend for one bottleneck rate.
-    /// The corresponding direction's `config.rate` must be `0`; otherwise the
-    /// call panics with a "double-shape" message.
+    /// [`BottleneckShaper`] so that multiple flows contend for one bottleneck
+    /// rate. The corresponding direction's `config.rate` must be `0`; otherwise
+    /// the call panics with a "double-shape" message.
     pub fn spawn_shared(
         server_addr: SocketAddr,
         c2s: NetemConfig,
         s2c: NetemConfig,
-        c2s_shared: Option<SharedShaper>,
-        s2c_shared: Option<SharedShaper>,
+        c2s_shared: Option<BottleneckShaper>,
+        s2c_shared: Option<BottleneckShaper>,
     ) -> io::Result<Self> {
         let localhost = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
         Self::spawn_shared_on(
@@ -887,8 +892,8 @@ impl NetemPair {
         server_addr: SocketAddr,
         c2s: NetemConfig,
         s2c: NetemConfig,
-        c2s_shared: Option<SharedShaper>,
-        s2c_shared: Option<SharedShaper>,
+        c2s_shared: Option<BottleneckShaper>,
+        s2c_shared: Option<BottleneckShaper>,
         client_bind: SocketAddr,
         server_bind: SocketAddr,
     ) -> io::Result<Self> {
@@ -927,17 +932,17 @@ impl NetemPair {
         if c2s_shared.is_some() {
             assert_eq!(
                 c2s.rate, 0,
-                "double-shape: c2s has both config.rate and a SharedShaper"
+                "double-shape: c2s has both config.rate and a BottleneckShaper"
             );
         }
         if s2c_shared.is_some() {
             assert_eq!(
                 s2c.rate, 0,
-                "double-shape: s2c has both config.rate and a SharedShaper"
+                "double-shape: s2c has both config.rate and a BottleneckShaper"
             );
         }
-        let stats_c2s = Arc::new(AtomicStats::default());
-        let stats_s2c = Arc::new(AtomicStats::default());
+        let stats_c2s = Arc::new(AtomicCounters::default());
+        let stats_s2c = Arc::new(AtomicCounters::default());
         let queue_len_c2s = Arc::new(AtomicU64::new(0));
         let queue_len_s2c = Arc::new(AtomicU64::new(0));
         let blackout_c2s = Arc::new(AtomicBool::new(false));
@@ -964,7 +969,7 @@ impl NetemPair {
 
         // c2s: recv on client_sock, send on server_sock to server_addr; learn
         // the client's address from the first packet.
-        let c2s_runner = DirectionRunner::new(
+        let c2s_runner = SharedLinkRunner::new(
             Arc::clone(&client_sock),
             Arc::clone(&server_sock),
             DirectionRunnerConfig {
@@ -985,7 +990,7 @@ impl NetemPair {
 
         // s2c: recv on server_sock, send on client_sock to the learned client
         // address.
-        let s2c_runner = DirectionRunner::new(
+        let s2c_runner = SharedLinkRunner::new(
             server_sock,
             client_sock,
             DirectionRunnerConfig {
@@ -1017,13 +1022,13 @@ impl NetemPair {
         self.server_addr
     }
 
-    /// Stats for the client→server direction.
-    pub fn stats_c2s(&self) -> Stats {
+    /// Counters for the client→server direction.
+    pub fn stats_c2s(&self) -> Counters {
         self.stats_c2s.snapshot()
     }
 
-    /// Stats for the server→client direction.
-    pub fn stats_s2c(&self) -> Stats {
+    /// Counters for the server→client direction.
+    pub fn stats_s2c(&self) -> Counters {
         self.stats_s2c.snapshot()
     }
 
@@ -1038,10 +1043,10 @@ impl NetemPair {
     }
 
     /// Combined stats across both directions.
-    pub fn stats(&self) -> Stats {
+    pub fn stats(&self) -> Counters {
         let a = self.stats_c2s();
         let b = self.stats_s2c();
-        Stats {
+        Counters {
             delayed: a.delayed + b.delayed,
             dropped: a.dropped + b.dropped,
             duplicated: a.duplicated + b.duplicated,
@@ -1054,15 +1059,15 @@ impl NetemPair {
     }
 
     /// Per-direction snapshots.
-    pub fn snapshot_c2s(&self) -> Snapshot {
-        Snapshot {
+    pub fn snapshot_c2s(&self) -> CountersSnapshot {
+        CountersSnapshot {
             stats: self.stats_c2s(),
             queue_len: self.queue_len_c2s(),
         }
     }
 
-    pub fn snapshot_s2c(&self) -> Snapshot {
-        Snapshot {
+    pub fn snapshot_s2c(&self) -> CountersSnapshot {
+        CountersSnapshot {
             stats: self.stats_s2c(),
             queue_len: self.queue_len_s2c(),
         }
@@ -1087,29 +1092,29 @@ impl NetemPair {
 
 // ─────────────────────── per-direction runner ────────────────────────────
 
-struct DirectionRunner {
+struct SharedLinkRunner {
     recv: Arc<dyn UdpTransport>,
     send: Arc<dyn UdpTransport>,
     /// Fixed destination (the real server for c2s). When `None`, the runner
     /// uses the learned client address (`learned_dst`).
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<Mutex<Option<SocketAddr>>>,
-    pipeline: Pipeline,
+    pipeline: NetemState,
 }
 
 struct DirectionRunnerConfig {
     netem: NetemConfig,
-    stats: Arc<AtomicStats>,
+    stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<Mutex<Option<SocketAddr>>>,
-    shared: Option<SharedShaper>,
+    shared: Option<BottleneckShaper>,
     clock: Option<Clock>,
 }
 
-impl DirectionRunner {
+impl SharedLinkRunner {
     fn new(
         recv: Arc<dyn UdpTransport>,
         send: Arc<dyn UdpTransport>,
@@ -1131,7 +1136,7 @@ impl DirectionRunner {
             send,
             fixed_dst,
             learned_dst,
-            pipeline: Pipeline::new(netem, stats, queue_len, blackout, stop, shared, clock),
+            pipeline: NetemState::new(netem, stats, queue_len, blackout, stop, shared, clock),
         }
     }
 
@@ -1254,36 +1259,36 @@ mod tests {
             p23: 0,
         };
         let model = LossModel::FourState(p);
-        let mut clg = FourState::TxInGap;
+        let mut state = FourStateState::TxInGap;
         let mut cor = CorRng::new(0);
         let mut rng = RndState::seed(42);
         // first packet: rnd < p14 => lost, transition to LostInGap
-        assert!(model.loss(&mut clg, &mut cor, &mut rng, 0));
-        assert_eq!(clg, FourState::LostInGap);
+        assert!(model.loss(&mut state, &mut cor, &mut rng, 0));
+        assert_eq!(state, FourStateState::LostInGap);
         // next packet: LostInGap -> TxInGap, transmit
-        assert!(!model.loss(&mut clg, &mut cor, &mut rng, 0));
-        assert_eq!(clg, FourState::TxInGap);
+        assert!(!model.loss(&mut state, &mut cor, &mut rng, 0));
+        assert_eq!(state, FourStateState::TxInGap);
     }
 
     #[test]
     fn random_loss_zero_never_drops() {
         let model = LossModel::Random;
-        let mut clg = FourState::default();
+        let mut state = FourStateState::default();
         let mut cor = CorRng::new(0);
         let mut rng = RndState::seed(1);
         for _ in 0..1000 {
-            assert!(!model.loss(&mut clg, &mut cor, &mut rng, 0));
+            assert!(!model.loss(&mut state, &mut cor, &mut rng, 0));
         }
     }
 
     #[test]
     fn random_loss_max_always_drops() {
         let model = LossModel::Random;
-        let mut clg = FourState::default();
+        let mut state = FourStateState::default();
         let mut cor = CorRng::new(0);
         let mut rng = RndState::seed(1);
         for _ in 0..1000 {
-            assert!(model.loss(&mut clg, &mut cor, &mut rng, u32::MAX));
+            assert!(model.loss(&mut state, &mut cor, &mut rng, u32::MAX));
         }
     }
 
@@ -1295,7 +1300,7 @@ mod tests {
         assert_eq!(c.loss, 0);
         assert_eq!(c.duplicate, 0);
         assert_eq!(c.rate, 0);
-        assert_eq!(c.limit, 0);
+        assert_eq!(c.queue_limit_pkts, 0);
         assert_eq!(c.max_datagram_size, 0);
     }
 
@@ -1331,7 +1336,7 @@ mod tests {
     }
 
     /// In-memory transport that records sent payloads and can return them on
-    /// `recv_from`. Used to drive [`Runner`] deterministically in unit tests.
+    /// `recv_from`. Used to drive [`LinkRunner`] deterministically in unit tests.
     /// It also owns an injectable [`Clock`] so tests can advance emulated time
     /// directly instead of `thread::sleep`.
     #[derive(Debug)]
@@ -1407,17 +1412,17 @@ mod tests {
         }
     }
 
-    /// Build a [`Runner`] directly and expose it via `handle_datagram` /
+    /// Build a [`LinkRunner`] directly and expose it via `handle_datagram` /
     /// `drain_ready`. The runner's clock is owned by the returned mock so
     /// tests can advance emulated time through it.
-    fn mock_runner(config: NetemConfig) -> (Runner, Arc<MockTransport>) {
+    fn mock_runner(config: NetemConfig) -> (LinkRunner, Arc<MockTransport>) {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
         let captured = Arc::new(MockTransport::new(server_addr));
         let clock = captured.clock();
-        let runner = Runner::new(RunnerConfig {
+        let runner = LinkRunner::new(RunnerConfig {
             netem: config,
             server_addr,
-            stats: Arc::new(AtomicStats::default()),
+            stats: Arc::new(AtomicCounters::default()),
             queue_len: Arc::new(AtomicU64::new(0)),
             blackout: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(Mutex::new(false)),
@@ -1427,13 +1432,13 @@ mod tests {
         (runner, captured)
     }
 
-    /// Helper: run a single datagram through a [`Runner`] and return the runner
+    /// Helper: run a single datagram through a [`LinkRunner`] and return the runner
     /// plus the send-side mock.
     fn one_packet_runner(
         data: &[u8],
         from: SocketAddr,
         config: NetemConfig,
-    ) -> (Runner, Arc<MockTransport>) {
+    ) -> (LinkRunner, Arc<MockTransport>) {
         let (mut runner, sent) = mock_runner(config);
         runner.handle_datagram(data, from, sent.clock().now());
         (runner, sent)
@@ -1457,7 +1462,7 @@ mod tests {
     fn limit_zero_is_unbounded() {
         let config = NetemConfig {
             latency: Duration::from_secs(1),
-            limit: 0,
+            queue_limit_pkts: 0,
             ..Default::default()
         };
         let (mut runner, sent) = one_packet_runner(
@@ -1483,7 +1488,7 @@ mod tests {
     fn limit_tail_drops_and_counts_overflow() {
         let config = NetemConfig {
             latency: Duration::from_secs(1),
-            limit: 4,
+            queue_limit_pkts: 4,
             ..Default::default()
         };
         let (mut runner, sent) = one_packet_runner(
@@ -1491,7 +1496,7 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             config,
         );
-        // With limit=4, the first 4 packets fill the queue; the 6th-10th are tail-dropped.
+        // With queue_limit_pkts=4, the first 4 packets fill the queue; the 6th-10th are tail-dropped.
         for i in 0..10u8 {
             runner.handle_datagram(
                 &[i],
@@ -1511,7 +1516,7 @@ mod tests {
     fn overflow_drops_do_not_advance_shaper_clock_or_reorder_slot() {
         let config = NetemConfig {
             rate: 8_000, // 1 byte per ms
-            limit: 2,
+            queue_limit_pkts: 2,
             ..Default::default()
         };
         // Fill queue to capacity.
@@ -1525,7 +1530,7 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             Instant::now(),
         );
-        let first_next_send = runner.next_send;
+        let first_link_free_at = runner.link_free_at;
         let first_counter = runner.reorder_counter;
         // The next packet must be tail-dropped, leaving state unchanged.
         runner.handle_datagram(
@@ -1533,7 +1538,7 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             Instant::now(),
         );
-        assert_eq!(runner.next_send, first_next_send);
+        assert_eq!(runner.link_free_at, first_link_free_at);
         assert_eq!(runner.reorder_counter, first_counter);
         assert_eq!(runner.stats.snapshot().overflow_dropped, 1);
         drop(sent);
@@ -1543,7 +1548,7 @@ mod tests {
     fn limit_decisions_consume_no_prng_draws() {
         let config = NetemConfig {
             latency: Duration::from_secs(1),
-            limit: 1,
+            queue_limit_pkts: 1,
             ..Default::default()
         };
         // Gap/reorder/reorder_corr are zero so no reorder draws happen anyway;
@@ -1602,12 +1607,12 @@ mod tests {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3000));
         let c2s = NetemConfig {
             latency: Duration::from_secs(1),
-            limit: 5,
+            queue_limit_pkts: 5,
             ..Default::default()
         };
         let s2c = NetemConfig {
             latency: Duration::from_millis(500),
-            limit: 2,
+            queue_limit_pkts: 2,
             ..Default::default()
         };
 
@@ -1633,7 +1638,7 @@ mod tests {
         )
         .unwrap();
 
-        // Pump c2s: send 3 client packets; with limit 5 they all queue.
+        // Pump c2s: send 3 client packets; with queue_limit_pkts 5 they all queue.
         for i in 0..3u8 {
             client_sock.push_recv(
                 vec![i],
@@ -1727,13 +1732,13 @@ mod tests {
 
     #[test]
     fn shared_shaper_rate_must_be_nonzero() {
-        let result = std::panic::catch_unwind(|| SharedShaper::new(0, 0));
+        let result = std::panic::catch_unwind(|| BottleneckShaper::new(0, 0));
         assert!(result.is_err());
     }
 
     #[test]
     fn shared_shaper_exact_fifo_arithmetic() {
-        let shaper = SharedShaper::new(800_000, 0);
+        let shaper = BottleneckShaper::new(800_000, 0);
         let base = Instant::now();
         let len = 1000usize;
         let mut last = None;
@@ -1762,7 +1767,7 @@ mod tests {
 
     #[test]
     fn shared_shaper_tail_drop_at_byte_limit() {
-        let shaper = SharedShaper::new(8_000, 120);
+        let shaper = BottleneckShaper::new(8_000, 120);
         let base = Instant::now();
         // 100 B serializes in 100 ms and fits.
         let t1 = shaper.schedule(base, 100).unwrap();
@@ -1780,7 +1785,7 @@ mod tests {
 
     #[test]
     fn shared_shaper_backlog_bytes_reports_and_drains() {
-        let shaper = SharedShaper::new(8_000, 0);
+        let shaper = BottleneckShaper::new(8_000, 0);
         let base = Instant::now();
         assert_eq!(shaper.backlog_bytes(base), 0);
         shaper.schedule(base, 100);
@@ -1791,7 +1796,7 @@ mod tests {
 
     #[test]
     fn shared_shaper_clone_shares_state() {
-        let a = SharedShaper::new(800_000, 0);
+        let a = BottleneckShaper::new(800_000, 0);
         let b = a.clone();
         let base = Instant::now();
         a.schedule(base, 1000);
@@ -1802,7 +1807,7 @@ mod tests {
 
     #[test]
     fn shared_shaper_overflow_counts_in_direction_stats() {
-        let shared = SharedShaper::new(8_000, 80);
+        let shared = BottleneckShaper::new(8_000, 80);
         let c2s = NetemConfig {
             rate: 0,
             ..Default::default()
@@ -1870,7 +1875,7 @@ mod tests {
             server,
             c2s,
             NetemConfig::default(),
-            Some(SharedShaper::new(1_000_000, 0)),
+            Some(BottleneckShaper::new(1_000_000, 0)),
             None,
         );
     }
@@ -1888,13 +1893,13 @@ mod tests {
             NetemConfig::default(),
             s2c,
             None,
-            Some(SharedShaper::new(1_000_000, 0)),
+            Some(BottleneckShaper::new(1_000_000, 0)),
         );
     }
 
     #[test]
     fn spawn_shared_two_udp_flows_serialize_to_shared_rate_and_route_correctly() {
-        let shaper = SharedShaper::new(400 * 1024 * 8, 0);
+        let shaper = BottleneckShaper::new(400 * 1024 * 8, 0);
         let packet_size = 1024usize;
         let packets_per_flow = 50usize;
 
@@ -2015,7 +2020,7 @@ mod tests {
     /// they arrive at the single paired runner.
     #[test]
     fn two_flows_queue_arrival_order_shared_bottleneck() {
-        let shaper = SharedShaper::new(8_000_000, 0);
+        let shaper = BottleneckShaper::new(8_000_000, 0);
         let c2s = NetemConfig {
             rate: 0,
             ..Default::default()
@@ -2080,7 +2085,7 @@ mod tests {
     /// `overflow_dropped` on the direction carrying the overflowed packet.
     #[test]
     fn shared_bottleneck_overflow_counts_overflow_dropped() {
-        let shaper = SharedShaper::new(8_000, 80);
+        let shaper = BottleneckShaper::new(8_000, 80);
         let c2s = NetemConfig {
             rate: 0,
             ..Default::default()

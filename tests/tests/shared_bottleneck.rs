@@ -1,6 +1,6 @@
 //! Shared-bottleneck scenarios for `rtp` through [`netem_test::NetemPair`].
 //!
-//! These tests exercise the new [`SharedShaper`] primitive: multiple RTP flows
+//! These tests exercise the new [`BottleneckShaper`] primitive: multiple RTP flows
 //! are routed through separate [`NetemPair`]s that share one serialization
 //! clock, so they contend for a single bottleneck rate. They are marked
 //! `#[ignore]` because they probe contested latency and need the in-flight
@@ -18,7 +18,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use netem_test::{NetemConfig, NetemPair, SharedShaper};
+use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::payload::cyclic_payload;
 use support::rtp::{
     rtp_connect, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, spawn_rtp_echo_server,
@@ -37,7 +37,7 @@ mod support;
 const OWD_MS: u64 = 50;
 
 /// Build a per-flow [`NetemConfig`] with the desired OWD and no per-flow
-/// rate. The actual bottleneck is supplied separately as a [`SharedShaper`].
+/// rate. The actual bottleneck is supplied separately as a [`BottleneckShaper`].
 fn flow_config(owd: Duration, seed: u64) -> NetemConfig {
     NetemConfig {
         latency: owd,
@@ -136,7 +136,7 @@ async fn rr_under_bulk_ab(
         echo_addr,
         flow_config(owd, 11),
         flow_config(owd, 12),
-        Some(SharedShaper::new(rate_bps, limit_bytes)),
+        Some(BottleneckShaper::new(rate_bps, limit_bytes)),
         None,
     )
     .unwrap();
@@ -153,7 +153,7 @@ async fn rr_under_bulk_ab(
     // ── contested phase ───────────────────────────────────────────────────
     let (sink_addr, delivered) = spawn_rtp_byte_sink_server(false).await.unwrap();
     let echo_addr = spawn_rtp_echo_server(false).await.unwrap();
-    let shaper = SharedShaper::new(rate_bps, limit_bytes);
+    let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
     let bulk_pair = NetemPair::spawn_shared(
         sink_addr,
         flow_config(owd, 21),
@@ -306,7 +306,7 @@ async fn shared_bneck_late_joiner_fairness() {
     let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server(false).await.unwrap();
     let (sink_b_addr, delivered_b) = spawn_rtp_byte_sink_server(false).await.unwrap();
 
-    let shaper = SharedShaper::new(rate_bps, limit_bytes);
+    let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
     let pair_a = NetemPair::spawn_shared(
         sink_a_addr,
         flow_config(owd, 31),

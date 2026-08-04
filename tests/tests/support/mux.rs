@@ -9,8 +9,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 
-use rtp::transmission::fec_tuning::FecTuning;
-use rtp::transmission::frame_delivery::FrameDelivery;
+use rtp::FecTuning;
+use rtp::FrameMode;
 
 use super::stats::SinkProgress;
 
@@ -803,7 +803,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
 
-    let fd = FrameDelivery::enabled();
+    let fd = FrameMode::enabled();
     let listener_accept = Arc::clone(&listener);
     let bulk_delivered_for_server = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {

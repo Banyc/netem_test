@@ -318,14 +318,14 @@ async fn contested_capped_clean() {
                     NetemConfig {
                         rate: 400 * 1024 * 8,
                         latency: Duration::from_millis(5),
-                        limit: 4096,
+                        queue_limit_pkts: 4096,
                         seed,
                         ..NetemConfig::default()
                     },
                     NetemConfig {
                         rate: 400 * 1024 * 8,
                         latency: Duration::from_millis(5),
-                        limit: 4096,
+                        queue_limit_pkts: 4096,
                         seed: seed + 1,
                         ..NetemConfig::default()
                     },
@@ -357,7 +357,7 @@ async fn contested_capped_jitter_loss() {
                         loss,
                         latency: Duration::from_millis(25),
                         jitter: Duration::from_millis(20),
-                        limit: 4096,
+                        queue_limit_pkts: 4096,
                         seed,
                         ..NetemConfig::default()
                     },
@@ -366,7 +366,7 @@ async fn contested_capped_jitter_loss() {
                         loss,
                         latency: Duration::from_millis(25),
                         jitter: Duration::from_millis(20),
-                        limit: 4096,
+                        queue_limit_pkts: 4096,
                         seed: seed + 1,
                         ..NetemConfig::default()
                     },
@@ -389,10 +389,10 @@ async fn contested_hostile() {
             "hostile",
             |seed| {
                 let mut c2s = hostile_real_link();
-                c2s.limit = 4096;
+                c2s.queue_limit_pkts = 4096;
                 c2s.seed = seed;
                 let mut s2c = hostile_real_link();
-                s2c.limit = 4096;
+                s2c.queue_limit_pkts = 4096;
                 s2c.seed = seed + 1;
                 (c2s, s2c)
             },

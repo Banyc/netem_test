@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 dfsql = { git = "https://github.com/Banyc/dfsql", tag = "v0.17.0", default-features = false }
+serde = { version = "1", features = ["derive"] }

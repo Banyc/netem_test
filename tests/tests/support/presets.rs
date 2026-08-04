@@ -65,7 +65,7 @@ pub fn hostile_fat_pipe() -> NetemConfig {
         latency: Duration::from_millis(150),
         jitter: Duration::from_millis(30),
         loss_model: gilbert_elliott_loss(2.0, 4.0),
-        limit: 16 * 1024,
+        queue_limit_pkts: 16 * 1024,
         seed: 4,
         ..NetemConfig::default()
     }

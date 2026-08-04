@@ -23,7 +23,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use mux::{DeliveryMode, DualMessageSender, LaneClass, MigratingStreamWriter};
-use netem_test::{NetemConfig, NetemPair, SharedShaper};
+use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::contested::{DynTrafficResult, dyn_run_secs, summarize};
 use support::dual::{
     dual_mux_client_connect, spawn_dual_msg_channel_server,
@@ -57,7 +57,7 @@ fn dyn_reps() -> usize {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Shared bottleneck config
 //
-// The rate lives on a SharedShaper shared across all lanes; the per-pair
+// The rate lives on a BottleneckShaper shared across all lanes; the per-pair
 // configs carry only loss/latency/jitter/limit and have rate=0 so that
 // spawn_shared does not panic with "double-shape".
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -70,7 +70,7 @@ fn bottleneck_config(seed: u64, _rate_bps: u64) -> (NetemConfig, NetemConfig) {
             loss,
             latency: Duration::from_millis(25),
             jitter: Duration::from_millis(20),
-            limit: 4096,
+            queue_limit_pkts: 4096,
             seed,
             ..NetemConfig::default()
         },
@@ -79,7 +79,7 @@ fn bottleneck_config(seed: u64, _rate_bps: u64) -> (NetemConfig, NetemConfig) {
             loss,
             latency: Duration::from_millis(25),
             jitter: Duration::from_millis(20),
-            limit: 4096,
+            queue_limit_pkts: 4096,
             seed: seed + 1,
             ..NetemConfig::default()
         },
@@ -169,8 +169,8 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
 
     let (server_addr, mut lat_rx, bulk_counter) =
         spawn_mux_latency_bulk_server(false, base).await.unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
 
@@ -276,8 +276,8 @@ async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTraf
     let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
         .await
         .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -374,8 +374,8 @@ async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTraffi
     let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
         .await
         .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -507,8 +507,8 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
     let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
         .await
         .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -631,8 +631,8 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
     let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_mux_latency_bulk_server(false, base)
         .await
         .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -773,8 +773,8 @@ async fn dyn_dual_msg_channel_rep(
     let (server_addr, mut lat_rx, bulk_counter) = spawn_dual_msg_channel_server(false, base, mode)
         .await
         .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -952,10 +952,10 @@ fn summarize_gaming(label: &str, results: &[GamingResult]) {
         ("steady", steady.as_slice()),
         ("transition", trans.as_slice()),
     ];
-    if let Ok(path) = netem_test::dist::dump_csv(&format!("gaming_{label}"), &arms) {
+    if let Ok(path) = netem_test::report::dump_csv(&format!("gaming_{label}"), &arms) {
         eprintln!("[gaming {label}] samples: {}", path.display());
     }
-    eprintln!("{}", netem_test::dist::ab_report(label, "ms", &arms));
+    eprintln!("{}", netem_test::report::ab_report(label, "ms", &arms));
 
     // Gaming arms: the sticky variant is expected to have very poor
     // delivery (deltas pinned to the congested bulk lane).  Require only
@@ -1021,7 +1021,7 @@ async fn run_game_sync_client(
         let logical_id = seed_base;
         let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
         if game_writer.write_all(&sync_buf).await.is_err() {
-            let _ = game_writer.shutdown();
+            let _ = game_writer.finalize_detached();
             return GamingResult {
                 transition_latencies,
                 steady_latencies,
@@ -1053,7 +1053,7 @@ async fn run_game_sync_client(
             }
             tokio::time::sleep(LATENCY_CADENCE).await;
         }
-        let _ = game_writer.shutdown();
+        let _ = game_writer.finalize_detached();
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
     } else {
@@ -1118,8 +1118,8 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
         spawn_dual_mux_gaming_latency_bulk_server(false, base)
             .await
             .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -1164,8 +1164,8 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
         spawn_dual_mux_gaming_latency_bulk_server(false, base)
             .await
             .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -1211,8 +1211,8 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let (server_addr, mut lat_rx, bulk_counter) = spawn_mux_gaming_latency_bulk_server(false, base)
         .await
         .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
 
@@ -1407,8 +1407,8 @@ async fn dyn_dual_auto_small_first_migrating_rep(
         spawn_dual_mux_migrating_latency_bulk_server(false, base)
             .await
             .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -1460,7 +1460,7 @@ async fn dyn_dual_auto_small_first_migrating_rep(
         false,
     )
     .await;
-    let _ = game_writer.shutdown();
+    let _ = game_writer.finalize_detached();
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
@@ -1502,8 +1502,8 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
         spawn_dual_mux_migrating_latency_bulk_server(false, base)
             .await
             .unwrap();
-    let c2s_shaper = SharedShaper::new(RATE_BPS, 0);
-    let s2c_shaper = SharedShaper::new(RATE_BPS, 0);
+    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
     let int_pair = NetemPair::spawn_shared(
         server_addr,
         c2s.clone(),
@@ -1553,7 +1553,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
     first_buf.extend_from_slice(LATENCY_TAG);
     first_buf.extend_from_slice(&first_frame);
     if game_writer.write_all(&first_buf).await.is_err() {
-        let _ = game_writer.shutdown();
+        let _ = game_writer.finalize_detached();
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
         return DynTrafficResult {
@@ -1577,7 +1577,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
         .await;
         burst.insert(0, lat);
         sent += 1;
-        let _ = game_writer.shutdown();
+        let _ = game_writer.finalize_detached();
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
         let received = (small.len() + burst.len()) as u64;
@@ -1590,7 +1590,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
         };
     }
 
-    let _ = game_writer.shutdown();
+    let _ = game_writer.finalize_detached();
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
     DynTrafficResult {

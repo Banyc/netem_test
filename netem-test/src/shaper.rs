@@ -15,36 +15,39 @@ pub(crate) fn serialization_delay(len: usize, rate_bps: u64) -> Option<Duration>
 
 /// Multi-flow shared-bottleneck serialization clock.
 ///
-/// Several [`NetemPair`] directions can share one [`SharedShaper`] so that
+/// Several [`NetemPair`] directions can share one [`BottleneckShaper`] so that
 /// N flows contend for a single link rate instead of each flow getting its
 /// own independent cap. Per-packet propagation delay, loss, jitter, and the
-/// per-direction queue limit stay with each [`DirectionRunner`]; only the
+/// per-direction queue limit stay with each [`SharedLinkRunner`]; only the
 /// send-time serialization clock and the optional shared tail-drop buffer are
 /// shared.
 #[derive(Clone, Debug)]
-pub struct SharedShaper(Arc<Mutex<ShaperState>>);
+pub struct BottleneckShaper(Arc<Mutex<BottleneckState>>);
 
 #[derive(Debug)]
-struct ShaperState {
+struct BottleneckState {
     /// Shared rate in bits per second.
     rate: u64,
     /// Shared tail-drop buffer in bytes. `0` means unbounded.
     limit_bytes: u64,
     /// Earliest time the next packet may leave the shared bottleneck.
-    next_send: Instant,
+    link_free_at: Instant,
     /// Packets dropped because they exceeded `limit_bytes`.
     dropped: u64,
 }
 
-impl SharedShaper {
+impl BottleneckShaper {
     /// Create a shared shaper. `rate_bps` must be greater than zero.
     /// `limit_bytes` is the shared tail-drop buffer; use `0` for unbounded.
     pub fn new(rate_bps: u64, limit_bytes: u64) -> Self {
-        assert!(rate_bps > 0, "SharedShaper rate must be greater than zero");
-        Self(Arc::new(Mutex::new(ShaperState {
+        assert!(
+            rate_bps > 0,
+            "BottleneckShaper rate must be greater than zero"
+        );
+        Self(Arc::new(Mutex::new(BottleneckState {
             rate: rate_bps,
             limit_bytes,
-            next_send: Instant::now(),
+            link_free_at: Instant::now(),
             dropped: 0,
         })))
     }
@@ -62,7 +65,7 @@ impl SharedShaper {
     /// Bytes currently sitting in the shared serialization backlog as of `now`.
     pub fn backlog_bytes(&self, now: Instant) -> u64 {
         let state = self.0.lock().unwrap();
-        let backlog_ns = state.next_send.saturating_duration_since(now).as_nanos();
+        let backlog_ns = state.link_free_at.saturating_duration_since(now).as_nanos();
         (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64
     }
 
@@ -75,7 +78,10 @@ impl SharedShaper {
     /// add its own latency/jitter afterwards.
     pub fn schedule(&self, base: Instant, len: usize) -> Option<Instant> {
         let mut state = self.0.lock().unwrap();
-        let backlog_ns = state.next_send.saturating_duration_since(base).as_nanos();
+        let backlog_ns = state
+            .link_free_at
+            .saturating_duration_since(base)
+            .as_nanos();
         let backlog = (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64;
         if state.limit_bytes != 0 && backlog.saturating_add(len as u64) > state.limit_bytes {
             state.dropped += 1;
@@ -83,8 +89,8 @@ impl SharedShaper {
         }
         let packet_bits = (len as u64).saturating_mul(8);
         let serialize_ns = (packet_bits as u128).saturating_mul(1_000_000_000) / state.rate as u128;
-        let t = base.max(state.next_send) + Duration::from_nanos(serialize_ns as u64);
-        state.next_send = t;
+        let t = base.max(state.link_free_at) + Duration::from_nanos(serialize_ns as u64);
+        state.link_free_at = t;
         Some(t)
     }
 }

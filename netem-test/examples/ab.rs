@@ -1,4 +1,4 @@
-use netem_test::dist;
+use netem_test::report;
 use std::path::PathBuf;
 fn main() {
     let paths: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
@@ -12,7 +12,7 @@ fn main() {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        match dist::load_csv(path) {
+        match report::load_csv(path) {
             Ok(arms) => files.push((stem, arms)),
             Err(error) => {
                 eprintln!("failed to read {}: {}", path.display(), error);
@@ -26,7 +26,7 @@ fn main() {
             .iter()
             .map(|(label, vs)| (label.as_str(), vs.as_slice()))
             .collect();
-        print!("{}", dist::ab_report(stem, "ms", &arms));
+        print!("{}", report::ab_report(stem, "ms", &arms));
         return;
     }
     let mut series_order: Vec<String> = Vec::new();
@@ -50,7 +50,7 @@ fn main() {
             .iter()
             .map(|(label, vs)| (label.as_str(), *vs))
             .collect();
-        print!("{}", dist::ab_report(series, "ms", &arms));
+        print!("{}", report::ab_report(series, "ms", &arms));
         println!();
     }
 }

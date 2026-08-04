@@ -15,7 +15,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use netem_test::{NetemConfig, NetemPair, SharedShaper};
+use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::dual::{
     dual_mux_client_connect_with_lane_modes, spawn_dual_mux_latency_bulk_server_two_listeners,
 };
@@ -56,8 +56,8 @@ pub enum BulkMode {
     Shared,
     /// Separate independent NetemPair for the bulk flow.
     Split(Box<(NetemConfig, NetemConfig)>),
-    /// Two NetemPairs sharing one [`SharedShaper`] per direction.
-    SplitSharedBneck(SharedShaper, SharedShaper),
+    /// Two NetemPairs sharing one [`BottleneckShaper`] per direction.
+    SplitSharedBneck(BottleneckShaper, BottleneckShaper),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -848,8 +848,8 @@ hol_test!(
 async fn hol_cap400_loss1_split_shared() {
     let label = "cap400 loss1 split-shared";
     let rate_bps = 400 * 1024 * 8;
-    let c2s_shaper = SharedShaper::new(rate_bps, 0);
-    let s2c_shaper = SharedShaper::new(rate_bps, 0);
+    let c2s_shaper = BottleneckShaper::new(rate_bps, 0);
+    let s2c_shaper = BottleneckShaper::new(rate_bps, 0);
     let mut c2s = cap400(41);
     c2s.rate = 0;
     c2s.loss = u32::MAX / 100;

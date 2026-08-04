@@ -52,10 +52,10 @@ pub fn summarize(label: &str, results: &[DynTrafficResult]) {
         ("small", all_small.as_slice()),
         ("burst", all_burst.as_slice()),
     ];
-    if let Ok(path) = netem_test::dist::dump_csv(&format!("dyn_{label}"), &arms) {
+    if let Ok(path) = netem_test::report::dump_csv(&format!("dyn_{label}"), &arms) {
         eprintln!("[dyn {label}] samples: {}", path.display());
     }
-    eprintln!("{}", netem_test::dist::ab_report(label, "ms", &arms));
+    eprintln!("{}", netem_test::report::ab_report(label, "ms", &arms));
 
     assert!(
         delivery > 0.80,

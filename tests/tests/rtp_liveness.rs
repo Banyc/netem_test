@@ -292,7 +292,7 @@ fn rtp_permanent_hole_liveness_smoke() {
         };
         let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-        let watchdog_tuning = rtp::transmission::watchdog_tuning::WatchdogTuning::new(
+        let watchdog_tuning = rtp::WatchdogTuning::new(
             1,
             Duration::from_millis(1500),
             Duration::from_millis(1500),

@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
 
-use support::fan::NetemFan;
+use support::fan::PerFlowNetem;
 use support::payload::{payload, with_timeout};
 use support::presets::clean;
 use support::stats::combined_stats;
@@ -186,7 +186,7 @@ fn contended_lane() -> NetemConfig {
     NetemConfig {
         latency: Duration::from_millis(20),
         rate: 16_000_000,
-        limit: 120,
+        queue_limit_pkts: 120,
         seed: 811,
         ..NetemConfig::default()
     }
@@ -331,12 +331,12 @@ async fn rtp_mux_response_migration_offloads_download() {
     assert_eq!(arm.downloaded, DOWNLOAD_LEN, "download truncated");
     assert!(arm.ping_rtts_ms.len() >= 20, "too few ping samples");
     let arms = [("migrating", arm.ping_rtts_ms.as_slice())];
-    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_response_migration", &arms) {
+    if let Ok(path) = netem_test::report::dump_csv("rtp_mux_response_migration", &arms) {
         eprintln!("[resp-mig] samples: {}", path.display());
     }
     eprintln!(
         "{}",
-        netem_test::dist::ab_report("response migration ping RTT", "ms", &arms)
+        netem_test::report::ab_report("response migration ping RTT", "ms", &arms)
     );
     assert!(
         arm.bulk_lane_wire_pkts > 2000,
@@ -345,7 +345,7 @@ async fn rtp_mux_response_migration_offloads_download() {
     );
     let mut m = arm.ping_rtts_ms.clone();
     m.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p90 = netem_test::dist::percentile(&m, 0.90);
+    let p90 = netem_test::report::percentile(&m, 0.90);
     assert!(
         p90 < 65.0,
         "pings must stay clear of the download: p90={p90:.1}ms"
@@ -451,12 +451,12 @@ async fn rtp_mux_bidirectional_contention_offloads_both_transfers() {
     assert!(arm.uploaded_ok, "upload not fully acked");
     assert!(arm.ping_rtts_ms.len() >= 20, "too few ping samples");
     let arms = [("migrating", arm.ping_rtts_ms.as_slice())];
-    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_bidirectional_contention", &arms) {
+    if let Ok(path) = netem_test::report::dump_csv("rtp_mux_bidirectional_contention", &arms) {
         eprintln!("[bidir] samples: {}", path.display());
     }
     eprintln!(
         "{}",
-        netem_test::dist::ab_report("bidirectional contention ping RTT", "ms", &arms)
+        netem_test::report::ab_report("bidirectional contention ping RTT", "ms", &arms)
     );
     assert!(
         arm.bulk_lane_wire_pkts > 12_000,
@@ -465,7 +465,7 @@ async fn rtp_mux_bidirectional_contention_offloads_both_transfers() {
     );
     let mut m = arm.ping_rtts_ms.clone();
     m.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p90 = netem_test::dist::percentile(&m, 0.90);
+    let p90 = netem_test::report::percentile(&m, 0.90);
     assert!(
         p90 < 80.0,
         "pings must stay clear of both transfers: p90={p90:.1}ms"
@@ -484,8 +484,9 @@ struct RecycleArm {
 async fn run_recycle_arm() -> RecycleArm {
     let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
     let interactive_fan =
-        NetemFan::spawn(interactive_server, || (contended_lane(), contended_lane())).unwrap();
-    let bulk_fan = NetemFan::spawn(bulk_server, || (contended_lane(), contended_lane())).unwrap();
+        PerFlowNetem::spawn(interactive_server, || (contended_lane(), contended_lane())).unwrap();
+    let bulk_fan =
+        PerFlowNetem::spawn(bulk_server, || (contended_lane(), contended_lane())).unwrap();
     let connector = connector(bulk_fan.client_addr());
     let addr = interactive_fan.client_addr();
     let mut ping = connector.connect_stream(addr).await.unwrap();
@@ -529,7 +530,7 @@ async fn run_recycle_arm() -> RecycleArm {
             && downloaded_gauge.load(std::sync::atomic::Ordering::Relaxed) > 2 * 1024 * 1024
         {
             recycled = true;
-            connector.reset_addr(addr);
+            connector.force_redial(addr);
         }
         tokio::time::sleep(PING_INTERVAL).await;
     }
@@ -576,7 +577,7 @@ async fn rtp_mux_recycle_migrates_live_streams() {
         arm.old_session_died,
     );
     let arms = [("migrating", arm.ping_rtts_ms.as_slice())];
-    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_recycle_migration", &arms) {
+    if let Ok(path) = netem_test::report::dump_csv("rtp_mux_recycle_migration", &arms) {
         eprintln!("[recycle-mig] samples: {}", path.display());
     }
     assert_eq!(arm.downloaded, DOWNLOAD_LEN, "download truncated");
@@ -594,7 +595,7 @@ async fn rtp_mux_recycle_migrates_live_streams() {
     assert!(arm.ping_rtts_ms.len() >= 20, "too few ping samples");
     let mut m = arm.ping_rtts_ms.clone();
     m.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p90 = netem_test::dist::percentile(&m, 0.90);
+    let p90 = netem_test::report::percentile(&m, 0.90);
     assert!(
         p90 < 80.0,
         "pings must stay clean across the recycle: p90={p90:.1}ms"
@@ -605,7 +606,7 @@ fn explorer_slow_lane(seed: u64) -> NetemConfig {
     NetemConfig {
         latency: Duration::from_millis(40),
         rate: 16_000_000,
-        limit: 120,
+        queue_limit_pkts: 120,
         seed,
         ..NetemConfig::default()
     }
@@ -615,7 +616,7 @@ fn explorer_fast_lane(seed: u64) -> NetemConfig {
     NetemConfig {
         latency: Duration::from_millis(5),
         rate: 16_000_000,
-        limit: 120,
+        queue_limit_pkts: 120,
         seed,
         ..NetemConfig::default()
     }
@@ -636,7 +637,7 @@ struct ExplorerArm {
 async fn run_explorer_arm() -> ExplorerArm {
     let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
     let interactive_flows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let interactive_fan = NetemFan::spawn(interactive_server, {
+    let interactive_fan = PerFlowNetem::spawn(interactive_server, {
         let flows = Arc::clone(&interactive_flows);
         move || {
             let index = flows.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -649,7 +650,7 @@ async fn run_explorer_arm() -> ExplorerArm {
         }
     })
     .unwrap();
-    let bulk_fan = NetemFan::spawn(bulk_server, || {
+    let bulk_fan = PerFlowNetem::spawn(bulk_server, || {
         (explorer_slow_lane(950), explorer_slow_lane(951))
     })
     .unwrap();
@@ -773,7 +774,7 @@ async fn rtp_mux_explorer_relays_onto_better_path() {
     .await;
     let p = |mut v: Vec<f64>, q| {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        netem_test::dist::percentile(&v, q)
+        netem_test::report::percentile(&v, q)
     };
     eprintln!(
         "[explorer] download {} B in {:.1}s pings pre={} post={} pre_p50={:.1}ms post_p50={:.1}ms post_p90={:.1}ms port {} == {}",
@@ -791,12 +792,12 @@ async fn rtp_mux_explorer_relays_onto_better_path() {
         ("pre_relay", arm.pre_rtts_ms.as_slice()),
         ("post_relay", arm.post_rtts_ms.as_slice()),
     ];
-    if let Ok(path) = netem_test::dist::dump_csv("rtp_mux_explorer_relay", &arms) {
+    if let Ok(path) = netem_test::report::dump_csv("rtp_mux_explorer_relay", &arms) {
         eprintln!("[explorer] samples: {}", path.display());
     }
     eprintln!(
         "{}",
-        netem_test::dist::ab_report("explorer re-lay ping RTT", "ms", &arms)
+        netem_test::report::ab_report("explorer re-lay ping RTT", "ms", &arms)
     );
     assert_eq!(arm.downloaded, DOWNLOAD_LEN, "download truncated");
     assert!(arm.download_clean, "download corrupted");

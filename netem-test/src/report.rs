@@ -1,4 +1,4 @@
-use dfsql::backend::dynamic::{Executor, Frame, Value};
+use dfsql::backend::dynamic::{Engine, Frame, Value};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -44,7 +44,7 @@ fn dfsql_summary(arms: &[(String, Vec<f64>)]) -> HashMap<String, (u64, f64, f64,
             .map(move |v| vec![Value::String(label.as_str().into()), Value::Float(*v)])
     });
     let frame = Frame::from_rows(["arm", "v"], rows).expect("uniform two-column rows");
-    let mut ex = Executor::from_frame("samples", frame);
+    let mut ex = Engine::from_frame("samples", frame);
     let stmts = dfsql::parse(
         "group arm agg (alias n len) (alias avg mean v) (alias med median v) (alias sd std v)",
     )
@@ -258,13 +258,14 @@ fn render_cdf(arms: &[(String, Vec<f64>)], unit: &str) -> String {
     out.push_str(&format!(" {OVERLAP}=overlap\n"));
     out
 }
-fn dist_dir() -> PathBuf {
-    std::env::var_os("NETEM_DIST_DIR")
+fn report_dir() -> PathBuf {
+    std::env::var_os("NETEM_REPORT_DIR")
+        .or_else(|| std::env::var_os("NETEM_DIST_DIR"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/netem-dist"))
+        .unwrap_or_else(|| PathBuf::from("target/netem-report"))
 }
 pub fn dump_csv(scenario: &str, arms: &[(&str, &[f64])]) -> io::Result<PathBuf> {
-    dump_csv_to(&dist_dir(), scenario, arms)
+    dump_csv_to(&report_dir(), scenario, arms)
 }
 pub fn dump_csv_to(dir: &Path, scenario: &str, arms: &[(&str, &[f64])]) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;

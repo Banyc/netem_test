@@ -11,8 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinSet;
 
-use rtp::transmission::fec_tuning::FecTuning;
-use rtp::transmission::frame_delivery::FrameDelivery;
+use rtp::FecTuning;
+use rtp::FrameMode;
 
 use super::frame::{RtpFrameDeliveryWriter, RtpFrameReader, rtp_frame_delivery_connect};
 use super::rtp::rtp_connect;
@@ -66,7 +66,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
@@ -77,13 +77,9 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
 
-            let result = mux::spawn_dual_mux_acceptor(
-                reader,
-                writer,
-                config.clone(),
-                Duration::from_secs(3),
-            )
-            .await;
+            let result =
+                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                    .await;
 
             if let Ok((_class, nonce, pa)) = result {
                 let entries = pending.entry(nonce).or_default();
@@ -224,7 +220,7 @@ pub async fn spawn_dual_msg_channel_server(
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
@@ -235,13 +231,9 @@ pub async fn spawn_dual_msg_channel_server(
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
 
-            let result = mux::spawn_dual_mux_acceptor(
-                reader,
-                writer,
-                config.clone(),
-                Duration::from_secs(3),
-            )
-            .await;
+            let result =
+                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                    .await;
 
             if let Ok((_class, nonce, pa)) = result {
                 let entries = pending.entry(nonce).or_default();
@@ -364,7 +356,7 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
@@ -375,13 +367,9 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
 
-            let result = mux::spawn_dual_mux_acceptor(
-                reader,
-                writer,
-                config.clone(),
-                Duration::from_secs(3),
-            )
-            .await;
+            let result =
+                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                    .await;
 
             if let Ok((_class, nonce, pa)) = result {
                 let entries = pending.entry(nonce).or_default();
@@ -540,7 +528,7 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
@@ -551,13 +539,9 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
 
-            let result = mux::spawn_dual_mux_acceptor(
-                reader,
-                writer,
-                config.clone(),
-                Duration::from_secs(3),
-            )
-            .await;
+            let result =
+                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                    .await;
 
             if let Ok((_class, nonce, pa)) = result {
                 let entries = pending.entry(nonce).or_default();
@@ -696,7 +680,7 @@ async fn handle_gaming_stream<R: AsyncRead + Unpin + Send + 'static>(
 /// facade and the [`JoinSet`] that must be kept alive.
 /// Connect a dual-mux client where each lane rides its OWN proxy
 /// (`int_proxy_addr` / `bulk_proxy_addr`).  Both proxies share one
-/// [`netem_test::SharedShaper`] per direction upstream, so the two lanes
+/// [`netem_test::BottleneckShaper`] per direction upstream, so the two lanes
 /// funnel through ONE bottleneck capacity — the point of the battery.
 pub async fn dual_mux_client_connect(
     int_proxy_addr: std::net::SocketAddr,
@@ -956,20 +940,16 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
 
     let bulk_for_main = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<(mux::PendingAcceptor, mux::MuxConfig)>> =
+        let mut pending: HashMap<mux::PairingNonce, Vec<(mux::UnpairedLane, mux::MuxConfig)>> =
             HashMap::new();
 
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
 
-            let result = mux::spawn_dual_mux_acceptor(
-                reader,
-                writer,
-                int_config.clone(),
-                Duration::from_secs(3),
-            )
-            .await;
+            let result =
+                mux::begin_lane_pairing(reader, writer, int_config.clone(), Duration::from_secs(3))
+                    .await;
 
             if let Ok((class, nonce, pa)) = result {
                 let cfg = match class {
@@ -1119,9 +1099,9 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
         tokio::spawn(async move {
             loop {
                 let fd = if lane_frame {
-                    FrameDelivery::enabled()
+                    FrameMode::enabled()
                 } else {
-                    FrameDelivery::default()
+                    FrameMode::default()
                 };
                 match listener
                     .accept_without_handshake_with(rtp::udp::AcceptConfig {
@@ -1145,12 +1125,12 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     }
     let bulk_for_main = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::PendingAcceptor>> = HashMap::new();
+        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         while let Some((accepted, config)) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
             if let Ok((_class, nonce, pa)) =
-                mux::spawn_dual_mux_acceptor(reader, writer, config, Duration::from_secs(3)).await
+                mux::begin_lane_pairing(reader, writer, config, Duration::from_secs(3)).await
             {
                 let entries = pending.entry(nonce).or_default();
                 entries.push(pa);

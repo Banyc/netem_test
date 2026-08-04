@@ -339,7 +339,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
 pub async fn spawn_rtp_bulk_upload(
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
-) -> std::io::Result<rtp::socket::WriteStream> {
+) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
     spawn_rtp_bulk_upload_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
 }
 
@@ -348,7 +348,7 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
-) -> std::io::Result<rtp::socket::WriteStream> {
+) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
     let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &proxy_client_addr.to_string(),

@@ -13,7 +13,7 @@ from collections import OrderedDict
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dist-dir", default="tests/target/netem-dist")
+parser.add_argument("--dist-dir", default="tests/target/netem-report")
 parser.add_argument("--out", default="shape_report.html")
 args = parser.parse_args()
 

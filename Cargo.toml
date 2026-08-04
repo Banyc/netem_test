@@ -16,11 +16,11 @@ rtp = { path = "../rtp" }
 [patch."https://github.com/Banyc/rtp_mux.git"]
 rtp_mux = { path = "../rtp_mux" }
 
-[patch."https://github.com/Banyc/tokio_udp.git"]
-tokio_udp = { path = "../tokio_udp" }
+# [patch."https://github.com/Banyc/tokio_udp.git"]
+# tokio_udp = { path = "../tokio_udp" }
 
-[patch."https://github.com/Banyc/udp_listener.git"]
-udp_listener = { path = "../udp_listener" }
+# [patch."https://github.com/Banyc/udp_listener.git"]
+# udp_listener = { path = "../udp_listener" }
 
 [patch."https://github.com/Banyc/dfsql"]
 dfsql = { path = "../dfsql" }

@@ -2,8 +2,8 @@
 // Frame‑delivery adapter
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub type RtpFrameReader = rtp::socket::FrameReader;
-pub type RtpFrameDeliveryWriter = rtp::socket::FrameWriter;
+pub type RtpFrameReader = rtp::socket::FrameByteReader;
+pub type RtpFrameDeliveryWriter = rtp::socket::FrameByteWriter;
 
 /// Connect an rtp client using frame delivery.  Returns the frame-preserving
 /// reader and writer adapters that guarantee one-mux-frame-per-one-rtp-frame.

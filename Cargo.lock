@@ -440,7 +440,7 @@ dependencies = [
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.56)",
  "rand 0.8.7",
  "tokio",
- "udp_listener",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13)",
 ]
 
 [[package]]
@@ -459,6 +459,7 @@ name = "netem-test"
 version = "0.1.0"
 dependencies = [
  "dfsql",
+ "serde",
 ]
 
 [[package]]
@@ -553,6 +554,16 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "primitive"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.55#57489ef98acfcfb819e048964805ef16a386787f"
+dependencies = [
+ "anyhow",
+ "num-traits",
+ "thiserror",
 ]
 
 [[package]]
@@ -702,9 +713,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.16"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -743,7 +754,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tokio_udp",
- "udp_listener",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.15)",
 ]
 
 [[package]]
@@ -967,6 +978,7 @@ dependencies = [
 [[package]]
 name = "tokio_udp"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/tokio_udp.git?tag=v0.0.3#b8f36184f041930551f6ea87bcb2156da91b2b68"
 dependencies = [
  "bytes",
  "socket2",
@@ -1007,6 +1019,17 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13#076920b9a83f9472e7d6209502f1fecb58f7d665"
+dependencies = [
+ "bytes",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.55)",
+ "tokio",
+]
+
+[[package]]
+name = "udp_listener"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.15#d0e16f49886772cd98bb0edd6631a02465605223"
 dependencies = [
  "bytes",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",

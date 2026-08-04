@@ -29,13 +29,13 @@ impl RndState {
     #[inline]
     pub fn next_u32(&mut self) -> u32 {
         #[inline]
-        fn tauswortho(s: &mut u32, a: u32, b: u32, c: u32, d: u32) {
+        fn tausworthe(s: &mut u32, a: u32, b: u32, c: u32, d: u32) {
             *s = ((*s & c) << d) ^ (((*s << a) ^ *s) >> b);
         }
-        tauswortho(&mut self.s1, 6, 13, 4_294_967_294, 18);
-        tauswortho(&mut self.s2, 2, 27, 4_294_967_288, 2);
-        tauswortho(&mut self.s3, 13, 21, 4_294_967_280, 7);
-        tauswortho(&mut self.s4, 3, 12, 4_294_967_168, 13);
+        tausworthe(&mut self.s1, 6, 13, 4_294_967_294, 18);
+        tausworthe(&mut self.s2, 2, 27, 4_294_967_288, 2);
+        tausworthe(&mut self.s3, 13, 21, 4_294_967_280, 7);
+        tausworthe(&mut self.s4, 3, 12, 4_294_967_168, 13);
         self.s1 ^ self.s2 ^ self.s3 ^ self.s4
     }
 }

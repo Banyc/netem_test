@@ -259,13 +259,14 @@ fn netem_rate_limit_throttles_burst() {
 fn netem_reorder_with_rate_jumps_ahead() {
     // Reorder + rate together: a reordered packet must be scheduled at `now`
     // and must NOT be rate-shaped, so it is delivered ahead of the shaped
-    // tail. With gap=5 and reorder=u32::MAX (always reorder once the counter
-    // reaches gap-1), the 5th packet of a burst is reordered. A low rate
-    // (8 kbit/s ⇒ 8 ms per 8-byte payload) would otherwise delay every
-    // normal packet by at least the serialization backlog.
+    // tail. With reorder_gap_pkts=5 and reorder=u32::MAX (always reorder once
+    // the counter reaches reorder_gap_pkts-1), the 5th packet of a burst is
+    // reordered. A low rate (8 kbit/s ⇒ 8 ms per 8-byte payload) would
+    // otherwise delay every normal packet by at least the serialization
+    // backlog.
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
-        gap: 5,
+        reorder_gap_pkts: 5,
         reorder: u32::MAX,
         rate: 8_000,
         seed: 7,

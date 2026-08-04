@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use netem_test::{NetemConfig, NetemPair};
 
-pub struct NetemFan {
+pub struct PerFlowNetem {
     addr: std::net::SocketAddr,
     stop: Arc<AtomicBool>,
 }
 
-impl NetemFan {
+impl PerFlowNetem {
     pub fn spawn(
         server_addr: std::net::SocketAddr,
         config: impl Fn() -> (NetemConfig, NetemConfig) + Send + 'static,
