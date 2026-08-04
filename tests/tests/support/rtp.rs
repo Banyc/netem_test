@@ -21,7 +21,14 @@ pub async fn spawn_rtp_echo_server_with_mss(
     let addr = listener.local_addr();
     tokio::spawn(async move {
         loop {
-            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
+            let accepted = match listener
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
+                    mss: rtp::udp::MssConfig::Custom(mss),
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -143,7 +150,14 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
     tokio::spawn({
         let listener = Arc::clone(&listener);
         async move {
-            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
+            let accepted = match listener
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
+                    mss: rtp::udp::MssConfig::Custom(mss),
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -154,7 +168,11 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
             tokio::spawn(async move {
                 loop {
                     if listener
-                        .accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() })
+                        .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                            fec,
+                            mss: rtp::udp::MssConfig::Custom(mss),
+                            ..rtp::udp::AcceptConfig::default()
+                        })
                         .await
                         .is_err()
                     {
@@ -233,7 +251,14 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
     tokio::spawn({
         let listener = Arc::clone(&listener);
         async move {
-            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
+            let accepted = match listener
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
+                    mss: rtp::udp::MssConfig::Custom(mss),
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -241,7 +266,11 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
             tokio::spawn(async move {
                 loop {
                     if listener
-                        .accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() })
+                        .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                            fec,
+                            mss: rtp::udp::MssConfig::Custom(mss),
+                            ..rtp::udp::AcceptConfig::default()
+                        })
                         .await
                         .is_err()
                     {

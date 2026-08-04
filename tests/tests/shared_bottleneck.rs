@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
 use support::payload::cyclic_payload;
-use support::rtp::{rtp_connect, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, spawn_rtp_echo_server};
+use support::rtp::{
+    rtp_connect, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, spawn_rtp_echo_server,
+};
 use support::stats::{combined_stats, percentile, print_perf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;

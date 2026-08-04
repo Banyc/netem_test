@@ -1,7 +1,7 @@
 // ───────────────────────────── shared shaper ───────────────────────────
 
-use crate::rng::{CorRng, RndState};
 use crate::NetemConfig;
+use crate::rng::{CorRng, RndState};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -89,7 +89,11 @@ impl SharedShaper {
     }
 }
 
-pub(crate) fn sample_delay(config: &NetemConfig, rng: &mut RndState, delay_cor: &mut CorRng) -> Duration {
+pub(crate) fn sample_delay(
+    config: &NetemConfig,
+    rng: &mut RndState,
+    delay_cor: &mut CorRng,
+) -> Duration {
     if config.jitter.is_zero() {
         return config.latency;
     }

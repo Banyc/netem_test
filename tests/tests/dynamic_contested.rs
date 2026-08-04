@@ -24,16 +24,18 @@ use std::time::{Duration, Instant};
 
 use mux::{DeliveryMode, DualMessageSender, LaneClass, MigratingStreamWriter};
 use netem_test::{NetemConfig, NetemPair, SharedShaper};
+use support::contested::{DynTrafficResult, dyn_run_secs, summarize};
 use support::dual::{
     dual_mux_client_connect, spawn_dual_msg_channel_server,
     spawn_dual_mux_gaming_latency_bulk_server, spawn_dual_mux_latency_bulk_server,
     spawn_dual_mux_migrating_latency_bulk_server,
 };
-use support::mux::{mux_client_connect, spawn_mux_gaming_latency_bulk_server, spawn_mux_latency_bulk_server};
+use support::mux::{
+    mux_client_connect, spawn_mux_gaming_latency_bulk_server, spawn_mux_latency_bulk_server,
+};
 use support::payload::{cyclic_payload, with_timeout};
 use support::prng::SplitMix64;
 use support::stats::percentile;
-use support::contested::{DynTrafficResult, dyn_run_secs, summarize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;

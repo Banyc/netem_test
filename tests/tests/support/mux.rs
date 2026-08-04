@@ -47,7 +47,14 @@ where
         let listener = Arc::clone(&listener);
         async move {
             // First (and only) rtp connection.
-            let accepted = match listener.accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() }).await {
+            let accepted = match listener
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
+                    mss: rtp::udp::MssConfig::Custom(mss),
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
                 Ok(a) => a,
                 Err(_) => return,
             };
@@ -62,7 +69,11 @@ where
                 async move {
                     loop {
                         if listener
-                            .accept_without_handshake_with(rtp::udp::AcceptConfig { fec, mss: rtp::udp::MssConfig::Custom(mss), ..rtp::udp::AcceptConfig::default() })
+                            .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                                fec,
+                                mss: rtp::udp::MssConfig::Custom(mss),
+                                ..rtp::udp::AcceptConfig::default()
+                            })
                             .await
                             .is_err()
                         {

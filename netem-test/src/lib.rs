@@ -750,7 +750,8 @@ impl Runner {
                 break;
             }
             // Drain ready packets first so latency is honoured.
-            self.pipeline.drain_ready(self.pipeline.now(), &*self.transport);
+            self.pipeline
+                .drain_ready(self.pipeline.now(), &*self.transport);
 
             // Block briefly on recv so we don't spin. Use the explicit
             // timeout API so the receive deadline is decoupled from the
@@ -760,8 +761,11 @@ impl Runner {
                 .recv_from_timeout(&mut buf, Duration::from_millis(5))
             {
                 Ok((n, _from)) => {
-                    self.pipeline
-                        .handle_datagram(&buf[..n], self.pipeline.now(), Some(self.server_addr));
+                    self.pipeline.handle_datagram(
+                        &buf[..n],
+                        self.pipeline.now(),
+                        Some(self.server_addr),
+                    );
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -1152,7 +1156,8 @@ impl DirectionRunner {
                         *self.learned_dst.lock().unwrap() = Some(from);
                     }
                     let dst = self.fixed_dst.or_else(|| *self.learned_dst.lock().unwrap());
-                    self.pipeline.handle_datagram(&buf[..n], self.pipeline.now(), dst);
+                    self.pipeline
+                        .handle_datagram(&buf[..n], self.pipeline.now(), dst);
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -1442,10 +1447,7 @@ mod tests {
     fn wait_until(what: &str, cond: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !cond() {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::yield_now();
             std::thread::sleep(Duration::from_millis(1));
         }

@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use netem_test::{NetemConfig, NetemPair};
 use support::mux::send_timestamped_messages;
 use support::payload::{cyclic_payload, with_timeout};
-use support::rtp::{spawn_rtp_bulk_upload_with_mss, spawn_rtp_byte_sink_server_with_mss, spawn_rtp_msg_latency_sink};
+use support::rtp::{
+    spawn_rtp_bulk_upload_with_mss, spawn_rtp_byte_sink_server_with_mss, spawn_rtp_msg_latency_sink,
+};
 use support::stats::{combined_stats, percentile, print_perf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
