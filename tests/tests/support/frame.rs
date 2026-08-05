@@ -46,5 +46,10 @@ async fn rtp_frame_delivery_connect_with_mss_config(
     )
     .await
     .unwrap();
+    // Hold the rtp session owner for the connection's lifetime; dropping it
+    // aborts the session.
+    tokio::spawn(async move {
+        let _ = connected.supervisor.await;
+    });
     (connected.read, connected.write)
 }

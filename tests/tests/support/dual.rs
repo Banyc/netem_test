@@ -76,7 +76,11 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            let _supervisor = accepted.supervisor;
+            // Hold the accepted lane's rtp session for its whole life;
+            // dropping it aborts the session.
+            tokio::spawn(async move {
+                let _ = accepted.supervisor.await;
+            });
 
             let result =
                 mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
@@ -231,7 +235,11 @@ pub async fn spawn_dual_msg_channel_server(
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            let _supervisor = accepted.supervisor;
+            // Hold the accepted lane's rtp session for its whole life;
+            // dropping it aborts the session.
+            tokio::spawn(async move {
+                let _ = accepted.supervisor.await;
+            });
 
             let result =
                 mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
@@ -368,7 +376,11 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            let _supervisor = accepted.supervisor;
+            // Hold the accepted lane's rtp session for its whole life;
+            // dropping it aborts the session.
+            tokio::spawn(async move {
+                let _ = accepted.supervisor.await;
+            });
 
             let result =
                 mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
@@ -541,7 +553,11 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            let _supervisor = accepted.supervisor;
+            // Hold the accepted lane's rtp session for its whole life;
+            // dropping it aborts the session.
+            tokio::spawn(async move {
+                let _ = accepted.supervisor.await;
+            });
 
             let result =
                 mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
@@ -706,7 +722,12 @@ pub async fn dual_mux_client_connect(
     let mut spawner = JoinSet::new();
 
     let connect = |adr: std::net::SocketAddr, f: bool| async move {
-        let (r, w, _supervisor) = rtp_connect(adr, f).await;
+        let (r, w, supervisor) = rtp_connect(adr, f).await;
+        // Hold the lane's rtp session for the whole connection; dropping the
+        // supervisor aborts it.
+        tokio::spawn(async move {
+            let _ = supervisor.await;
+        });
         Some((r, w))
     };
 
@@ -796,7 +817,11 @@ pub async fn dual_mux_client_connect_with_lane_modes(
             let (r, w) = rtp_frame_delivery_connect(addr, fec).await;
             Some((Box::new(r), Box::new(w)))
         } else {
-            let (r, w, _supervisor) = rtp_connect(addr, fec).await;
+            let (r, w, supervisor) = rtp_connect(addr, fec).await;
+            // Hold the lane's rtp session for the whole connection.
+            tokio::spawn(async move {
+                let _ = supervisor.await;
+            });
             Some((Box::new(r), Box::new(w)))
         }
     }
@@ -950,7 +975,11 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            let _supervisor = accepted.supervisor;
+            // Hold the accepted lane's rtp session for its whole life;
+            // dropping it aborts the session.
+            tokio::spawn(async move {
+                let _ = accepted.supervisor.await;
+            });
 
             let result =
                 mux::begin_lane_pairing(reader, writer, int_config.clone(), Duration::from_secs(3))
@@ -1134,7 +1163,11 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
         while let Some((accepted, config)) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
-            let _supervisor = accepted.supervisor;
+            // Hold the accepted lane's rtp session for its whole life;
+            // dropping it aborts the session.
+            tokio::spawn(async move {
+                let _ = accepted.supervisor.await;
+            });
             if let Ok((_class, nonce, pa)) =
                 mux::begin_lane_pairing(reader, writer, config, Duration::from_secs(3)).await
             {
