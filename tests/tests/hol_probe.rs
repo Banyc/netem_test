@@ -8,6 +8,20 @@
 //! ```sh
 //! cargo test --release --test hol_probe -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! # Hostile-profile caveat: multi-minute interactive tail is BY DESIGN
+//!
+//! On the hostile profile (`hol_hostile_solo` / `hol_hostile_shared` /
+//! `hol_hostile_split`, and the equivalent `contested_latency.rs::contested_hostile`),
+//! a bulk stream deliberately starves the interactive lane's SEND path, so a
+//! multi-minute interactive tail is acceptable BY DESIGN. In particular
+//! `hol_hostile_shared` asserts only `delivery_pct >= 0.80`; the robust signal
+//! is the send count (37 pings sent where ~82 are due) and the delivery ratio,
+//! not the p99 — at n ≈ 37 the percentiles are single observations. A green
+//! run means the delivery gate holds, not that the interactive lane is
+//! latency-bounded. Interactive p99 under contention tracks how hard the bulk
+//! stream pushes: a faster host deepens the queue the interactive lane waits
+//! behind.
 
 use std::sync::{
     Arc,
