@@ -29,8 +29,11 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let bulk_for_server = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
+        let spawner = rtp_mux::SessionSpawner::new(|fut| {
+            tokio::spawn(fut);
+        });
         let _ = server
-            .serve(move |stream| {
+            .serve(spawner, move |stream| {
                 let source_lane = stream.source_lane();
                 let (reader, writer) = tokio::io::split(stream);
                 spawn_tagged_stream_sink(

@@ -29,7 +29,7 @@ async fn rtp_over_netem_survives_mild_loss_400kib() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
-    let (read, write) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = payload(400 * 1024);
     let got = with_timeout(

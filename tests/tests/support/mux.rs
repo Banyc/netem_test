@@ -85,6 +85,7 @@ where
 
             let read = accepted.read.into_async_read();
             let write = accepted.write.into_async_write();
+            let _supervisor = accepted.supervisor;
 
             let config = mux::MuxConfig {
                 initiation: mux::Initiation::Server,
@@ -843,6 +844,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
 
         let read = accepted.read.into_async_read();
         let write = accepted.write.into_async_write();
+            let _supervisor = accepted.supervisor;
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),

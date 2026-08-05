@@ -30,7 +30,7 @@ async fn rtp_small_mss_clean_link_delivers_data() {
     let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
+    let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
 
     let payload = b"netem-rtp-small-mss";
     let got = with_timeout(
@@ -57,7 +57,7 @@ async fn rtp_tiny_mss_survives_mild_loss() {
     let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
-    let (read, write) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
+    let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
 
     let payload = payload(100 * 1024);
     let got = with_timeout(
@@ -86,7 +86,7 @@ async fn rtp_custom_mss_clean_link_delivers_200kib() {
     let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
+    let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
 
     let payload = payload(200 * 1024);
     let got = with_timeout(

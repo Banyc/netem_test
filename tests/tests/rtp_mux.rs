@@ -24,8 +24,11 @@ async fn spawn_echo_server() -> io::Result<(
     let bulk_addr = server.bulk_listener().local_addr();
     let (lane_tx, lane_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
+        let spawner = rtp_mux::SessionSpawner::new(|fut| {
+            tokio::spawn(fut);
+        });
         let _ = server
-            .serve(move |stream| {
+            .serve(spawner, move |stream| {
                 let _ = lane_tx.send(stream.source_lane());
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -128,8 +131,11 @@ async fn spawn_cmd_server() -> io::Result<(SocketAddr, SocketAddr)> {
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     tokio::spawn(async move {
+        let spawner = rtp_mux::SessionSpawner::new(|fut| {
+            tokio::spawn(fut);
+        });
         let _ = server
-            .serve(|stream| {
+            .serve(spawner, |stream| {
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = tokio::io::split(stream);
                     let mut cmd = [0u8; 1];

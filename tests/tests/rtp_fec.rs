@@ -33,7 +33,7 @@ async fn rtp_with_fec_recovers_under_netem_loss() {
         ..NetemConfig::default()
     };
     let pair = NetemPair::spawn(server_addr, lossy.clone(), lossy).unwrap();
-    let (read, write) = rtp_connect(pair.client_addr(), true).await;
+    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), true).await;
 
     let payload = payload(1024 * 1024);
     let got = with_timeout(

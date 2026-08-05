@@ -27,7 +27,7 @@ async fn rtp_over_netem_clean_link_delivers_data() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = b"netem-rtp-integration";
     let got = with_timeout(
@@ -53,7 +53,7 @@ async fn rtp_over_netem_clean_link_delivers_400kib() {
     let server_addr = spawn_rtp_echo_server(false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = payload(400 * 1024);
     let got = with_timeout(
@@ -84,7 +84,7 @@ async fn rtp_over_netem_latency_is_observable() {
 
     let latency_ms = 60;
     let pair = NetemPair::spawn(server_addr, latency(latency_ms), latency(latency_ms)).unwrap();
-    let (read, write) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let start = std::time::Instant::now();
     let got = with_timeout(

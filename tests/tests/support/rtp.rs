@@ -35,6 +35,9 @@ pub async fn spawn_rtp_echo_server_with_mss(
             tokio::spawn(async move {
                 let mut read = accepted.read.into_async_read();
                 let mut write = accepted.write.into_async_write();
+                // The supervisor owns the session drivers; dropping it aborts
+                // the session, so keep it alive for the echo loop.
+                let _supervisor = accepted.supervisor;
                 let mut buf = vec![0u8; 8 * 1024];
                 loop {
                     match read.read(&mut buf).await {
@@ -68,6 +71,7 @@ pub async fn rtp_connect(
 ) -> (
     impl AsyncRead + Unpin + Send,
     impl AsyncWrite + Unpin + Send,
+    rtp::socket::SessionHandle,
 ) {
     rtp_connect_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
 }
@@ -84,6 +88,7 @@ pub async fn rtp_connect_with_mss(
 ) -> (
     impl AsyncRead + Unpin + Send,
     impl AsyncWrite + Unpin + Send,
+    rtp::socket::SessionHandle,
 ) {
     let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
@@ -100,6 +105,10 @@ pub async fn rtp_connect_with_mss(
     (
         connected.read.into_async_read(),
         connected.write.into_async_write(),
+        // The supervisor owns the session drivers; dropping it aborts the
+        // session, so return it for the caller to hold while the halves are
+        // in use.
+        connected.supervisor,
     )
 }
 
@@ -184,6 +193,8 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
             // Hold the write half alive so the connection stays open while we
             // only receive.
             let _write = accepted.write;
+            // The supervisor owns the session drivers; keep it alive.
+            let _supervisor = accepted.supervisor;
             let mut buf = vec![0u8; 64 * 1024];
             let mut offset: u64 = 0;
             loop {
@@ -280,6 +291,8 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
             });
             let mut read = accepted.read.into_async_read();
             let _write = accepted.write;
+            // The supervisor owns the session drivers; keep it alive.
+            let _supervisor = accepted.supervisor;
             let mut buf = vec![0u8; 64 * 1024];
             let mut offset = 0usize;
             loop {
@@ -362,7 +375,11 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
     .await?;
     let mut read = connected.read.into_async_read();
     let write = connected.write.into_async_write();
+    // The supervisor owns the session drivers; hold it in the keepalive task
+    // so the returned write half keeps working.
+    let supervisor = connected.supervisor;
     tokio::spawn(async move {
+        let _supervisor = supervisor;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match read.read(&mut buf).await {

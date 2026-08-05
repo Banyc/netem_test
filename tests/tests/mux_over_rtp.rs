@@ -30,7 +30,7 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
     let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
     let (opener, _spawner) = mux_client_connect(read, write);
 
     let payload = b"mux-rtp-netem";
@@ -64,7 +64,7 @@ async fn mux_over_rtp_survives_netem_latency() {
         ..NetemConfig::default()
     };
     let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
-    let (read, write) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
     let (opener, _spawner) = mux_client_connect(read, write);
 
     let payload = b"mux-over-rtp-through-netem";
