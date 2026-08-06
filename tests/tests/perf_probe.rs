@@ -97,7 +97,8 @@ async fn probe_rtp_echo_4mib_mss8k() {
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
     for _ in 0..PROBE_ITERS {
-        let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
+        let (read, write, _supervisor) =
+            rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
         let start = Instant::now();
         let got = with_timeout(
             Duration::from_secs(60),
@@ -179,7 +180,8 @@ async fn probe_mux_sink_4mib_mss8k() {
                 .await
                 .unwrap();
         let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-        let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
+        let (read, write, _supervisor) =
+            rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
         let (opener, _spawner) = mux_client_connect(read, write);
 
         let elapsed = with_timeout(
@@ -265,7 +267,8 @@ async fn probe_mux_echo_1mib_mss8k() {
             .await
             .unwrap();
         let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-        let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
+        let (read, write, _supervisor) =
+            rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
         let (opener, _spawner) = mux_client_connect(read, write);
 
         let (got, elapsed) = with_timeout(
@@ -315,7 +318,8 @@ async fn probe_hostile_goodput_30s() {
     )
     .unwrap();
     let pair_ref = &pair;
-    let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
+    let (read, write, _supervisor) =
+        rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
     let (opener, _spawner) = mux_client_connect(read, write);
 
     // Open the stream under a generous timeout before we start the clock.
