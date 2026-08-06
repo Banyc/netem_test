@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc;
+
+use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
 
 /// Spawn an rtp_mux server with interactive and bulk listeners. Accepted
 /// streams are classified by lane class: interactive-lane streams are treated
@@ -19,13 +21,13 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
 ) -> std::io::Result<(
     std::net::SocketAddr,
     std::net::SocketAddr,
-    UnboundedReceiver<(u8, f64)>,
+    mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
 )> {
     let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0", fec).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let bulk_for_server = Arc::clone(&bulk_delivered);
     tokio::spawn(async move {
@@ -73,7 +75,7 @@ pub fn rtp_mux_connector(
 pub fn spawn_tagged_stream_sink(
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     mut writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
-    tx: mpsc::UnboundedSender<(u8, f64)>,
+    tx: mpsc::Sender<(u8, f64)>,
     bulk: Arc<AtomicU64>,
     base: Instant,
     is_interactive: bool,
@@ -117,7 +119,9 @@ pub fn spawn_tagged_stream_sink(
                     ]);
                     let now_us = base.elapsed().as_micros() as u64;
                     let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                    let _ = tx.send((tag[0], latency_ms));
+                    if !try_send_observation(&tx, (tag[0], latency_ms), "latency sample") {
+                        break;
+                    }
                     buf.copy_within(frame_len..offset, 0);
                     offset -= frame_len;
                 }

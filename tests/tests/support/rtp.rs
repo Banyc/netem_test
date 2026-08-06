@@ -6,6 +6,8 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
+
 /// Spawn an `rtp` server that accepts one connection and echoes back
 /// everything it receives until the peer closes. Returns the server's
 /// listening address.
@@ -238,10 +240,7 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
 pub async fn spawn_rtp_msg_latency_sink(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(
-    std::net::SocketAddr,
-    tokio::sync::mpsc::UnboundedReceiver<f64>,
-)> {
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
     spawn_rtp_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
@@ -250,11 +249,8 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
     fec: bool,
     base: Instant,
     mss: usize,
-) -> std::io::Result<(
-    std::net::SocketAddr,
-    tokio::sync::mpsc::UnboundedReceiver<f64>,
-)> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
@@ -332,7 +328,9 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
                     ]);
                     let now_us = base.elapsed().as_micros() as u64;
                     let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                    let _ = tx.send(latency_ms);
+                    if !try_send_observation(&tx, latency_ms, "latency sample") {
+                        return;
+                    }
                     buf.copy_within(frame_len..offset, 0);
                     offset -= frame_len;
                 }

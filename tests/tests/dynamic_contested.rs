@@ -115,7 +115,7 @@ async fn run_latency_flow(
     seed_base: u64,
     run_for: Duration,
     lat_write: &mut (impl tokio::io::AsyncWrite + Unpin),
-    lat_rx: &mut tokio::sync::mpsc::UnboundedReceiver<f64>,
+    lat_rx: &mut tokio::sync::mpsc::Receiver<f64>,
     tag_written: bool,
 ) -> (Vec<f64>, Vec<f64>, u64) {
     let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
@@ -1002,7 +1002,7 @@ async fn run_game_sync_client(
     seed_base: u64,
     run_secs: u64,
     opener: &mux::DualStreamOpener,
-    mut lat_rx: tokio::sync::mpsc::UnboundedReceiver<f64>,
+    mut lat_rx: tokio::sync::mpsc::Receiver<f64>,
     base: Instant,
     migrating: bool,
 ) -> GamingResult {
@@ -1024,7 +1024,7 @@ async fn run_game_sync_client(
         let logical_id = seed_base;
         let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
         if game_writer.write_all(&sync_buf).await.is_err() {
-            let _ = game_writer.finalize_detached();
+            let _ = game_writer.finalize().await;
             return GamingResult {
                 transition_latencies,
                 steady_latencies,
@@ -1056,7 +1056,7 @@ async fn run_game_sync_client(
             }
             tokio::time::sleep(LATENCY_CADENCE).await;
         }
-        let _ = game_writer.finalize_detached();
+        let _ = game_writer.finalize().await;
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
     } else {
@@ -1358,7 +1358,7 @@ async fn run_migrating_latency_flow(
     seed_base: u64,
     run_for: Duration,
     game_writer: &mut MigratingStreamWriter,
-    lat_rx: &mut tokio::sync::mpsc::UnboundedReceiver<f64>,
+    lat_rx: &mut tokio::sync::mpsc::Receiver<f64>,
     tag_written: bool,
 ) -> (Vec<f64>, Vec<f64>, u64) {
     let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
@@ -1466,7 +1466,7 @@ async fn dyn_dual_auto_small_first_migrating_rep(
         false,
     )
     .await;
-    let _ = game_writer.finalize_detached();
+    let _ = game_writer.finalize().await;
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
     let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
@@ -1559,7 +1559,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
     first_buf.extend_from_slice(LATENCY_TAG);
     first_buf.extend_from_slice(&first_frame);
     if game_writer.write_all(&first_buf).await.is_err() {
-        let _ = game_writer.finalize_detached();
+        let _ = game_writer.finalize().await;
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
         return DynTrafficResult {
@@ -1583,7 +1583,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
         .await;
         burst.insert(0, lat);
         sent += 1;
-        let _ = game_writer.finalize_detached();
+        let _ = game_writer.finalize().await;
         bulk_stop.store(true, Ordering::Relaxed);
         let _ = bulk_handle.await;
         let received = (small.len() + burst.len()) as u64;
@@ -1596,7 +1596,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
         };
     }
 
-    let _ = game_writer.finalize_detached();
+    let _ = game_writer.finalize().await;
     bulk_stop.store(true, Ordering::Relaxed);
     let _ = bulk_handle.await;
     DynTrafficResult {

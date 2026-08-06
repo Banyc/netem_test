@@ -11,6 +11,7 @@
 //! [`StdUdpTransport`] wraps the standard library socket.
 
 #![forbid(unsafe_code)]
+#![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod report;
 

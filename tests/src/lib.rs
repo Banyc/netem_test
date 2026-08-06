@@ -3,3 +3,5 @@
 //! This crate deliberately contains *only* application-specific scenarios –
 //! the generic impairment machinery lives in the `netem-test` workspace
 //! member and is consumed here as a dev-dependency.
+
+#![warn(clippy::disallowed_methods, clippy::disallowed_types)]

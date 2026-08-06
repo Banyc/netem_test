@@ -6,13 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 
 use rtp::FecTuning;
 use rtp::FrameMode;
 
 use super::stats::SinkProgress;
+use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
 
 /// Spawn an `rtp` server that accepts one connection and runs a `mux` server
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
@@ -190,10 +190,7 @@ pub async fn spawn_mux_over_rtp_sink_server(
 pub async fn spawn_mux_msg_latency_sink(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(
-    std::net::SocketAddr,
-    tokio::sync::mpsc::UnboundedReceiver<f64>,
-)> {
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
     spawn_mux_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
@@ -202,11 +199,8 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
     fec: bool,
     base: Instant,
     mss: usize,
-) -> std::io::Result<(
-    std::net::SocketAddr,
-    tokio::sync::mpsc::UnboundedReceiver<f64>,
-)> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let addr =
         spawn_mux_over_rtp_server_with_mss(fec, mss, move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
@@ -245,7 +239,9 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
                         ]);
                         let now_us = base.elapsed().as_micros() as u64;
                         let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                        let _ = tx.send(latency_ms);
+                        if !try_send_observation(&tx, latency_ms, "latency sample") {
+                            break;
+                        }
                         buf.copy_within(frame_len..offset, 0);
                         offset -= frame_len;
                     }
@@ -499,8 +495,12 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_default(
 pub async fn spawn_mux_latency_bulk_server(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let addr = spawn_mux_over_rtp_server_with_mss(fec, rtp::udp::NO_FEC_MSS, {
         let tx = tx.clone();
@@ -556,7 +556,9 @@ pub async fn spawn_mux_latency_bulk_server(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            let _ = tx.send(latency_ms);
+                            if !try_send_observation(&tx, latency_ms, "latency sample") {
+                                break;
+                            }
                             buf.copy_within(frame_len..offset, 0);
                             offset -= frame_len;
                         }
@@ -598,8 +600,12 @@ pub async fn spawn_mux_sized_latency_bulk_server(
     fec: bool,
     base: Instant,
     mss: usize,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let addr = spawn_mux_over_rtp_server_with_mss(fec, mss, {
         let tx = tx.clone();
@@ -654,7 +660,9 @@ pub async fn spawn_mux_sized_latency_bulk_server(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            let _ = tx.send(latency_ms);
+                            if !try_send_observation(&tx, latency_ms, "latency sample") {
+                                break;
+                            }
                             buf.copy_within(frame_len..offset, 0);
                             offset -= frame_len;
                         }
@@ -695,8 +703,12 @@ pub async fn spawn_mux_sized_latency_bulk_server(
 pub async fn spawn_mux_gaming_latency_bulk_server(
     fec: bool,
     base: Instant,
-) -> std::io::Result<(std::net::SocketAddr, UnboundedReceiver<f64>, Arc<AtomicU64>)> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let addr = spawn_mux_over_rtp_server_with_mss(fec, rtp::udp::NO_FEC_MSS, {
         let tx = tx.clone();
@@ -756,7 +768,9 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            let _ = tx.send(latency_ms);
+                            if !try_send_observation(&tx, latency_ms, "latency sample") {
+                                break;
+                            }
                             buf.copy_within(frame_len..offset, 0);
                             offset -= frame_len;
                         }
@@ -800,10 +814,10 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     base: Instant,
 ) -> std::io::Result<(
     std::net::SocketAddr,
-    UnboundedReceiver<(u8, f64)>,
+    tokio::sync::mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
 )> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u8, f64)>();
+    let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
@@ -848,11 +862,11 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
 
         let read = accepted.read.into_async_read();
         let write = accepted.write.into_async_write();
-            // Hold the accepted lane's rtp session for its whole life;
-            // dropping it aborts the session.
-            tokio::spawn(async move {
-                let _ = accepted.supervisor.await;
-            });
+        // Hold the accepted lane's rtp session for its whole life;
+        // dropping it aborts the session.
+        tokio::spawn(async move {
+            let _ = accepted.supervisor.await;
+        });
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
@@ -901,7 +915,9 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            let _ = tx.send((tag[0], latency_ms));
+                            if !try_send_observation(&tx, (tag[0], latency_ms), "latency sample") {
+                                break;
+                            }
                             buf.copy_within(frame_len..offset, 0);
                             offset -= frame_len;
                         }

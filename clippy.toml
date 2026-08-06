@@ -1,0 +1,10 @@
+# existing spawn entries are NOT included for netem_test
+disallowed-methods = [
+  { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a named bounded mpsc capacity" },
+  { path = "tokio::sync::mpsc::Sender::blocking_send", reason = "do not block runtime synchronization" },
+]
+disallowed-types = [
+  { path = "tokio::sync::mpsc::UnboundedSender", reason = "use bounded mpsc::Sender" },
+  { path = "tokio::sync::mpsc::UnboundedReceiver", reason = "use bounded mpsc::Receiver" },
+  { path = "tokio::sync::Semaphore", reason = "use atomic/RAII admission plus watch or Notify" },
+]

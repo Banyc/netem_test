@@ -13,23 +13,26 @@ use support::fan::PerFlowNetem;
 use support::payload::{payload, with_timeout};
 use support::presets::clean;
 use support::stats::combined_stats;
+use support::{LANE_EVENT_CAPACITY, try_send_observation};
 
 async fn spawn_echo_server() -> io::Result<(
     SocketAddr,
     SocketAddr,
-    tokio::sync::mpsc::UnboundedReceiver<LaneClass>,
+    tokio::sync::mpsc::Receiver<LaneClass>,
 )> {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
-    let (lane_tx, lane_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (lane_tx, lane_rx) = tokio::sync::mpsc::channel(LANE_EVENT_CAPACITY);
     tokio::spawn(async move {
         let spawner = rtp_mux::SessionSpawner::new(|fut| {
             tokio::spawn(fut);
         });
         let _ = server
             .serve(spawner, move |stream| {
-                let _ = lane_tx.send(stream.source_lane());
+                if !try_send_observation(&lane_tx, stream.source_lane(), "lane event") {
+                    return;
+                }
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = tokio::io::split(stream);
                     let _ = tokio::io::copy(&mut reader, &mut writer).await;
