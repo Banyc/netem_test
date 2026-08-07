@@ -33,7 +33,7 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_lossy_perf_smoke() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
         .await
         .unwrap();
@@ -45,15 +45,19 @@ async fn mux_over_rtp_lossy_perf_smoke() {
     let (opener, _spawner) = mux_client_connect(read, write);
 
     let payload = payload(1024);
-    let (got, elapsed) = with_timeout(
-        Duration::from_secs(30),
-        "mux-over-rtp 1KiB lossy perf smoke",
-        mux_timed_echo_round_trip(&opener, &payload),
-    )
-    .await;
+    tasks
+        .run(async {
+            let (got, elapsed) = with_timeout(
+                Duration::from_secs(30),
+                "mux-over-rtp 1KiB lossy perf smoke",
+                mux_timed_echo_round_trip(&opener, &payload),
+            )
+            .await;
 
-    assert_eq!(got, payload, "mux stream must deliver all 1KiB intact");
-    print_perf("mux-over-rtp 1KiB lossy perf smoke", payload.len(), elapsed);
+            assert_eq!(got, payload, "mux stream must deliver all 1KiB intact");
+            print_perf("mux-over-rtp 1KiB lossy perf smoke", payload.len(), elapsed);
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -75,7 +79,7 @@ async fn mux_over_rtp_lossy_perf_smoke() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_400kib_lossy_contended_perf() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
         .await
         .unwrap();
@@ -87,26 +91,30 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
     let (opener, _spawner) = mux_client_connect(read, write);
 
     let payload = payload(400 * 1024);
-    let elapsed = with_timeout(
-        Duration::from_secs(120),
-        "mux-over-rtp 400KiB lossy perf",
-        mux_send_payload(&opener, &payload),
-    )
-    .await;
+    tasks
+        .run(async {
+            let elapsed = with_timeout(
+                Duration::from_secs(120),
+                "mux-over-rtp 400KiB lossy perf",
+                mux_send_payload(&opener, &payload),
+            )
+            .await;
 
-    let got = with_timeout(
-        Duration::from_secs(120),
-        "mux-over-rtp 400KiB lossy perf receive",
-        async { received.recv().await.expect("sink channel closed") },
-    )
-    .await;
+            let got = with_timeout(
+                Duration::from_secs(120),
+                "mux-over-rtp 400KiB lossy perf receive",
+                async { received.recv().await.expect("sink channel closed") },
+            )
+            .await;
 
-    assert_eq!(got, payload, "mux stream must deliver all 400KiB intact");
-    print_perf(
-        "mux-over-rtp 400KiB lossy/contended",
-        payload.len(),
-        elapsed,
-    );
+            assert_eq!(got, payload, "mux stream must deliver all 400KiB intact");
+            print_perf(
+                "mux-over-rtp 400KiB lossy/contended",
+                payload.len(),
+                elapsed,
+            );
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -129,7 +137,7 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_small_stream_while_bulk_perf() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
         .await
         .unwrap();
@@ -160,58 +168,62 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
     let mut bulk_tasks: tokio::task::JoinSet<Duration> = tokio::task::JoinSet::new();
     bulk_tasks.spawn(async move { mux_send_payload(&bulk_opener, &bulk).await });
 
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    let small_elapsed = mux_send_payload(&opener, &small).await;
+    tasks
+        .run(async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let small_elapsed = mux_send_payload(&opener, &small).await;
 
-    // Drain the sink channel until both payloads have arrived, matching by
-    // equality. Panic on any unexpected payload.
-    let mut got_bulk = false;
-    let mut got_small = false;
-    let mut small_arrived_at: Option<Instant> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while !got_bulk || !got_small {
-        let recv = tokio::time::timeout_at(deadline, received.recv())
-            .await
-            .unwrap_or_else(|_| panic!("timeout waiting for sink payloads"))
-            .expect("sink channel closed");
-        if recv == bulk_for_compare {
-            got_bulk = true;
-        } else if recv == small {
-            got_small = true;
-            small_arrived_at = Some(Instant::now());
-        } else {
-            panic!("unexpected payload from sink: len {}", recv.len());
-        }
-    }
+            // Drain the sink channel until both payloads have arrived,
+            // matching by equality. Panic on any unexpected payload.
+            let mut got_bulk = false;
+            let mut got_small = false;
+            let mut small_arrived_at: Option<Instant> = None;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            while !got_bulk || !got_small {
+                let recv = tokio::time::timeout_at(deadline, received.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("timeout waiting for sink payloads"))
+                    .expect("sink channel closed");
+                if recv == bulk_for_compare {
+                    got_bulk = true;
+                } else if recv == small {
+                    got_small = true;
+                    small_arrived_at = Some(Instant::now());
+                } else {
+                    panic!("unexpected payload from sink: len {}", recv.len());
+                }
+            }
 
-    let bulk_elapsed = with_timeout(
-        Duration::from_secs(120),
-        "mux-over-rtp small-while-bulk bulk join",
-        async {
-            bulk_tasks
-                .join_next()
-                .await
-                .expect("bulk send task ended without a result")
-                .expect("bulk send task panicked")
-        },
-    )
-    .await;
+            let bulk_elapsed = with_timeout(
+                Duration::from_secs(120),
+                "mux-over-rtp small-while-bulk bulk join",
+                async {
+                    bulk_tasks
+                        .join_next()
+                        .await
+                        .expect("bulk send task ended without a result")
+                        .expect("bulk send task panicked")
+                },
+            )
+            .await;
 
-    assert!(got_bulk, "bulk stream must deliver all 400KiB intact");
-    assert!(got_small, "small stream must deliver intact");
-    let small_arrived_after = small_arrived_at
-        .expect("small payload arrived")
-        .duration_since(start);
-    assert!(
-        small_arrived_after < Duration::from_secs(5),
-        "small stream should arrive < 5 s after start, took {small_arrived_after:?}"
-    );
-    let _ = small_elapsed;
-    print_perf(
-        "mux-over-rtp bulk 400KiB (small-while-bulk)",
-        bulk_for_compare.len(),
-        bulk_elapsed,
-    );
+            assert!(got_bulk, "bulk stream must deliver all 400KiB intact");
+            assert!(got_small, "small stream must deliver intact");
+            let small_arrived_after = small_arrived_at
+                .expect("small payload arrived")
+                .duration_since(start);
+            assert!(
+                small_arrived_after < Duration::from_secs(5),
+                "small stream should arrive < 5 s after start, took {small_arrived_after:?}"
+            );
+            let _ = small_elapsed;
+            print_perf(
+                "mux-over-rtp bulk 400KiB (small-while-bulk)",
+                bulk_for_compare.len(),
+                bulk_elapsed,
+            );
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -244,7 +256,7 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
 async fn mux_over_rtp_400mib_hostile_perf() {
     const TARGET_BYTES: usize = 400 * 1024 * 1024;
     const BUDGET: Duration = Duration::from_secs(335);
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, progress) =
         spawn_mux_over_rtp_counting_sink_server(&mut tasks, false, rtp::udp::NO_FEC_MSS)
             .await
@@ -256,22 +268,26 @@ async fn mux_over_rtp_400mib_hostile_perf() {
     let chunk = cyclic_payload(1024 * 1024);
     let repeat = TARGET_BYTES.div_ceil(chunk.len());
     let sent = chunk.len() * repeat;
-    let elapsed = with_timeout(
-        BUDGET,
-        "mux-over-rtp 400MiB hostile perf",
-        mux_send_repeated(&opener, &chunk, repeat),
-    )
-    .await;
-    assert!(
-        !progress.is_corrupt(),
-        "sink saw bytes diverging from the payload pattern"
-    );
-    assert_eq!(
-        progress.delivered_bytes(),
-        sent as u64,
-        "mux stream must deliver every byte sent"
-    );
-    print_perf("mux-over-rtp 400MiB hostile", sent, elapsed);
+    tasks
+        .run(async {
+            let elapsed = with_timeout(
+                BUDGET,
+                "mux-over-rtp 400MiB hostile perf",
+                mux_send_repeated(&opener, &chunk, repeat),
+            )
+            .await;
+            assert!(
+                !progress.is_corrupt(),
+                "sink saw bytes diverging from the payload pattern"
+            );
+            assert_eq!(
+                progress.delivered_bytes(),
+                sent as u64,
+                "mux stream must deliver every byte sent"
+            );
+            print_perf("mux-over-rtp 400MiB hostile", sent, elapsed);
+        })
+        .await;
     pair.stop();
     let stats = combined_stats(&pair);
     eprintln!("[perf] mux-over-rtp 400MiB hostile stats: {stats:?}");

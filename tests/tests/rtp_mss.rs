@@ -26,7 +26,7 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_small_mss_clean_link_delivers_data() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mss = 512;
     let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
         .await
@@ -36,14 +36,17 @@ async fn rtp_small_mss_clean_link_delivers_data() {
     let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
 
     let payload = b"netem-rtp-small-mss";
-    let got = with_timeout(
-        Duration::from_secs(10),
-        "rtp small-mss clean echo",
-        support::rtp::rtp_echo_payload(read, write, payload),
-    )
-    .await;
-
-    assert_eq!(got, payload);
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(10),
+                "rtp small-mss clean echo",
+                support::rtp::rtp_echo_payload(read, write, payload),
+            )
+            .await;
+            assert_eq!(got, payload);
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -56,7 +59,7 @@ async fn rtp_small_mss_clean_link_delivers_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_tiny_mss_survives_mild_loss() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mss = 256;
     let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
         .await
@@ -66,14 +69,17 @@ async fn rtp_tiny_mss_survives_mild_loss() {
     let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
 
     let payload = payload(100 * 1024);
-    let got = with_timeout(
-        Duration::from_secs(60),
-        "rtp tiny-mss lossy 100KiB echo",
-        support::rtp::rtp_echo_payload(read, write, &payload),
-    )
-    .await;
-
-    assert_eq!(got, payload, "reliable layer must recover all 100KiB");
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(60),
+                "rtp tiny-mss lossy 100KiB echo",
+                support::rtp::rtp_echo_payload(read, write, &payload),
+            )
+            .await;
+            assert_eq!(got, payload, "reliable layer must recover all 100KiB");
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -88,7 +94,7 @@ async fn rtp_tiny_mss_survives_mild_loss() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_custom_mss_clean_link_delivers_200kib() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mss = 1024;
     let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
         .await
@@ -98,17 +104,20 @@ async fn rtp_custom_mss_clean_link_delivers_200kib() {
     let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
 
     let payload = payload(200 * 1024);
-    let got = with_timeout(
-        Duration::from_secs(30),
-        "rtp custom-mss clean 200KiB echo",
-        support::rtp::rtp_echo_payload(read, write, &payload),
-    )
-    .await;
-
-    assert_eq!(
-        got, payload,
-        "custom-mss clean 200KiB delivery must be byte-exact"
-    );
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(30),
+                "rtp custom-mss clean 200KiB echo",
+                support::rtp::rtp_echo_payload(read, write, &payload),
+            )
+            .await;
+            assert_eq!(
+                got, payload,
+                "custom-mss clean 200KiB delivery must be byte-exact"
+            );
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);

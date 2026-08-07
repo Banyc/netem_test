@@ -130,7 +130,7 @@ async fn run_hol_probe(
             },
     } = config;
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, mut latencies, mux_bulk_counter) =
         spawn_mux_latency_bulk_server(&mut tasks, fec, base)
             .await
@@ -242,46 +242,51 @@ async fn run_hol_probe(
         _ => tokio::task::JoinSet::new(),
     };
 
-    let rr_fut = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
-    let bulk_fut = async {
-        if let Some(mut w) = shared_bulk_write {
-            tokio::time::sleep(BULK_RAMP).await;
-            run_mux_bulk_stream(&mut w, Arc::clone(&payload), active_for).await
-        } else {
-            0u64
-        }
-    };
-    let split_fut = async {
-        while let Some(result) = split_bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        0u64
-    };
-    let (sent, _shared_bulk_written, _) = tokio::join!(rr_fut, bulk_fut, split_fut);
+    tasks
+        .run(async {
+            let rr_fut =
+                run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
+            let bulk_fut = async {
+                if let Some(mut w) = shared_bulk_write {
+                    tokio::time::sleep(BULK_RAMP).await;
+                    run_mux_bulk_stream(&mut w, Arc::clone(&payload), active_for).await
+                } else {
+                    0u64
+                }
+            };
+            let split_fut = async {
+                while let Some(result) = split_bulk_tasks.join_next().await {
+                    result.unwrap();
+                }
+                0u64
+            };
+            let (sent, _shared_bulk_written, _) = tokio::join!(rr_fut, bulk_fut, split_fut);
 
-    // Allow stragglers to arrive before draining the latency channel.
-    tokio::time::sleep(grace).await;
-    let mut samples = Vec::new();
-    while let Ok(lat) = latencies.try_recv() {
-        samples.push(lat);
-    }
+            // Allow stragglers to arrive before draining the latency channel.
+            tokio::time::sleep(grace).await;
+            let mut samples = Vec::new();
+            while let Ok(lat) = latencies.try_recv() {
+                samples.push(lat);
+            }
 
-    let received = samples.len() as u64;
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
-    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+            let received = samples.len() as u64;
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let bulk_secs = (run_for - BULK_RAMP).as_secs_f64();
+            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
 
-    print_hol_summary(label, &summary);
-    eprintln!(
-        "[hol {label}] pair stats = {:?}",
-        combined_stats(&interactive_pair)
-    );
+            print_hol_summary(label, &summary);
+            eprintln!(
+                "[hol {label}] pair stats = {:?}",
+                combined_stats(&interactive_pair)
+            );
 
-    interactive_pair.stop();
-    if let Some(pair) = bulk_pair_opt {
-        pair.stop();
-    }
-    summary
+            interactive_pair.stop();
+            if let Some(pair) = bulk_pair_opt {
+                pair.stop();
+            }
+            summary
+        })
+        .await
 }
 
 /// Send timestamped `b'L'` frames through a byte-stream write half.
@@ -1145,7 +1150,7 @@ async fn run_hol_probe_frame_delivery_shared(
         grace,
     } = traffic;
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, mut latencies, mux_bulk_counter) =
         spawn_mux_frame_delivery_latency_bulk_server(&mut tasks, fec, base)
             .await
@@ -1181,27 +1186,32 @@ async fn run_hol_probe_frame_delivery_shared(
     });
     let active_for = run_for - BULK_RAMP;
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let rr_fut = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
-    let bulk_fut = async {
-        let mut w = bulk_write;
-        tokio::time::sleep(BULK_RAMP).await;
-        run_mux_bulk_stream(&mut w, Arc::clone(&payload), active_for).await
-    };
-    let (sent, _bulk_written) = tokio::join!(rr_fut, bulk_fut);
-    tokio::time::sleep(grace).await;
-    drop(spawner);
-    let mut samples = Vec::new();
-    while let Ok((_tag, lat)) = latencies.try_recv() {
-        samples.push(lat);
-    }
-    let received = samples.len() as u64;
-    let bulk_bytes = mux_bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = active_for.as_secs_f64();
-    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
-    print_hol_summary(label, &summary);
-    eprintln!("[hol {}] pair stats = {:?}", label, combined_stats(&pair));
-    pair.stop();
-    summary
+    tasks
+        .run(async {
+            let rr_fut =
+                run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
+            let bulk_fut = async {
+                let mut w = bulk_write;
+                tokio::time::sleep(BULK_RAMP).await;
+                run_mux_bulk_stream(&mut w, Arc::clone(&payload), active_for).await
+            };
+            let (sent, _bulk_written) = tokio::join!(rr_fut, bulk_fut);
+            tokio::time::sleep(grace).await;
+            drop(spawner);
+            let mut samples = Vec::new();
+            while let Ok((_tag, lat)) = latencies.try_recv() {
+                samples.push(lat);
+            }
+            let received = samples.len() as u64;
+            let bulk_bytes = mux_bulk_counter.load(Ordering::Relaxed);
+            let bulk_secs = active_for.as_secs_f64();
+            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+            print_hol_summary(label, &summary);
+            eprintln!("[hol {}] pair stats = {:?}", label, combined_stats(&pair));
+            pair.stop();
+            summary
+        })
+        .await
 }
 
 /// Run an HOL probe through production `rtp_mux`.  Both lanes use
@@ -1222,7 +1232,7 @@ async fn run_hol_probe_rtp_mux(
         grace,
     } = traffic;
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
         spawn_rtp_mux_latency_bulk_server(&mut tasks, false, base)
             .await
@@ -1256,36 +1266,41 @@ async fn run_hol_probe_rtp_mux(
             let _ = stream.shutdown().await;
         });
     }
-    let mut stream = connector
-        .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
+    tasks
+        .run(async {
+            let mut stream = connector
+                .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
+                .await
+                .unwrap();
+            let sent =
+                run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for).await;
+            let _ = stream.shutdown().await;
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk flow exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            tokio::time::sleep(grace).await;
+            let mut samples = Vec::new();
+            while let Ok((_tag, latency)) = latencies.try_recv() {
+                samples.push(latency);
+            }
+            let received = samples.len() as u64;
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let bulk_secs = active_for.as_secs_f64();
+            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+            print_hol_summary(label, &summary);
+            eprintln!(
+                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                combined_stats(&int_pair),
+                combined_stats(&bulk_pair)
+            );
+            int_pair.stop();
+            bulk_pair.stop();
+            summary
+        })
         .await
-        .unwrap();
-    let sent = run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for).await;
-    let _ = stream.shutdown().await;
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk flow exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    tokio::time::sleep(grace).await;
-    let mut samples = Vec::new();
-    while let Ok((_tag, latency)) = latencies.try_recv() {
-        samples.push(latency);
-    }
-    let received = samples.len() as u64;
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = active_for.as_secs_f64();
-    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
-    print_hol_summary(label, &summary);
-    eprintln!(
-        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-        combined_stats(&int_pair),
-        combined_stats(&bulk_pair)
-    );
-    int_pair.stop();
-    bulk_pair.stop();
-    summary
 }
 
 /// Run an HOL probe on a dual-lane setup: two independent RTP connections
@@ -1321,7 +1336,7 @@ async fn run_hol_probe_dual_lane(
         grace,
     } = traffic;
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
             &mut tasks,
@@ -1372,32 +1387,37 @@ async fn run_hol_probe_dual_lane(
             }
         }
     });
-    let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
-    let _ = rr_write.shutdown();
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    tokio::time::sleep(grace).await;
-    let mut samples = Vec::new();
-    while let Ok((_tag, lat)) = latencies.try_recv() {
-        samples.push(lat);
-    }
-    let received = samples.len() as u64;
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = active_for.as_secs_f64();
-    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
-    print_hol_summary(label, &summary);
-    eprintln!(
-        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-        combined_stats(&int_pair),
-        combined_stats(&bulk_pair)
-    );
-    int_pair.stop();
-    bulk_pair.stop();
-    summary
+    tasks
+        .run(async {
+            let sent =
+                run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
+            let _ = rr_write.shutdown();
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            tokio::time::sleep(grace).await;
+            let mut samples = Vec::new();
+            while let Ok((_tag, lat)) = latencies.try_recv() {
+                samples.push(lat);
+            }
+            let received = samples.len() as u64;
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let bulk_secs = active_for.as_secs_f64();
+            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+            print_hol_summary(label, &summary);
+            eprintln!(
+                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                combined_stats(&int_pair),
+                combined_stats(&bulk_pair)
+            );
+            int_pair.stop();
+            bulk_pair.stop();
+            summary
+        })
+        .await
 }
 
 /// Dual‑lane HOL probe with TWO interactive streams on the interactive
@@ -1423,7 +1443,7 @@ async fn run_hol_probe_dual_lane_two_interactive(
             },
     } = config;
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (int_addr, bulk_addr, mut latencies_all, bulk_counter, _sink_streams) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
             &mut tasks,
@@ -1488,95 +1508,99 @@ async fn run_hol_probe_dual_lane_two_interactive(
         }
     });
 
-    if write_a.write_all(b"A").await.is_err() {
-        let _ = write_a.shutdown();
-        drop(write_b);
-        bulk_stop.store(true, Ordering::Relaxed);
-        while let Some(result) = bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        return (
-            HolSummary::default(),
-            HolSummary::default(),
-            HolSummary::default(),
-            0.0,
-        );
-    }
-    if write_b.write_all(b"B").await.is_err() {
-        let _ = write_b.shutdown();
-        let _ = write_a.shutdown();
-        bulk_stop.store(true, Ordering::Relaxed);
-        while let Some(result) = bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        return (
-            HolSummary::default(),
-            HolSummary::default(),
-            HolSummary::default(),
-            0.0,
-        );
-    }
-    let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
-    let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
-    let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
-    let _ = write_a.shutdown();
-    let _ = write_b.shutdown();
+    tasks
+        .run(async {
+            if write_a.write_all(b"A").await.is_err() {
+                let _ = write_a.shutdown();
+                drop(write_b);
+                bulk_stop.store(true, Ordering::Relaxed);
+                while let Some(result) = bulk_tasks.join_next().await {
+                    result.unwrap();
+                }
+                return (
+                    HolSummary::default(),
+                    HolSummary::default(),
+                    HolSummary::default(),
+                    0.0,
+                );
+            }
+            if write_b.write_all(b"B").await.is_err() {
+                let _ = write_b.shutdown();
+                let _ = write_a.shutdown();
+                bulk_stop.store(true, Ordering::Relaxed);
+                while let Some(result) = bulk_tasks.join_next().await {
+                    result.unwrap();
+                }
+                return (
+                    HolSummary::default(),
+                    HolSummary::default(),
+                    HolSummary::default(),
+                    0.0,
+                );
+            }
+            let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
+            let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
+            let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
+            let _ = write_a.shutdown();
+            let _ = write_b.shutdown();
 
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
 
-    tokio::time::sleep(grace).await;
-    let mut samples = Vec::new();
-    let mut samples_a = Vec::new();
-    let mut samples_b = Vec::new();
-    while let Ok((tag, lat)) = latencies_all.try_recv() {
-        samples.push(lat);
-        if tag == b'A' {
-            samples_a.push(lat);
-        } else if tag == b'B' {
-            samples_b.push(lat);
-        }
-    }
+            tokio::time::sleep(grace).await;
+            let mut samples = Vec::new();
+            let mut samples_a = Vec::new();
+            let mut samples_b = Vec::new();
+            while let Ok((tag, lat)) = latencies_all.try_recv() {
+                samples.push(lat);
+                if tag == b'A' {
+                    samples_a.push(lat);
+                } else if tag == b'B' {
+                    samples_b.push(lat);
+                }
+            }
 
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = active_for.as_secs_f64();
-    let bulk_mibps = if bulk_secs > 0.0 {
-        bulk_bytes as f64 / (1024.0 * 1024.0) / bulk_secs
-    } else {
-        0.0
-    };
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let bulk_secs = active_for.as_secs_f64();
+            let bulk_mibps = if bulk_secs > 0.0 {
+                bulk_bytes as f64 / (1024.0 * 1024.0) / bulk_secs
+            } else {
+                0.0
+            };
 
-    let n_all = samples.len() as u64;
-    let combined = summarize(samples, sent_a + sent_b, n_all, bulk_bytes, bulk_secs);
-    let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
-    let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
+            let n_all = samples.len() as u64;
+            let combined = summarize(samples, sent_a + sent_b, n_all, bulk_bytes, bulk_secs);
+            let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
+            let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
 
-    eprintln!(
-        "[hol {label} A] p50={p50_a:.1} p99={p99_a:.1} max={max_a:.1}",
-        p50_a = summary_a.p50,
-        p99_a = summary_a.p99,
-        max_a = summary_a.max,
-    );
-    eprintln!(
-        "[hol {label} B] p50={p50_b:.1} p99={p99_b:.1} max={max_b:.1}",
-        p50_b = summary_b.p50,
-        p99_b = summary_b.p99,
-        max_b = summary_b.max,
-    );
-    print_hol_summary(&format!("{label}_combined"), &combined);
-    eprintln!(
-        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-        combined_stats(&int_pair),
-        combined_stats(&bulk_pair),
-    );
+            eprintln!(
+                "[hol {label} A] p50={p50_a:.1} p99={p99_a:.1} max={max_a:.1}",
+                p50_a = summary_a.p50,
+                p99_a = summary_a.p99,
+                max_a = summary_a.max,
+            );
+            eprintln!(
+                "[hol {label} B] p50={p50_b:.1} p99={p99_b:.1} max={max_b:.1}",
+                p50_b = summary_b.p50,
+                p99_b = summary_b.p99,
+                max_b = summary_b.max,
+            );
+            print_hol_summary(&format!("{label}_combined"), &combined);
+            eprintln!(
+                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                combined_stats(&int_pair),
+                combined_stats(&bulk_pair),
+            );
 
-    int_pair.stop();
-    bulk_pair.stop();
-    (summary_a, summary_b, combined, bulk_mibps)
+            int_pair.stop();
+            bulk_pair.stop();
+            (summary_a, summary_b, combined, bulk_mibps)
+        })
+        .await
 }
 
 /// Two‑interactive baseline on a single frame‑delivery RTP connection:
@@ -1598,7 +1622,7 @@ async fn run_frame_delivery_two_interactive(
             },
     } = config;
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, mut latencies, _bulk_counter) =
         spawn_mux_frame_delivery_latency_bulk_server(&mut tasks, fec, base)
             .await
@@ -1631,46 +1655,50 @@ async fn run_frame_delivery_two_interactive(
             }
         }
     });
-    let _ = write_a.write_all(b"A").await;
-    let _ = write_b.write_all(b"L").await;
-    let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
-    let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
-    let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
-    let _ = write_a.shutdown();
-    let _ = write_b.shutdown();
-    tokio::time::sleep(grace).await;
-    drop(spawner);
-    let mut samples = Vec::new();
-    let mut samples_a = Vec::new();
-    let mut samples_b = Vec::new();
-    while let Ok((tag, lat)) = latencies.try_recv() {
-        samples.push(lat);
-        if tag == b'A' {
-            samples_a.push(lat);
-        } else if tag == b'L' {
-            samples_b.push(lat);
-        }
-    }
-    let combined = summarize(
-        samples.clone(),
-        sent_a + sent_b,
-        samples.len() as u64,
-        0,
-        0.0,
-    );
-    let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
-    let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
-    eprintln!(
-        "[hol {} A] p50={:.1} p99={:.1} max={:.1}",
-        label, summary_a.p50, summary_a.p99, summary_a.max
-    );
-    eprintln!(
-        "[hol {} B] p50={:.1} p99={:.1} max={:.1}",
-        label, summary_b.p50, summary_b.p99, summary_b.max
-    );
-    print_hol_summary(&format!("{}_combined", label), &combined);
-    pair.stop();
-    (summary_a, summary_b, combined)
+    tasks
+        .run(async {
+            let _ = write_a.write_all(b"A").await;
+            let _ = write_b.write_all(b"L").await;
+            let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
+            let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
+            let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
+            let _ = write_a.shutdown();
+            let _ = write_b.shutdown();
+            tokio::time::sleep(grace).await;
+            drop(spawner);
+            let mut samples = Vec::new();
+            let mut samples_a = Vec::new();
+            let mut samples_b = Vec::new();
+            while let Ok((tag, lat)) = latencies.try_recv() {
+                samples.push(lat);
+                if tag == b'A' {
+                    samples_a.push(lat);
+                } else if tag == b'L' {
+                    samples_b.push(lat);
+                }
+            }
+            let combined = summarize(
+                samples.clone(),
+                sent_a + sent_b,
+                samples.len() as u64,
+                0,
+                0.0,
+            );
+            let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
+            let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
+            eprintln!(
+                "[hol {} A] p50={:.1} p99={:.1} max={:.1}",
+                label, summary_a.p50, summary_a.p99, summary_a.max
+            );
+            eprintln!(
+                "[hol {} B] p50={:.1} p99={:.1} max={:.1}",
+                label, summary_b.p50, summary_b.p99, summary_b.max
+            );
+            print_hol_summary(&format!("{}_combined", label), &combined);
+            pair.stop();
+            (summary_a, summary_b, combined)
+        })
+        .await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2044,7 +2072,7 @@ async fn run_hol_probe_dual_lane_separate_listeners(
             },
     } = config;
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
             &mut tasks,
@@ -2099,36 +2127,41 @@ async fn run_hol_probe_dual_lane_separate_listeners(
             }
         }
     });
-    let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
-    let _ = rr_write.shutdown();
+    tasks
+        .run(async {
+            let sent =
+                run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
+            let _ = rr_write.shutdown();
 
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
 
-    tokio::time::sleep(grace).await;
-    let mut samples = Vec::new();
-    while let Ok((_tag, lat)) = latencies.try_recv() {
-        samples.push(lat);
-    }
+            tokio::time::sleep(grace).await;
+            let mut samples = Vec::new();
+            while let Ok((_tag, lat)) = latencies.try_recv() {
+                samples.push(lat);
+            }
 
-    let received = samples.len() as u64;
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let bulk_secs = active_for.as_secs_f64();
-    let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+            let received = samples.len() as u64;
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let bulk_secs = active_for.as_secs_f64();
+            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
 
-    print_hol_summary(label, &summary);
-    eprintln!(
-        "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-        combined_stats(&int_pair),
-        combined_stats(&bulk_pair),
-    );
-    int_pair.stop();
-    bulk_pair.stop();
-    summary
+            print_hol_summary(label, &summary);
+            eprintln!(
+                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                combined_stats(&int_pair),
+                combined_stats(&bulk_pair),
+            );
+            int_pair.stop();
+            bulk_pair.stop();
+            summary
+        })
+        .await
 }
 
 /// Asymmetric frame‑delivery dual‑lane test: interactive lane uses

@@ -24,7 +24,7 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp+FEC recovery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_with_fec_recovers_under_netem_loss() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, true).await.unwrap();
 
     let lossy = NetemConfig {
@@ -37,14 +37,17 @@ async fn rtp_with_fec_recovers_under_netem_loss() {
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), true).await;
 
     let payload = payload(1024 * 1024);
-    let got = with_timeout(
-        Duration::from_secs(90),
-        "rtp+FEC 1MiB echo",
-        rtp_echo_payload(read, write, &payload),
-    )
-    .await;
-
-    assert_eq!(got, payload, "FEC + reliable layer must recover all data");
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(90),
+                "rtp+FEC 1MiB echo",
+                rtp_echo_payload(read, write, &payload),
+            )
+            .await;
+            assert_eq!(got, payload, "FEC + reliable layer must recover all data");
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);

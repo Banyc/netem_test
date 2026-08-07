@@ -166,7 +166,7 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -238,25 +238,30 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
         }
     });
 
-    let (small, burst, sent) =
-        run_latency_flow(base, seed_base, run_for, &mut lat_write, &mut lat_rx, false).await;
-    let _ = lat_write.shutdown();
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let received = (small.len() + burst.len()) as u64;
+    tasks
+        .run(async {
+            let (small, burst, sent) =
+                run_latency_flow(base, seed_base, run_for, &mut lat_write, &mut lat_rx, false)
+                    .await;
+            let _ = lat_write.shutdown();
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let received = (small.len() + burst.len()) as u64;
 
-    DynTrafficResult {
-        small_latencies: small,
-        burst_latencies: burst,
-        sent,
-        received,
-        bulk_bytes,
-    }
+            DynTrafficResult {
+                small_latencies: small,
+                burst_latencies: burst,
+                sent,
+                received,
+                bulk_bytes,
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -285,7 +290,7 @@ async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTraf
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -336,36 +341,40 @@ async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTraf
         });
     }
 
-    tokio::time::sleep(BULK_RAMP).await;
+    tasks
+        .run(async {
+            tokio::time::sleep(BULK_RAMP).await;
 
-    let (auto_reader, mut auto_writer) = opener.open_auto();
-    let (small, burst, sent) = run_latency_flow(
-        base,
-        seed_base,
-        run_for,
-        &mut auto_writer,
-        &mut lat_rx,
-        false,
-    )
-    .await;
-    let _ = auto_writer.shutdown();
-    drop(auto_reader);
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let received = (small.len() + burst.len()) as u64;
+            let (auto_reader, mut auto_writer) = opener.open_auto();
+            let (small, burst, sent) = run_latency_flow(
+                base,
+                seed_base,
+                run_for,
+                &mut auto_writer,
+                &mut lat_rx,
+                false,
+            )
+            .await;
+            let _ = auto_writer.shutdown();
+            drop(auto_reader);
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let received = (small.len() + burst.len()) as u64;
 
-    DynTrafficResult {
-        small_latencies: small,
-        burst_latencies: burst,
-        sent,
-        received,
-        bulk_bytes,
-    }
+            DynTrafficResult {
+                small_latencies: small,
+                burst_latencies: burst,
+                sent,
+                received,
+                bulk_bytes,
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -394,7 +403,7 @@ async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTraffi
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -445,76 +454,80 @@ async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTraffi
         });
     }
 
-    tokio::time::sleep(BULK_RAMP).await;
+    tasks
+        .run(async {
+            tokio::time::sleep(BULK_RAMP).await;
 
-    let (auto_reader, mut auto_writer) = opener.open_auto();
+            let (auto_reader, mut auto_writer) = opener.open_auto();
 
-    // FIRST write is forced to be large (> 2 KiB) so auto classifies as Bulk.
-    let first_size: usize = 4 * 1024;
-    let first_frame = make_latency_frame(first_size, base);
-    let mut first_buf = Vec::with_capacity(LATENCY_TAG.len() + first_frame.len());
-    first_buf.extend_from_slice(LATENCY_TAG);
-    first_buf.extend_from_slice(&first_frame);
-    if auto_writer.write_all(&first_buf).await.is_err() {
-        let _ = auto_writer.shutdown();
-        drop(auto_reader);
-        bulk_stop.store(true, Ordering::Relaxed);
-        // The bulk pump exits once the stop flag is set; drain it.
-        while let Some(result) = bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        return DynTrafficResult {
-            small_latencies: vec![],
-            burst_latencies: vec![],
-            sent: 0,
-            received: 0,
-            bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-        };
-    }
-    if let Some(lat) = lat_rx.recv().await {
-        let rest_run = run_for.saturating_sub(base.elapsed());
-        let (small, mut burst, mut sent) = run_latency_flow(
-            base,
-            seed_base,
-            rest_run,
-            &mut auto_writer,
-            &mut lat_rx,
-            true,
-        )
-        .await;
-        burst.insert(0, lat);
-        sent += 1;
-        let _ = auto_writer.shutdown();
-        drop(auto_reader);
-        bulk_stop.store(true, Ordering::Relaxed);
-        // The bulk pump exits once the stop flag is set; drain it.
-        while let Some(result) = bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        let received = (small.len() + burst.len()) as u64;
-        return DynTrafficResult {
-            small_latencies: small,
-            burst_latencies: burst,
-            sent,
-            received,
-            bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-        };
-    }
+            // FIRST write is forced to be large (> 2 KiB) so auto classifies as Bulk.
+            let first_size: usize = 4 * 1024;
+            let first_frame = make_latency_frame(first_size, base);
+            let mut first_buf = Vec::with_capacity(LATENCY_TAG.len() + first_frame.len());
+            first_buf.extend_from_slice(LATENCY_TAG);
+            first_buf.extend_from_slice(&first_frame);
+            if auto_writer.write_all(&first_buf).await.is_err() {
+                let _ = auto_writer.shutdown();
+                drop(auto_reader);
+                bulk_stop.store(true, Ordering::Relaxed);
+                // The bulk pump exits once the stop flag is set; drain it.
+                while let Some(result) = bulk_tasks.join_next().await {
+                    result.unwrap();
+                }
+                return DynTrafficResult {
+                    small_latencies: vec![],
+                    burst_latencies: vec![],
+                    sent: 0,
+                    received: 0,
+                    bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+                };
+            }
+            if let Some(lat) = lat_rx.recv().await {
+                let rest_run = run_for.saturating_sub(base.elapsed());
+                let (small, mut burst, mut sent) = run_latency_flow(
+                    base,
+                    seed_base,
+                    rest_run,
+                    &mut auto_writer,
+                    &mut lat_rx,
+                    true,
+                )
+                .await;
+                burst.insert(0, lat);
+                sent += 1;
+                let _ = auto_writer.shutdown();
+                drop(auto_reader);
+                bulk_stop.store(true, Ordering::Relaxed);
+                // The bulk pump exits once the stop flag is set; drain it.
+                while let Some(result) = bulk_tasks.join_next().await {
+                    result.unwrap();
+                }
+                let received = (small.len() + burst.len()) as u64;
+                return DynTrafficResult {
+                    small_latencies: small,
+                    burst_latencies: burst,
+                    sent,
+                    received,
+                    bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+                };
+            }
 
-    let _ = auto_writer.shutdown();
-    drop(auto_reader);
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    DynTrafficResult {
-        small_latencies: vec![],
-        burst_latencies: vec![],
-        sent: 1,
-        received: 0,
-        bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-    }
+            let _ = auto_writer.shutdown();
+            drop(auto_reader);
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            DynTrafficResult {
+                small_latencies: vec![],
+                burst_latencies: vec![],
+                sent: 1,
+                received: 0,
+                bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -543,7 +556,7 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -596,60 +609,64 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
-    let mut small_latencies = Vec::new();
-    let mut burst_latencies = Vec::new();
-    let mut sent = 0u64;
-    let start = Instant::now();
+    tasks
+        .run(async {
+            let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
+            let mut small_latencies = Vec::new();
+            let mut burst_latencies = Vec::new();
+            let mut sent = 0u64;
+            let start = Instant::now();
 
-    while start.elapsed() < run_for {
-        sent += 1;
-        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
-            msg_rng.uniform_usize(4 * 1024, 64 * 1024)
-        } else {
-            SMALL_MSG_BYTES
-        };
-        let is_burst = msg_size > SMALL_MSG_BYTES;
-        let frame = make_latency_frame(msg_size, base);
-
-        let (reader, mut writer) = opener.open_auto();
-        let write_buf = [LATENCY_TAG, &frame[..]].concat();
-        if writer.write_all(&write_buf).await.is_err() {
-            break;
-        }
-        let _ = writer.shutdown();
-        drop(reader);
-
-        match lat_rx.recv().await {
-            Some(lat) => {
-                if is_burst {
-                    burst_latencies.push(lat);
+            while start.elapsed() < run_for {
+                sent += 1;
+                let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
+                    msg_rng.uniform_usize(4 * 1024, 64 * 1024)
                 } else {
-                    small_latencies.push(lat);
+                    SMALL_MSG_BYTES
+                };
+                let is_burst = msg_size > SMALL_MSG_BYTES;
+                let frame = make_latency_frame(msg_size, base);
+
+                let (reader, mut writer) = opener.open_auto();
+                let write_buf = [LATENCY_TAG, &frame[..]].concat();
+                if writer.write_all(&write_buf).await.is_err() {
+                    break;
                 }
+                let _ = writer.shutdown();
+                drop(reader);
+
+                match lat_rx.recv().await {
+                    Some(lat) => {
+                        if is_burst {
+                            burst_latencies.push(lat);
+                        } else {
+                            small_latencies.push(lat);
+                        }
+                    }
+                    None => break,
+                }
+
+                tokio::time::sleep(LATENCY_CADENCE).await;
             }
-            None => break,
-        }
 
-        tokio::time::sleep(LATENCY_CADENCE).await;
-    }
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
-
-    DynTrafficResult {
-        small_latencies,
-        burst_latencies,
-        sent,
-        received,
-        bulk_bytes,
-    }
+            DynTrafficResult {
+                small_latencies,
+                burst_latencies,
+                sent,
+                received,
+                bulk_bytes,
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -678,7 +695,7 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -731,74 +748,78 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let (int_reader, mut int_writer) = opener
-        .open(LaneClass::Interactive)
-        .await
-        .expect("open interactive");
-    int_writer
-        .write_all(LATENCY_TAG)
-        .await
-        .expect("write latency tag");
+    tasks
+        .run(async {
+            let (int_reader, mut int_writer) = opener
+                .open(LaneClass::Interactive)
+                .await
+                .expect("open interactive");
+            int_writer
+                .write_all(LATENCY_TAG)
+                .await
+                .expect("write latency tag");
 
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
-    let mut small_latencies = Vec::new();
-    let mut burst_latencies = Vec::new();
-    let mut sent = 0u64;
-    let start = Instant::now();
+            let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
+            let mut small_latencies = Vec::new();
+            let mut burst_latencies = Vec::new();
+            let mut sent = 0u64;
+            let start = Instant::now();
 
-    while start.elapsed() < run_for {
-        sent += 1;
-        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
-            msg_rng.uniform_usize(4 * 1024, 64 * 1024)
-        } else {
-            SMALL_MSG_BYTES
-        };
-        let is_burst = msg_size > SMALL_MSG_BYTES;
-        let frame = make_latency_frame(msg_size, base);
+            while start.elapsed() < run_for {
+                sent += 1;
+                let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
+                    msg_rng.uniform_usize(4 * 1024, 64 * 1024)
+                } else {
+                    SMALL_MSG_BYTES
+                };
+                let is_burst = msg_size > SMALL_MSG_BYTES;
+                let frame = make_latency_frame(msg_size, base);
 
-        if is_burst {
-            if let Ok((_, mut bw)) = opener.open(LaneClass::Bulk).await {
-                let _ = bw.write_all(LATENCY_TAG).await;
-                if bw.write_all(&frame).await.is_err() {
-                    break;
+                if is_burst {
+                    if let Ok((_, mut bw)) = opener.open(LaneClass::Bulk).await {
+                        let _ = bw.write_all(LATENCY_TAG).await;
+                        if bw.write_all(&frame).await.is_err() {
+                            break;
+                        }
+                        let _ = bw.shutdown();
+                        match lat_rx.recv().await {
+                            Some(lat) => burst_latencies.push(lat),
+                            None => break,
+                        }
+                    }
+                } else {
+                    if int_writer.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                    match lat_rx.recv().await {
+                        Some(lat) => small_latencies.push(lat),
+                        None => break,
+                    }
                 }
-                let _ = bw.shutdown();
-                match lat_rx.recv().await {
-                    Some(lat) => burst_latencies.push(lat),
-                    None => break,
-                }
-            }
-        } else {
-            if int_writer.write_all(&frame).await.is_err() {
-                break;
-            }
-            match lat_rx.recv().await {
-                Some(lat) => small_latencies.push(lat),
-                None => break,
-            }
-        }
 
-        tokio::time::sleep(LATENCY_CADENCE).await;
-    }
+                tokio::time::sleep(LATENCY_CADENCE).await;
+            }
 
-    let _ = int_writer.shutdown();
-    drop(int_reader);
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
+            let _ = int_writer.shutdown();
+            drop(int_reader);
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
-    DynTrafficResult {
-        small_latencies,
-        burst_latencies,
-        sent,
-        received,
-        bulk_bytes,
-    }
+            DynTrafficResult {
+                small_latencies,
+                burst_latencies,
+                sent,
+                received,
+                bulk_bytes,
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -831,7 +852,7 @@ async fn dyn_dual_msg_channel_rep(
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -883,57 +904,61 @@ async fn dyn_dual_msg_channel_rep(
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let sender = DualMessageSender::new(opener, mode);
-    let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
-    let mut small_latencies = Vec::new();
-    let mut burst_latencies = Vec::new();
-    let mut sent = 0u64;
-    let start = Instant::now();
+    tasks
+        .run(async {
+            let sender = DualMessageSender::new(opener, mode);
+            let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
+            let mut small_latencies = Vec::new();
+            let mut burst_latencies = Vec::new();
+            let mut sent = 0u64;
+            let start = Instant::now();
 
-    while start.elapsed() < run_for {
-        let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
-            msg_rng.uniform_usize(4 * 1024, 64 * 1024)
-        } else {
-            SMALL_MSG_BYTES
-        };
-        let is_burst = msg_size > SMALL_MSG_BYTES;
-        let frame = make_latency_frame(msg_size, base);
-
-        if sender.send(&frame).await.is_err() {
-            break;
-        }
-        sent += 1;
-
-        match lat_rx.recv().await {
-            Some(lat) => {
-                if is_burst {
-                    burst_latencies.push(lat);
+            while start.elapsed() < run_for {
+                let msg_size = if msg_rng.next_u64().is_multiple_of(BURST_RATIO) {
+                    msg_rng.uniform_usize(4 * 1024, 64 * 1024)
                 } else {
-                    small_latencies.push(lat);
+                    SMALL_MSG_BYTES
+                };
+                let is_burst = msg_size > SMALL_MSG_BYTES;
+                let frame = make_latency_frame(msg_size, base);
+
+                if sender.send(&frame).await.is_err() {
+                    break;
                 }
+                sent += 1;
+
+                match lat_rx.recv().await {
+                    Some(lat) => {
+                        if is_burst {
+                            burst_latencies.push(lat);
+                        } else {
+                            small_latencies.push(lat);
+                        }
+                    }
+                    None => break,
+                }
+
+                tokio::time::sleep(LATENCY_CADENCE).await;
             }
-            None => break,
-        }
 
-        tokio::time::sleep(LATENCY_CADENCE).await;
-    }
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let received = (small_latencies.len() + burst_latencies.len()) as u64;
 
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let received = (small_latencies.len() + burst_latencies.len()) as u64;
-
-    DynTrafficResult {
-        small_latencies,
-        burst_latencies,
-        sent,
-        received,
-        bulk_bytes,
-    }
+            DynTrafficResult {
+                small_latencies,
+                burst_latencies,
+                sent,
+                received,
+                bulk_bytes,
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1203,7 +1228,7 @@ async fn run_game_sync_client(
 async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult {
     let (c2s, s2c) = bottleneck_config(200 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, lat_rx, bulk_counter) =
         spawn_dual_mux_gaming_latency_bulk_server(&mut tasks, false, base)
             .await
@@ -1228,7 +1253,11 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
     )
     .await
     .unwrap();
-    let mut result = run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false).await;
+    let mut result = tasks
+        .run(async {
+            run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false).await
+        })
+        .await;
     result.bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     result
 }
@@ -1254,7 +1283,7 @@ async fn dyn_game_sync_sticky() {
 async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingResult {
     let (c2s, s2c) = bottleneck_config(300 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, lat_rx, bulk_counter) =
         spawn_dual_mux_gaming_latency_bulk_server(&mut tasks, false, base)
             .await
@@ -1279,7 +1308,9 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
     )
     .await
     .unwrap();
-    let mut result = run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, true).await;
+    let mut result = tasks
+        .run(async { run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, true).await })
+        .await;
     result.bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     result
 }
@@ -1306,7 +1337,7 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(400 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -1386,56 +1417,60 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let mut steady_latencies = Vec::new();
     let mut sent = 0u64;
 
-    if game_write.write_all(&sync_buf).await.is_err() {
-        let _ = game_write.shutdown();
-        bulk_stop.store(true, Ordering::Relaxed);
-        // The bulk pump exits once the stop flag is set; drain it.
-        while let Some(result) = bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        return GamingResult {
-            transition_latencies,
-            steady_latencies,
-            sent,
-            received: 0,
-            bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-        };
-    }
-    let start = Instant::now();
-    let phase2_start = Instant::now();
-    while start.elapsed() < run_for {
-        let frame = make_latency_frame(SMALL_MSG_BYTES, base);
-        if game_write.write_all(&frame).await.is_err() {
-            break;
-        }
-        sent += 1;
-        match tokio::time::timeout(run_for, lat_rx.recv()).await {
-            Ok(Some(lat)) => {
-                if phase2_start.elapsed().as_secs() < GAMING_TRANSITION_SECS {
-                    transition_latencies.push(lat);
-                } else {
-                    steady_latencies.push(lat);
+    tasks
+        .run(async {
+            if game_write.write_all(&sync_buf).await.is_err() {
+                let _ = game_write.shutdown();
+                bulk_stop.store(true, Ordering::Relaxed);
+                // The bulk pump exits once the stop flag is set; drain it.
+                while let Some(result) = bulk_tasks.join_next().await {
+                    result.unwrap();
                 }
+                return GamingResult {
+                    transition_latencies,
+                    steady_latencies,
+                    sent,
+                    received: 0,
+                    bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+                };
             }
-            _ => break,
-        }
-        tokio::time::sleep(LATENCY_CADENCE).await;
-    }
+            let start = Instant::now();
+            let phase2_start = Instant::now();
+            while start.elapsed() < run_for {
+                let frame = make_latency_frame(SMALL_MSG_BYTES, base);
+                if game_write.write_all(&frame).await.is_err() {
+                    break;
+                }
+                sent += 1;
+                match tokio::time::timeout(run_for, lat_rx.recv()).await {
+                    Ok(Some(lat)) => {
+                        if phase2_start.elapsed().as_secs() < GAMING_TRANSITION_SECS {
+                            transition_latencies.push(lat);
+                        } else {
+                            steady_latencies.push(lat);
+                        }
+                    }
+                    _ => break,
+                }
+                tokio::time::sleep(LATENCY_CADENCE).await;
+            }
 
-    let _ = game_write.shutdown();
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    let received = (transition_latencies.len() + steady_latencies.len()) as u64;
-    GamingResult {
-        transition_latencies,
-        steady_latencies,
-        sent,
-        received,
-        bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-    }
+            let _ = game_write.shutdown();
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            let received = (transition_latencies.len() + steady_latencies.len()) as u64;
+            GamingResult {
+                transition_latencies,
+                steady_latencies,
+                sent,
+                received,
+                bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1515,7 +1550,7 @@ async fn dyn_dual_auto_small_first_migrating_rep(
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(500 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -1568,34 +1603,38 @@ async fn dyn_dual_auto_small_first_migrating_rep(
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let logical_id = 1000 + seed_base;
-    let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
-    let (small, burst, sent) = run_migrating_latency_flow(
-        base,
-        seed_base,
-        run_for,
-        &mut game_writer,
-        &mut lat_rx,
-        false,
-    )
-    .await;
-    let _ = game_writer.finalize().await;
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it so any panic
-    // surfaces.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let received = (small.len() + burst.len()) as u64;
+    tasks
+        .run(async {
+            let logical_id = 1000 + seed_base;
+            let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
+            let (small, burst, sent) = run_migrating_latency_flow(
+                base,
+                seed_base,
+                run_for,
+                &mut game_writer,
+                &mut lat_rx,
+                false,
+            )
+            .await;
+            let _ = game_writer.finalize().await;
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it so any panic
+            // surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            let received = (small.len() + burst.len()) as u64;
 
-    DynTrafficResult {
-        small_latencies: small,
-        burst_latencies: burst,
-        sent,
-        received,
-        bulk_bytes,
-    }
+            DynTrafficResult {
+                small_latencies: small,
+                burst_latencies: burst,
+                sent,
+                received,
+                bulk_bytes,
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1620,7 +1659,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
     let run_for = Duration::from_secs(run_secs);
     let (c2s, s2c) = bottleneck_config(600 + seed_base, RATE_BPS);
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (server_addr, mut lat_rx, bulk_counter) =
@@ -1673,71 +1712,75 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
 
     tokio::time::sleep(BULK_RAMP).await;
 
-    let logical_id = 2000 + seed_base;
-    let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
+    tasks
+        .run(async {
+            let logical_id = 2000 + seed_base;
+            let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
 
-    let first_size: usize = 4 * 1024;
-    let first_frame = make_latency_frame(first_size, base);
-    let mut first_buf = Vec::with_capacity(LATENCY_TAG.len() + first_frame.len());
-    first_buf.extend_from_slice(LATENCY_TAG);
-    first_buf.extend_from_slice(&first_frame);
-    if game_writer.write_all(&first_buf).await.is_err() {
-        let _ = game_writer.finalize().await;
-        bulk_stop.store(true, Ordering::Relaxed);
-        // The bulk pump exits once the stop flag is set; drain it.
-        while let Some(result) = bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        return DynTrafficResult {
-            small_latencies: vec![],
-            burst_latencies: vec![],
-            sent: 0,
-            received: 0,
-            bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-        };
-    }
-    if let Some(lat) = lat_rx.recv().await {
-        let rest_run = run_for.saturating_sub(base.elapsed());
-        let (small, mut burst, mut sent) = run_migrating_latency_flow(
-            base,
-            seed_base,
-            rest_run,
-            &mut game_writer,
-            &mut lat_rx,
-            true,
-        )
-        .await;
-        burst.insert(0, lat);
-        sent += 1;
-        let _ = game_writer.finalize().await;
-        bulk_stop.store(true, Ordering::Relaxed);
-        // The bulk pump exits once the stop flag is set; drain it.
-        while let Some(result) = bulk_tasks.join_next().await {
-            result.unwrap();
-        }
-        let received = (small.len() + burst.len()) as u64;
-        return DynTrafficResult {
-            small_latencies: small,
-            burst_latencies: burst,
-            sent,
-            received,
-            bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-        };
-    }
+            let first_size: usize = 4 * 1024;
+            let first_frame = make_latency_frame(first_size, base);
+            let mut first_buf = Vec::with_capacity(LATENCY_TAG.len() + first_frame.len());
+            first_buf.extend_from_slice(LATENCY_TAG);
+            first_buf.extend_from_slice(&first_frame);
+            if game_writer.write_all(&first_buf).await.is_err() {
+                let _ = game_writer.finalize().await;
+                bulk_stop.store(true, Ordering::Relaxed);
+                // The bulk pump exits once the stop flag is set; drain it.
+                while let Some(result) = bulk_tasks.join_next().await {
+                    result.unwrap();
+                }
+                return DynTrafficResult {
+                    small_latencies: vec![],
+                    burst_latencies: vec![],
+                    sent: 0,
+                    received: 0,
+                    bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+                };
+            }
+            if let Some(lat) = lat_rx.recv().await {
+                let rest_run = run_for.saturating_sub(base.elapsed());
+                let (small, mut burst, mut sent) = run_migrating_latency_flow(
+                    base,
+                    seed_base,
+                    rest_run,
+                    &mut game_writer,
+                    &mut lat_rx,
+                    true,
+                )
+                .await;
+                burst.insert(0, lat);
+                sent += 1;
+                let _ = game_writer.finalize().await;
+                bulk_stop.store(true, Ordering::Relaxed);
+                // The bulk pump exits once the stop flag is set; drain it.
+                while let Some(result) = bulk_tasks.join_next().await {
+                    result.unwrap();
+                }
+                let received = (small.len() + burst.len()) as u64;
+                return DynTrafficResult {
+                    small_latencies: small,
+                    burst_latencies: burst,
+                    sent,
+                    received,
+                    bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+                };
+            }
 
-    let _ = game_writer.finalize().await;
-    bulk_stop.store(true, Ordering::Relaxed);
-    // The bulk pump exits once the stop flag is set; drain it.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
-    DynTrafficResult {
-        small_latencies: vec![],
-        burst_latencies: vec![],
-        sent: 1,
-        received: 0,
-        bulk_bytes: bulk_counter.load(Ordering::Relaxed),
-    }
+            let _ = game_writer.finalize().await;
+            bulk_stop.store(true, Ordering::Relaxed);
+            // The bulk pump exits once the stop flag is set; drain it.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            DynTrafficResult {
+                small_latencies: vec![],
+                burst_latencies: vec![],
+                sent: 1,
+                received: 0,
+                bulk_bytes: bulk_counter.load(Ordering::Relaxed),
+            }
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]

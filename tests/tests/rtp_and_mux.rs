@@ -29,21 +29,24 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads, binds ephemeral ports, and runs for hundreds of milliseconds; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_data() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = b"netem-rtp-integration";
-    let got = with_timeout(
-        Duration::from_secs(10),
-        "rtp clean small echo",
-        rtp_echo_payload(read, write, payload),
-    )
-    .await;
-
-    assert_eq!(got, payload);
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(10),
+                "rtp clean small echo",
+                rtp_echo_payload(read, write, payload),
+            )
+            .await;
+            assert_eq!(got, payload);
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -57,21 +60,24 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads, binds ephemeral ports, and runs for hundreds of milliseconds; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_reliability_survives_mild_loss() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = payload(256 * 1024);
-    let got = with_timeout(
-        Duration::from_secs(60),
-        "rtp lossy 256KiB echo",
-        rtp_echo_payload(read, write, &payload),
-    )
-    .await;
-
-    assert_eq!(got, payload, "reliable layer must recover all data");
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(60),
+                "rtp lossy 256KiB echo",
+                rtp_echo_payload(read, write, &payload),
+            )
+            .await;
+            assert_eq!(got, payload, "reliable layer must recover all data");
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -86,7 +92,7 @@ async fn rtp_over_netem_reliability_survives_mild_loss() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads, binds ephemeral ports, and runs for hundreds of milliseconds; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_over_netem_clean_link_echoes() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
         .await
         .unwrap();
@@ -96,14 +102,17 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
     let (opener, _spawner) = mux_client_connect(read, write);
 
     let payload = b"mux-rtp-netem";
-    let got = with_timeout(
-        Duration::from_secs(15),
-        "mux-over-rtp clean echo",
-        mux_echo_round_trip(&opener, payload),
-    )
-    .await;
-
-    assert_eq!(got, payload);
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(15),
+                "mux-over-rtp clean echo",
+                mux_echo_round_trip(&opener, payload),
+            )
+            .await;
+            assert_eq!(got, payload);
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);

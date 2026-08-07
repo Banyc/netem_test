@@ -24,21 +24,24 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_data() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = b"netem-rtp-integration";
-    let got = with_timeout(
-        Duration::from_secs(10),
-        "rtp clean small echo",
-        rtp_echo_payload(read, write, payload),
-    )
-    .await;
-
-    assert_eq!(got, payload);
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(10),
+                "rtp clean small echo",
+                rtp_echo_payload(read, write, payload),
+            )
+            .await;
+            assert_eq!(got, payload);
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -51,21 +54,24 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_400kib() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = payload(400 * 1024);
-    let got = with_timeout(
-        Duration::from_secs(30),
-        "rtp clean 400KiB echo",
-        rtp_echo_payload(read, write, &payload),
-    )
-    .await;
-
-    assert_eq!(got, payload, "clean 400KiB delivery must be byte-exact");
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(30),
+                "rtp clean 400KiB echo",
+                rtp_echo_payload(read, write, &payload),
+            )
+            .await;
+            assert_eq!(got, payload, "clean 400KiB delivery must be byte-exact");
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -82,27 +88,31 @@ async fn rtp_over_netem_clean_link_delivers_400kib() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_latency_is_observable() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let latency_ms = 60;
     let pair = NetemPair::spawn(server_addr, latency(latency_ms), latency(latency_ms)).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
-    let start = std::time::Instant::now();
-    let got = with_timeout(
-        Duration::from_secs(10),
-        "rtp latency ping",
-        rtp_echo_payload(read, write, b"ping"),
-    )
-    .await;
-    let elapsed = start.elapsed();
-    assert_eq!(got, b"ping");
-    assert!(
-        elapsed >= Duration::from_millis(latency_ms),
-        "round trip {elapsed:?} should be >= one-way latency {}ms",
-        latency_ms,
-    );
+    tasks
+        .run(async {
+            let start = std::time::Instant::now();
+            let got = with_timeout(
+                Duration::from_secs(10),
+                "rtp latency ping",
+                rtp_echo_payload(read, write, b"ping"),
+            )
+            .await;
+            let elapsed = start.elapsed();
+            assert_eq!(got, b"ping");
+            assert!(
+                elapsed >= Duration::from_millis(latency_ms),
+                "round trip {elapsed:?} should be >= one-way latency {}ms",
+                latency_ms,
+            );
+        })
+        .await;
 
     pair.stop();
 }

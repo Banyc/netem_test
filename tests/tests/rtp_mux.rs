@@ -105,7 +105,7 @@ async fn echo_round_trip(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (interactive_server, bulk_server, mut accepted_lanes) =
         spawn_echo_server(&mut tasks).await.unwrap();
     let interactive_pair = NetemPair::spawn(interactive_server, clean(), clean()).unwrap();
@@ -113,37 +113,41 @@ async fn rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams() {
     let connector = connector(&mut tasks, bulk_pair.client_addr());
     let interactive_payload = payload(64 * 1024);
     let bulk_payload = payload(512 * 1024);
-    let (interactive_echo, bulk_echo) = with_timeout(
-        Duration::from_secs(30),
-        "rtp_mux clean dual-lane echo",
-        async {
-            tokio::join!(
-                echo_round_trip(
-                    &connector,
-                    interactive_pair.client_addr(),
-                    LaneClass::Interactive,
-                    &interactive_payload
-                ),
-                echo_round_trip(
-                    &connector,
-                    interactive_pair.client_addr(),
-                    LaneClass::Bulk,
-                    &bulk_payload
-                ),
+    tasks
+        .run(async {
+            let (interactive_echo, bulk_echo) = with_timeout(
+                Duration::from_secs(30),
+                "rtp_mux clean dual-lane echo",
+                async {
+                    tokio::join!(
+                        echo_round_trip(
+                            &connector,
+                            interactive_pair.client_addr(),
+                            LaneClass::Interactive,
+                            &interactive_payload
+                        ),
+                        echo_round_trip(
+                            &connector,
+                            interactive_pair.client_addr(),
+                            LaneClass::Bulk,
+                            &bulk_payload
+                        ),
+                    )
+                },
             )
-        },
-    )
-    .await;
-    assert_eq!(interactive_echo, interactive_payload);
-    assert_eq!(bulk_echo, bulk_payload);
-    let first_lane = accepted_lanes.recv().await.unwrap();
-    let second_lane = accepted_lanes.recv().await.unwrap();
-    assert!(
-        (first_lane == LaneClass::Interactive && second_lane == LaneClass::Bulk)
-            || (first_lane == LaneClass::Bulk && second_lane == LaneClass::Interactive)
-    );
-    assert!(combined_stats(&interactive_pair).forwarded > 0);
-    assert!(combined_stats(&bulk_pair).forwarded > 0);
+            .await;
+            assert_eq!(interactive_echo, interactive_payload);
+            assert_eq!(bulk_echo, bulk_payload);
+            let first_lane = accepted_lanes.recv().await.unwrap();
+            let second_lane = accepted_lanes.recv().await.unwrap();
+            assert!(
+                (first_lane == LaneClass::Interactive && second_lane == LaneClass::Bulk)
+                    || (first_lane == LaneClass::Bulk && second_lane == LaneClass::Interactive)
+            );
+            assert!(combined_stats(&interactive_pair).forwarded > 0);
+            assert!(combined_stats(&bulk_pair).forwarded > 0);
+        })
+        .await;
     interactive_pair.stop();
     bulk_pair.stop();
 }
@@ -251,7 +255,7 @@ struct ResponseArm {
     bulk_lane_wire_pkts: u64,
 }
 async fn run_response_arm() -> ResponseArm {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_pair =
         NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
@@ -280,38 +284,44 @@ async fn run_response_arm() -> ResponseArm {
         }
         (total, started.elapsed().as_secs_f64())
     });
-    let mut rtts = Vec::new();
-    let mut seq = 0u64;
-    let mut buf = [0u8; PING_LEN];
-    let mut download = None;
-    while download.is_none() {
-        seq += 1;
-        let sent = std::time::Instant::now();
-        ping.write_all(&seq.to_le_bytes()).await.unwrap();
-        ping.read_exact(&mut buf).await.unwrap();
-        assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
-        rtts.push(sent.elapsed().as_secs_f64() * 1e3);
-        if let Some(result) = download_tasks.try_join_next() {
-            download = Some(result);
-        }
-        tokio::time::sleep(PING_INTERVAL).await;
-    }
-    let (downloaded, download_secs) = download.expect("download task never completed").unwrap();
-    let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
+    let arm = tasks
+        .run(async {
+            let mut rtts = Vec::new();
+            let mut seq = 0u64;
+            let mut buf = [0u8; PING_LEN];
+            let mut download = None;
+            while download.is_none() {
+                seq += 1;
+                let sent = std::time::Instant::now();
+                ping.write_all(&seq.to_le_bytes()).await.unwrap();
+                ping.read_exact(&mut buf).await.unwrap();
+                assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
+                rtts.push(sent.elapsed().as_secs_f64() * 1e3);
+                if let Some(result) = download_tasks.try_join_next() {
+                    download = Some(result);
+                }
+                tokio::time::sleep(PING_INTERVAL).await;
+            }
+            let (downloaded, download_secs) =
+                download.expect("download task never completed").unwrap();
+            let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
+            ResponseArm {
+                ping_rtts_ms: rtts,
+                downloaded,
+                download_secs,
+                bulk_lane_wire_pkts,
+            }
+        })
+        .await;
     interactive_pair.stop();
     bulk_pair.stop();
-    ResponseArm {
-        ping_rtts_ms: rtts,
-        downloaded,
-        download_secs,
-        bulk_lane_wire_pkts,
-    }
+    arm
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_survives_independent_impaired_lanes() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (interactive_server, bulk_server, _accepted_lanes) =
         spawn_echo_server(&mut tasks).await.unwrap();
     let interactive_impairment = NetemConfig {
@@ -339,31 +349,35 @@ async fn rtp_mux_survives_independent_impaired_lanes() {
     let connector = connector(&mut tasks, bulk_pair.client_addr());
     let interactive_payload = payload(16 * 1024);
     let bulk_payload = payload(256 * 1024);
-    let (interactive_echo, bulk_echo) = with_timeout(
-        Duration::from_secs(90),
-        "rtp_mux independently impaired lanes",
-        async {
-            tokio::join!(
-                echo_round_trip(
-                    &connector,
-                    interactive_pair.client_addr(),
-                    LaneClass::Interactive,
-                    &interactive_payload
-                ),
-                echo_round_trip(
-                    &connector,
-                    interactive_pair.client_addr(),
-                    LaneClass::Bulk,
-                    &bulk_payload
-                ),
+    tasks
+        .run(async {
+            let (interactive_echo, bulk_echo) = with_timeout(
+                Duration::from_secs(90),
+                "rtp_mux independently impaired lanes",
+                async {
+                    tokio::join!(
+                        echo_round_trip(
+                            &connector,
+                            interactive_pair.client_addr(),
+                            LaneClass::Interactive,
+                            &interactive_payload
+                        ),
+                        echo_round_trip(
+                            &connector,
+                            interactive_pair.client_addr(),
+                            LaneClass::Bulk,
+                            &bulk_payload
+                        ),
+                    )
+                },
             )
-        },
-    )
-    .await;
-    assert_eq!(interactive_echo, interactive_payload);
-    assert_eq!(bulk_echo, bulk_payload);
-    assert!(combined_stats(&interactive_pair).forwarded > 0);
-    assert!(combined_stats(&bulk_pair).forwarded > 0);
+            .await;
+            assert_eq!(interactive_echo, interactive_payload);
+            assert_eq!(bulk_echo, bulk_payload);
+            assert!(combined_stats(&interactive_pair).forwarded > 0);
+            assert!(combined_stats(&bulk_pair).forwarded > 0);
+        })
+        .await;
     interactive_pair.stop();
     bulk_pair.stop();
 }
@@ -421,7 +435,7 @@ struct BidirArm {
 }
 
 async fn run_bidir_arm() -> BidirArm {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_pair =
         NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
@@ -470,37 +484,42 @@ async fn run_bidir_arm() -> BidirArm {
         let mut ack = [0u8; 1];
         upload.read_exact(&mut ack).await.is_ok() && ack[0] == 1
     });
-    let mut rtts = Vec::new();
-    let mut seq = 0u64;
-    let mut buf = [0u8; PING_LEN];
-    let mut download = None;
-    let mut upload = None;
-    while download.is_none() || upload.is_none() {
-        seq += 1;
-        let sent = std::time::Instant::now();
-        ping.write_all(&seq.to_le_bytes()).await.unwrap();
-        ping.read_exact(&mut buf).await.unwrap();
-        assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
-        rtts.push(sent.elapsed().as_secs_f64() * 1e3);
-        if let Some(result) = download_tasks.try_join_next() {
-            download = Some(result);
-        }
-        if let Some(result) = upload_tasks.try_join_next() {
-            upload = Some(result);
-        }
-        tokio::time::sleep(PING_INTERVAL).await;
-    }
-    let downloaded = download.expect("download task never completed").unwrap();
-    let uploaded_ok = upload.expect("upload task never completed").unwrap();
-    let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
+    let arm = tasks
+        .run(async {
+            let mut rtts = Vec::new();
+            let mut seq = 0u64;
+            let mut buf = [0u8; PING_LEN];
+            let mut download = None;
+            let mut upload = None;
+            while download.is_none() || upload.is_none() {
+                seq += 1;
+                let sent = std::time::Instant::now();
+                ping.write_all(&seq.to_le_bytes()).await.unwrap();
+                ping.read_exact(&mut buf).await.unwrap();
+                assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
+                rtts.push(sent.elapsed().as_secs_f64() * 1e3);
+                if let Some(result) = download_tasks.try_join_next() {
+                    download = Some(result);
+                }
+                if let Some(result) = upload_tasks.try_join_next() {
+                    upload = Some(result);
+                }
+                tokio::time::sleep(PING_INTERVAL).await;
+            }
+            let downloaded = download.expect("download task never completed").unwrap();
+            let uploaded_ok = upload.expect("upload task never completed").unwrap();
+            let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
+            BidirArm {
+                ping_rtts_ms: rtts,
+                downloaded,
+                uploaded_ok,
+                bulk_lane_wire_pkts,
+            }
+        })
+        .await;
     interactive_pair.stop();
     bulk_pair.stop();
-    BidirArm {
-        ping_rtts_ms: rtts,
-        downloaded,
-        uploaded_ok,
-        bulk_lane_wire_pkts,
-    }
+    arm
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -554,7 +573,7 @@ struct RecycleArm {
 }
 
 async fn run_recycle_arm() -> RecycleArm {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_fan =
         PerFlowNetem::spawn(interactive_server, || (contended_lane(), contended_lane())).unwrap();
@@ -589,52 +608,57 @@ async fn run_recycle_arm() -> RecycleArm {
         }
     });
     let old_probe = connector.probe_session(addr).expect("session must exist");
-    let mut rtts = Vec::new();
-    let mut seq = 0u64;
-    let mut buf = [0u8; PING_LEN];
-    let mut recycled = false;
-    let mut download = None;
-    while download.is_none() {
-        seq += 1;
-        let sent = std::time::Instant::now();
-        ping.write_all(&seq.to_le_bytes()).await.unwrap();
-        ping.read_exact(&mut buf).await.unwrap();
-        assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
-        rtts.push(sent.elapsed().as_secs_f64() * 1e3);
-        if !recycled
-            && downloaded_gauge.load(std::sync::atomic::Ordering::Relaxed) > 2 * 1024 * 1024
-        {
-            recycled = true;
-            connector.force_redial(addr);
-        }
-        if let Some(result) = download_tasks.try_join_next() {
-            download = Some(result);
-        }
-        tokio::time::sleep(PING_INTERVAL).await;
-    }
-    let (downloaded, download_clean, download_secs) =
-        download.expect("download task never completed").unwrap();
-    let session_replaced = connector
-        .probe_session(addr)
-        .is_some_and(|probe| probe.id() != old_probe.id());
-    let mut old_session_died = false;
-    for _ in 0..100 {
-        if !old_probe.is_alive() {
-            old_session_died = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let arm = tasks
+        .run(async {
+            let mut rtts = Vec::new();
+            let mut seq = 0u64;
+            let mut buf = [0u8; PING_LEN];
+            let mut recycled = false;
+            let mut download = None;
+            while download.is_none() {
+                seq += 1;
+                let sent = std::time::Instant::now();
+                ping.write_all(&seq.to_le_bytes()).await.unwrap();
+                ping.read_exact(&mut buf).await.unwrap();
+                assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
+                rtts.push(sent.elapsed().as_secs_f64() * 1e3);
+                if !recycled
+                    && downloaded_gauge.load(std::sync::atomic::Ordering::Relaxed) > 2 * 1024 * 1024
+                {
+                    recycled = true;
+                    connector.force_redial(addr);
+                }
+                if let Some(result) = download_tasks.try_join_next() {
+                    download = Some(result);
+                }
+                tokio::time::sleep(PING_INTERVAL).await;
+            }
+            let (downloaded, download_clean, download_secs) =
+                download.expect("download task never completed").unwrap();
+            let session_replaced = connector
+                .probe_session(addr)
+                .is_some_and(|probe| probe.id() != old_probe.id());
+            let mut old_session_died = false;
+            for _ in 0..100 {
+                if !old_probe.is_alive() {
+                    old_session_died = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            RecycleArm {
+                ping_rtts_ms: rtts,
+                downloaded,
+                download_clean,
+                download_secs,
+                old_session_died,
+                session_replaced,
+            }
+        })
+        .await;
     interactive_fan.stop();
     bulk_fan.stop();
-    RecycleArm {
-        ping_rtts_ms: rtts,
-        downloaded,
-        download_clean,
-        download_secs,
-        old_session_died,
-        session_replaced,
-    }
+    arm
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -714,7 +738,7 @@ struct ExplorerArm {
 }
 
 async fn run_explorer_arm() -> ExplorerArm {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_flows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let interactive_fan = PerFlowNetem::spawn(interactive_server, {
@@ -783,74 +807,79 @@ async fn run_explorer_arm() -> ExplorerArm {
         }
     });
     let old_probe = connector.probe_session(addr).expect("session must exist");
-    let mut pre_rtts = Vec::new();
-    let mut post_rtts = Vec::new();
-    let mut seq = 0u64;
-    let mut buf = [0u8; PING_LEN];
-    let mut fast_candidate_port: Option<u16> = None;
-    let mut download = None;
-    while download.is_none() {
-        seq += 1;
-        let sent = std::time::Instant::now();
-        ping.write_all(&seq.to_le_bytes()).await.unwrap();
-        ping.read_exact(&mut buf).await.unwrap();
-        assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
-        let rtt = sent.elapsed().as_secs_f64() * 1e3;
-        if fast_candidate_port.is_some() {
-            post_rtts.push(rtt);
-        } else {
-            pre_rtts.push(rtt);
-        }
-        if fast_candidate_port.is_none()
-            && downloaded_gauge.load(std::sync::atomic::Ordering::Relaxed) > 2 * 1024 * 1024
-        {
-            let report = connector.explorer_report(addr).await.unwrap();
-            let fast = report.candidates.iter().find(|candidate| {
-                candidate.alive
-                    && candidate
-                        .rtt
-                        .is_some_and(|rtt| rtt < Duration::from_millis(40))
-            });
-            let active_probed = report.active.is_some_and(|active| active.alive);
-            if let (Some(fast), true) = (fast, active_probed) {
-                fast_candidate_port = Some(fast.local_addr.port());
-                connector.reoptimize(addr);
+    let arm = tasks
+        .run(async {
+            let mut pre_rtts = Vec::new();
+            let mut post_rtts = Vec::new();
+            let mut seq = 0u64;
+            let mut buf = [0u8; PING_LEN];
+            let mut fast_candidate_port: Option<u16> = None;
+            let mut download = None;
+            while download.is_none() {
+                seq += 1;
+                let sent = std::time::Instant::now();
+                ping.write_all(&seq.to_le_bytes()).await.unwrap();
+                ping.read_exact(&mut buf).await.unwrap();
+                assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
+                let rtt = sent.elapsed().as_secs_f64() * 1e3;
+                if fast_candidate_port.is_some() {
+                    post_rtts.push(rtt);
+                } else {
+                    pre_rtts.push(rtt);
+                }
+                if fast_candidate_port.is_none()
+                    && downloaded_gauge.load(std::sync::atomic::Ordering::Relaxed) > 2 * 1024 * 1024
+                {
+                    let report = connector.explorer_report(addr).await.unwrap();
+                    let fast = report.candidates.iter().find(|candidate| {
+                        candidate.alive
+                            && candidate
+                                .rtt
+                                .is_some_and(|rtt| rtt < Duration::from_millis(40))
+                    });
+                    let active_probed = report.active.is_some_and(|active| active.alive);
+                    if let (Some(fast), true) = (fast, active_probed) {
+                        fast_candidate_port = Some(fast.local_addr.port());
+                        connector.reoptimize(addr);
+                    }
+                }
+                if let Some(result) = download_tasks.try_join_next() {
+                    download = Some(result);
+                }
+                tokio::time::sleep(PING_INTERVAL).await;
             }
-        }
-        if let Some(result) = download_tasks.try_join_next() {
-            download = Some(result);
-        }
-        tokio::time::sleep(PING_INTERVAL).await;
-    }
-    let (downloaded, download_clean, download_secs) =
-        download.expect("download task never completed").unwrap();
-    let fast_candidate_port =
-        fast_candidate_port.expect("explorer never converged on the fast tuple");
-    let session_replaced = connector
-        .probe_session(addr)
-        .is_some_and(|probe| probe.id() != old_probe.id());
-    let fresh = connector.connect_stream(addr).await.unwrap();
-    let session_port = fresh.addr().local_addr.port();
-    drop(fresh);
-    let migrated_probe = connector.probe_session(addr).expect("migrated session");
-    connector.reoptimize(addr);
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let noop_survived = connector
-        .probe_session(addr)
-        .is_some_and(|probe| probe.id() == migrated_probe.id());
+            let (downloaded, download_clean, download_secs) =
+                download.expect("download task never completed").unwrap();
+            let fast_candidate_port =
+                fast_candidate_port.expect("explorer never converged on the fast tuple");
+            let session_replaced = connector
+                .probe_session(addr)
+                .is_some_and(|probe| probe.id() != old_probe.id());
+            let fresh = connector.connect_stream(addr).await.unwrap();
+            let session_port = fresh.addr().local_addr.port();
+            drop(fresh);
+            let migrated_probe = connector.probe_session(addr).expect("migrated session");
+            connector.reoptimize(addr);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let noop_survived = connector
+                .probe_session(addr)
+                .is_some_and(|probe| probe.id() == migrated_probe.id());
+            ExplorerArm {
+                pre_rtts_ms: pre_rtts,
+                post_rtts_ms: post_rtts,
+                downloaded,
+                download_clean,
+                download_secs,
+                session_replaced,
+                session_port,
+                fast_candidate_port,
+                noop_survived,
+            }
+        })
+        .await;
     interactive_fan.stop();
     bulk_fan.stop();
-    ExplorerArm {
-        pre_rtts_ms: pre_rtts,
-        post_rtts_ms: post_rtts,
-        downloaded,
-        download_clean,
-        download_secs,
-        session_replaced,
-        session_port,
-        fast_candidate_port,
-        noop_survived,
-    }
+    arm
 }
 
 #[tokio::test(flavor = "multi_thread")]

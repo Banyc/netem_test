@@ -134,7 +134,7 @@ async fn rr_under_bulk_ab(
     let contested_run = Duration::from_secs(contested_run_s);
     let warmup = Duration::from_secs(3);
 
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     // ── solo phase ────────────────────────────────────────────────────────
@@ -197,21 +197,27 @@ async fn rr_under_bulk_ab(
     )
     .await;
 
-    let contested_samples =
-        rr_echo_samples(rr_conn.0, rr_conn.1, msg_bytes, gap, contested_run, warmup).await;
+    let (contested_samples, delivered_bytes) = tasks
+        .run(async {
+            let contested_samples =
+                rr_echo_samples(rr_conn.0, rr_conn.1, msg_bytes, gap, contested_run, warmup).await;
 
-    // Signal the bulk flow to stop and let final bytes drain.
-    bulk_stop.store(true, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let delivered_bytes = delivered.load(Ordering::Relaxed);
-    bulk_pair.stop();
-    rr_pair.stop();
+            // Signal the bulk flow to stop and let final bytes drain.
+            bulk_stop.store(true, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let delivered_bytes = delivered.load(Ordering::Relaxed);
+            bulk_pair.stop();
+            rr_pair.stop();
+            (contested_samples, delivered_bytes)
+        })
+        .await;
 
     // The bulk flow completed its run window; drain it so any panic surfaces.
+    // The keepalive/sink tasks may complete once the upload sessions end;
+    // that happens after the raced body, so it is not an early exit.
     while let Some(result) = bulk_tasks.join_next().await {
         result.unwrap();
     }
-
     // ── analysis ──────────────────────────────────────────────────────────
     let mut solo = solo_samples;
     solo.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -318,7 +324,7 @@ async fn shared_bneck_late_joiner_fairness() {
     let overlap_start = Duration::from_secs(6);
     let bin_width = Duration::from_millis(500);
 
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let mut bulk_tasks = tokio::task::JoinSet::new();
 
     let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
@@ -364,29 +370,36 @@ async fn shared_bneck_late_joiner_fairness() {
     )
     .await;
 
-    // Sample both counters every 500 ms for the whole run.
-    let mut bins_a = Vec::new();
-    let mut bins_b = Vec::new();
-    let mut last_a = 0u64;
-    let mut last_b = 0u64;
-    let sample_start = Instant::now();
-    while sample_start.elapsed() < total_run {
-        tokio::time::sleep(bin_width).await;
-        let now_a = delivered_a.load(Ordering::Relaxed);
-        let now_b = delivered_b.load(Ordering::Relaxed);
-        bins_a.push(now_a - last_a);
-        bins_b.push(now_b - last_b);
-        last_a = now_a;
-        last_b = now_b;
-    }
+    let (bins_a, bins_b) = tasks
+        .run(async {
+            // Sample both counters every 500 ms for the whole run.
+            let mut bins_a = Vec::new();
+            let mut bins_b = Vec::new();
+            let mut last_a = 0u64;
+            let mut last_b = 0u64;
+            let sample_start = Instant::now();
+            while sample_start.elapsed() < total_run {
+                tokio::time::sleep(bin_width).await;
+                let now_a = delivered_a.load(Ordering::Relaxed);
+                let now_b = delivered_b.load(Ordering::Relaxed);
+                bins_a.push(now_a - last_a);
+                bins_b.push(now_b - last_b);
+                last_a = now_a;
+                last_b = now_b;
+            }
 
-    // Wait for the final bytes to drain through the shaped c2s path.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    pair_a.stop();
-    pair_b.stop();
+            // Wait for the final bytes to drain through the shaped c2s path.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            pair_a.stop();
+            pair_b.stop();
+            (bins_a, bins_b)
+        })
+        .await;
 
     // Both flows completed their run windows; drain them so any panic
-    // surfaces.
+    // surfaces. The keepalive/sink tasks may complete once the upload
+    // sessions end; that happens after the raced body, so it is not an
+    // early exit.
     while let Some(result) = bulk_tasks.join_next().await {
         result.unwrap();
     }

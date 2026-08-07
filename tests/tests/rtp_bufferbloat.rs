@@ -61,7 +61,7 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     let floor_mib_s: f64 = capacity_mib_s * GOODPUT_CAPACITY_FLOOR;
 
     let base = Instant::now();
-    let mut server_tasks = tokio::task::JoinSet::new();
+    let mut server_tasks = support::TestScope::new();
     let (sink_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(&mut server_tasks, false, MSS)
         .await
         .unwrap();
@@ -119,83 +119,89 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
         }
     });
 
-    let ping_sent = with_timeout(
-        Duration::from_secs(25),
-        "send sparse pings during bufferbloat",
-        send_timestamped_messages(
-            &mut write,
-            base,
-            128,
-            Duration::from_millis(500),
-            Duration::from_secs(15),
-        ),
-    )
-    .await;
+    server_tasks
+        .run(async {
+            let ping_sent = with_timeout(
+                Duration::from_secs(25),
+                "send sparse pings during bufferbloat",
+                send_timestamped_messages(
+                    &mut write,
+                    base,
+                    128,
+                    Duration::from_millis(500),
+                    Duration::from_secs(15),
+                ),
+            )
+            .await;
 
-    // Sample the queue length every 50 ms while the transfer runs.
-    let mut max_queue = 0usize;
-    let sample_window = Duration::from_secs(15);
-    let sample_start = Instant::now();
-    while sample_start.elapsed() < sample_window {
-        let q = pair.queue_len_c2s();
-        if q > max_queue {
-            max_queue = q;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+            // Sample the queue length every 50 ms while the transfer runs.
+            let mut max_queue = 0usize;
+            let sample_window = Duration::from_secs(15);
+            let sample_start = Instant::now();
+            while sample_start.elapsed() < sample_window {
+                let q = pair.queue_len_c2s();
+                if q > max_queue {
+                    max_queue = q;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
 
-    // Give the final bulk bytes time to drain through the shaped link before
-    // measuring elapsed goodput.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let delivered_bytes = delivered.load(std::sync::atomic::Ordering::Relaxed);
-    let elapsed = bulk_start.elapsed();
-    // The pump has completed its 15s window; drain it so any panic surfaces.
-    while let Some(result) = pump_tasks.join_next().await {
-        result.unwrap();
-    }
-    pair.stop();
-    latency_pair.stop();
+            // Give the final bulk bytes time to drain through the shaped
+            // link before measuring elapsed goodput.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let delivered_bytes = delivered.load(std::sync::atomic::Ordering::Relaxed);
+            let elapsed = bulk_start.elapsed();
+            // The pump has completed its 15s window; drain it so any panic
+            // surfaces.
+            while let Some(result) = pump_tasks.join_next().await {
+                result.unwrap();
+            }
+            pair.stop();
+            latency_pair.stop();
 
-    let stats = combined_stats(&pair);
-    print_perf(
-        "rtp bufferbloat bulk goodput",
-        delivered_bytes as usize,
-        elapsed,
-    );
-    eprintln!("[rtp_bufferbloat] max_queue={max_queue} stats={stats:?}");
+            let stats = combined_stats(&pair);
+            print_perf(
+                "rtp bufferbloat bulk goodput",
+                delivered_bytes as usize,
+                elapsed,
+            );
+            eprintln!("[rtp_bufferbloat] max_queue={max_queue} stats={stats:?}");
 
-    assert!(
-        max_queue <= MAX_QUEUE_FLOOR,
-        "max c2s queue {max_queue} > {MAX_QUEUE_FLOOR}"
-    );
+            assert!(
+                max_queue <= MAX_QUEUE_FLOOR,
+                "max c2s queue {max_queue} > {MAX_QUEUE_FLOOR}"
+            );
 
-    let goodput_mib_s = delivered_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
-    assert!(
-        goodput_mib_s >= floor_mib_s,
-        "goodput {goodput_mib_s:.3} MiB/s < floor {floor_mib_s:.3} MiB/s"
-    );
+            let goodput_mib_s = delivered_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+            assert!(
+                goodput_mib_s >= floor_mib_s,
+                "goodput {goodput_mib_s:.3} MiB/s < floor {floor_mib_s:.3} MiB/s"
+            );
 
-    // The delay-gate rtp build is expected to take zero overflow drops.
-    assert_eq!(
-        stats.overflow_dropped, 0,
-        "delay-gate build must take zero overflow drops, got {stats:?}"
-    );
+            // The delay-gate rtp build is expected to take zero overflow drops.
+            assert_eq!(
+                stats.overflow_dropped, 0,
+                "delay-gate build must take zero overflow drops, got {stats:?}"
+            );
 
-    // Drain the sparse latency samples and assert tail bounds.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let mut samples = Vec::new();
-    while let Ok(latency_ms) = latencies.try_recv() {
-        samples.push(latency_ms);
-    }
-    let received = samples.len() as u64;
-    if received > 0 {
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p50 = percentile(&samples, 0.50);
-        let p99 = percentile(&samples, 0.99);
-        eprintln!(
-            "[rtp_bufferbloat] pings sent={ping_sent} received={received} p50={p50:.1} ms p99={p99:.1} ms"
-        );
-        // Floor: p50 ping latency should stay under ~0.8× the max queue build-up.
-        assert!(p50 <= 800.0, "bufferbloat ping p50 {p50:.1} ms > 800 ms");
-    }
+            // Drain the sparse latency samples and assert tail bounds.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut samples = Vec::new();
+            while let Ok(latency_ms) = latencies.try_recv() {
+                samples.push(latency_ms);
+            }
+            let received = samples.len() as u64;
+            if received > 0 {
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&samples, 0.50);
+                let p99 = percentile(&samples, 0.99);
+                eprintln!(
+                    "[rtp_bufferbloat] pings sent={ping_sent} received={received} p50={p50:.1} ms p99={p99:.1} ms"
+                );
+                // Floor: p50 ping latency should stay under ~0.8× the max queue
+                // build-up.
+                assert!(p50 <= 800.0, "bufferbloat ping p50 {p50:.1} ms > 800 ms");
+            }
+        })
+        .await;
 }

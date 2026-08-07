@@ -85,7 +85,7 @@ async fn contested_rep(
     straggler: Duration,
 ) -> ContestedRepResult {
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, mut latencies, bulk_counter) =
         spawn_mux_latency_bulk_server(&mut tasks, fec, base)
             .await
@@ -156,41 +156,46 @@ async fn contested_rep(
     // Run bulk and ping concurrently. Ping runs for the full window;
     // bulk sleeps BULK_RAMP (1.5s) so the ping has a solo baseline
     // before congestion builds.
-    let ping_window = straggler + BULK_RAMP;
-    let ping_fut = send_tagged_pings(&mut ping_write, base, PING_BYTES, cadence, ping_window);
-    let bulk_fut = run_mux_bulk_stream(&mut bulk_write, Arc::clone(&payload), straggler);
-    let (sent, _written) = tokio::join!(ping_fut, async {
-        tokio::time::sleep(BULK_RAMP).await;
-        bulk_fut.await
-    });
+    let result = tasks
+        .run(async {
+            let ping_window = straggler + BULK_RAMP;
+            let ping_fut =
+                send_tagged_pings(&mut ping_write, base, PING_BYTES, cadence, ping_window);
+            let bulk_fut = run_mux_bulk_stream(&mut bulk_write, Arc::clone(&payload), straggler);
+            let (sent, _written) = tokio::join!(ping_fut, async {
+                tokio::time::sleep(BULK_RAMP).await;
+                bulk_fut.await
+            });
 
-    // Let stragglers drain, then stop the sampler before the pair.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    stop_sampler.store(true, Ordering::Relaxed);
-    // The sampler exits once the stop flag is set; join it so any panic
-    // surfaces.
-    let queue_samples = loop {
-        match sampler_tasks.join_next().await {
-            Some(result) => break result.unwrap(),
-            None => break Vec::new(),
-        }
-    };
+            // Let stragglers drain, then stop the sampler before the pair.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            stop_sampler.store(true, Ordering::Relaxed);
+            // The sampler exits once the stop flag is set; join it so any
+            // panic surfaces.
+            let queue_samples = loop {
+                match sampler_tasks.join_next().await {
+                    Some(result) => break result.unwrap(),
+                    None => break Vec::new(),
+                }
+            };
 
-    // Drain latency channel.
-    let mut samples = Vec::new();
-    while let Ok(lat) = latencies.try_recv() {
-        samples.push(lat);
-    }
+            // Drain latency channel.
+            let mut samples = Vec::new();
+            while let Ok(lat) = latencies.try_recv() {
+                samples.push(lat);
+            }
 
-    let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-    let result = ContestedRepResult {
-        sent,
-        received: samples.len() as u64,
-        latencies: samples,
-        queue_samples,
-        bulk_bytes,
-        bulk_secs: straggler.as_secs_f64(),
-    };
+            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            ContestedRepResult {
+                sent,
+                received: samples.len() as u64,
+                latencies: samples,
+                queue_samples,
+                bulk_bytes,
+                bulk_secs: straggler.as_secs_f64(),
+            }
+        })
+        .await;
 
     pair.stop();
     result

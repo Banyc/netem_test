@@ -56,25 +56,29 @@ const HOSTILE_GOODPUT_FLOOR_MIB_S: f64 = 0.5;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_direct() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
 
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
-    for _ in 0..PROBE_ITERS {
-        let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-        let start = Instant::now();
-        let got = with_timeout(
-            Duration::from_secs(60),
-            "rtp 4MiB direct echo",
-            rtp_echo_payload(read, write, &data),
-        )
+    tasks
+        .run(async {
+            for _ in 0..PROBE_ITERS {
+                let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
+                let start = Instant::now();
+                let got = with_timeout(
+                    Duration::from_secs(60),
+                    "rtp 4MiB direct echo",
+                    rtp_echo_payload(read, write, &data),
+                )
+                .await;
+                let elapsed = start.elapsed();
+                assert_eq!(got, data);
+                samples.push(elapsed);
+            }
+        })
         .await;
-        let elapsed = start.elapsed();
-        assert_eq!(got, data);
-        samples.push(elapsed);
-    }
 
     print_median_worst("rtp 4MiB direct echo (one-way bytes)", BULK, samples);
 
@@ -90,7 +94,7 @@ async fn probe_rtp_echo_4mib_direct() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_mss8k() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, LOOPBACK_MSS)
         .await
         .unwrap();
@@ -98,20 +102,24 @@ async fn probe_rtp_echo_4mib_mss8k() {
 
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
-    for _ in 0..PROBE_ITERS {
-        let (read, write, _supervisor) =
-            rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
-        let start = Instant::now();
-        let got = with_timeout(
-            Duration::from_secs(60),
-            "rtp 4MiB 8KiB-MSS echo",
-            rtp_echo_payload(read, write, &data),
-        )
+    tasks
+        .run(async {
+            for _ in 0..PROBE_ITERS {
+                let (read, write, _supervisor) =
+                    rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
+                let start = Instant::now();
+                let got = with_timeout(
+                    Duration::from_secs(60),
+                    "rtp 4MiB 8KiB-MSS echo",
+                    rtp_echo_payload(read, write, &data),
+                )
+                .await;
+                let elapsed = start.elapsed();
+                assert_eq!(got, data);
+                samples.push(elapsed);
+            }
+        })
         .await;
-        let elapsed = start.elapsed();
-        assert_eq!(got, data);
-        samples.push(elapsed);
-    }
 
     print_median_worst("rtp 4MiB 8KiB-MSS echo (one-way bytes)", BULK, samples);
 
@@ -134,40 +142,52 @@ async fn probe_rtp_echo_4mib_mss8k() {
 async fn probe_mux_sink_4mib_direct() {
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
 
+    // Pre-spawn one one-shot mux sink server per iteration; each accepts its
+    // first (and only) RTP connection during that iteration and its task
+    // completes once the client closes the session afterwards.
+    let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
-        let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
+        let (server_addr, received) = spawn_mux_over_rtp_sink_server(&mut tasks.tasks, false)
             .await
             .unwrap();
-        let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-        let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-        let (opener, _spawner) = mux_client_connect(read, write);
-
-        let elapsed = with_timeout(
-            Duration::from_secs(60),
-            "mux sink 4MiB direct upload",
-            mux_send_payload(&opener, &data),
-        )
-        .await;
-
-        let got = with_timeout(
-            Duration::from_secs(60),
-            "mux sink 4MiB direct receive",
-            async { received.recv().await.expect("sink channel closed") },
-        )
-        .await;
-
-        assert_eq!(got, data, "mux sink must deliver all 4MiB intact");
-        samples.push(elapsed);
-
-        pair.stop();
-        let stats = combined_stats(&pair);
-        assert!(
-            stats.forwarded > 0,
-            "proxy should forward packets, got {stats:?}"
-        );
+        servers.push((server_addr, received));
     }
+
+    tasks
+        .run(async {
+            for (server_addr, mut received) in servers {
+                let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+                let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
+                let (opener, _spawner) = mux_client_connect(read, write);
+
+                let elapsed = with_timeout(
+                    Duration::from_secs(60),
+                    "mux sink 4MiB direct upload",
+                    mux_send_payload(&opener, &data),
+                )
+                .await;
+
+                let got = with_timeout(
+                    Duration::from_secs(60),
+                    "mux sink 4MiB direct receive",
+                    async { received.recv().await.expect("sink channel closed") },
+                )
+                .await;
+
+                assert_eq!(got, data, "mux sink must deliver all 4MiB intact");
+                samples.push(elapsed);
+
+                pair.stop();
+                let stats = combined_stats(&pair);
+                assert!(
+                    stats.forwarded > 0,
+                    "proxy should forward packets, got {stats:?}"
+                );
+            }
+        })
+        .await;
 
     print_median_worst("mux sink 4MiB direct", BULK, samples);
 }
@@ -178,42 +198,53 @@ async fn probe_mux_sink_4mib_direct() {
 async fn probe_mux_sink_4mib_mss8k() {
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
 
+    // Pre-spawn one one-shot mux sink server per iteration; each accepts its
+    // first (and only) RTP connection during that iteration.
+    let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
-        let (server_addr, mut received) =
-            spawn_mux_over_rtp_sink_server_with_mss(&mut tasks, false, LOOPBACK_MSS)
+        let (server_addr, received) =
+            spawn_mux_over_rtp_sink_server_with_mss(&mut tasks.tasks, false, LOOPBACK_MSS)
                 .await
                 .unwrap();
-        let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-        let (read, write, _supervisor) =
-            rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
-        let (opener, _spawner) = mux_client_connect(read, write);
-
-        let elapsed = with_timeout(
-            Duration::from_secs(60),
-            "mux sink 4MiB 8KiB-MSS upload",
-            mux_send_payload(&opener, &data),
-        )
-        .await;
-
-        let got = with_timeout(
-            Duration::from_secs(60),
-            "mux sink 4MiB 8KiB-MSS receive",
-            async { received.recv().await.expect("sink channel closed") },
-        )
-        .await;
-
-        assert_eq!(got, data, "mux sink must deliver all 4MiB intact");
-        samples.push(elapsed);
-
-        pair.stop();
-        let stats = combined_stats(&pair);
-        assert!(
-            stats.forwarded > 0,
-            "proxy should forward packets, got {stats:?}"
-        );
+        servers.push((server_addr, received));
     }
+
+    tasks
+        .run(async {
+            for (server_addr, mut received) in servers {
+                let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+                let (read, write, _supervisor) =
+                    rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
+                let (opener, _spawner) = mux_client_connect(read, write);
+
+                let elapsed = with_timeout(
+                    Duration::from_secs(60),
+                    "mux sink 4MiB 8KiB-MSS upload",
+                    mux_send_payload(&opener, &data),
+                )
+                .await;
+
+                let got = with_timeout(
+                    Duration::from_secs(60),
+                    "mux sink 4MiB 8KiB-MSS receive",
+                    async { received.recv().await.expect("sink channel closed") },
+                )
+                .await;
+
+                assert_eq!(got, data, "mux sink must deliver all 4MiB intact");
+                samples.push(elapsed);
+
+                pair.stop();
+                let stats = combined_stats(&pair);
+                assert!(
+                    stats.forwarded > 0,
+                    "proxy should forward packets, got {stats:?}"
+                );
+            }
+        })
+        .await;
 
     print_median_worst("mux sink 4MiB 8KiB-MSS", BULK, samples);
 }
@@ -229,33 +260,44 @@ async fn probe_mux_sink_4mib_mss8k() {
 async fn probe_mux_echo_1mib_direct() {
     let data = payload(1024 * 1024);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
 
+    // Pre-spawn one one-shot mux echo server per iteration; each accepts its
+    // first (and only) RTP connection during that iteration.
+    let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
-        let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
+        let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks.tasks, false)
             .await
             .unwrap();
-        let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-        let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-        let (opener, _spawner) = mux_client_connect(read, write);
-
-        let (got, elapsed) = with_timeout(
-            Duration::from_secs(60),
-            "mux echo 1MiB direct round-trip",
-            mux_timed_echo_round_trip(&opener, &data),
-        )
-        .await;
-
-        assert_eq!(got, data, "mux echo must deliver all 1MiB intact");
-        samples.push(elapsed);
-
-        pair.stop();
-        let stats = combined_stats(&pair);
-        assert!(
-            stats.forwarded > 0,
-            "proxy should forward packets, got {stats:?}"
-        );
+        servers.push(server_addr);
     }
+
+    tasks
+        .run(async {
+            for server_addr in servers {
+                let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+                let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
+                let (opener, _spawner) = mux_client_connect(read, write);
+
+                let (got, elapsed) = with_timeout(
+                    Duration::from_secs(60),
+                    "mux echo 1MiB direct round-trip",
+                    mux_timed_echo_round_trip(&opener, &data),
+                )
+                .await;
+
+                assert_eq!(got, data, "mux echo must deliver all 1MiB intact");
+                samples.push(elapsed);
+
+                pair.stop();
+                let stats = combined_stats(&pair);
+                assert!(
+                    stats.forwarded > 0,
+                    "proxy should forward packets, got {stats:?}"
+                );
+            }
+        })
+        .await;
 
     print_median_worst("mux echo 1MiB direct (one-way bytes)", 1024 * 1024, samples);
 }
@@ -270,34 +312,46 @@ async fn probe_mux_echo_1mib_direct() {
 async fn probe_mux_echo_1mib_mss8k() {
     let data = payload(1024 * 1024);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
 
+    // Pre-spawn one one-shot mux echo server per iteration; each accepts its
+    // first (and only) RTP connection during that iteration.
+    let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
-        let server_addr = spawn_mux_over_rtp_echo_server_with_mss(&mut tasks, false, LOOPBACK_MSS)
-            .await
-            .unwrap();
-        let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-        let (read, write, _supervisor) =
-            rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
-        let (opener, _spawner) = mux_client_connect(read, write);
-
-        let (got, elapsed) = with_timeout(
-            Duration::from_secs(60),
-            "mux echo 1MiB 8KiB-MSS round-trip",
-            mux_timed_echo_round_trip(&opener, &data),
-        )
-        .await;
-
-        assert_eq!(got, data, "mux echo must deliver all 1MiB intact");
-        samples.push(elapsed);
-
-        pair.stop();
-        let stats = combined_stats(&pair);
-        assert!(
-            stats.forwarded > 0,
-            "proxy should forward packets, got {stats:?}"
-        );
+        let server_addr =
+            spawn_mux_over_rtp_echo_server_with_mss(&mut tasks.tasks, false, LOOPBACK_MSS)
+                .await
+                .unwrap();
+        servers.push(server_addr);
     }
+
+    tasks
+        .run(async {
+            for server_addr in servers {
+                let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+                let (read, write, _supervisor) =
+                    rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
+                let (opener, _spawner) = mux_client_connect(read, write);
+
+                let (got, elapsed) = with_timeout(
+                    Duration::from_secs(60),
+                    "mux echo 1MiB 8KiB-MSS round-trip",
+                    mux_timed_echo_round_trip(&opener, &data),
+                )
+                .await;
+
+                assert_eq!(got, data, "mux echo must deliver all 1MiB intact");
+                samples.push(elapsed);
+
+                pair.stop();
+                let stats = combined_stats(&pair);
+                assert!(
+                    stats.forwarded > 0,
+                    "proxy should forward packets, got {stats:?}"
+                );
+            }
+        })
+        .await;
 
     print_median_worst(
         "mux echo 1MiB 8KiB-MSS (one-way bytes)",
@@ -318,7 +372,7 @@ async fn probe_hostile_goodput_30s() {
     const WINDOW: f64 = 30.0;
     const HOSTILE_BULK: usize = 128 * 1024 * 1024;
 
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, progress) =
         spawn_mux_over_rtp_counting_sink_server(&mut tasks, false, LOOPBACK_MSS)
             .await
@@ -346,47 +400,52 @@ async fn probe_hostile_goodput_30s() {
     let start = Instant::now();
 
     // Keep the write half busy and the read half open for the full window.
-    // Parked for the window; the owning JoinSet aborts it at scope end.
+    // Parked for the window; the owning scope aborts it at scope end.
     let _writer = tasks.spawn(async move {
         let _ = stream_write.write_all(&data).await;
     });
 
-    tokio::time::sleep(Duration::from_secs_f64(WINDOW)).await;
-    let delivered = progress.delivered_bytes();
-    let elapsed = start.elapsed();
+    tasks
+        .run(async {
+            tokio::time::sleep(Duration::from_secs_f64(WINDOW)).await;
+            let delivered = progress.delivered_bytes();
+            let elapsed = start.elapsed();
 
-    pair_ref.stop();
-    let stats = combined_stats(pair_ref);
-    assert!(
-        stats.dropped > 0 && stats.delayed > 0,
-        "hostile link should drop and delay packets, got {stats:?}"
-    );
+            pair_ref.stop();
+            let stats = combined_stats(pair_ref);
+            assert!(
+                stats.dropped > 0 && stats.delayed > 0,
+                "hostile link should drop and delay packets, got {stats:?}"
+            );
 
-    // The sink verifies every accepted byte but a corrupt byte only freezes the
-    // counter, so the freeze must be asserted explicitly rather than left to the
-    // goodput floor.
-    assert!(
-        !progress.is_corrupt(),
-        "sink saw bytes diverging from the payload pattern"
-    );
-    assert!(
-        delivered <= HOSTILE_BULK as u64,
-        "sink counted more bytes than were sent: {delivered}"
-    );
+            // The sink verifies every accepted byte but a corrupt byte only
+            // freezes the counter, so the freeze must be asserted explicitly
+            // rather than left to the goodput floor.
+            assert!(
+                !progress.is_corrupt(),
+                "sink saw bytes diverging from the payload pattern"
+            );
+            assert!(
+                delivered <= HOSTILE_BULK as u64,
+                "sink counted more bytes than were sent: {delivered}"
+            );
 
-    let goodput_mib_s = delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
-    assert!(
-        goodput_mib_s >= HOSTILE_GOODPUT_FLOOR_MIB_S,
-        "goodput {goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s"
-    );
+            let goodput_mib_s = delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+            assert!(
+                goodput_mib_s >= HOSTILE_GOODPUT_FLOOR_MIB_S,
+                "goodput {goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s"
+            );
 
-    print_perf(
-        "mux-over-rtp hostile 30s goodput window",
-        delivered as usize,
-        elapsed,
-    );
-    eprintln!("[stats] {stats:?}");
+            print_perf(
+                "mux-over-rtp hostile 30s goodput window",
+                delivered as usize,
+                elapsed,
+            );
+            eprintln!("[stats] {stats:?}");
 
-    // Keep the stream read half alive until after the delivered snapshot.
-    let _ = stream_read;
+            // Keep the stream read half alive until after the delivered
+            // snapshot.
+            let _ = stream_read;
+        })
+        .await;
 }

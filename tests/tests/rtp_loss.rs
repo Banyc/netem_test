@@ -26,21 +26,24 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp loss-recovery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_survives_mild_loss_400kib() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
 
     let payload = payload(400 * 1024);
-    let got = with_timeout(
-        Duration::from_secs(60),
-        "rtp lossy 400KiB echo",
-        rtp_echo_payload(read, write, &payload),
-    )
-    .await;
-
-    assert_eq!(got, payload, "reliable layer must recover all 400KiB");
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(60),
+                "rtp lossy 400KiB echo",
+                rtp_echo_payload(read, write, &payload),
+            )
+            .await;
+            assert_eq!(got, payload, "reliable layer must recover all 400KiB");
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);

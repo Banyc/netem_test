@@ -74,7 +74,7 @@ async fn spawn_mux_bulk_sink(
 /// `label` is used only for logging. Returns the total bytes delivered at the
 /// server-side sink.
 async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, delivered) = spawn_mux_bulk_sink(&mut tasks).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
@@ -109,24 +109,31 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
         }
     });
 
-    let stop = Arc::new(AtomicBool::new(false));
     let payload = cyclic_payload(CHUNK);
     let start = Instant::now();
-    while !stop.load(Ordering::Relaxed) {
-        if start.elapsed() >= BULK_WINDOW {
-            stop.store(true, Ordering::Relaxed);
-            break;
-        }
-        match stream_write.write_all(&payload[..CHUNK]).await {
-            Ok(()) => {}
-            Err(_) => break,
-        }
-    }
-    let elapsed = start.elapsed();
-    let delivered_at_window = delivered.load(Ordering::Relaxed);
-    let _ = stream_write.shutdown();
+    let (elapsed, delivered_at_window) = tasks
+        .run(async {
+            let stop = Arc::new(AtomicBool::new(false));
+            while !stop.load(Ordering::Relaxed) {
+                if start.elapsed() >= BULK_WINDOW {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                match stream_write.write_all(&payload[..CHUNK]).await {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            let elapsed = start.elapsed();
+            let delivered_at_window = delivered.load(Ordering::Relaxed);
+            let _ = stream_write.shutdown();
+            (elapsed, delivered_at_window)
+        })
+        .await;
 
     // Wait for the mux supervision tasks to settle before stopping the pair.
+    // This ends the client session, after which the server task completes;
+    // that happens outside the raced body, so it is not an early exit.
     spawner.shutdown().await;
     pair.stop();
 
@@ -147,7 +154,7 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 /// The sink is [`support::spawn_rtp_byte_sink_server`]. Returns the total bytes
 /// delivered at the server-side sink.
 async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (sink_addr, delivered) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
     let pair = NetemPair::spawn(sink_addr, c2s, s2c).unwrap();
 
@@ -156,16 +163,22 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
         .unwrap();
     let payload = cyclic_payload(CHUNK);
     let start = Instant::now();
-    while start.elapsed() < BULK_WINDOW {
-        match writer.write_all(&payload[..CHUNK]).await {
-            Ok(()) => {}
-            Err(_) => break,
-        }
-    }
+    tasks
+        .run(async {
+            while start.elapsed() < BULK_WINDOW {
+                match writer.write_all(&payload[..CHUNK]).await {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
     let elapsed = start.elapsed();
     let delivered_at_window = delivered.load(Ordering::Relaxed);
 
     // Explicitly drop the writer so the server sees EOF and stops counting.
+    // The server task then completes; that happens outside the raced body,
+    // so it is not an early exit.
     drop(writer);
     // Give stragglers time to drain before stopping the proxy.
     tokio::time::sleep(Duration::from_secs(3)).await;

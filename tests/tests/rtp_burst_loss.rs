@@ -181,7 +181,7 @@ async fn run_rtp_sink_upload(
     data: &'static [u8],
     window: Duration,
 ) -> (NetemPair, u64) {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(&mut tasks, false, MSS)
         .await
         .unwrap();
@@ -203,14 +203,19 @@ async fn run_rtp_sink_upload(
         }
     });
 
-    tokio::time::sleep(window).await;
-    let d = delivered.load(Ordering::Relaxed);
-    // The pump ran its full window and completed; drain it so any panic
-    // surfaces. The parked server/keepalive tasks are aborted by the owning
-    // JoinSet at scope end.
-    while let Some(result) = pump_tasks.join_next().await {
-        result.unwrap();
-    }
+    let d = tasks
+        .run(async {
+            tokio::time::sleep(window).await;
+            let d = delivered.load(Ordering::Relaxed);
+            // The pump ran its full window and completed; drain it so any
+            // panic surfaces. The parked server/keepalive tasks are aborted
+            // by the owning scope at scope end.
+            while let Some(result) = pump_tasks.join_next().await {
+                result.unwrap();
+            }
+            d
+        })
+        .await;
     (pair, d)
 }
 
@@ -230,7 +235,7 @@ async fn run_rtp_sink_upload(
 #[ignore = "burst-loss goodput/tail-latency regression; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     let base = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let (server_addr, mut latencies) = spawn_mux_msg_latency_sink(&mut tasks, false, base)
         .await
         .unwrap();
@@ -271,25 +276,31 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
         }
     });
 
-    let sent = with_timeout(
-        Duration::from_secs(80),
-        "send sparse timestamped messages",
-        send_timestamped_messages(
-            &mut stream_write,
-            base,
-            SPARSE_MSG_BYTES,
-            SPARSE_MSG_INTERVAL,
-            SPARSE_MSG_INTERVAL * SPARSE_MSG_COUNT as u32,
-        ),
-    )
-    .await;
+    let (sent, mut samples) = tasks
+        .run(async {
+            let sent = with_timeout(
+                Duration::from_secs(80),
+                "send sparse timestamped messages",
+                send_timestamped_messages(
+                    &mut stream_write,
+                    base,
+                    SPARSE_MSG_BYTES,
+                    SPARSE_MSG_INTERVAL,
+                    SPARSE_MSG_INTERVAL * SPARSE_MSG_COUNT as u32,
+                ),
+            )
+            .await;
 
-    // Give stragglers a few RTTs to arrive, then drain the latency channel.
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    let mut samples = Vec::new();
-    while let Ok(latency_ms) = latencies.try_recv() {
-        samples.push(latency_ms);
-    }
+            // Give stragglers a few RTTs to arrive, then drain the latency
+            // channel.
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let mut samples = Vec::new();
+            while let Ok(latency_ms) = latencies.try_recv() {
+                samples.push(latency_ms);
+            }
+            (sent, samples)
+        })
+        .await;
     pair.stop();
 
     let received = samples.len() as u64;

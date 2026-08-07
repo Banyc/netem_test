@@ -76,7 +76,7 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
     rt.block_on(async {
         let base = Instant::now();
         let start = Instant::now();
-        let mut tasks = tokio::task::JoinSet::new();
+        let mut tasks = support::TestScope::new();
 
         let (server_addr, mut latency_rx) =
             spawn_rtp_msg_latency_sink(&mut tasks, false, base).await.unwrap();
@@ -147,12 +147,14 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
         let s2c_before = pair.stats_s2c().forwarded;
         let c2s_before = pair.stats_c2s();
 
-        let mut heartbeat_count = 0u64;
-        let mut write_error: Option<std::io::ErrorKind> = None;
-        let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
+        let (write_error, heartbeat_count, reverse_traffic) = tasks
+            .run(async {
+                let mut heartbeat_count = 0u64;
+                let mut write_error: Option<std::io::ErrorKind> = None;
+                let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
 
-        loop {
-            if start.elapsed() >= MAX_DURATION {
+                loop {
+                    if start.elapsed() >= MAX_DURATION {
                 panic!(
                     "Connection stayed alive >{:?} without cumulative progress; \
                      delivered {} post-hole frames",
@@ -191,7 +193,11 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
                     break;
                 }
             }
-        }
+                }
+
+                (write_error, heartbeat_count, reverse_traffic)
+            })
+            .await;
 
         let termination_time = Instant::now();
 
@@ -281,7 +287,7 @@ fn rtp_permanent_hole_liveness_smoke() {
     rt.block_on(async {
         let base = Instant::now();
         let start = Instant::now();
-        let mut tasks = tokio::task::JoinSet::new();
+        let mut tasks = support::TestScope::new();
 
         let (server_addr, mut latency_rx) = spawn_rtp_msg_latency_sink(&mut tasks, false, base)
             .await
@@ -361,16 +367,18 @@ fn rtp_permanent_hole_liveness_smoke() {
         let s2c_before = pair.stats_s2c().forwarded;
         let c2s_before = pair.stats_c2s();
 
-        let mut post_hole_writes = 0u64;
-        let mut write_error: Option<std::io::ErrorKind> = None;
-        let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
-
         let max_duration = Duration::from_secs(5);
         let post_hole_interval = Duration::from_millis(100);
         let msg = support::payload::payload(MSG_BYTES);
 
-        loop {
-            if start.elapsed() >= max_duration {
+        let (write_error, post_hole_writes) = tasks
+            .run(async {
+                let mut post_hole_writes = 0u64;
+                let mut write_error: Option<std::io::ErrorKind> = None;
+                let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
+
+                loop {
+                    if start.elapsed() >= max_duration {
                 panic!(
                     "Connection stayed alive >{:?} without cumulative progress; \
                  delivered {} post-hole writes",
@@ -403,7 +411,11 @@ fn rtp_permanent_hole_liveness_smoke() {
                     break;
                 }
             }
-        }
+                }
+
+                (write_error, post_hole_writes)
+            })
+            .await;
 
         let c2s_after = pair.stats_c2s();
         let s2c_after = pair.stats_s2c();

@@ -28,7 +28,7 @@ mod support;
 async fn netem_pair_raw_udp_echo_clean_link() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     tasks.spawn(async move {
         let mut buf = [0u8; 64];
         while let Ok((n, from)) = echo.recv_from(&mut buf).await {
@@ -40,12 +40,16 @@ async fn netem_pair_raw_udp_echo_clean_link() {
     let proxy_addr = pair.client_addr();
 
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    client.send_to(b"bidir-hello", proxy_addr).await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = with_timeout(Duration::from_secs(2), "raw echo", client.recv(&mut buf))
-        .await
-        .unwrap();
-    assert_eq!(&buf[..n], b"bidir-hello");
+    tasks
+        .run(async {
+            client.send_to(b"bidir-hello", proxy_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = with_timeout(Duration::from_secs(2), "raw echo", client.recv(&mut buf))
+                .await
+                .unwrap();
+            assert_eq!(&buf[..n], b"bidir-hello");
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -64,7 +68,7 @@ async fn netem_pair_raw_udp_echo_clean_link() {
 async fn netem_pair_raw_udp_latency_is_observable() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     tasks.spawn(async move {
         let mut buf = [0u8; 64];
         while let Ok((n, from)) = echo.recv_from(&mut buf).await {
@@ -77,23 +81,27 @@ async fn netem_pair_raw_udp_latency_is_observable() {
     let proxy_addr = pair.client_addr();
 
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let start = std::time::Instant::now();
-    client.send_to(b"ping", proxy_addr).await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = with_timeout(
-        Duration::from_secs(2),
-        "raw latency echo",
-        client.recv(&mut buf),
-    )
-    .await
-    .unwrap();
-    let elapsed = start.elapsed();
+    tasks
+        .run(async {
+            let start = std::time::Instant::now();
+            client.send_to(b"ping", proxy_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = with_timeout(
+                Duration::from_secs(2),
+                "raw latency echo",
+                client.recv(&mut buf),
+            )
+            .await
+            .unwrap();
+            let elapsed = start.elapsed();
 
-    assert_eq!(&buf[..n], b"ping");
-    assert!(
-        elapsed >= one_way,
-        "round trip {elapsed:?} should be >= one-way latency {one_way:?}",
-    );
+            assert_eq!(&buf[..n], b"ping");
+            assert!(
+                elapsed >= one_way,
+                "round trip {elapsed:?} should be >= one-way latency {one_way:?}",
+            );
+        })
+        .await;
 
     pair.stop();
 }

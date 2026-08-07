@@ -18,6 +18,12 @@ pub(crate) mod prng;
 pub(crate) mod rtp;
 pub(crate) mod rtp_mux;
 pub(crate) mod stats;
+pub(crate) mod task_scope;
+
+// Re-exported for the scenario files; targets that spawn no background tasks
+// (e.g. `netem_scenarios`) do not reference it.
+#[allow(unused_imports)]
+pub(crate) use task_scope::TestScope;
 
 pub mod contested;
 
@@ -61,15 +67,19 @@ pub(crate) fn spawn_test_task_reaper(
 }
 
 /// Submit a test-owned task future; panics if the bounded submission
-/// channel is full (the reaper is not draining), mirroring
-/// [`try_send_observation`].
+/// channel is full (the reaper is not draining) or closed (the reaper
+/// stopped unexpectedly), mirroring [`try_send_observation`]. A closed
+/// channel must fail the test too: silently dropping the submitted future
+/// would hide a task the test is relying on.
 pub(crate) fn submit_test_task(tx: &tokio::sync::mpsc::Sender<TestTask>, fut: TestTask) {
     match tx.try_send(fut) {
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             panic!("test task submission channel is full; the reaper is not draining")
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            panic!("test task reaper stopped unexpectedly")
+        }
     }
 }
 

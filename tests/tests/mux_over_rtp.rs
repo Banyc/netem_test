@@ -27,7 +27,7 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_over_netem_clean_link_echoes() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
         .await
         .unwrap();
@@ -37,14 +37,17 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
     let (opener, _spawner) = mux_client_connect(read, write);
 
     let payload = b"mux-rtp-netem";
-    let got = with_timeout(
-        Duration::from_secs(15),
-        "mux-over-rtp clean echo",
-        mux_echo_round_trip(&opener, payload),
-    )
-    .await;
-
-    assert_eq!(got, payload);
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(15),
+                "mux-over-rtp clean echo",
+                mux_echo_round_trip(&opener, payload),
+            )
+            .await;
+            assert_eq!(got, payload);
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
@@ -59,7 +62,7 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_survives_netem_latency() {
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = support::TestScope::new();
     let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
         .await
         .unwrap();
@@ -74,14 +77,17 @@ async fn mux_over_rtp_survives_netem_latency() {
     let (opener, _spawner) = mux_client_connect(read, write);
 
     let payload = b"mux-over-rtp-through-netem";
-    let got = with_timeout(
-        Duration::from_secs(15),
-        "mux-over-rtp latency echo",
-        mux_echo_round_trip(&opener, payload),
-    )
-    .await;
-
-    assert_eq!(got, payload, "mux stream must deliver all data intact");
+    tasks
+        .run(async {
+            let got = with_timeout(
+                Duration::from_secs(15),
+                "mux-over-rtp latency echo",
+                mux_echo_round_trip(&opener, payload),
+            )
+            .await;
+            assert_eq!(got, payload, "mux stream must deliver all data intact");
+        })
+        .await;
 
     pair.stop();
     let stats = combined_stats(&pair);
