@@ -50,7 +50,7 @@ fn connector(bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
         SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
     });
     let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
-    RtpMuxConnector::with_config(RtpMuxConnectorConfig {
+    let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
         bind,
         bulk_addr,
         fec: false,
@@ -58,7 +58,9 @@ fn connector(bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
             enabled: false,
             ..ExplorerConfig::default()
         },
-    })
+    });
+    tokio::spawn(driver);
+    connector
 }
 
 async fn echo_round_trip(
@@ -669,17 +671,21 @@ async fn run_explorer_arm() -> ExplorerArm {
     });
     let bulk_proxy_addr = bulk_fan.client_addr();
     let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
-    let connector = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
-        bind,
-        bulk_addr,
-        fec: false,
-        explorer: ExplorerConfig {
-            enabled: true,
-            probe_mean_interval: Duration::from_millis(250),
-            rotation_period: Duration::from_secs(60),
-            ..ExplorerConfig::default()
-        },
-    });
+    let connector = {
+        let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
+            bind,
+            bulk_addr,
+            fec: false,
+            explorer: ExplorerConfig {
+                enabled: true,
+                probe_mean_interval: Duration::from_millis(250),
+                rotation_period: Duration::from_secs(60),
+                ..ExplorerConfig::default()
+            },
+        });
+        tokio::spawn(driver);
+        connector
+    };
     let addr = interactive_fan.client_addr();
     let mut ping = connector.connect_stream(addr).await.unwrap();
     ping.write_all(&[CMD_PING]).await.unwrap();

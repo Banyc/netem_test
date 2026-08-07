@@ -61,15 +61,18 @@ pub fn rtp_mux_connector(
         std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
     });
     let bulk_addr: rtp_mux::BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
-    rtp_mux::RtpMuxConnector::with_config(rtp_mux::RtpMuxConnectorConfig {
-        bind,
-        bulk_addr,
-        fec,
-        explorer: rtp_mux::ExplorerConfig {
-            enabled: false,
-            ..rtp_mux::ExplorerConfig::default()
-        },
-    })
+    let (connector, driver) =
+        rtp_mux::RtpMuxConnector::with_config(rtp_mux::RtpMuxConnectorConfig {
+            bind,
+            bulk_addr,
+            fec,
+            explorer: rtp_mux::ExplorerConfig {
+                enabled: false,
+                ..rtp_mux::ExplorerConfig::default()
+            },
+        });
+    tokio::spawn(driver);
+    connector
 }
 
 pub fn spawn_tagged_stream_sink(
