@@ -15,7 +15,13 @@ use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
 /// streams are classified by lane class: interactive-lane streams are treated
 /// as timestamped latency streams; bulk-lane streams are treated as
 /// deterministic byte sinks.
+///
+/// The returned last element is the shared session scope: session futures
+/// spawned by the `SessionSpawner` and the per-stream sink tasks all land in
+/// this `JoinSet`. The caller must keep the `Arc` alive for the server's
+/// lifetime and drops it to abort those tasks.
 pub async fn spawn_rtp_mux_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -23,6 +29,7 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
+    Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
 )> {
     let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0", fec).await?;
     let interactive_addr = server.listener().local_addr();
@@ -30,29 +37,39 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let bulk_for_server = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
-        let spawner = rtp_mux::SessionSpawner::new(|fut| {
-            tokio::spawn(fut);
-        });
-        let _ = server
-            .serve(spawner, move |stream| {
-                let source_lane = stream.source_lane();
-                let (reader, writer) = tokio::io::split(stream);
-                spawn_tagged_stream_sink(
-                    reader,
-                    writer,
-                    tx.clone(),
-                    Arc::clone(&bulk_for_server),
-                    base,
-                    source_lane == mux::LaneClass::Interactive,
-                );
-            })
-            .await;
+    let streams: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>> = Arc::default();
+    tasks.spawn({
+        let streams = Arc::clone(&streams);
+        async move {
+            let spawner = rtp_mux::SessionSpawner::new({
+                let streams = Arc::clone(&streams);
+                move |fut| {
+                    let mut set = streams.lock().unwrap();
+                    set.spawn(fut);
+                }
+            });
+            let _ = server
+                .serve(spawner, move |stream| {
+                    let source_lane = stream.source_lane();
+                    let (reader, writer) = tokio::io::split(stream);
+                    spawn_tagged_stream_sink(
+                        &streams,
+                        reader,
+                        writer,
+                        tx.clone(),
+                        Arc::clone(&bulk_for_server),
+                        base,
+                        source_lane == mux::LaneClass::Interactive,
+                    );
+                })
+                .await;
+        }
     });
-    Ok((interactive_addr, bulk_addr, rx, bulk_delivered))
+    Ok((interactive_addr, bulk_addr, rx, bulk_delivered, streams))
 }
 
 pub fn rtp_mux_connector(
+    tasks: &mut tokio::task::JoinSet<()>,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
 ) -> rtp_mux::RtpMuxConnector {
@@ -71,11 +88,12 @@ pub fn rtp_mux_connector(
                 ..rtp_mux::ExplorerConfig::default()
             },
         });
-    tokio::spawn(driver);
+    tasks.spawn(driver);
     connector
 }
 
 pub fn spawn_tagged_stream_sink(
+    streams: &Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     mut writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     tx: mpsc::Sender<(u8, f64)>,
@@ -83,7 +101,8 @@ pub fn spawn_tagged_stream_sink(
     base: Instant,
     is_interactive: bool,
 ) {
-    tokio::spawn(async move {
+    let streams = Arc::clone(streams);
+    streams.lock().unwrap().spawn(async move {
         let mut tag = [0u8; 1];
         if reader.read_exact(&mut tag).await.is_err() {
             let _ = writer.shutdown().await;

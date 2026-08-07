@@ -24,7 +24,8 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp+FEC recovery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_with_fec_recovers_under_netem_loss() {
-    let server_addr = spawn_rtp_echo_server(true).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server(&mut tasks, true).await.unwrap();
 
     let lossy = NetemConfig {
         loss: u32::MAX / 33, // ~3%

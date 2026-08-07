@@ -29,7 +29,8 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads, binds ephemeral ports, and runs for hundreds of milliseconds; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_data() {
-    let server_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
@@ -56,7 +57,8 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads, binds ephemeral ports, and runs for hundreds of milliseconds; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_reliability_survives_mild_loss() {
-    let server_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
@@ -84,7 +86,10 @@ async fn rtp_over_netem_reliability_survives_mild_loss() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads, binds ephemeral ports, and runs for hundreds of milliseconds; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_over_netem_clean_link_echoes() {
-    let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
+        .await
+        .unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;

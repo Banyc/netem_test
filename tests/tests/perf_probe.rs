@@ -56,7 +56,8 @@ const HOSTILE_GOODPUT_FLOOR_MIB_S: f64 = 0.5;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_direct() {
-    let server_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
 
     let data = payload(BULK);
@@ -89,7 +90,8 @@ async fn probe_rtp_echo_4mib_direct() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_mss8k() {
-    let server_addr = spawn_rtp_echo_server_with_mss(false, LOOPBACK_MSS)
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, LOOPBACK_MSS)
         .await
         .unwrap();
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
@@ -132,9 +134,12 @@ async fn probe_rtp_echo_4mib_mss8k() {
 async fn probe_mux_sink_4mib_direct() {
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
+    let mut tasks = tokio::task::JoinSet::new();
 
     for _ in 0..PROBE_ITERS {
-        let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(false).await.unwrap();
+        let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
+            .await
+            .unwrap();
         let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
         let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
         let (opener, _spawner) = mux_client_connect(read, write);
@@ -173,10 +178,11 @@ async fn probe_mux_sink_4mib_direct() {
 async fn probe_mux_sink_4mib_mss8k() {
     let data = payload(BULK);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
+    let mut tasks = tokio::task::JoinSet::new();
 
     for _ in 0..PROBE_ITERS {
         let (server_addr, mut received) =
-            spawn_mux_over_rtp_sink_server_with_mss(false, LOOPBACK_MSS)
+            spawn_mux_over_rtp_sink_server_with_mss(&mut tasks, false, LOOPBACK_MSS)
                 .await
                 .unwrap();
         let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
@@ -223,9 +229,12 @@ async fn probe_mux_sink_4mib_mss8k() {
 async fn probe_mux_echo_1mib_direct() {
     let data = payload(1024 * 1024);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
+    let mut tasks = tokio::task::JoinSet::new();
 
     for _ in 0..PROBE_ITERS {
-        let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
+        let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
+            .await
+            .unwrap();
         let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
         let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
         let (opener, _spawner) = mux_client_connect(read, write);
@@ -261,9 +270,10 @@ async fn probe_mux_echo_1mib_direct() {
 async fn probe_mux_echo_1mib_mss8k() {
     let data = payload(1024 * 1024);
     let mut samples = Vec::with_capacity(PROBE_ITERS);
+    let mut tasks = tokio::task::JoinSet::new();
 
     for _ in 0..PROBE_ITERS {
-        let server_addr = spawn_mux_over_rtp_echo_server_with_mss(false, LOOPBACK_MSS)
+        let server_addr = spawn_mux_over_rtp_echo_server_with_mss(&mut tasks, false, LOOPBACK_MSS)
             .await
             .unwrap();
         let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
@@ -308,9 +318,11 @@ async fn probe_hostile_goodput_30s() {
     const WINDOW: f64 = 30.0;
     const HOSTILE_BULK: usize = 128 * 1024 * 1024;
 
-    let (server_addr, progress) = spawn_mux_over_rtp_counting_sink_server(false, LOOPBACK_MSS)
-        .await
-        .unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (server_addr, progress) =
+        spawn_mux_over_rtp_counting_sink_server(&mut tasks, false, LOOPBACK_MSS)
+            .await
+            .unwrap();
     let pair = NetemPair::spawn(
         server_addr,
         support::presets::hostile_real_link(),
@@ -334,7 +346,8 @@ async fn probe_hostile_goodput_30s() {
     let start = Instant::now();
 
     // Keep the write half busy and the read half open for the full window.
-    let _writer = tokio::spawn(async move {
+    // Parked for the window; the owning JoinSet aborts it at scope end.
+    let _writer = tasks.spawn(async move {
         let _ = stream_write.write_all(&data).await;
     });
 

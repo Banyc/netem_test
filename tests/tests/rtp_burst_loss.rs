@@ -181,15 +181,17 @@ async fn run_rtp_sink_upload(
     data: &'static [u8],
     window: Duration,
 ) -> (NetemPair, u64) {
-    let (server_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(false, MSS)
+    let mut tasks = tokio::task::JoinSet::new();
+    let (server_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(&mut tasks, false, MSS)
         .await
         .unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let mut writer = spawn_rtp_bulk_upload_with_mss(pair.client_addr(), false, MSS)
+    let mut writer = spawn_rtp_bulk_upload_with_mss(&mut tasks, pair.client_addr(), false, MSS)
         .await
         .unwrap();
 
-    let pump = tokio::spawn(async move {
+    let mut pump_tasks = tokio::task::JoinSet::new();
+    pump_tasks.spawn(async move {
         let mut offset = 0usize;
         let start = Instant::now();
         while start.elapsed() < window {
@@ -203,7 +205,12 @@ async fn run_rtp_sink_upload(
 
     tokio::time::sleep(window).await;
     let d = delivered.load(Ordering::Relaxed);
-    pump.abort();
+    // The pump ran its full window and completed; drain it so any panic
+    // surfaces. The parked server/keepalive tasks are aborted by the owning
+    // JoinSet at scope end.
+    while let Some(result) = pump_tasks.join_next().await {
+        result.unwrap();
+    }
     (pair, d)
 }
 
@@ -223,7 +230,10 @@ async fn run_rtp_sink_upload(
 #[ignore = "burst-loss goodput/tail-latency regression; slow; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     let base = Instant::now();
-    let (server_addr, mut latencies) = spawn_mux_msg_latency_sink(false, base).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (server_addr, mut latencies) = spawn_mux_msg_latency_sink(&mut tasks, false, base)
+        .await
+        .unwrap();
     let pair = NetemPair::spawn(
         server_addr,
         burst_loss_link(5.0, 3.0, OWD, 11),
@@ -249,8 +259,9 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
 
     // Keep the stream read half alive for the duration of the test so the mux
-    // connection is not closed while we are only sending pings.
-    let _reader = tokio::spawn(async move {
+    // connection is not closed while we are only sending pings. Parked until
+    // the connection closes; the owning JoinSet aborts it at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         loop {
             match stream_read.read(&mut buf).await {

@@ -28,7 +28,8 @@ mod support;
 async fn netem_pair_raw_udp_echo_clean_link() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
-    tokio::spawn(async move {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
         let mut buf = [0u8; 64];
         while let Ok((n, from)) = echo.recv_from(&mut buf).await {
             let _ = echo.send_to(&buf[..n], from).await;
@@ -63,7 +64,8 @@ async fn netem_pair_raw_udp_echo_clean_link() {
 async fn netem_pair_raw_udp_latency_is_observable() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
-    tokio::spawn(async move {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
         let mut buf = [0u8; 64];
         while let Ok((n, from)) = echo.recv_from(&mut buf).await {
             let _ = echo.send_to(&buf[..n], from).await;

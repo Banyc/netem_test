@@ -26,8 +26,11 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_small_mss_clean_link_delivers_data() {
+    let mut tasks = tokio::task::JoinSet::new();
     let mss = 512;
-    let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
+    let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
+        .await
+        .unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
@@ -53,8 +56,11 @@ async fn rtp_small_mss_clean_link_delivers_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_tiny_mss_survives_mild_loss() {
+    let mut tasks = tokio::task::JoinSet::new();
     let mss = 256;
-    let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
+    let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
+        .await
+        .unwrap();
 
     let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
     let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
@@ -82,8 +88,11 @@ async fn rtp_tiny_mss_survives_mild_loss() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_custom_mss_clean_link_delivers_200kib() {
+    let mut tasks = tokio::task::JoinSet::new();
     let mss = 1024;
-    let server_addr = spawn_rtp_echo_server_with_mss(false, mss).await.unwrap();
+    let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
+        .await
+        .unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;

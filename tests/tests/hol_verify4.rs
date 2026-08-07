@@ -41,10 +41,13 @@ const CHUNK: usize = 262_044;
 /// Returns the RTP listener address and an atomic counter that is incremented
 /// by the number of bytes read from each stream until `Ok(0)`/Err. There is
 /// no payload verification; all bytes are counted.
-async fn spawn_mux_bulk_sink() -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
+async fn spawn_mux_bulk_sink(
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_server = Arc::clone(&delivered);
     let addr = spawn_mux_over_rtp_server_with_mss(
+        tasks,
         false,
         rtp::udp::NO_FEC_MSS,
         move |mut stream_read, mut stream_write| {
@@ -71,7 +74,8 @@ async fn spawn_mux_bulk_sink() -> std::io::Result<(std::net::SocketAddr, Arc<Ato
 /// `label` is used only for logging. Returns the total bytes delivered at the
 /// server-side sink.
 async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
-    let (server_addr, delivered) = spawn_mux_bulk_sink().await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (server_addr, delivered) = spawn_mux_bulk_sink(&mut tasks).await.unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
     let connected = rtp::udp::connect_with(
@@ -94,8 +98,9 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
 
     // Drain the stream read half in the background so flow-control ACKs keep
-    // moving and the writer does not stall.
-    tokio::spawn(async move {
+    // moving and the writer does not stall. Parked for the bulk window; the
+    // owning JoinSet aborts it at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = stream_read.read(&mut buf).await {
             if n == 0 {
@@ -142,10 +147,11 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 /// The sink is [`support::spawn_rtp_byte_sink_server`]. Returns the total bytes
 /// delivered at the server-side sink.
 async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
-    let (sink_addr, delivered) = spawn_rtp_byte_sink_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (sink_addr, delivered) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
     let pair = NetemPair::spawn(sink_addr, c2s, s2c).unwrap();
 
-    let mut writer = spawn_rtp_bulk_upload(pair.client_addr(), false)
+    let mut writer = spawn_rtp_bulk_upload(&mut tasks, pair.client_addr(), false)
         .await
         .unwrap();
     let payload = cyclic_payload(CHUNK);

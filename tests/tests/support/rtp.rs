@@ -15,53 +15,69 @@ use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
 /// `mss` controls the RTP maximum segment size passed to
 /// [`Listener::accept_without_handshake_with_mss`]. Use [`rtp::udp::NO_FEC_MSS`]
 /// for the default size.
+///
+/// `tasks` owns the server and its per-connection echo handlers; the caller
+/// must keep it alive for the server's lifetime.
 pub async fn spawn_rtp_echo_server_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
+        let mut handlers = tokio::task::JoinSet::new();
         loop {
-            let accepted = match listener
-                .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                    fec,
-                    mss: rtp::udp::MssConfig::Custom(mss),
-                    ..rtp::udp::AcceptConfig::default()
-                })
-                .await
-            {
-                Ok(a) => a,
-                Err(_) => return,
-            };
-            tokio::spawn(async move {
-                let mut read = accepted.read.into_async_read();
-                let mut write = accepted.write.into_async_write();
-                // The supervisor owns the session drivers; dropping it aborts
-                // the session, so keep it alive for the echo loop.
-                let _supervisor = accepted.supervisor;
-                let mut buf = vec![0u8; 8 * 1024];
-                loop {
-                    match read.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if write.write_all(&buf[..n]).await.is_err() {
-                                break;
+            tokio::select! {
+                accepted = listener
+                    .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                        fec,
+                        mss: rtp::udp::MssConfig::Custom(mss),
+                        ..rtp::udp::AcceptConfig::default()
+                    }) => {
+                    let accepted = match accepted {
+                        Ok(a) => a,
+                        Err(_) => break,
+                    };
+                    handlers.spawn(async move {
+                        let mut read = accepted.read.into_async_read();
+                        let mut write = accepted.write.into_async_write();
+                        // The supervisor owns the session drivers; dropping it aborts
+                        // the session, so keep it alive for the echo loop.
+                        let _supervisor = accepted.supervisor;
+                        let mut buf = vec![0u8; 8 * 1024];
+                        loop {
+                            match read.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if write.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
                             }
                         }
-                        Err(_) => break,
-                    }
+                        let _ = write.shutdown().await;
+                    });
                 }
-                let _ = write.shutdown().await;
-            });
+                joined = handlers.join_next(), if !handlers.is_empty() => {
+                    joined.unwrap().unwrap();
+                }
+            }
+        }
+        while let Some(result) = handlers.join_next().await {
+            result.unwrap();
         }
     });
     Ok(addr)
 }
 
 /// Spawn an `rtp` echo server using the default MSS.
-pub async fn spawn_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
-    spawn_rtp_echo_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
+pub async fn spawn_rtp_echo_server(
+    tasks: &mut tokio::task::JoinSet<()>,
+    fec: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    spawn_rtp_echo_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Connect an `rtp` client to a proxy's client-side address and return the
@@ -142,13 +158,15 @@ where
 /// successful read. This lets tests observe live goodput without waiting for an
 /// EOF.
 pub async fn spawn_rtp_byte_sink_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
-    spawn_rtp_byte_sink_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
+    spawn_rtp_byte_sink_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Spawn an `rtp` byte sink server using a custom MSS.
 pub async fn spawn_rtp_byte_sink_server_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
@@ -158,7 +176,7 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
 
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_server = Arc::clone(&delivered);
-    tokio::spawn({
+    tasks.spawn({
         let listener = Arc::clone(&listener);
         async move {
             let accepted = match listener
@@ -175,19 +193,22 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
             // Keep driving the listener's dispatcher so packets keep flowing to
             // the accepted connection. Extra incoming connections are accepted
             // and ignored.
-            let listener = Arc::clone(&listener);
-            tokio::spawn(async move {
-                loop {
-                    if listener
-                        .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                            fec,
-                            mss: rtp::udp::MssConfig::Custom(mss),
-                            ..rtp::udp::AcceptConfig::default()
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+            let mut drainer = tokio::task::JoinSet::new();
+            drainer.spawn({
+                let listener = Arc::clone(&listener);
+                async move {
+                    loop {
+                        if listener
+                            .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                                fec,
+                                mss: rtp::udp::MssConfig::Custom(mss),
+                                ..rtp::udp::AcceptConfig::default()
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             });
@@ -238,14 +259,16 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
 /// so the `udp_listener` dispatcher keeps forwarding datagrams to the accepted
 /// connection for the server's lifetime.
 pub async fn spawn_rtp_msg_latency_sink(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
-    spawn_rtp_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
+    spawn_rtp_msg_latency_sink_with_mss(tasks, fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
 /// [`spawn_rtp_msg_latency_sink`] with a custom RTP MSS.
 pub async fn spawn_rtp_msg_latency_sink_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -255,7 +278,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
 
-    tokio::spawn({
+    tasks.spawn({
         let listener = Arc::clone(&listener);
         async move {
             let accepted = match listener
@@ -269,19 +292,22 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
                 Ok(a) => a,
                 Err(_) => return,
             };
-            let listener = Arc::clone(&listener);
-            tokio::spawn(async move {
-                loop {
-                    if listener
-                        .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                            fec,
-                            mss: rtp::udp::MssConfig::Custom(mss),
-                            ..rtp::udp::AcceptConfig::default()
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+            let mut drainer = tokio::task::JoinSet::new();
+            drainer.spawn({
+                let listener = Arc::clone(&listener);
+                async move {
+                    loop {
+                        if listener
+                            .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                                fec,
+                                mss: rtp::udp::MssConfig::Custom(mss),
+                                ..rtp::udp::AcceptConfig::default()
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             });
@@ -348,14 +374,16 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
 /// through the returned write half and drops it (or aborts the writing task)
 /// when done; the read-keepalive task exits automatically when the peer closes.
 pub async fn spawn_rtp_bulk_upload(
+    tasks: &mut tokio::task::JoinSet<()>,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
-    spawn_rtp_bulk_upload_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
+    spawn_rtp_bulk_upload_with_mss(tasks, proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// [`spawn_rtp_bulk_upload`] with a custom MSS.
 pub async fn spawn_rtp_bulk_upload_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
@@ -376,7 +404,7 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
     // The supervisor owns the session drivers; hold it in the keepalive task
     // so the returned write half keeps working.
     let supervisor = connected.supervisor;
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _supervisor = supervisor;
         let mut buf = vec![0u8; 64 * 1024];
         loop {

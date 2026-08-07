@@ -76,9 +76,10 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
     rt.block_on(async {
         let base = Instant::now();
         let start = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
 
         let (server_addr, mut latency_rx) =
-            spawn_rtp_msg_latency_sink(false, base).await.unwrap();
+            spawn_rtp_msg_latency_sink(&mut tasks, false, base).await.unwrap();
 
         let c2s = NetemConfig {
             max_datagram_size: MAX_DATAGRAM,
@@ -106,7 +107,9 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
         let mut read = connected.read.into_async_read();
         let mut write = connected.write.into_async_write();
 
-        tokio::spawn(async move {
+        // Keep the read half alive so ACKs keep flowing; parked until the
+        // connection closes, so the owning JoinSet aborts it at scope end.
+        tasks.spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 let n = read.read(&mut buf).await;
@@ -278,8 +281,11 @@ fn rtp_permanent_hole_liveness_smoke() {
     rt.block_on(async {
         let base = Instant::now();
         let start = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
 
-        let (server_addr, mut latency_rx) = spawn_rtp_msg_latency_sink(false, base).await.unwrap();
+        let (server_addr, mut latency_rx) = spawn_rtp_msg_latency_sink(&mut tasks, false, base)
+            .await
+            .unwrap();
 
         let c2s = NetemConfig {
             max_datagram_size: MAX_DATAGRAM,
@@ -315,7 +321,9 @@ fn rtp_permanent_hole_liveness_smoke() {
         let mut read = connected.read.into_async_read();
         let mut write = connected.write.into_async_write();
 
-        tokio::spawn(async move {
+        // Keep the read half alive so ACKs keep flowing; parked until the
+        // connection closes, so the owning JoinSet aborts it at scope end.
+        tasks.spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 let n = read.read(&mut buf).await;

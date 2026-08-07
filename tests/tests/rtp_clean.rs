@@ -24,7 +24,8 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_data() {
-    let server_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
@@ -50,7 +51,8 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_400kib() {
-    let server_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
@@ -80,7 +82,8 @@ async fn rtp_over_netem_clean_link_delivers_400kib() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_latency_is_observable() {
-    let server_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
 
     let latency_ms = 60;
     let pair = NetemPair::spawn(server_addr, latency(latency_ms), latency(latency_ms)).unwrap();

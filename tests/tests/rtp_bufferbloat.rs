@@ -61,21 +61,26 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     let floor_mib_s: f64 = capacity_mib_s * GOODPUT_CAPACITY_FLOOR;
 
     let base = Instant::now();
-    let (sink_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(false, MSS)
+    let mut server_tasks = tokio::task::JoinSet::new();
+    let (sink_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(&mut server_tasks, false, MSS)
         .await
         .unwrap();
-    let (latency_addr, mut latencies) = spawn_rtp_msg_latency_sink(false, base).await.unwrap();
+    let (latency_addr, mut latencies) = spawn_rtp_msg_latency_sink(&mut server_tasks, false, base)
+        .await
+        .unwrap();
 
     let pair = NetemPair::spawn(sink_addr, bufferbloat_link(4), bufferbloat_link(5)).unwrap();
 
     // Bulk upload sender. Write a repeating deterministic stream large enough
     // that the measurement window is receive-limited, not send-limited.
-    let mut writer = spawn_rtp_bulk_upload_with_mss(pair.client_addr(), false, MSS)
-        .await
-        .unwrap();
+    let mut writer =
+        spawn_rtp_bulk_upload_with_mss(&mut server_tasks, pair.client_addr(), false, MSS)
+            .await
+            .unwrap();
     let bulk_start = Instant::now();
     let data = cyclic_payload(64 * 1024 * 1024);
-    let pump = tokio::spawn(async move {
+    let mut pump_tasks = tokio::task::JoinSet::new();
+    pump_tasks.spawn(async move {
         let mut offset = 0usize;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(15) {
@@ -103,7 +108,9 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     .unwrap();
     let mut write = connected.write.into_async_write();
     let mut read = connected.read.into_async_read();
-    let _reader = tokio::spawn(async move {
+    // Keep the read half alive so ACKs keep moving; parked until the
+    // connection closes, so the owning JoinSet aborts it at scope end.
+    server_tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = read.read(&mut buf).await {
             if n == 0 {
@@ -142,7 +149,10 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let delivered_bytes = delivered.load(std::sync::atomic::Ordering::Relaxed);
     let elapsed = bulk_start.elapsed();
-    pump.abort();
+    // The pump has completed its 15s window; drain it so any panic surfaces.
+    while let Some(result) = pump_tasks.join_next().await {
+        result.unwrap();
+    }
     pair.stop();
     latency_pair.stop();
 

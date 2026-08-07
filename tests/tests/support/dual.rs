@@ -3,8 +3,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use rtp::FecTuning;
 use rtp::FrameMode;
 
-use super::frame::{RtpFrameDeliveryWriter, RtpFrameReader, rtp_frame_delivery_connect};
+use super::frame::rtp_frame_delivery_connect;
 use super::rtp::rtp_connect;
 use super::rtp_mux::spawn_tagged_stream_sink;
 use crate::support::{LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, try_send_observation};
@@ -24,22 +24,25 @@ use crate::support::{LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, try_send_obs
 /// dual‑lane mux. Returns `(addr, lat_rx, bulk_counter)` like
 /// [`spawn_mux_latency_bulk_server`].
 pub async fn spawn_dual_mux_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
-    spawn_dual_mux_latency_bulk_server_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
+    spawn_dual_mux_latency_bulk_server_with_mss(tasks, fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Like [`spawn_dual_mux_latency_bulk_server`] but with a custom RTP MSS.
 pub async fn spawn_dual_mux_sized_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
-    spawn_dual_mux_latency_bulk_server_with_mss(fec, base, mss).await
+    spawn_dual_mux_latency_bulk_server_with_mss(tasks, fec, base, mss).await
 }
 
 async fn spawn_dual_mux_latency_bulk_server_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -51,8 +54,9 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
 
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
 
+    // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Ok(accepted) = listener_bg
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
@@ -67,8 +71,9 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
         }
     });
 
+    // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
@@ -76,12 +81,19 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
             frame_reassembly: false,
         };
 
+        // Accepted-lane rtp-session keepalives owned by this task's scope;
+        // never drained (scope-drop abort).
+        let mut lane_keepers = JoinSet::new();
+        // Per-pair handlers owned by this task's scope; drained after the
+        // accept loop ends so panics surface.
+        let mut pair_handlers = JoinSet::new();
+
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
             // Hold the accepted lane's rtp session for its whole life;
             // dropping it aborts the session.
-            tokio::spawn(async move {
+            lane_keepers.spawn(async move {
                 let _ = accepted.supervisor.await;
             });
 
@@ -103,13 +115,17 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                     {
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
-                        tokio::spawn(async move {
+                        pair_handlers.spawn(async move {
                             let _spawner = pair_spawner;
+                            // Per-stream handlers owned by the pair handler's
+                            // scope; drained after the accept loop ends so
+                            // panics surface.
+                            let mut stream_handlers = JoinSet::new();
                             while let Ok((mut reader, mut writer, _class)) = accepter.accept().await
                             {
                                 let bulk = Arc::clone(&bulk);
                                 let tx = tx.clone();
-                                tokio::spawn(async move {
+                                stream_handlers.spawn(async move {
                                     let mut tag = [0u8; 1];
                                     if reader.read_exact(&mut tag).await.is_err() {
                                         let _ = writer.shutdown();
@@ -190,10 +206,16 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                     let _ = writer.shutdown();
                                 });
                             }
+                            while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
                         });
                     }
                 }
             }
+        }
+        while let Some(result) = pair_handlers.join_next().await {
+            result.unwrap();
         }
     });
 
@@ -205,6 +227,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
 /// messages. Latency is computed from the embedded send timestamp and
 /// pushed to the returned [`mpsc::Receiver`].
 pub async fn spawn_dual_msg_channel_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     mode: mux::DeliveryMode,
@@ -216,8 +239,9 @@ pub async fn spawn_dual_msg_channel_server(
 
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
 
+    // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Ok(accepted) = listener_bg
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
@@ -234,8 +258,9 @@ pub async fn spawn_dual_msg_channel_server(
         }
     });
 
+    // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
@@ -243,12 +268,19 @@ pub async fn spawn_dual_msg_channel_server(
             frame_reassembly: false,
         };
 
+        // Accepted-lane rtp-session keepalives owned by this task's scope;
+        // never drained (scope-drop abort).
+        let mut lane_keepers = JoinSet::new();
+        // Per-pair handlers owned by this task's scope; drained after the
+        // accept loop ends so panics surface.
+        let mut pair_handlers = JoinSet::new();
+
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
             // Hold the accepted lane's rtp session for its whole life;
             // dropping it aborts the session.
-            tokio::spawn(async move {
+            lane_keepers.spawn(async move {
                 let _ = accepted.supervisor.await;
             });
 
@@ -270,12 +302,16 @@ pub async fn spawn_dual_msg_channel_server(
                     {
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
-                        tokio::spawn(async move {
+                        pair_handlers.spawn(async move {
                             let _spawner = pair_spawner;
+
+                            // Per-stream handlers owned by the pair handler's
+                            // scope; drained when the pair ends.
+                            let mut stream_handlers = JoinSet::new();
 
                             let bulk = Arc::clone(&bulk);
                             if let Ok((mut reader, writer, _class)) = accepter.accept().await {
-                                tokio::spawn(async move {
+                                stream_handlers.spawn(async move {
                                     let _w = writer;
                                     let mut buf = vec![0u8; 64 * 1024];
                                     let mut offset: u64 = 0;
@@ -331,7 +367,7 @@ pub async fn spawn_dual_msg_channel_server(
                                                     latency_ms,
                                                     "latency sample",
                                                 ) {
-                                                    return;
+                                                    break;
                                                 }
                                             }
                                         }
@@ -340,10 +376,16 @@ pub async fn spawn_dual_msg_channel_server(
                                     Err(_) => break,
                                 }
                             }
+                            while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
                         });
                     }
                 }
             }
+        }
+        while let Some(result) = pair_handlers.join_next().await {
+            result.unwrap();
         }
     });
 
@@ -355,6 +397,7 @@ pub async fn spawn_dual_msg_channel_server(
 /// [`mux::MigratingStreamWriter::open_migrating`] are handled
 /// correctly (successor generations arrive through the accept loop).
 pub async fn spawn_dual_mux_migrating_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
@@ -365,8 +408,9 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
 
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
 
+    // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Ok(accepted) = listener_bg
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
@@ -383,8 +427,9 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
         }
     });
 
+    // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
@@ -392,12 +437,19 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
             frame_reassembly: false,
         };
 
+        // Accepted-lane rtp-session keepalives owned by this task's scope;
+        // never drained (scope-drop abort).
+        let mut lane_keepers = JoinSet::new();
+        // Per-pair handlers owned by this task's scope; drained after the
+        // accept loop ends so panics surface.
+        let mut pair_handlers = JoinSet::new();
+
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
             // Hold the accepted lane's rtp session for its whole life;
             // dropping it aborts the session.
-            tokio::spawn(async move {
+            lane_keepers.spawn(async move {
                 let _ = accepted.supervisor.await;
             });
 
@@ -419,9 +471,12 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
                     {
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
-                        tokio::spawn(async move {
+                        pair_handlers.spawn(async move {
                             let _spawner = pair_spawner;
                             let mut mac = accepter.into_migrating_capable();
+                            // Per-stream handlers owned by the pair handler's
+                            // scope; drained after the accept loop ends.
+                            let mut stream_handlers = JoinSet::new();
                             loop {
                                 match mac.accept().await {
                                     Ok(mux::AcceptedStream::Migrating {
@@ -429,7 +484,7 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
                                     }) => {
                                         let bulk = Arc::clone(&bulk);
                                         let tx = tx.clone();
-                                        tokio::spawn(handle_latency_bulk_stream(
+                                        stream_handlers.spawn(handle_latency_bulk_stream(
                                             reader, writer, base, bulk, tx,
                                         ));
                                     }
@@ -439,17 +494,23 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
                                     Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
                                         let bulk = Arc::clone(&bulk);
                                         let tx = tx.clone();
-                                        tokio::spawn(handle_latency_bulk_stream(
+                                        stream_handlers.spawn(handle_latency_bulk_stream(
                                             reader, writer, base, bulk, tx,
                                         ));
                                     }
                                     Err(_) => break,
                                 }
                             }
+                            while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
                         });
                     }
                 }
             }
+        }
+        while let Some(result) = pair_handlers.join_next().await {
+            result.unwrap();
         }
     });
 
@@ -536,6 +597,7 @@ async fn handle_latency_bulk_stream<R: AsyncRead + Unpin + Send + 'static>(
 /// [`mux::MigratingCapableAccepter`] so it works with both sticky
 /// (`open_auto`) and migrating (`open_migrating`) clients.
 pub async fn spawn_dual_mux_gaming_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
@@ -546,8 +608,9 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
 
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
 
+    // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Ok(accepted) = listener_bg
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
@@ -564,8 +627,9 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
         }
     });
 
+    // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
@@ -573,12 +637,19 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
             frame_reassembly: false,
         };
 
+        // Accepted-lane rtp-session keepalives owned by this task's scope;
+        // never drained (scope-drop abort).
+        let mut lane_keepers = JoinSet::new();
+        // Per-pair handlers owned by this task's scope; drained after the
+        // accept loop ends so panics surface.
+        let mut pair_handlers = JoinSet::new();
+
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
             // Hold the accepted lane's rtp session for its whole life;
             // dropping it aborts the session.
-            tokio::spawn(async move {
+            lane_keepers.spawn(async move {
                 let _ = accepted.supervisor.await;
             });
 
@@ -600,9 +671,12 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
                     {
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
-                        tokio::spawn(async move {
+                        pair_handlers.spawn(async move {
                             let _spawner = pair_spawner;
                             let mut mac = accepter.into_migrating_capable();
+                            // Per-stream handlers owned by the pair handler's
+                            // scope; drained after the accept loop ends.
+                            let mut stream_handlers = JoinSet::new();
                             loop {
                                 match mac.accept().await {
                                     Ok(mux::AcceptedStream::Migrating {
@@ -610,7 +684,7 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
                                     }) => {
                                         let bulk = Arc::clone(&bulk);
                                         let tx = tx.clone();
-                                        tokio::spawn(handle_gaming_stream(
+                                        stream_handlers.spawn(handle_gaming_stream(
                                             reader, writer, base, bulk, tx,
                                         ));
                                     }
@@ -620,17 +694,23 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
                                     Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
                                         let bulk = Arc::clone(&bulk);
                                         let tx = tx.clone();
-                                        tokio::spawn(handle_gaming_stream(
+                                        stream_handlers.spawn(handle_gaming_stream(
                                             reader, writer, base, bulk, tx,
                                         ));
                                     }
                                     Err(_) => break,
                                 }
                             }
+                            while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
                         });
                     }
                 }
             }
+        }
+        while let Some(result) = pair_handlers.join_next().await {
+            result.unwrap();
         }
     });
 
@@ -728,6 +808,7 @@ async fn handle_gaming_stream<R: AsyncRead + Unpin + Send + 'static>(
 /// [`netem_test::BottleneckShaper`] per direction upstream, so the two lanes
 /// funnel through ONE bottleneck capacity — the point of the battery.
 pub async fn dual_mux_client_connect(
+    tasks: &mut tokio::task::JoinSet<()>,
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
@@ -744,32 +825,52 @@ pub async fn dual_mux_client_connect(
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: false,
     };
-    let mut spawner = JoinSet::new();
+    let nonce = mux::PairingNonce::generate();
+    let group = mux::GroupToken::generate();
 
-    let connect = |adr: std::net::SocketAddr, f: bool| async move {
-        let (r, w, supervisor) = rtp_connect(adr, f).await;
-        // Hold the lane's rtp session for the whole connection; dropping the
-        // supervisor aborts it.
-        tokio::spawn(async move {
-            let _ = supervisor.await;
-        });
-        Some((r, w))
-    };
+    let (int_reader, mut int_writer, int_supervisor) = rtp_connect(int_proxy_addr, fec).await;
+    // Hold the lane's rtp session for the whole connection; dropping the
+    // supervisor aborts it.
+    tasks.spawn(async move {
+        let _ = int_supervisor.await;
+    });
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
 
-    let (opener, accepter) = mux::spawn_dual_mux_connector(
-        || connect(int_proxy_addr, fec),
-        || connect(bulk_proxy_addr, fec),
-        config,
-        &mut spawner,
-    )
-    .await?;
+    let (bulk_reader, mut bulk_writer, bulk_supervisor) = rtp_connect(bulk_proxy_addr, fec).await;
+    // Hold the lane's rtp session for the whole connection; dropping the
+    // supervisor aborts it.
+    tasks.spawn(async move {
+        let _ = bulk_supervisor.await;
+    });
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
 
-    Ok((opener, accepter, spawner))
+    let mut int_spawner = JoinSet::new();
+    let (int_opener, int_accepter) =
+        mux::spawn_mux_no_reconnection(int_reader, int_writer, config.clone(), &mut int_spawner);
+    let mut bulk_spawner = JoinSet::new();
+    let (bulk_opener, bulk_accepter) =
+        mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
+    let mut super_spawner = JoinSet::new();
+    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+        int_opener,
+        int_accepter,
+        int_spawner,
+        bulk_opener,
+        bulk_accepter,
+        bulk_spawner,
+        &mut super_spawner,
+    );
+    Ok((opener, accepter, super_spawner))
 }
 
 /// Connect a dual-mux client with frame reassembly enabled on both lanes.
 /// Each lane rides its own frame-delivery RTP connection.
 pub async fn dual_mux_client_connect_frame_reassembly(
+    tasks: &mut tokio::task::JoinSet<()>,
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
@@ -786,28 +887,41 @@ pub async fn dual_mux_client_connect_frame_reassembly(
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: true,
     };
-    let mut spawner = JoinSet::new();
+    let nonce = mux::PairingNonce::generate();
+    let group = mux::GroupToken::generate();
 
-    async fn frame_connect(
-        addr: std::net::SocketAddr,
-        fec: bool,
-    ) -> Option<(RtpFrameReader, RtpFrameDeliveryWriter)> {
-        let (r, w) = rtp_frame_delivery_connect(addr, fec).await;
-        Some((r, w))
-    }
+    let (int_reader, mut int_writer) = rtp_frame_delivery_connect(tasks, int_proxy_addr, fec).await;
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
 
-    let (opener, accepter) = mux::spawn_dual_mux_connector(
-        || frame_connect(int_proxy_addr, fec),
-        || frame_connect(bulk_proxy_addr, fec),
-        config,
-        &mut spawner,
-    )
-    .await?;
+    let (bulk_reader, mut bulk_writer) =
+        rtp_frame_delivery_connect(tasks, bulk_proxy_addr, fec).await;
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
 
-    Ok((opener, accepter, spawner))
+    let mut int_spawner = JoinSet::new();
+    let (int_opener, int_accepter) =
+        mux::spawn_mux_no_reconnection(int_reader, int_writer, config.clone(), &mut int_spawner);
+    let mut bulk_spawner = JoinSet::new();
+    let (bulk_opener, bulk_accepter) =
+        mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
+    let mut super_spawner = JoinSet::new();
+    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+        int_opener,
+        int_accepter,
+        int_spawner,
+        bulk_opener,
+        bulk_accepter,
+        bulk_spawner,
+        &mut super_spawner,
+    );
+    Ok((opener, accepter, super_spawner))
 }
 
 pub async fn dual_mux_client_connect_with_lane_modes(
+    tasks: &mut tokio::task::JoinSet<()>,
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
@@ -834,17 +948,18 @@ pub async fn dual_mux_client_connect_with_lane_modes(
     type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
     type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
     async fn connect_lane(
+        tasks: &mut tokio::task::JoinSet<()>,
         addr: std::net::SocketAddr,
         fec: bool,
         frame: bool,
     ) -> Option<(BoxedRead, BoxedWrite)> {
         if frame {
-            let (r, w) = rtp_frame_delivery_connect(addr, fec).await;
+            let (r, w) = rtp_frame_delivery_connect(tasks, addr, fec).await;
             Some((Box::new(r), Box::new(w)))
         } else {
             let (r, w, supervisor) = rtp_connect(addr, fec).await;
             // Hold the lane's rtp session for the whole connection.
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _ = supervisor.await;
             });
             Some((Box::new(r), Box::new(w)))
@@ -854,7 +969,7 @@ pub async fn dual_mux_client_connect_with_lane_modes(
     let nonce = mux::PairingNonce::generate();
     let group = mux::GroupToken::generate();
     let Some((int_reader, mut int_writer)) =
-        connect_lane(int_proxy_addr, fec, interactive_frame).await
+        connect_lane(tasks, int_proxy_addr, fec, interactive_frame).await
     else {
         return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
             std::io::ErrorKind::ConnectionRefused,
@@ -863,7 +978,8 @@ pub async fn dual_mux_client_connect_with_lane_modes(
     mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
-    let Some((bulk_reader, mut bulk_writer)) = connect_lane(bulk_proxy_addr, fec, bulk_frame).await
+    let Some((bulk_reader, mut bulk_writer)) =
+        connect_lane(tasks, bulk_proxy_addr, fec, bulk_frame).await
     else {
         return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
             std::io::ErrorKind::ConnectionRefused,
@@ -898,6 +1014,7 @@ pub async fn dual_mux_client_connect_with_lane_modes(
 /// use `frame_reassembly: true` so that extended‑data frames from a
 /// frame‑delivery RTP connection are reassembled correctly.
 pub async fn spawn_dual_mux_frame_delivery_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -906,6 +1023,7 @@ pub async fn spawn_dual_mux_frame_delivery_latency_bulk_server(
     Arc<AtomicU64>,
 )> {
     spawn_dual_mux_latency_bulk_server_with_config(
+        tasks,
         fec,
         base,
         mux::MuxConfig {
@@ -922,6 +1040,7 @@ pub async fn spawn_dual_mux_frame_delivery_latency_bulk_server(
 /// `interactive_frame` enables frame‑reassembly on the interactive lane’s
 /// mux session; `bulk_frame` does the same for the bulk lane.
 pub async fn spawn_dual_mux_latency_bulk_server_with_lane_modes(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     interactive_frame: bool,
@@ -941,12 +1060,19 @@ pub async fn spawn_dual_mux_latency_bulk_server_with_lane_modes(
         heartbeat_interval: Duration::from_secs(5),
         frame_reassembly: bulk_frame,
     };
-    spawn_dual_mux_latency_bulk_server_with_per_lane_configs(fec, base, int_config, bulk_config)
-        .await
+    spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
+        tasks,
+        fec,
+        base,
+        int_config,
+        bulk_config,
+    )
+    .await
 }
 
 /// Shared implementation: dual‑mux server with per‑lane [`mux::MuxConfig`]s.
 async fn spawn_dual_mux_latency_bulk_server_with_config(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     config: mux::MuxConfig,
@@ -955,11 +1081,18 @@ async fn spawn_dual_mux_latency_bulk_server_with_config(
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
 )> {
-    spawn_dual_mux_latency_bulk_server_with_per_lane_configs(fec, base, config.clone(), config)
-        .await
+    spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
+        tasks,
+        fec,
+        base,
+        config.clone(),
+        config,
+    )
+    .await
 }
 
 async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     int_config: mux::MuxConfig,
@@ -976,8 +1109,9 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
 
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
 
+    // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Ok(accepted) = listener_bg
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
@@ -994,17 +1128,25 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
         }
     });
 
+    // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut pending: HashMap<mux::PairingNonce, Vec<(mux::UnpairedLane, mux::MuxConfig)>> =
             HashMap::new();
+
+        // Accepted-lane rtp-session keepalives owned by this task's scope;
+        // never drained (scope-drop abort).
+        let mut lane_keepers = JoinSet::new();
+        // Per-pair handlers owned by this task's scope; drained after the
+        // accept loop ends so panics surface.
+        let mut pair_handlers = JoinSet::new();
 
         while let Some(accepted) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
             // Hold the accepted lane's rtp session for its whole life;
             // dropping it aborts the session.
-            tokio::spawn(async move {
+            lane_keepers.spawn(async move {
                 let _ = accepted.supervisor.await;
             });
 
@@ -1030,15 +1172,18 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                     {
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
-                        tokio::spawn(async move {
+                        pair_handlers.spawn(async move {
                             let _spawner = pair_spawner;
                             let _cfg1 = cfg1;
                             let _cfg2 = cfg2;
+                            // Per-stream handlers owned by the pair handler's
+                            // scope; drained after the accept loop ends.
+                            let mut stream_handlers = JoinSet::new();
                             while let Ok((mut reader, mut writer, _class)) = accepter.accept().await
                             {
                                 let bulk = Arc::clone(&bulk);
                                 let tx = tx.clone();
-                                tokio::spawn(async move {
+                                stream_handlers.spawn(async move {
                                     let mut tag = [0u8; 1];
                                     if reader.read_exact(&mut tag).await.is_err() {
                                         let _ = writer.shutdown();
@@ -1119,10 +1264,16 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                                     let _ = writer.shutdown();
                                 });
                             }
+                            while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
                         });
                     }
                 }
             }
+        }
+        while let Some(result) = pair_handlers.join_next().await {
+            result.unwrap();
         }
     });
 
@@ -1133,9 +1284,12 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
 /// listener's accept loop and applies per-lane frame delivery at accept time,
 /// then spawns the mux handshake in the pairing loop.
 ///
-/// Returns `(int_addr, bulk_addr, lat_rx, bulk_counter)` so the client can
-/// connect each lane to its dedicated listener.
+/// Returns `(int_addr, bulk_addr, lat_rx, bulk_counter, streams)` so the client
+/// can connect each lane to its dedicated listener. `streams` is the shared
+/// scope owning the tagged-stream sink tasks; the caller must keep it alive
+/// (dropping it aborts the sinks at scope end).
 pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     interactive_frame: bool,
@@ -1145,6 +1299,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
+    Arc<Mutex<JoinSet<()>>>,
 )> {
     let int_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let bulk_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
@@ -1153,6 +1308,12 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
+
+    // Shared scope for the tagged-stream sink tasks spawned by the pair
+    // handler; aborted when the caller drops this Arc at scope end.
+    let streams = Arc::new(Mutex::new(JoinSet::new()));
+
+    // Parked accept loops (aborted when `tasks` drops at scope end).
     for (listener, lane_frame) in [
         (int_listener, interactive_frame),
         (bulk_listener, bulk_frame),
@@ -1163,7 +1324,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             heartbeat_interval: Duration::from_secs(5),
             frame_reassembly: lane_frame,
         };
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 let fd = if lane_frame {
                     FrameMode::enabled()
@@ -1190,15 +1351,26 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             }
         });
     }
+
+    // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
+    let streams_for_pair = Arc::clone(&streams);
+    tasks.spawn(async move {
         let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
+
+        // Accepted-lane rtp-session keepalives owned by this task's scope;
+        // never drained (scope-drop abort).
+        let mut lane_keepers = JoinSet::new();
+        // Per-pair handlers owned by this task's scope; drained after the
+        // accept loop ends so panics surface.
+        let mut pair_handlers = JoinSet::new();
+
         while let Some((accepted, config)) = accept_rx.recv().await {
             let reader = accepted.read.into_async_read();
             let writer = accepted.write.into_async_write();
             // Hold the accepted lane's rtp session for its whole life;
             // dropping it aborts the session.
-            tokio::spawn(async move {
+            lane_keepers.spawn(async move {
                 let _ = accepted.supervisor.await;
             });
             if let Ok((_class, nonce, pa)) =
@@ -1216,10 +1388,12 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
                     {
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
-                        tokio::spawn(async move {
+                        let streams = Arc::clone(&streams_for_pair);
+                        pair_handlers.spawn(async move {
                             let _spawner = pair_spawner;
                             while let Ok((reader, writer, class)) = accepter.accept().await {
                                 spawn_tagged_stream_sink(
+                                    &streams,
                                     reader,
                                     writer,
                                     tx.clone(),
@@ -1233,6 +1407,9 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
                 }
             }
         }
+        while let Some(result) = pair_handlers.join_next().await {
+            result.unwrap();
+        }
     });
-    Ok((int_addr, bulk_addr, rx, bulk_delivered))
+    Ok((int_addr, bulk_addr, rx, bulk_delivered, streams))
 }

@@ -27,7 +27,10 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_over_netem_clean_link_echoes() {
-    let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
+        .await
+        .unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
@@ -56,7 +59,10 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_survives_netem_latency() {
-    let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
+        .await
+        .unwrap();
 
     let impaired = NetemConfig {
         latency: Duration::from_millis(20),

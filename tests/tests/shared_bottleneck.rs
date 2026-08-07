@@ -25,7 +25,6 @@ use support::rtp::{
 };
 use support::stats::{combined_stats, percentile, print_perf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::task::JoinHandle;
 
 use crate::support::payload::with_timeout;
 
@@ -84,17 +83,22 @@ where
 }
 
 /// Run a bulk upload through one shared-shaper [`NetemPair`] for `run_for`.
-/// Returns a handle that completes when the run ends.
-fn spawn_bulk_flow(
+///
+/// `tasks` owns the bulk upload's read-keepalive (parked; aborted when the
+/// caller drops it). `bulk_tasks` owns the pump task, which completes once
+/// `run_for` elapses and should be drained by the caller.
+async fn spawn_bulk_flow(
+    tasks: &mut tokio::task::JoinSet<()>,
+    bulk_tasks: &mut tokio::task::JoinSet<()>,
     proxy_client_addr: std::net::SocketAddr,
     payload: Arc<Vec<u8>>,
     run_for: Duration,
     stop: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let Ok(mut writer) = spawn_rtp_bulk_upload(proxy_client_addr, false).await else {
-            return;
-        };
+) {
+    let Ok(mut writer) = spawn_rtp_bulk_upload(tasks, proxy_client_addr, false).await else {
+        return;
+    };
+    bulk_tasks.spawn(async move {
         let start = Instant::now();
         let mut offset = 0usize;
         while start.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
@@ -104,7 +108,7 @@ fn spawn_bulk_flow(
                 Err(_) => break,
             }
         }
-    })
+    });
 }
 
 /// A/B scenario: sparse rr echo alone vs rr echo competing with a bulk upload,
@@ -130,8 +134,11 @@ async fn rr_under_bulk_ab(
     let contested_run = Duration::from_secs(contested_run_s);
     let warmup = Duration::from_secs(3);
 
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut bulk_tasks = tokio::task::JoinSet::new();
+
     // ── solo phase ────────────────────────────────────────────────────────
-    let echo_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let echo_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
     let solo_pair = NetemPair::spawn_shared(
         echo_addr,
         flow_config(owd, 11),
@@ -151,8 +158,8 @@ async fn rr_under_bulk_ab(
     solo_pair.stop();
 
     // ── contested phase ───────────────────────────────────────────────────
-    let (sink_addr, delivered) = spawn_rtp_byte_sink_server(false).await.unwrap();
-    let echo_addr = spawn_rtp_echo_server(false).await.unwrap();
+    let (sink_addr, delivered) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
+    let echo_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
     let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
     let bulk_pair = NetemPair::spawn_shared(
         sink_addr,
@@ -180,12 +187,15 @@ async fn rr_under_bulk_ab(
 
     let bulk_payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
-    let _bulk_handle = spawn_bulk_flow(
+    spawn_bulk_flow(
+        &mut tasks,
+        &mut bulk_tasks,
         bulk_pair.client_addr(),
         bulk_payload,
         contested_run,
         Arc::clone(&bulk_stop),
-    );
+    )
+    .await;
 
     let contested_samples =
         rr_echo_samples(rr_conn.0, rr_conn.1, msg_bytes, gap, contested_run, warmup).await;
@@ -196,6 +206,11 @@ async fn rr_under_bulk_ab(
     let delivered_bytes = delivered.load(Ordering::Relaxed);
     bulk_pair.stop();
     rr_pair.stop();
+
+    // The bulk flow completed its run window; drain it so any panic surfaces.
+    while let Some(result) = bulk_tasks.join_next().await {
+        result.unwrap();
+    }
 
     // ── analysis ──────────────────────────────────────────────────────────
     let mut solo = solo_samples;
@@ -303,8 +318,11 @@ async fn shared_bneck_late_joiner_fairness() {
     let overlap_start = Duration::from_secs(6);
     let bin_width = Duration::from_millis(500);
 
-    let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server(false).await.unwrap();
-    let (sink_b_addr, delivered_b) = spawn_rtp_byte_sink_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut bulk_tasks = tokio::task::JoinSet::new();
+
+    let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
+    let (sink_b_addr, delivered_b) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
 
     let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
     let pair_a = NetemPair::spawn_shared(
@@ -326,19 +344,25 @@ async fn shared_bneck_late_joiner_fairness() {
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
-    let _handle_a = spawn_bulk_flow(
+    spawn_bulk_flow(
+        &mut tasks,
+        &mut bulk_tasks,
         pair_a.client_addr(),
         Arc::clone(&payload),
         total_run,
         Arc::clone(&bulk_stop),
-    );
+    )
+    .await;
     tokio::time::sleep(b_join).await;
-    let _handle_b = spawn_bulk_flow(
+    spawn_bulk_flow(
+        &mut tasks,
+        &mut bulk_tasks,
         pair_b.client_addr(),
         Arc::clone(&payload),
         total_run - b_join,
         Arc::clone(&bulk_stop),
-    );
+    )
+    .await;
 
     // Sample both counters every 500 ms for the whole run.
     let mut bins_a = Vec::new();
@@ -360,6 +384,12 @@ async fn shared_bneck_late_joiner_fairness() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     pair_a.stop();
     pair_b.stop();
+
+    // Both flows completed their run windows; drain them so any panic
+    // surfaces.
+    while let Some(result) = bulk_tasks.join_next().await {
+        result.unwrap();
+    }
 
     let total_a = delivered_a.load(Ordering::Relaxed);
     let total_b = delivered_b.load(Ordering::Relaxed);

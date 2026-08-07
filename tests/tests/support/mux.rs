@@ -32,6 +32,7 @@ use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
 /// to put `accept()` in a loop to drive the packet dispatch among the
 /// sub-connections").
 pub async fn spawn_mux_over_rtp_server_with_mss<F, Fut>(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     mss: usize,
     handle_stream: F,
@@ -43,7 +44,7 @@ where
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
-    tokio::spawn({
+    tasks.spawn({
         let listener = Arc::clone(&listener);
         async move {
             // First (and only) rtp connection.
@@ -58,13 +59,18 @@ where
                 Ok(a) => a,
                 Err(_) => return,
             };
+            // Parked tasks owned by this outer task's scope: the extra-accept
+            // drainer loop (keeps driving `udp_listener`'s dispatcher for the
+            // server's lifetime) and the rtp-supervisor keepalive. Both are
+            // aborted when this JoinSet drops at scope end.
+            let mut parked = tokio::task::JoinSet::new();
             // Keep driving `udp_listener`'s dispatcher for the lifetime of the
             // server: `accept()` both establishes new connections and
             // dispatches packets to existing ones. Without a background
             // accept-loop, the dispatcher stops after the first connection
             // and subsequent datagrams are never forwarded to it, so the
             // reliable layer stalls.
-            tokio::spawn({
+            parked.spawn({
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
@@ -87,7 +93,7 @@ where
             let write = accepted.write.into_async_write();
             // Hold the accepted lane's rtp session for its whole life;
             // dropping it aborts the session.
-            tokio::spawn(async move {
+            parked.spawn(async move {
                 let _ = accepted.supervisor.await;
             });
 
@@ -100,9 +106,21 @@ where
             let (_opener, mut accepter) =
                 mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
 
+            // Per-stream handlers owned by this accept loop's scope. They are
+            // drained once the accept loop ends (peer closed), unwrapping so
+            // panics surface; any still-running handlers are aborted when the
+            // local JoinSet drops at scope end.
+            let mut handlers = tokio::task::JoinSet::new();
             while let Ok((stream_read, stream_write)) = accepter.accept().await {
                 let handle_stream = &handle_stream;
-                tokio::spawn(handle_stream(stream_read, stream_write));
+                handlers.spawn(handle_stream(stream_read, stream_write));
+            }
+            while let Some(result) = handlers.join_next().await {
+                result.unwrap();
+            }
+            // Drain the mux supervision tasks, unwrapping so panics surface.
+            while let Some(result) = spawner.join_next().await {
+                result.unwrap();
             }
         }
     });
@@ -113,30 +131,39 @@ where
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
 /// echoed back. Returns the rtp server's listening address.
 pub async fn spawn_mux_over_rtp_echo_server_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
-    spawn_mux_over_rtp_server_with_mss(fec, mss, |mut stream_read, mut stream_write| async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match stream_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stream_write.write_all(&buf[..n]).await.is_err() {
-                        break;
+    spawn_mux_over_rtp_server_with_mss(
+        tasks,
+        fec,
+        mss,
+        |mut stream_read, mut stream_write| async move {
+            let mut buf = vec![0u8; 8 * 1024];
+            loop {
+                match stream_read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stream_write.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-        let _ = stream_write.shutdown();
-    })
+            let _ = stream_write.shutdown();
+        },
+    )
     .await
 }
 
 /// Spawn a mux-over-RTP echo server using the default MSS.
-pub async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<std::net::SocketAddr> {
-    spawn_mux_over_rtp_echo_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
+pub async fn spawn_mux_over_rtp_echo_server(
+    tasks: &mut tokio::task::JoinSet<()>,
+    fec: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    spawn_mux_over_rtp_echo_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Spawn an `rtp` server that accepts one connection and runs a `mux` server
@@ -146,12 +173,16 @@ pub async fn spawn_mux_over_rtp_echo_server(fec: bool) -> std::io::Result<std::n
 /// is shut down. Returns the rtp server's listening address and the receiver
 /// for completed payloads.
 pub async fn spawn_mux_over_rtp_sink_server_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let addr =
-        spawn_mux_over_rtp_server_with_mss(fec, mss, move |mut stream_read, mut stream_write| {
+    let addr = spawn_mux_over_rtp_server_with_mss(
+        tasks,
+        fec,
+        mss,
+        move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             async move {
                 let mut buf = Vec::new();
@@ -161,16 +192,18 @@ pub async fn spawn_mux_over_rtp_sink_server_with_mss(
                 }
                 let _ = stream_write.shutdown();
             }
-        })
-        .await?;
+        },
+    )
+    .await?;
     Ok((addr, rx))
 }
 
 /// Spawn a mux-over-RTP sink server using the default MSS.
 pub async fn spawn_mux_over_rtp_sink_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
-    spawn_mux_over_rtp_sink_server_with_mss(fec, rtp::udp::NO_FEC_MSS).await
+    spawn_mux_over_rtp_sink_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Spawn a mux-over-RTP server that accepts one connection and parses a simple
@@ -188,21 +221,26 @@ pub async fn spawn_mux_over_rtp_sink_server(
 /// acknowledged, avoiding the RTP layer's proactive broken-pipe heuristic that
 /// fires on quiet unidirectional streams.
 pub async fn spawn_mux_msg_latency_sink(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
-    spawn_mux_msg_latency_sink_with_mss(fec, base, rtp::udp::NO_FEC_MSS).await
+    spawn_mux_msg_latency_sink_with_mss(tasks, fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
 /// [`spawn_mux_msg_latency_sink`] with a custom RTP MSS.
 pub async fn spawn_mux_msg_latency_sink_with_mss(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
-    let addr =
-        spawn_mux_over_rtp_server_with_mss(fec, mss, move |mut stream_read, mut stream_write| {
+    let addr = spawn_mux_over_rtp_server_with_mss(
+        tasks,
+        fec,
+        mss,
+        move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             async move {
                 let mut buf = vec![0u8; 64 * 1024];
@@ -248,8 +286,9 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
                 }
                 let _ = stream_write.shutdown();
             }
-        })
-        .await?;
+        },
+    )
+    .await?;
     Ok((addr, rx))
 }
 
@@ -428,11 +467,12 @@ pub async fn mux_send_repeated(
 /// the transfer is still alive reflects true goodput without an inflated
 /// delivery snapshot.
 pub async fn spawn_mux_over_rtp_counting_sink_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
     let progress = Arc::new(SinkProgress::new());
-    let addr = spawn_mux_over_rtp_server_with_mss(fec, mss, {
+    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, mss, {
         let progress = Arc::clone(&progress);
         move |mut stream_read, mut stream_write| {
             let progress = Arc::clone(&progress);
@@ -474,9 +514,10 @@ pub async fn spawn_mux_over_rtp_counting_sink_server(
 
 /// Convenience wrapper using the default RTP MSS.
 pub async fn spawn_mux_over_rtp_counting_sink_server_default(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
-    spawn_mux_over_rtp_counting_sink_server(fec, rtp::udp::NO_FEC_MSS).await
+    spawn_mux_over_rtp_counting_sink_server(tasks, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Spawn a mux-over-RTP server that accepts one connection and classifies each
@@ -493,6 +534,7 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_default(
 /// interactive ping stream and a competing bulk sink stream on the same mux
 /// connection while using a single server address.
 pub async fn spawn_mux_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -502,7 +544,7 @@ pub async fn spawn_mux_latency_bulk_server(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(fec, rtp::udp::NO_FEC_MSS, {
+    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -597,6 +639,7 @@ pub async fn spawn_mux_latency_bulk_server(
 
 /// Like [`spawn_mux_latency_bulk_server`] but with a custom RTP MSS.
 pub async fn spawn_mux_sized_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -607,7 +650,7 @@ pub async fn spawn_mux_sized_latency_bulk_server(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(fec, mss, {
+    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, mss, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -701,6 +744,7 @@ pub async fn spawn_mux_sized_latency_bulk_server(
 /// stream (3 MiB state-sync followed by 200 B delta frames); all other
 /// streams are bulk.
 pub async fn spawn_mux_gaming_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -710,7 +754,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(fec, rtp::udp::NO_FEC_MSS, {
+    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -810,6 +854,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
 /// but the server uses `frame_reassembly: true` and each RTP connection is
 /// accepted in frame-delivery mode.
 pub async fn spawn_mux_frame_delivery_latency_bulk_server(
+    tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -825,7 +870,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     let fd = FrameMode::enabled();
     let listener_accept = Arc::clone(&listener);
     let bulk_delivered_for_server = Arc::clone(&bulk_delivered);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let accepted = match listener_accept
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
@@ -839,7 +884,11 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
             Ok(a) => a,
             Err(_) => return,
         };
-        tokio::spawn({
+        // Parked tasks owned by this outer task's scope: the extra-accept
+        // drainer loop and the rtp-supervisor keepalive. Both are aborted
+        // when this JoinSet drops at scope end.
+        let mut parked = tokio::task::JoinSet::new();
+        parked.spawn({
             let listener = Arc::clone(&listener);
             async move {
                 loop {
@@ -864,7 +913,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         let write = accepted.write.into_async_write();
         // Hold the accepted lane's rtp session for its whole life;
         // dropping it aborts the session.
-        tokio::spawn(async move {
+        parked.spawn(async move {
             let _ = accepted.supervisor.await;
         });
         let config = mux::MuxConfig {
@@ -876,10 +925,13 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         let (_opener, mut accepter) =
             mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
 
+        // Per-stream sink tasks owned by this accept loop's scope; drained
+        // (with unwrap) once the accept loop ends so panics surface.
+        let mut handlers = tokio::task::JoinSet::new();
         while let Ok((mut reader, mut writer)) = accepter.accept().await {
             let tx = tx.clone();
             let bulk = Arc::clone(&bulk_delivered_for_server);
-            tokio::spawn(async move {
+            handlers.spawn(async move {
                 let mut tag = [0u8; 1];
                 if reader.read_exact(&mut tag).await.is_err() {
                     let _ = writer.shutdown();
@@ -947,6 +999,13 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                 }
                 let _ = writer.shutdown();
             });
+        }
+        while let Some(result) = handlers.join_next().await {
+            result.unwrap();
+        }
+        // Drain the mux supervision tasks, unwrapping so panics surface.
+        while let Some(result) = spawner.join_next().await {
+            result.unwrap();
         }
     });
 

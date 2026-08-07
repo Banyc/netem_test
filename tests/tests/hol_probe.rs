@@ -130,8 +130,11 @@ async fn run_hol_probe(
             },
     } = config;
     let base = Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
     let (server_addr, mut latencies, mux_bulk_counter) =
-        spawn_mux_latency_bulk_server(fec, base).await.unwrap();
+        spawn_mux_latency_bulk_server(&mut tasks, fec, base)
+            .await
+            .unwrap();
 
     // Set up the interactive NetemPair and, for split modes, a bulk pair.
     let (interactive_pair, bulk_pair_opt, bulk_counter) = match &bulk {
@@ -142,7 +145,7 @@ async fn run_hol_probe(
         BulkMode::Split(box_config) => {
             let (c2s_bulk, s2c_bulk) = box_config.as_ref();
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-            let (sink_addr, counter) = spawn_rtp_byte_sink_server(fec).await.unwrap();
+            let (sink_addr, counter) = spawn_rtp_byte_sink_server(&mut tasks, fec).await.unwrap();
             let bulk_pair =
                 NetemPair::spawn(sink_addr, c2s_bulk.clone(), s2c_bulk.clone()).unwrap();
             (pair, Some(bulk_pair), counter)
@@ -158,7 +161,7 @@ async fn run_hol_probe(
                 Some(shaper_s2c.clone()),
             )
             .unwrap();
-            let (sink_addr, counter) = spawn_rtp_byte_sink_server(fec).await.unwrap();
+            let (sink_addr, counter) = spawn_rtp_byte_sink_server(&mut tasks, fec).await.unwrap();
             let bulk_pair = NetemPair::spawn_shared(
                 sink_addr,
                 c2s_bulk,
@@ -191,7 +194,8 @@ async fn run_hol_probe(
 
     // Open the interactive `b'L'` stream and keep its read half alive.
     let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
-    tokio::spawn(async move {
+    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = rr_read.read(&mut buf).await {
             if n == 0 {
@@ -204,7 +208,8 @@ async fn run_hol_probe(
     let mut shared_bulk_write = None;
     if matches!(bulk, BulkMode::Shared) {
         let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
-        tokio::spawn(async move {
+        // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+        tasks.spawn(async move {
             let mut buf = vec![0u8; 8 * 1024];
             while let Ok(n) = bulk_read.read(&mut buf).await {
                 if n == 0 {
@@ -221,18 +226,20 @@ async fn run_hol_probe(
     // Run the interactive sender and the bulk sender concurrently.
     // For split modes, spawn the bulk flow on its own pair BEFORE the
     // join so it runs concurrently with the interactive sender.
-    let split_bulk_handle = match &bulk {
+    let mut split_bulk_tasks: tokio::task::JoinSet<u64> = match &bulk {
         BulkMode::Split(_) | BulkMode::SplitSharedBneck(_, _) => {
+            let mut set = tokio::task::JoinSet::new();
             let client_addr = bulk_pair_opt.as_ref().unwrap().client_addr();
-            Some(tokio::spawn(run_rtp_bulk_flow(
+            set.spawn(run_rtp_bulk_flow(
                 client_addr,
                 fec,
                 Arc::clone(&payload),
                 BULK_RAMP,
                 active_for,
-            )))
+            ));
+            set
         }
-        _ => None,
+        _ => tokio::task::JoinSet::new(),
     };
 
     let rr_fut = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
@@ -245,8 +252,8 @@ async fn run_hol_probe(
         }
     };
     let split_fut = async {
-        if let Some(h) = split_bulk_handle {
-            let _ = h.await;
+        while let Some(result) = split_bulk_tasks.join_next().await {
+            result.unwrap();
         }
         0u64
     };
@@ -351,7 +358,11 @@ async fn run_rtp_bulk_flow(
     ramp: Duration,
     active_for: Duration,
 ) -> u64 {
-    let Ok(mut writer) = spawn_rtp_bulk_upload(proxy_client_addr, fec).await else {
+    // Owns the read-keepalive for the upload connection; aborted when this
+    // scope drops at the end of the flow.
+    let mut keepalives = tokio::task::JoinSet::new();
+    let Ok(mut writer) = spawn_rtp_bulk_upload(&mut keepalives, proxy_client_addr, fec).await
+    else {
         return 0;
     };
     tokio::time::sleep(ramp).await;
@@ -1134,12 +1145,13 @@ async fn run_hol_probe_frame_delivery_shared(
         grace,
     } = traffic;
     let base = Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
     let (server_addr, mut latencies, mux_bulk_counter) =
-        spawn_mux_frame_delivery_latency_bulk_server(fec, base)
+        spawn_mux_frame_delivery_latency_bulk_server(&mut tasks, fec, base)
             .await
             .unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (reader, writer) = rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let (reader, writer) = rtp_frame_delivery_connect(&mut tasks, pair.client_addr(), fec).await;
     let config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
         heartbeat_interval: Duration::from_secs(5),
@@ -1148,7 +1160,8 @@ async fn run_hol_probe_frame_delivery_shared(
     let mut spawner = tokio::task::JoinSet::new();
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
     let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
-    tokio::spawn(async move {
+    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = rr_read.read(&mut buf).await {
             if n == 0 {
@@ -1157,7 +1170,8 @@ async fn run_hol_probe_frame_delivery_shared(
         }
     });
     let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
-    tokio::spawn(async move {
+    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = bulk_read.read(&mut buf).await {
             if n == 0 {
@@ -1208,22 +1222,28 @@ async fn run_hol_probe_rtp_mux(
         grace,
     } = traffic;
     let base = Instant::now();
-    let (int_addr, bulk_addr, mut latencies, bulk_counter) =
-        spawn_rtp_mux_latency_bulk_server(false, base)
+    let mut tasks = tokio::task::JoinSet::new();
+    let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
+        spawn_rtp_mux_latency_bulk_server(&mut tasks, false, base)
             .await
             .unwrap();
     let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
-    let connector = Arc::new(rtp_mux_connector(bulk_pair.client_addr(), false));
+    let connector = Arc::new(rtp_mux_connector(
+        &mut tasks,
+        bulk_pair.client_addr(),
+        false,
+    ));
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let active_for = run_for - BULK_RAMP;
     let bulk_stop = Arc::new(AtomicBool::new(false));
-    let bulk_handle = {
+    let mut bulk_tasks = tokio::task::JoinSet::new();
+    {
         let connector = Arc::clone(&connector);
         let payload = Arc::clone(&payload);
         let stop = Arc::clone(&bulk_stop);
         let int_proxy_addr = int_pair.client_addr();
-        tokio::spawn(async move {
+        bulk_tasks.spawn(async move {
             let mut stream = match connector
                 .connect_stream_with_lane(int_proxy_addr, mux::LaneClass::Bulk)
                 .await
@@ -1234,8 +1254,8 @@ async fn run_hol_probe_rtp_mux(
             let _ = run_delayed_mux_bulk_stream(&mut stream, payload, BULK_RAMP, active_for, &stop)
                 .await;
             let _ = stream.shutdown().await;
-        })
-    };
+        });
+    }
     let mut stream = connector
         .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
         .await
@@ -1243,7 +1263,11 @@ async fn run_hol_probe_rtp_mux(
     let sent = run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for).await;
     let _ = stream.shutdown().await;
     bulk_stop.store(true, Ordering::Relaxed);
-    let _ = bulk_handle.await;
+    // The bulk flow exits once the stop flag is set; drain it so any panic
+    // surfaces.
+    while let Some(result) = bulk_tasks.join_next().await {
+        result.unwrap();
+    }
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();
     while let Ok((_tag, latency)) = latencies.try_recv() {
@@ -1297,8 +1321,10 @@ async fn run_hol_probe_dual_lane(
         grace,
     } = traffic;
     let base = Instant::now();
-    let (int_addr, bulk_addr, mut latencies, bulk_counter) =
+    let mut tasks = tokio::task::JoinSet::new();
+    let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
+            &mut tasks,
             false,
             base,
             interactive_frame,
@@ -1309,6 +1335,7 @@ async fn run_hol_probe_dual_lane(
     let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
     let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
+        &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
         false,
@@ -1321,10 +1348,11 @@ async fn run_hol_probe_dual_lane(
     let active_for = run_for - BULK_RAMP;
     let bulk_stop = Arc::new(AtomicBool::new(false));
     let bulk_opener = opener.clone();
-    let bulk_handle = {
+    let mut bulk_tasks = tokio::task::JoinSet::new();
+    {
         let payload = Arc::clone(&payload);
         let stop = Arc::clone(&bulk_stop);
-        tokio::spawn(async move {
+        bulk_tasks.spawn(async move {
             let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                 Ok(v) => v,
                 Err(_) => return,
@@ -1332,10 +1360,11 @@ async fn run_hol_probe_dual_lane(
             let _ =
                 run_delayed_mux_bulk_stream(&mut w, payload, BULK_RAMP, active_for, &stop).await;
             let _ = w.shutdown();
-        })
-    };
+        });
+    }
     let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
-    tokio::spawn(async move {
+    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = rr_read.read(&mut buf).await {
             if n == 0 {
@@ -1346,7 +1375,11 @@ async fn run_hol_probe_dual_lane(
     let sent = run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
     let _ = rr_write.shutdown();
     bulk_stop.store(true, Ordering::Relaxed);
-    let _ = bulk_handle.await;
+    // The bulk pump exits once the stop flag is set; drain it so any panic
+    // surfaces.
+    while let Some(result) = bulk_tasks.join_next().await {
+        result.unwrap();
+    }
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();
     while let Ok((_tag, lat)) = latencies.try_recv() {
@@ -1390,8 +1423,10 @@ async fn run_hol_probe_dual_lane_two_interactive(
             },
     } = config;
     let base = Instant::now();
-    let (int_addr, bulk_addr, mut latencies_all, bulk_counter) =
+    let mut tasks = tokio::task::JoinSet::new();
+    let (int_addr, bulk_addr, mut latencies_all, bulk_counter, _sink_streams) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
+            &mut tasks,
             false,
             base,
             interactive_frame,
@@ -1404,6 +1439,7 @@ async fn run_hol_probe_dual_lane_two_interactive(
     let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
 
     let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
+        &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
         false,
@@ -1417,10 +1453,11 @@ async fn run_hol_probe_dual_lane_two_interactive(
     let active_for = run_for - BULK_RAMP;
     let bulk_stop = Arc::new(AtomicBool::new(false));
     let bulk_opener = opener.clone();
-    let bulk_handle = {
+    let mut bulk_tasks = tokio::task::JoinSet::new();
+    {
         let payload = Arc::clone(&payload);
         let stop = Arc::clone(&bulk_stop);
-        tokio::spawn(async move {
+        bulk_tasks.spawn(async move {
             let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                 Ok(v) => v,
                 Err(_) => return,
@@ -1428,12 +1465,13 @@ async fn run_hol_probe_dual_lane_two_interactive(
             let _ =
                 run_delayed_mux_bulk_stream(&mut w, payload, BULK_RAMP, active_for, &stop).await;
             let _ = w.shutdown();
-        })
-    };
+        });
+    }
 
     let (mut read_a, mut write_a) = opener.open_auto();
     let (mut read_b, mut write_b) = opener.open_auto();
-    tokio::spawn(async move {
+    // Parked until the streams close; the owning JoinSet aborts them at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = read_a.read(&mut buf).await {
             if n == 0 {
@@ -1441,7 +1479,7 @@ async fn run_hol_probe_dual_lane_two_interactive(
             }
         }
     });
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = read_b.read(&mut buf).await {
             if n == 0 {
@@ -1454,7 +1492,9 @@ async fn run_hol_probe_dual_lane_two_interactive(
         let _ = write_a.shutdown();
         drop(write_b);
         bulk_stop.store(true, Ordering::Relaxed);
-        let _ = bulk_handle.await;
+        while let Some(result) = bulk_tasks.join_next().await {
+            result.unwrap();
+        }
         return (
             HolSummary::default(),
             HolSummary::default(),
@@ -1466,7 +1506,9 @@ async fn run_hol_probe_dual_lane_two_interactive(
         let _ = write_b.shutdown();
         let _ = write_a.shutdown();
         bulk_stop.store(true, Ordering::Relaxed);
-        let _ = bulk_handle.await;
+        while let Some(result) = bulk_tasks.join_next().await {
+            result.unwrap();
+        }
         return (
             HolSummary::default(),
             HolSummary::default(),
@@ -1481,7 +1523,11 @@ async fn run_hol_probe_dual_lane_two_interactive(
     let _ = write_b.shutdown();
 
     bulk_stop.store(true, Ordering::Relaxed);
-    let _ = bulk_handle.await;
+    // The bulk pump exits once the stop flag is set; drain it so any panic
+    // surfaces.
+    while let Some(result) = bulk_tasks.join_next().await {
+        result.unwrap();
+    }
 
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();
@@ -1552,12 +1598,13 @@ async fn run_frame_delivery_two_interactive(
             },
     } = config;
     let base = Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
     let (server_addr, mut latencies, _bulk_counter) =
-        spawn_mux_frame_delivery_latency_bulk_server(fec, base)
+        spawn_mux_frame_delivery_latency_bulk_server(&mut tasks, fec, base)
             .await
             .unwrap();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (reader, writer) = rtp_frame_delivery_connect(pair.client_addr(), fec).await;
+    let (reader, writer) = rtp_frame_delivery_connect(&mut tasks, pair.client_addr(), fec).await;
     let config = mux::MuxConfig {
         initiation: mux::Initiation::Client,
         heartbeat_interval: Duration::from_secs(5),
@@ -1567,7 +1614,8 @@ async fn run_frame_delivery_two_interactive(
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
     let (mut read_a, mut write_a) = opener.open().await.unwrap();
     let (mut read_b, mut write_b) = opener.open().await.unwrap();
-    tokio::spawn(async move {
+    // Parked until the streams close; the owning JoinSet aborts them at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = read_a.read(&mut buf).await {
             if n == 0 {
@@ -1575,7 +1623,7 @@ async fn run_frame_delivery_two_interactive(
             }
         }
     });
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = read_b.read(&mut buf).await {
             if n == 0 {
@@ -1996,8 +2044,10 @@ async fn run_hol_probe_dual_lane_separate_listeners(
             },
     } = config;
     let base = Instant::now();
-    let (int_addr, bulk_addr, mut latencies, bulk_counter) =
+    let mut tasks = tokio::task::JoinSet::new();
+    let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
         spawn_dual_mux_latency_bulk_server_two_listeners(
+            &mut tasks,
             false,
             base,
             interactive_frame,
@@ -2010,6 +2060,7 @@ async fn run_hol_probe_dual_lane_separate_listeners(
     let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
 
     let (opener, _accepter, _spawner) = dual_mux_client_connect_with_lane_modes(
+        &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
         false,
@@ -2023,10 +2074,11 @@ async fn run_hol_probe_dual_lane_separate_listeners(
     let active_for = run_for - BULK_RAMP;
     let bulk_stop = Arc::new(AtomicBool::new(false));
     let bulk_opener = opener.clone();
-    let bulk_handle = {
+    let mut bulk_tasks = tokio::task::JoinSet::new();
+    {
         let payload = Arc::clone(&payload);
         let stop = Arc::clone(&bulk_stop);
-        tokio::spawn(async move {
+        bulk_tasks.spawn(async move {
             let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                 Ok(v) => v,
                 Err(_) => return,
@@ -2034,11 +2086,12 @@ async fn run_hol_probe_dual_lane_separate_listeners(
             let _ =
                 run_delayed_mux_bulk_stream(&mut w, payload, BULK_RAMP, active_for, &stop).await;
             let _ = w.shutdown();
-        })
-    };
+        });
+    }
 
     let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
-    tokio::spawn(async move {
+    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = rr_read.read(&mut buf).await {
             if n == 0 {
@@ -2050,7 +2103,11 @@ async fn run_hol_probe_dual_lane_separate_listeners(
     let _ = rr_write.shutdown();
 
     bulk_stop.store(true, Ordering::Relaxed);
-    let _ = bulk_handle.await;
+    // The bulk pump exits once the stop flag is set; drain it so any panic
+    // surfaces.
+    while let Some(result) = bulk_tasks.join_next().await {
+        result.unwrap();
+    }
 
     tokio::time::sleep(grace).await;
     let mut samples = Vec::new();

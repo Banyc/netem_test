@@ -33,7 +33,10 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_lossy_perf_smoke() {
-    let server_addr = spawn_mux_over_rtp_echo_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
+        .await
+        .unwrap();
 
     let c2s = lossy_400kib_per_sec();
     let s2c = lossy_400kib_per_sec();
@@ -72,7 +75,10 @@ async fn mux_over_rtp_lossy_perf_smoke() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_400kib_lossy_contended_perf() {
-    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
+        .await
+        .unwrap();
 
     let c2s = lossy_400kib_per_sec();
     let s2c = lossy_400kib_per_sec();
@@ -123,7 +129,10 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_small_stream_while_bulk_perf() {
-    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(false).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
+        .await
+        .unwrap();
 
     // A mildly contended link: latency + small loss, no harsh rate limit so
     // the bulk and small streams can both make progress.
@@ -148,7 +157,8 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
     let start = Instant::now();
     let bulk_opener = opener.clone();
     let bulk_for_compare = bulk.clone();
-    let bulk_handle = tokio::spawn(async move { mux_send_payload(&bulk_opener, &bulk).await });
+    let mut bulk_tasks: tokio::task::JoinSet<Duration> = tokio::task::JoinSet::new();
+    bulk_tasks.spawn(async move { mux_send_payload(&bulk_opener, &bulk).await });
 
     tokio::time::sleep(Duration::from_millis(25)).await;
     let small_elapsed = mux_send_payload(&opener, &small).await;
@@ -177,7 +187,13 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
     let bulk_elapsed = with_timeout(
         Duration::from_secs(120),
         "mux-over-rtp small-while-bulk bulk join",
-        async { bulk_handle.await.expect("bulk send task panicked") },
+        async {
+            bulk_tasks
+                .join_next()
+                .await
+                .expect("bulk send task ended without a result")
+                .expect("bulk send task panicked")
+        },
     )
     .await;
 
@@ -228,8 +244,9 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
 async fn mux_over_rtp_400mib_hostile_perf() {
     const TARGET_BYTES: usize = 400 * 1024 * 1024;
     const BUDGET: Duration = Duration::from_secs(335);
+    let mut tasks = tokio::task::JoinSet::new();
     let (server_addr, progress) =
-        spawn_mux_over_rtp_counting_sink_server(false, rtp::udp::NO_FEC_MSS)
+        spawn_mux_over_rtp_counting_sink_server(&mut tasks, false, rtp::udp::NO_FEC_MSS)
             .await
             .unwrap();
     let impaired = hostile_fat_pipe();

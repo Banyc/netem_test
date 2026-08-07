@@ -85,8 +85,11 @@ async fn contested_rep(
     straggler: Duration,
 ) -> ContestedRepResult {
     let base = Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
     let (server_addr, mut latencies, bulk_counter) =
-        spawn_mux_latency_bulk_server(fec, base).await.unwrap();
+        spawn_mux_latency_bulk_server(&mut tasks, fec, base)
+            .await
+            .unwrap();
     let pair = Arc::new(NetemPair::spawn(server_addr, c2s, s2c).unwrap());
 
     let connected = rtp::udp::connect_with(
@@ -110,7 +113,8 @@ async fn contested_rep(
     let (mut ping_read, mut ping_write) = opener.open().await.unwrap();
     let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
 
-    tokio::spawn(async move {
+    // Parked until the streams close; the owning JoinSet aborts them at scope end.
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = ping_read.read(&mut buf).await {
             if n == 0 {
@@ -118,7 +122,7 @@ async fn contested_rep(
             }
         }
     });
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         while let Ok(n) = bulk_read.read(&mut buf).await {
             if n == 0 {
@@ -134,7 +138,8 @@ async fn contested_rep(
     let stop_sampler = Arc::new(AtomicBool::new(false));
     let stop_sampler_for_task = Arc::clone(&stop_sampler);
     let sampler_pair = Arc::clone(&pair);
-    let sampler_handle = tokio::spawn(async move {
+    let mut sampler_tasks = tokio::task::JoinSet::new();
+    sampler_tasks.spawn(async move {
         let mut samples = Vec::new();
         let start = Instant::now();
         while !stop_sampler_for_task.load(Ordering::Relaxed) {
@@ -162,7 +167,14 @@ async fn contested_rep(
     // Let stragglers drain, then stop the sampler before the pair.
     tokio::time::sleep(Duration::from_secs(2)).await;
     stop_sampler.store(true, Ordering::Relaxed);
-    let queue_samples = sampler_handle.await.unwrap_or_default();
+    // The sampler exits once the stop flag is set; join it so any panic
+    // surfaces.
+    let queue_samples = loop {
+        match sampler_tasks.join_next().await {
+            Some(result) => break result.unwrap_or_default(),
+            None => break Vec::new(),
+        }
+    };
 
     // Drain latency channel.
     let mut samples = Vec::new();

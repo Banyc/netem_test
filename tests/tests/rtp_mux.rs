@@ -15,7 +15,9 @@ use support::presets::clean;
 use support::stats::combined_stats;
 use support::{LANE_EVENT_CAPACITY, try_send_observation};
 
-async fn spawn_echo_server() -> io::Result<(
+async fn spawn_echo_server(
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> io::Result<(
     SocketAddr,
     SocketAddr,
     tokio::sync::mpsc::Receiver<LaneClass>,
@@ -24,27 +26,39 @@ async fn spawn_echo_server() -> io::Result<(
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     let (lane_tx, lane_rx) = tokio::sync::mpsc::channel(LANE_EVENT_CAPACITY);
-    tokio::spawn(async move {
-        let spawner = rtp_mux::SessionSpawner::new(|fut| {
-            tokio::spawn(fut);
+    tasks.spawn(async move {
+        // Session futures spawned by the SessionSpawner and the per-stream
+        // echo tasks are owned by this server task's scope; they are aborted
+        // when the local JoinSet drops at scope end.
+        let streams: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>> = Arc::default();
+        let spawner = rtp_mux::SessionSpawner::new({
+            let streams = Arc::clone(&streams);
+            move |fut| {
+                let mut set = streams.lock().unwrap();
+                set.spawn(fut);
+            }
         });
         let _ = server
-            .serve(spawner, move |stream| {
-                if !try_send_observation(&lane_tx, stream.source_lane(), "lane event") {
-                    return;
+            .serve(spawner, {
+                let streams = Arc::clone(&streams);
+                move |stream| {
+                    if !try_send_observation(&lane_tx, stream.source_lane(), "lane event") {
+                        return;
+                    }
+                    let streams = Arc::clone(&streams);
+                    streams.lock().unwrap().spawn(async move {
+                        let (mut reader, mut writer) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                        let _ = writer.shutdown().await;
+                    });
                 }
-                tokio::spawn(async move {
-                    let (mut reader, mut writer) = tokio::io::split(stream);
-                    let _ = tokio::io::copy(&mut reader, &mut writer).await;
-                    let _ = writer.shutdown().await;
-                });
             })
             .await;
     });
     Ok((interactive_addr, bulk_addr, lane_rx))
 }
 
-fn connector(bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
+fn connector(tasks: &mut tokio::task::JoinSet<()>, bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
     let bind: BindSelector = Arc::new(|addr| match addr {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
         SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
@@ -59,7 +73,7 @@ fn connector(bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
             ..ExplorerConfig::default()
         },
     });
-    tokio::spawn(driver);
+    tasks.spawn(driver);
     connector
 }
 
@@ -85,10 +99,12 @@ async fn echo_round_trip(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams() {
-    let (interactive_server, bulk_server, mut accepted_lanes) = spawn_echo_server().await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (interactive_server, bulk_server, mut accepted_lanes) =
+        spawn_echo_server(&mut tasks).await.unwrap();
     let interactive_pair = NetemPair::spawn(interactive_server, clean(), clean()).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_server, clean(), clean()).unwrap();
-    let connector = connector(bulk_pair.client_addr());
+    let connector = connector(&mut tasks, bulk_pair.client_addr());
     let interactive_payload = payload(64 * 1024);
     let bulk_payload = payload(512 * 1024);
     let (interactive_echo, bulk_echo) = with_timeout(
@@ -131,63 +147,77 @@ const PING_LEN: usize = 8;
 const PING_INTERVAL: Duration = Duration::from_millis(40);
 const CMD_DOWNLOAD: u8 = b'D';
 const CMD_PING: u8 = b'P';
-async fn spawn_cmd_server() -> io::Result<(SocketAddr, SocketAddr)> {
+async fn spawn_cmd_server(
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> io::Result<(SocketAddr, SocketAddr)> {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
-    tokio::spawn(async move {
-        let spawner = rtp_mux::SessionSpawner::new(|fut| {
-            tokio::spawn(fut);
+    tasks.spawn(async move {
+        // Session futures spawned by the SessionSpawner and the per-stream
+        // handler tasks are owned by this server task's scope; they are
+        // aborted when the local JoinSet drops at scope end.
+        let streams: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>> = Arc::default();
+        let spawner = rtp_mux::SessionSpawner::new({
+            let streams = Arc::clone(&streams);
+            move |fut| {
+                let mut set = streams.lock().unwrap();
+                set.spawn(fut);
+            }
         });
         let _ = server
-            .serve(spawner, |stream| {
-                tokio::spawn(async move {
-                    let (mut reader, mut writer) = tokio::io::split(stream);
-                    let mut cmd = [0u8; 1];
-                    if reader.read_exact(&mut cmd).await.is_err() {
-                        return;
-                    }
-                    match cmd[0] {
-                        CMD_DOWNLOAD => {
-                            let chunk = vec![0xCDu8; 64 * 1024];
-                            let mut sent = 0;
-                            while sent < DOWNLOAD_LEN {
-                                if writer.write_all(&chunk).await.is_err() {
-                                    return;
-                                }
-                                sent += chunk.len();
-                            }
-                            let _ = writer.shutdown().await;
+            .serve(spawner, {
+                let streams = Arc::clone(&streams);
+                move |stream| {
+                    let streams = Arc::clone(&streams);
+                    streams.lock().unwrap().spawn(async move {
+                        let (mut reader, mut writer) = tokio::io::split(stream);
+                        let mut cmd = [0u8; 1];
+                        if reader.read_exact(&mut cmd).await.is_err() {
+                            return;
                         }
-                        CMD_UPLOAD => {
-                            let mut buf = vec![0u8; 64 * 1024];
-                            let mut total = 0usize;
-                            while total < UPLOAD_LEN {
-                                match reader.read(&mut buf).await {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(n) => total += n,
+                        match cmd[0] {
+                            CMD_DOWNLOAD => {
+                                let chunk = vec![0xCDu8; 64 * 1024];
+                                let mut sent = 0;
+                                while sent < DOWNLOAD_LEN {
+                                    if writer.write_all(&chunk).await.is_err() {
+                                        return;
+                                    }
+                                    sent += chunk.len();
                                 }
+                                let _ = writer.shutdown().await;
                             }
-                            if total == UPLOAD_LEN {
-                                let _ = writer.write_all(&[1u8]).await;
-                                let _ = writer.flush().await;
-                            }
-                            let _ = writer.shutdown().await;
-                        }
-                        CMD_PING => {
-                            let mut buf = [0u8; PING_LEN];
-                            while reader.read_exact(&mut buf).await.is_ok() {
-                                if writer.write_all(&buf).await.is_err()
-                                    || writer.flush().await.is_err()
-                                {
-                                    break;
+                            CMD_UPLOAD => {
+                                let mut buf = vec![0u8; 64 * 1024];
+                                let mut total = 0usize;
+                                while total < UPLOAD_LEN {
+                                    match reader.read(&mut buf).await {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => total += n,
+                                    }
                                 }
+                                if total == UPLOAD_LEN {
+                                    let _ = writer.write_all(&[1u8]).await;
+                                    let _ = writer.flush().await;
+                                }
+                                let _ = writer.shutdown().await;
                             }
-                            let _ = writer.shutdown().await;
+                            CMD_PING => {
+                                let mut buf = [0u8; PING_LEN];
+                                while reader.read_exact(&mut buf).await.is_ok() {
+                                    if writer.write_all(&buf).await.is_err()
+                                        || writer.flush().await.is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                let _ = writer.shutdown().await;
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                });
+                    });
+                }
             })
             .await;
     });
@@ -209,11 +239,12 @@ struct ResponseArm {
     bulk_lane_wire_pkts: u64,
 }
 async fn run_response_arm() -> ResponseArm {
-    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_pair =
         NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
-    let connector = connector(bulk_pair.client_addr());
+    let connector = connector(&mut tasks, bulk_pair.client_addr());
     let mut ping = connector
         .connect_stream(interactive_pair.client_addr())
         .await
@@ -223,7 +254,8 @@ async fn run_response_arm() -> ResponseArm {
         .connect_stream(interactive_pair.client_addr())
         .await
         .unwrap();
-    let download_task = tokio::spawn(async move {
+    let mut download_tasks: tokio::task::JoinSet<(usize, f64)> = tokio::task::JoinSet::new();
+    download_tasks.spawn(async move {
         let started = std::time::Instant::now();
         download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
         let mut buf = vec![0u8; 64 * 1024];
@@ -239,16 +271,20 @@ async fn run_response_arm() -> ResponseArm {
     let mut rtts = Vec::new();
     let mut seq = 0u64;
     let mut buf = [0u8; PING_LEN];
-    while !download_task.is_finished() {
+    let mut download = None;
+    while download.is_none() {
         seq += 1;
         let sent = std::time::Instant::now();
         ping.write_all(&seq.to_le_bytes()).await.unwrap();
         ping.read_exact(&mut buf).await.unwrap();
         assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
         rtts.push(sent.elapsed().as_secs_f64() * 1e3);
+        if let Some(result) = download_tasks.try_join_next() {
+            download = Some(result);
+        }
         tokio::time::sleep(PING_INTERVAL).await;
     }
-    let (downloaded, download_secs) = download_task.await.unwrap();
+    let (downloaded, download_secs) = download.expect("download task never completed").unwrap();
     let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
     interactive_pair.stop();
     bulk_pair.stop();
@@ -263,7 +299,9 @@ async fn run_response_arm() -> ResponseArm {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_survives_independent_impaired_lanes() {
-    let (interactive_server, bulk_server, _accepted_lanes) = spawn_echo_server().await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (interactive_server, bulk_server, _accepted_lanes) =
+        spawn_echo_server(&mut tasks).await.unwrap();
     let interactive_impairment = NetemConfig {
         latency: Duration::from_millis(15),
         jitter: Duration::from_millis(3),
@@ -286,7 +324,7 @@ async fn rtp_mux_survives_independent_impaired_lanes() {
     .unwrap();
     let bulk_pair =
         NetemPair::spawn(bulk_server, bulk_impairment.clone(), bulk_impairment).unwrap();
-    let connector = connector(bulk_pair.client_addr());
+    let connector = connector(&mut tasks, bulk_pair.client_addr());
     let interactive_payload = payload(16 * 1024);
     let bulk_payload = payload(256 * 1024);
     let (interactive_echo, bulk_echo) = with_timeout(
@@ -371,11 +409,12 @@ struct BidirArm {
 }
 
 async fn run_bidir_arm() -> BidirArm {
-    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_pair =
         NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
     let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
-    let connector = connector(bulk_pair.client_addr());
+    let connector = connector(&mut tasks, bulk_pair.client_addr());
     let mut ping = connector
         .connect_stream(interactive_pair.client_addr())
         .await
@@ -385,7 +424,8 @@ async fn run_bidir_arm() -> BidirArm {
         .connect_stream(interactive_pair.client_addr())
         .await
         .unwrap();
-    let download_task = tokio::spawn(async move {
+    let mut download_tasks: tokio::task::JoinSet<usize> = tokio::task::JoinSet::new();
+    download_tasks.spawn(async move {
         download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
         let mut buf = vec![0u8; 64 * 1024];
         let mut total = 0usize;
@@ -401,7 +441,8 @@ async fn run_bidir_arm() -> BidirArm {
         .connect_stream(interactive_pair.client_addr())
         .await
         .unwrap();
-    let upload_task = tokio::spawn(async move {
+    let mut upload_tasks: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
+    upload_tasks.spawn(async move {
         upload.write_all(&[CMD_UPLOAD]).await.unwrap();
         let chunk = vec![0xC5u8; 64 * 1024];
         let mut sent = 0usize;
@@ -420,17 +461,25 @@ async fn run_bidir_arm() -> BidirArm {
     let mut rtts = Vec::new();
     let mut seq = 0u64;
     let mut buf = [0u8; PING_LEN];
-    while !(download_task.is_finished() && upload_task.is_finished()) {
+    let mut download = None;
+    let mut upload = None;
+    while download.is_none() || upload.is_none() {
         seq += 1;
         let sent = std::time::Instant::now();
         ping.write_all(&seq.to_le_bytes()).await.unwrap();
         ping.read_exact(&mut buf).await.unwrap();
         assert_eq!(u64::from_le_bytes(buf), seq, "ping echo out of sequence");
         rtts.push(sent.elapsed().as_secs_f64() * 1e3);
+        if let Some(result) = download_tasks.try_join_next() {
+            download = Some(result);
+        }
+        if let Some(result) = upload_tasks.try_join_next() {
+            upload = Some(result);
+        }
         tokio::time::sleep(PING_INTERVAL).await;
     }
-    let downloaded = download_task.await.unwrap();
-    let uploaded_ok = upload_task.await.unwrap();
+    let downloaded = download.expect("download task never completed").unwrap();
+    let uploaded_ok = upload.expect("upload task never completed").unwrap();
     let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
     interactive_pair.stop();
     bulk_pair.stop();
@@ -493,18 +542,20 @@ struct RecycleArm {
 }
 
 async fn run_recycle_arm() -> RecycleArm {
-    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_fan =
         PerFlowNetem::spawn(interactive_server, || (contended_lane(), contended_lane())).unwrap();
     let bulk_fan =
         PerFlowNetem::spawn(bulk_server, || (contended_lane(), contended_lane())).unwrap();
-    let connector = connector(bulk_fan.client_addr());
+    let connector = connector(&mut tasks, bulk_fan.client_addr());
     let addr = interactive_fan.client_addr();
     let mut ping = connector.connect_stream(addr).await.unwrap();
     ping.write_all(&[CMD_PING]).await.unwrap();
     let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut download = connector.connect_stream(addr).await.unwrap();
-    let download_task = tokio::spawn({
+    let mut download_tasks: tokio::task::JoinSet<(usize, bool, f64)> = tokio::task::JoinSet::new();
+    download_tasks.spawn({
         let gauge = Arc::clone(&downloaded_gauge);
         async move {
             let started = std::time::Instant::now();
@@ -530,7 +581,8 @@ async fn run_recycle_arm() -> RecycleArm {
     let mut seq = 0u64;
     let mut buf = [0u8; PING_LEN];
     let mut recycled = false;
-    while !download_task.is_finished() {
+    let mut download = None;
+    while download.is_none() {
         seq += 1;
         let sent = std::time::Instant::now();
         ping.write_all(&seq.to_le_bytes()).await.unwrap();
@@ -543,9 +595,13 @@ async fn run_recycle_arm() -> RecycleArm {
             recycled = true;
             connector.force_redial(addr);
         }
+        if let Some(result) = download_tasks.try_join_next() {
+            download = Some(result);
+        }
         tokio::time::sleep(PING_INTERVAL).await;
     }
-    let (downloaded, download_clean, download_secs) = download_task.await.unwrap();
+    let (downloaded, download_clean, download_secs) =
+        download.expect("download task never completed").unwrap();
     let session_replaced = connector
         .probe_session(addr)
         .is_some_and(|probe| probe.id() != old_probe.id());
@@ -646,7 +702,8 @@ struct ExplorerArm {
 }
 
 async fn run_explorer_arm() -> ExplorerArm {
-    let (interactive_server, bulk_server) = spawn_cmd_server().await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
     let interactive_flows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let interactive_fan = PerFlowNetem::spawn(interactive_server, {
         let flows = Arc::clone(&interactive_flows);
@@ -683,7 +740,7 @@ async fn run_explorer_arm() -> ExplorerArm {
                 ..ExplorerConfig::default()
             },
         });
-        tokio::spawn(driver);
+        tasks.spawn(driver);
         connector
     };
     let addr = interactive_fan.client_addr();
@@ -691,7 +748,8 @@ async fn run_explorer_arm() -> ExplorerArm {
     ping.write_all(&[CMD_PING]).await.unwrap();
     let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut download = connector.connect_stream(addr).await.unwrap();
-    let download_task = tokio::spawn({
+    let mut download_tasks: tokio::task::JoinSet<(usize, bool, f64)> = tokio::task::JoinSet::new();
+    download_tasks.spawn({
         let gauge = Arc::clone(&downloaded_gauge);
         async move {
             let started = std::time::Instant::now();
@@ -718,7 +776,8 @@ async fn run_explorer_arm() -> ExplorerArm {
     let mut seq = 0u64;
     let mut buf = [0u8; PING_LEN];
     let mut fast_candidate_port: Option<u16> = None;
-    while !download_task.is_finished() {
+    let mut download = None;
+    while download.is_none() {
         seq += 1;
         let sent = std::time::Instant::now();
         ping.write_all(&seq.to_le_bytes()).await.unwrap();
@@ -746,9 +805,13 @@ async fn run_explorer_arm() -> ExplorerArm {
                 connector.reoptimize(addr);
             }
         }
+        if let Some(result) = download_tasks.try_join_next() {
+            download = Some(result);
+        }
         tokio::time::sleep(PING_INTERVAL).await;
     }
-    let (downloaded, download_clean, download_secs) = download_task.await.unwrap();
+    let (downloaded, download_clean, download_secs) =
+        download.expect("download task never completed").unwrap();
     let fast_candidate_port =
         fast_candidate_port.expect("explorer never converged on the fast tuple");
     let session_replaced = connector
