@@ -171,7 +171,7 @@ async fn contested_rep(
     // surfaces.
     let queue_samples = loop {
         match sampler_tasks.join_next().await {
-            Some(result) => break result.unwrap_or_default(),
+            Some(result) => break result.unwrap(),
             None => break Vec::new(),
         }
     };

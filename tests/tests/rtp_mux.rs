@@ -13,7 +13,7 @@ use support::fan::PerFlowNetem;
 use support::payload::{payload, with_timeout};
 use support::presets::clean;
 use support::stats::combined_stats;
-use support::{LANE_EVENT_CAPACITY, try_send_observation};
+use support::{LANE_EVENT_CAPACITY, TEST_TASK_QUEUE_BOUND, submit_test_task, try_send_observation};
 
 async fn spawn_echo_server(
     tasks: &mut tokio::task::JoinSet<()>,
@@ -26,34 +26,40 @@ async fn spawn_echo_server(
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     let (lane_tx, lane_rx) = tokio::sync::mpsc::channel(LANE_EVENT_CAPACITY);
-    tasks.spawn(async move {
-        // Session futures spawned by the SessionSpawner and the per-stream
-        // echo tasks are owned by this server task's scope; they are aborted
-        // when the local JoinSet drops at scope end.
-        let streams: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>> = Arc::default();
-        let spawner = rtp_mux::SessionSpawner::new({
-            let streams = Arc::clone(&streams);
-            move |fut| {
-                let mut set = streams.lock().unwrap();
-                set.spawn(fut);
-            }
-        });
-        let _ = server
-            .serve(spawner, {
-                let streams = Arc::clone(&streams);
-                move |stream| {
-                    if !try_send_observation(&lane_tx, stream.source_lane(), "lane event") {
-                        return;
-                    }
-                    let streams = Arc::clone(&streams);
-                    streams.lock().unwrap().spawn(async move {
-                        let (mut reader, mut writer) = tokio::io::split(stream);
-                        let _ = tokio::io::copy(&mut reader, &mut writer).await;
-                        let _ = writer.shutdown().await;
-                    });
+    // Session futures spawned by the SessionSpawner and the per-stream echo
+    // tasks are submitted through a bounded channel feeding one test-owned
+    // reaper, which selects between submissions and join_next() completions
+    // and unwraps every completion so panics surface immediately.
+    let task_tx = support::spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
+    tasks.spawn({
+        let task_tx = task_tx.clone();
+        async move {
+            let spawner = rtp_mux::SessionSpawner::new({
+                let task_tx = task_tx.clone();
+                move |fut| {
+                    submit_test_task(&task_tx, fut);
                 }
-            })
-            .await;
+            });
+            let _ = server
+                .serve(spawner, {
+                    let task_tx = task_tx.clone();
+                    move |stream| {
+                        if !try_send_observation(&lane_tx, stream.source_lane(), "lane event") {
+                            return;
+                        }
+                        let task_tx = task_tx.clone();
+                        submit_test_task(
+                            &task_tx,
+                            Box::pin(async move {
+                                let (mut reader, mut writer) = tokio::io::split(stream);
+                                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                                let _ = writer.shutdown().await;
+                            }),
+                        );
+                    }
+                })
+                .await;
+        }
     });
     Ok((interactive_addr, bulk_addr, lane_rx))
 }
@@ -153,73 +159,79 @@ async fn spawn_cmd_server(
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
-    tasks.spawn(async move {
-        // Session futures spawned by the SessionSpawner and the per-stream
-        // handler tasks are owned by this server task's scope; they are
-        // aborted when the local JoinSet drops at scope end.
-        let streams: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>> = Arc::default();
-        let spawner = rtp_mux::SessionSpawner::new({
-            let streams = Arc::clone(&streams);
-            move |fut| {
-                let mut set = streams.lock().unwrap();
-                set.spawn(fut);
-            }
-        });
-        let _ = server
-            .serve(spawner, {
-                let streams = Arc::clone(&streams);
-                move |stream| {
-                    let streams = Arc::clone(&streams);
-                    streams.lock().unwrap().spawn(async move {
-                        let (mut reader, mut writer) = tokio::io::split(stream);
-                        let mut cmd = [0u8; 1];
-                        if reader.read_exact(&mut cmd).await.is_err() {
-                            return;
-                        }
-                        match cmd[0] {
-                            CMD_DOWNLOAD => {
-                                let chunk = vec![0xCDu8; 64 * 1024];
-                                let mut sent = 0;
-                                while sent < DOWNLOAD_LEN {
-                                    if writer.write_all(&chunk).await.is_err() {
-                                        return;
-                                    }
-                                    sent += chunk.len();
-                                }
-                                let _ = writer.shutdown().await;
-                            }
-                            CMD_UPLOAD => {
-                                let mut buf = vec![0u8; 64 * 1024];
-                                let mut total = 0usize;
-                                while total < UPLOAD_LEN {
-                                    match reader.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => total += n,
-                                    }
-                                }
-                                if total == UPLOAD_LEN {
-                                    let _ = writer.write_all(&[1u8]).await;
-                                    let _ = writer.flush().await;
-                                }
-                                let _ = writer.shutdown().await;
-                            }
-                            CMD_PING => {
-                                let mut buf = [0u8; PING_LEN];
-                                while reader.read_exact(&mut buf).await.is_ok() {
-                                    if writer.write_all(&buf).await.is_err()
-                                        || writer.flush().await.is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                let _ = writer.shutdown().await;
-                            }
-                            _ => {}
-                        }
-                    });
+    // Session futures spawned by the SessionSpawner and the per-stream
+    // handler tasks are submitted through a bounded channel feeding one
+    // test-owned reaper, which selects between submissions and join_next()
+    // completions and unwraps every completion so panics surface.
+    let task_tx = support::spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
+    tasks.spawn({
+        let task_tx = task_tx.clone();
+        async move {
+            let spawner = rtp_mux::SessionSpawner::new({
+                let task_tx = task_tx.clone();
+                move |fut| {
+                    submit_test_task(&task_tx, fut);
                 }
-            })
-            .await;
+            });
+            let _ = server
+                .serve(spawner, {
+                    let task_tx = task_tx.clone();
+                    move |stream| {
+                        let task_tx = task_tx.clone();
+                        submit_test_task(
+                            &task_tx,
+                            Box::pin(async move {
+                                let (mut reader, mut writer) = tokio::io::split(stream);
+                                let mut cmd = [0u8; 1];
+                                if reader.read_exact(&mut cmd).await.is_err() {
+                                    return;
+                                }
+                                match cmd[0] {
+                                    CMD_DOWNLOAD => {
+                                        let chunk = vec![0xCDu8; 64 * 1024];
+                                        let mut sent = 0;
+                                        while sent < DOWNLOAD_LEN {
+                                            if writer.write_all(&chunk).await.is_err() {
+                                                return;
+                                            }
+                                            sent += chunk.len();
+                                        }
+                                        let _ = writer.shutdown().await;
+                                    }
+                                    CMD_UPLOAD => {
+                                        let mut buf = vec![0u8; 64 * 1024];
+                                        let mut total = 0usize;
+                                        while total < UPLOAD_LEN {
+                                            match reader.read(&mut buf).await {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(n) => total += n,
+                                            }
+                                        }
+                                        if total == UPLOAD_LEN {
+                                            let _ = writer.write_all(&[1u8]).await;
+                                            let _ = writer.flush().await;
+                                        }
+                                        let _ = writer.shutdown().await;
+                                    }
+                                    CMD_PING => {
+                                        let mut buf = [0u8; PING_LEN];
+                                        while reader.read_exact(&mut buf).await.is_ok() {
+                                            if writer.write_all(&buf).await.is_err()
+                                                || writer.flush().await.is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        let _ = writer.shutdown().await;
+                                    }
+                                    _ => {}
+                                }
+                            }),
+                        );
+                    }
+                })
+                .await;
+        }
     });
     Ok((interactive_addr, bulk_addr))
 }

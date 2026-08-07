@@ -3,8 +3,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -17,7 +17,10 @@ use rtp::FrameMode;
 use super::frame::rtp_frame_delivery_connect;
 use super::rtp::rtp_connect;
 use super::rtp_mux::spawn_tagged_stream_sink;
-use crate::support::{LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, try_send_observation};
+use crate::support::{
+    LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestTask,
+    spawn_test_task_reaper, try_send_observation,
+};
 
 /// Server that accepts two RTP connections (lane‑hello paired) and handles
 /// both latency‑echo (tag byte `b'L'`) and bulk‑sink streams on the paired
@@ -1284,10 +1287,11 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
 /// listener's accept loop and applies per-lane frame delivery at accept time,
 /// then spawns the mux handshake in the pairing loop.
 ///
-/// Returns `(int_addr, bulk_addr, lat_rx, bulk_counter, streams)` so the client
-/// can connect each lane to its dedicated listener. `streams` is the shared
-/// scope owning the tagged-stream sink tasks; the caller must keep it alive
-/// (dropping it aborts the sinks at scope end).
+/// Returns `(int_addr, bulk_addr, lat_rx, bulk_counter, task_tx)` so the client
+/// can connect each lane to its dedicated listener. `task_tx` is the bounded
+/// submission channel feeding the test-owned reaper; the tagged-stream sink
+/// tasks are submitted through it, and the reaper unwraps every completion so
+/// panics surface immediately.
 pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     tasks: &mut tokio::task::JoinSet<()>,
     fec: bool,
@@ -1299,7 +1303,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
-    Arc<Mutex<JoinSet<()>>>,
+    mpsc::Sender<TestTask>,
 )> {
     let int_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let bulk_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
@@ -1309,9 +1313,11 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
 
-    // Shared scope for the tagged-stream sink tasks spawned by the pair
-    // handler; aborted when the caller drops this Arc at scope end.
-    let streams = Arc::new(Mutex::new(JoinSet::new()));
+    // Tagged-stream sink tasks spawned by the pairing handler are submitted
+    // through a bounded channel feeding one test-owned reaper (spawned into
+    // `tasks`), which selects between submissions and join_next() completions
+    // and unwraps every completion so panics surface immediately.
+    let task_tx = spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
 
     // Parked accept loops (aborted when `tasks` drops at scope end).
     for (listener, lane_frame) in [
@@ -1354,7 +1360,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
 
     // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    let streams_for_pair = Arc::clone(&streams);
+    let task_tx_for_pair = task_tx.clone();
     tasks.spawn(async move {
         let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
 
@@ -1388,12 +1394,12 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
                     {
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
-                        let streams = Arc::clone(&streams_for_pair);
+                        let task_tx = task_tx_for_pair.clone();
                         pair_handlers.spawn(async move {
                             let _spawner = pair_spawner;
                             while let Ok((reader, writer, class)) = accepter.accept().await {
                                 spawn_tagged_stream_sink(
-                                    &streams,
+                                    &task_tx,
                                     reader,
                                     writer,
                                     tx.clone(),
@@ -1411,5 +1417,5 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             result.unwrap();
         }
     });
-    Ok((int_addr, bulk_addr, rx, bulk_delivered, streams))
+    Ok((int_addr, bulk_addr, rx, bulk_delivered, task_tx))
 }

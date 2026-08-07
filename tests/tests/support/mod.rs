@@ -24,6 +24,54 @@ pub mod contested;
 pub(crate) const LATENCY_SAMPLE_CAPACITY: usize = 4096;
 pub(crate) const TEST_ACCEPT_CAPACITY: usize = 64;
 pub(crate) const LANE_EVENT_CAPACITY: usize = 64;
+pub(crate) const TEST_TASK_QUEUE_BOUND: usize = 256;
+
+/// A boxed test-owned task future: session supervisors, per-stream sinks,
+/// and rtp_mux drivers all submit through [`spawn_test_task_reaper`].
+pub(crate) type TestTask =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+/// A bounded submission channel feeding one test-owned reaper task. The
+/// reaper (spawned into `tasks`) selects between new submissions and
+/// `join_next()` completions, unwrapping every completion, so panics surface
+/// immediately instead of being observed only at scope destruction.
+///
+/// Returns the submission sender; clone it into every scope that spawns
+/// owned tasks and keep one alive for the channel to stay open.
+pub(crate) fn spawn_test_task_reaper(
+    tasks: &mut tokio::task::JoinSet<()>,
+    bound: usize,
+) -> tokio::sync::mpsc::Sender<TestTask> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TestTask>(bound);
+    tasks.spawn(async move {
+        let mut owned = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                Some(fut) = rx.recv() => {
+                    owned.spawn(fut);
+                }
+                Some(joined) = owned.join_next() => {
+                    joined.unwrap();
+                }
+                else => break,
+            }
+        }
+    });
+    tx
+}
+
+/// Submit a test-owned task future; panics if the bounded submission
+/// channel is full (the reaper is not draining), mirroring
+/// [`try_send_observation`].
+pub(crate) fn submit_test_task(tx: &tokio::sync::mpsc::Sender<TestTask>, fut: TestTask) {
+    match tx.try_send(fut) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            panic!("test task submission channel is full; the reaper is not draining")
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
 
 pub(crate) fn try_send_observation<T>(
     tx: &tokio::sync::mpsc::Sender<T>,
