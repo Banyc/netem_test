@@ -170,11 +170,23 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
             let start = Instant::now();
             let bulk_opener = opener.clone();
             let bulk_for_compare = bulk.clone();
-            let mut bulk_tasks: tokio::task::JoinSet<Duration> = tokio::task::JoinSet::new();
-            bulk_tasks.spawn(async move { mux_send_payload(&bulk_opener, &bulk).await });
 
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let small_elapsed = mux_send_payload(&opener, &small).await;
+            // The bulk and small sends run CONCURRENTLY as pinned futures
+            // driven through tokio::join!, so the small stream rides the
+            // same connection while the 400 KiB bulk is still in flight.
+            let (bulk_elapsed, small_elapsed) = with_timeout(
+                Duration::from_secs(120),
+                "mux-over-rtp small-while-bulk sends",
+                async {
+                    let bulk_send = mux_send_payload(&bulk_opener, &bulk);
+                    let small_send = async {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        mux_send_payload(&opener, &small).await
+                    };
+                    tokio::join!(bulk_send, small_send)
+                },
+            )
+            .await;
 
             // Drain the sink channel until both payloads have arrived,
             // matching by equality. Panic on any unexpected payload.
@@ -196,19 +208,6 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
                     panic!("unexpected payload from sink: len {}", recv.len());
                 }
             }
-
-            let bulk_elapsed = with_timeout(
-                Duration::from_secs(120),
-                "mux-over-rtp small-while-bulk bulk join",
-                async {
-                    bulk_tasks
-                        .join_next()
-                        .await
-                        .expect("bulk send task ended without a result")
-                        .unwrap()
-                },
-            )
-            .await;
 
             assert!(got_bulk, "bulk stream must deliver all 400KiB intact");
             assert!(got_small, "small stream must deliver intact");

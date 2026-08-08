@@ -38,10 +38,7 @@
 //! Interactive p99 under contention tracks how hard the bulk stream pushes:
 //! a faster host deepens the queue the interactive lane waits behind.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
@@ -135,24 +132,22 @@ async fn contested_rep(
             // Bulk payload: 64 MiB cyclic buffer, enough to keep any cap busy.
             let payload = Arc::new(support::payload::cyclic_payload(64 * 1024 * 1024));
 
-            // Start queue-length sampler on the LOADED pair.
-            let stop_sampler = Arc::new(AtomicBool::new(false));
-            let stop_sampler_for_task = Arc::clone(&stop_sampler);
+            // Start queue-length sampler on the LOADED pair, driven as a
+            // pinned future concurrently with the ping/bulk measurement via
+            // tokio::join!. It ends on its own elapsed budget
+            // (`straggler + 2 s`), so no stop flag is needed.
             let sampler_pair = Arc::clone(&pair);
-            let mut sampler_tasks = tokio::task::JoinSet::new();
-            sampler_tasks.spawn(async move {
+            let sampler_fut = async move {
                 let mut samples = Vec::new();
                 let start = Instant::now();
-                while !stop_sampler_for_task.load(Ordering::Relaxed) {
+                while start.elapsed() < straggler + Duration::from_secs(2) {
                     tokio::time::sleep(QUEUE_SAMPLE_INTERVAL).await;
                     samples.push(sampler_pair.queue_len_c2s());
-                    if start.elapsed() >= straggler + Duration::from_secs(2) {
-                        break;
-                    }
                 }
                 // Don't stop the pair — the caller does it.
                 samples
-            });
+            };
+            tokio::pin!(sampler_fut);
 
             // Run bulk and ping concurrently. Ping runs for the full window;
             // bulk sleeps BULK_RAMP (1.5s) so the ping has a solo baseline
@@ -161,20 +156,17 @@ async fn contested_rep(
             let ping_fut =
                 send_tagged_pings(&mut ping_write, base, PING_BYTES, cadence, ping_window);
             let bulk_fut = run_mux_bulk_stream(&mut bulk_write, Arc::clone(&payload), straggler);
-            let (sent, _written) = tokio::join!(ping_fut, async {
-                tokio::time::sleep(BULK_RAMP).await;
-                bulk_fut.await
-            });
+            let (sent, _written, queue_samples) = tokio::join!(
+                ping_fut,
+                async {
+                    tokio::time::sleep(BULK_RAMP).await;
+                    bulk_fut.await
+                },
+                &mut sampler_fut,
+            );
 
-            // Let stragglers drain, then stop the sampler before the pair.
+            // Let stragglers drain before reading the latency channel.
             tokio::time::sleep(Duration::from_secs(2)).await;
-            stop_sampler.store(true, Ordering::Relaxed);
-            // The sampler exits once the stop flag is set; join it so any
-            // panic surfaces.
-            let queue_samples = match sampler_tasks.join_next().await {
-                Some(result) => result.unwrap(),
-                None => Vec::new(),
-            };
 
             // Drain latency channel.
             let mut samples = Vec::new();
