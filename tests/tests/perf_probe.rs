@@ -602,16 +602,41 @@ async fn probe_hostile_goodput_30s() {
     let start = Instant::now();
 
     // Keep the write half busy and the read half open for the full window.
-    // Parked for the window; the owning scope aborts it at scope end.
-    tasks.spawn(async move {
-        let _ = stream_write.write_all(&data).await;
+    // The pump is raced against the window below, so an early completion
+    // (write failure) fails the test instead of measuring a dead upload.
+    let (pump_stop_tx, mut pump_stop_rx) = tokio::sync::watch::channel(false);
+    let mut pump_tasks = tokio::task::JoinSet::new();
+    pump_tasks.spawn(async move {
+        tokio::select! {
+            _ = pump_stop_rx.changed() => {}
+            result = stream_write.write_all(&data) => {
+                // The write finished before the window ended: surface the
+                // outcome (a write failure panics the pump).
+                result.unwrap();
+            }
+        }
     });
 
     tasks
         .run(async {
-            tokio::time::sleep(Duration::from_secs_f64(WINDOW)).await;
-            let delivered = progress.delivered_bytes();
-            let elapsed = start.elapsed();
+            let (delivered, elapsed) = tokio::select! {
+                joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
+                    // The bulk pump ended before the measurement window
+                    // completed: fail the test.
+                    joined.expect("bulk pump exists").unwrap();
+                    panic!("bulk pump ended before the measurement window completed");
+                }
+                _ = tokio::time::sleep(Duration::from_secs_f64(WINDOW)) => {
+                    let delivered = progress.delivered_bytes();
+                    let elapsed = start.elapsed();
+                    pump_stop_tx.send(true).unwrap();
+                    // Epilog: join the pump so any panic surfaces.
+                    while let Some(result) = pump_tasks.join_next().await {
+                        result.unwrap();
+                    }
+                    (delivered, elapsed)
+                }
+            };
 
             pair_ref.stop();
             let stats = combined_stats(pair_ref);

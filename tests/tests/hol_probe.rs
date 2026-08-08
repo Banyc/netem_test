@@ -1447,12 +1447,11 @@ async fn run_hol_probe_rtp_mux(
     ));
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let active_for = run_for - BULK_RAMP;
-    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
     let mut bulk_tasks = tokio::task::JoinSet::new();
     {
         let connector = Arc::clone(&connector);
         let payload = Arc::clone(&payload);
-        let stop = Arc::clone(&bulk_stop);
         let int_proxy_addr = int_pair.client_addr();
         bulk_tasks.spawn(async move {
             let mut stream = match connector
@@ -1462,50 +1461,73 @@ async fn run_hol_probe_rtp_mux(
                 Ok(stream) => stream,
                 Err(_) => return,
             };
-            let _ = run_delayed_mux_bulk_stream(
-                &mut stream,
-                payload,
-                BULK_RAMP,
-                active_for,
-                &stop,
-                BulkLoad::Saturating,
-            )
-            .await;
+            // The pump runs until the watch signals shutdown at the end of
+            // the interactive measurement (or a write failure ends it).
+            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+            // window is only a backstop so the pump never ends on its own
+            // while the measurement is still running.
+            tokio::select! {
+                _ = bulk_stop_rx.changed() => {}
+                _ = run_delayed_mux_bulk_stream(
+                    &mut stream,
+                    payload,
+                    BULK_RAMP,
+                    Duration::from_secs(3600),
+                    &BULK_NO_STOP,
+                    BulkLoad::Saturating,
+                ) => {}
+            }
             let _ = stream.shutdown().await;
         });
     }
     tasks
         .run(async {
-            let mut stream = connector
-                .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
-                .await
-                .unwrap();
-            let sent =
-                run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for).await;
-            let _ = stream.shutdown().await;
-            bulk_stop.store(true, Ordering::Relaxed);
-            // The bulk flow exits once the stop flag is set; drain it so any panic
-            // surfaces.
+            let body = async {
+                let mut stream = connector
+                    .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
+                    .await
+                    .unwrap();
+                let sent =
+                    run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for)
+                        .await;
+                let _ = stream.shutdown().await;
+                // Signal the pump to stop before the straggler grace; the
+                // epilog join happens after the raced body.
+                bulk_stop_tx.send(true).unwrap();
+                tokio::time::sleep(grace).await;
+                let mut samples = Vec::new();
+                while let Ok((_tag, latency)) = latencies.try_recv() {
+                    samples.push(latency);
+                }
+                let received = samples.len() as u64;
+                let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+                let bulk_secs = active_for.as_secs_f64();
+                let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+                print_hol_summary(label, &summary);
+                eprintln!(
+                    "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                    combined_stats(&int_pair),
+                    combined_stats(&bulk_pair)
+                );
+                int_pair.stop();
+                bulk_pair.stop();
+                summary
+            };
+            tokio::pin!(body);
+            let summary = tokio::select! {
+                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
+                    // The bulk pump ended before the interactive measurement
+                    // completed: fail the test instead of measuring without
+                    // contention.
+                    joined.expect("bulk pump exists").unwrap();
+                    panic!("bulk pump ended before the interactive measurement completed");
+                }
+                summary = &mut body => summary,
+            };
+            // Epilog: join the pump so any panic surfaces.
             while let Some(result) = bulk_tasks.join_next().await {
                 result.unwrap();
             }
-            tokio::time::sleep(grace).await;
-            let mut samples = Vec::new();
-            while let Ok((_tag, latency)) = latencies.try_recv() {
-                samples.push(latency);
-            }
-            let received = samples.len() as u64;
-            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-            let bulk_secs = active_for.as_secs_f64();
-            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
-            print_hol_summary(label, &summary);
-            eprintln!(
-                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-                combined_stats(&int_pair),
-                combined_stats(&bulk_pair)
-            );
-            int_pair.stop();
-            bulk_pair.stop();
             summary
         })
         .await
@@ -1569,26 +1591,32 @@ async fn run_hol_probe_dual_lane(
     .unwrap();
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let active_for = run_for - BULK_RAMP;
-    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
     let bulk_opener = opener.clone();
     let mut bulk_tasks = tokio::task::JoinSet::new();
     {
         let payload = Arc::clone(&payload);
-        let stop = Arc::clone(&bulk_stop);
         bulk_tasks.spawn(async move {
             let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let _ = run_delayed_mux_bulk_stream(
-                &mut w,
-                payload,
-                BULK_RAMP,
-                active_for,
-                &stop,
-                BulkLoad::Saturating,
-            )
-            .await;
+            // The pump runs until the watch signals shutdown at the end of
+            // the interactive measurement (or a write failure ends it).
+            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+            // window is only a backstop so the pump never ends on its own
+            // while the measurement is still running.
+            tokio::select! {
+                _ = bulk_stop_rx.changed() => {}
+                _ = run_delayed_mux_bulk_stream(
+                    &mut w,
+                    payload,
+                    BULK_RAMP,
+                    Duration::from_secs(3600),
+                    &BULK_NO_STOP,
+                    BulkLoad::Saturating,
+                ) => {}
+            }
             let _ = w.shutdown();
         });
     }
@@ -1604,32 +1632,48 @@ async fn run_hol_probe_dual_lane(
     });
     tasks
         .run(async {
-            let sent =
-                run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
-            let _ = rr_write.shutdown();
-            bulk_stop.store(true, Ordering::Relaxed);
-            // The bulk pump exits once the stop flag is set; drain it so any panic
-            // surfaces.
+            let body = async {
+                let sent =
+                    run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)
+                        .await;
+                let _ = rr_write.shutdown();
+                // Signal the pump to stop before the straggler grace; the
+                // epilog join happens after the raced body.
+                bulk_stop_tx.send(true).unwrap();
+                tokio::time::sleep(grace).await;
+                let mut samples = Vec::new();
+                while let Ok((_tag, lat)) = latencies.try_recv() {
+                    samples.push(lat);
+                }
+                let received = samples.len() as u64;
+                let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+                let bulk_secs = active_for.as_secs_f64();
+                let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+                print_hol_summary(label, &summary);
+                eprintln!(
+                    "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                    combined_stats(&int_pair),
+                    combined_stats(&bulk_pair)
+                );
+                int_pair.stop();
+                bulk_pair.stop();
+                summary
+            };
+            tokio::pin!(body);
+            let summary = tokio::select! {
+                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
+                    // The bulk pump ended before the interactive measurement
+                    // completed: fail the test instead of measuring without
+                    // contention.
+                    joined.expect("bulk pump exists").unwrap();
+                    panic!("bulk pump ended before the interactive measurement completed");
+                }
+                summary = &mut body => summary,
+            };
+            // Epilog: join the pump so any panic surfaces.
             while let Some(result) = bulk_tasks.join_next().await {
                 result.unwrap();
             }
-            tokio::time::sleep(grace).await;
-            let mut samples = Vec::new();
-            while let Ok((_tag, lat)) = latencies.try_recv() {
-                samples.push(lat);
-            }
-            let received = samples.len() as u64;
-            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-            let bulk_secs = active_for.as_secs_f64();
-            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
-            print_hol_summary(label, &summary);
-            eprintln!(
-                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-                combined_stats(&int_pair),
-                combined_stats(&bulk_pair)
-            );
-            int_pair.stop();
-            bulk_pair.stop();
             summary
         })
         .await
@@ -1686,26 +1730,32 @@ async fn run_hol_probe_dual_lane_two_interactive(
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let active_for = run_for - BULK_RAMP;
-    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
     let bulk_opener = opener.clone();
     let mut bulk_tasks = tokio::task::JoinSet::new();
     {
         let payload = Arc::clone(&payload);
-        let stop = Arc::clone(&bulk_stop);
         bulk_tasks.spawn(async move {
             let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let _ = run_delayed_mux_bulk_stream(
-                &mut w,
-                payload,
-                BULK_RAMP,
-                active_for,
-                &stop,
-                BulkLoad::Saturating,
-            )
-            .await;
+            // The pump runs until the watch signals shutdown at the end of
+            // the interactive measurement (or a write failure ends it).
+            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+            // window is only a backstop so the pump never ends on its own
+            // while the measurement is still running.
+            tokio::select! {
+                _ = bulk_stop_rx.changed() => {}
+                _ = run_delayed_mux_bulk_stream(
+                    &mut w,
+                    payload,
+                    BULK_RAMP,
+                    Duration::from_secs(3600),
+                    &BULK_NO_STOP,
+                    BulkLoad::Saturating,
+                ) => {}
+            }
             let _ = w.shutdown();
         });
     }
@@ -1732,95 +1782,105 @@ async fn run_hol_probe_dual_lane_two_interactive(
 
     tasks
         .run(async {
-            if write_a.write_all(b"A").await.is_err() {
-                let _ = write_a.shutdown();
-                drop(write_b);
-                bulk_stop.store(true, Ordering::Relaxed);
-                while let Some(result) = bulk_tasks.join_next().await {
-                    result.unwrap();
+            let body = async {
+                if write_a.write_all(b"A").await.is_err() {
+                    let _ = write_a.shutdown();
+                    drop(write_b);
+                    return (
+                        HolSummary::default(),
+                        HolSummary::default(),
+                        HolSummary::default(),
+                        0.0,
+                    );
                 }
-                return (
-                    HolSummary::default(),
-                    HolSummary::default(),
-                    HolSummary::default(),
-                    0.0,
-                );
-            }
-            if write_b.write_all(b"B").await.is_err() {
+                if write_b.write_all(b"B").await.is_err() {
+                    let _ = write_b.shutdown();
+                    let _ = write_a.shutdown();
+                    return (
+                        HolSummary::default(),
+                        HolSummary::default(),
+                        HolSummary::default(),
+                        0.0,
+                    );
+                }
+                let fut_a =
+                    send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
+                let fut_b =
+                    send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
+                let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
+                let _ = write_a.shutdown();
                 let _ = write_b.shutdown();
-                let _ = write_a.shutdown();
-                bulk_stop.store(true, Ordering::Relaxed);
-                while let Some(result) = bulk_tasks.join_next().await {
-                    result.unwrap();
-                }
-                return (
-                    HolSummary::default(),
-                    HolSummary::default(),
-                    HolSummary::default(),
-                    0.0,
-                );
-            }
-            let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
-            let fut_b = send_timestamped_messages(&mut write_b, base, msg_bytes, cadence, run_for);
-            let (sent_a, sent_b) = tokio::join!(fut_a, fut_b);
-            let _ = write_a.shutdown();
-            let _ = write_b.shutdown();
+                // Signal the pump to stop before the straggler grace; the
+                // epilog join happens after the raced body.
+                bulk_stop_tx.send(true).unwrap();
 
-            bulk_stop.store(true, Ordering::Relaxed);
-            // The bulk pump exits once the stop flag is set; drain it so any panic
-            // surfaces.
+                tokio::time::sleep(grace).await;
+                let mut samples = Vec::new();
+                let mut samples_a = Vec::new();
+                let mut samples_b = Vec::new();
+                while let Ok((tag, lat)) = latencies_all.try_recv() {
+                    samples.push(lat);
+                    if tag == b'A' {
+                        samples_a.push(lat);
+                    } else if tag == b'B' {
+                        samples_b.push(lat);
+                    }
+                }
+
+                let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+                let bulk_secs = active_for.as_secs_f64();
+                let bulk_mibps = if bulk_secs > 0.0 {
+                    bulk_bytes as f64 / (1024.0 * 1024.0) / bulk_secs
+                } else {
+                    0.0
+                };
+
+                let n_all = samples.len() as u64;
+                let combined = summarize(samples, sent_a + sent_b, n_all, bulk_bytes, bulk_secs);
+                let summary_a =
+                    summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
+                let summary_b =
+                    summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
+
+                eprintln!(
+                    "[hol {label} A] p50={p50_a:.1} p99={p99_a:.1} max={max_a:.1}",
+                    p50_a = summary_a.p50,
+                    p99_a = summary_a.p99,
+                    max_a = summary_a.max,
+                );
+                eprintln!(
+                    "[hol {label} B] p50={p50_b:.1} p99={p99_b:.1} max={max_b:.1}",
+                    p50_b = summary_b.p50,
+                    p99_b = summary_b.p99,
+                    max_b = summary_b.max,
+                );
+                print_hol_summary(&format!("{label}_combined"), &combined);
+                eprintln!(
+                    "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                    combined_stats(&int_pair),
+                    combined_stats(&bulk_pair),
+                );
+
+                int_pair.stop();
+                bulk_pair.stop();
+                (summary_a, summary_b, combined, bulk_mibps)
+            };
+            tokio::pin!(body);
+            let result = tokio::select! {
+                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
+                    // The bulk pump ended before the interactive measurement
+                    // completed: fail the test instead of measuring without
+                    // contention.
+                    joined.expect("bulk pump exists").unwrap();
+                    panic!("bulk pump ended before the interactive measurement completed");
+                }
+                result = &mut body => result,
+            };
+            // Epilog: join the pump so any panic surfaces.
             while let Some(result) = bulk_tasks.join_next().await {
                 result.unwrap();
             }
-
-            tokio::time::sleep(grace).await;
-            let mut samples = Vec::new();
-            let mut samples_a = Vec::new();
-            let mut samples_b = Vec::new();
-            while let Ok((tag, lat)) = latencies_all.try_recv() {
-                samples.push(lat);
-                if tag == b'A' {
-                    samples_a.push(lat);
-                } else if tag == b'B' {
-                    samples_b.push(lat);
-                }
-            }
-
-            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-            let bulk_secs = active_for.as_secs_f64();
-            let bulk_mibps = if bulk_secs > 0.0 {
-                bulk_bytes as f64 / (1024.0 * 1024.0) / bulk_secs
-            } else {
-                0.0
-            };
-
-            let n_all = samples.len() as u64;
-            let combined = summarize(samples, sent_a + sent_b, n_all, bulk_bytes, bulk_secs);
-            let summary_a = summarize(samples_a.clone(), sent_a, samples_a.len() as u64, 0, 0.0);
-            let summary_b = summarize(samples_b.clone(), sent_b, samples_b.len() as u64, 0, 0.0);
-
-            eprintln!(
-                "[hol {label} A] p50={p50_a:.1} p99={p99_a:.1} max={max_a:.1}",
-                p50_a = summary_a.p50,
-                p99_a = summary_a.p99,
-                max_a = summary_a.max,
-            );
-            eprintln!(
-                "[hol {label} B] p50={p50_b:.1} p99={p99_b:.1} max={max_b:.1}",
-                p50_b = summary_b.p50,
-                p99_b = summary_b.p99,
-                max_b = summary_b.max,
-            );
-            print_hol_summary(&format!("{label}_combined"), &combined);
-            eprintln!(
-                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-                combined_stats(&int_pair),
-                combined_stats(&bulk_pair),
-            );
-
-            int_pair.stop();
-            bulk_pair.stop();
-            (summary_a, summary_b, combined, bulk_mibps)
+            result
         })
         .await
 }
@@ -2365,26 +2425,32 @@ async fn run_hol_probe_dual_lane_separate_listeners(
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let active_for = run_for - BULK_RAMP;
-    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
     let bulk_opener = opener.clone();
     let mut bulk_tasks = tokio::task::JoinSet::new();
     {
         let payload = Arc::clone(&payload);
-        let stop = Arc::clone(&bulk_stop);
         bulk_tasks.spawn(async move {
             let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let _ = run_delayed_mux_bulk_stream(
-                &mut w,
-                payload,
-                BULK_RAMP,
-                active_for,
-                &stop,
-                BulkLoad::Saturating,
-            )
-            .await;
+            // The pump runs until the watch signals shutdown at the end of
+            // the interactive measurement (or a write failure ends it).
+            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+            // window is only a backstop so the pump never ends on its own
+            // while the measurement is still running.
+            tokio::select! {
+                _ = bulk_stop_rx.changed() => {}
+                _ = run_delayed_mux_bulk_stream(
+                    &mut w,
+                    payload,
+                    BULK_RAMP,
+                    Duration::from_secs(3600),
+                    &BULK_NO_STOP,
+                    BulkLoad::Saturating,
+                ) => {}
+            }
             let _ = w.shutdown();
         });
     }
@@ -2401,36 +2467,52 @@ async fn run_hol_probe_dual_lane_separate_listeners(
     });
     tasks
         .run(async {
-            let sent =
-                run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for).await;
-            let _ = rr_write.shutdown();
+            let body = async {
+                let sent =
+                    run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)
+                        .await;
+                let _ = rr_write.shutdown();
 
-            bulk_stop.store(true, Ordering::Relaxed);
-            // The bulk pump exits once the stop flag is set; drain it so any panic
-            // surfaces.
+                // Signal the pump to stop before the straggler grace; the
+                // epilog join happens after the raced body.
+                bulk_stop_tx.send(true).unwrap();
+
+                tokio::time::sleep(grace).await;
+                let mut samples = Vec::new();
+                while let Ok((_tag, lat)) = latencies.try_recv() {
+                    samples.push(lat);
+                }
+
+                let received = samples.len() as u64;
+                let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+                let bulk_secs = active_for.as_secs_f64();
+                let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
+
+                print_hol_summary(label, &summary);
+                eprintln!(
+                    "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
+                    combined_stats(&int_pair),
+                    combined_stats(&bulk_pair),
+                );
+                int_pair.stop();
+                bulk_pair.stop();
+                summary
+            };
+            tokio::pin!(body);
+            let summary = tokio::select! {
+                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
+                    // The bulk pump ended before the interactive measurement
+                    // completed: fail the test instead of measuring without
+                    // contention.
+                    joined.expect("bulk pump exists").unwrap();
+                    panic!("bulk pump ended before the interactive measurement completed");
+                }
+                summary = &mut body => summary,
+            };
+            // Epilog: join the pump so any panic surfaces.
             while let Some(result) = bulk_tasks.join_next().await {
                 result.unwrap();
             }
-
-            tokio::time::sleep(grace).await;
-            let mut samples = Vec::new();
-            while let Ok((_tag, lat)) = latencies.try_recv() {
-                samples.push(lat);
-            }
-
-            let received = samples.len() as u64;
-            let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-            let bulk_secs = active_for.as_secs_f64();
-            let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
-
-            print_hol_summary(label, &summary);
-            eprintln!(
-                "[hol {label}] int pair stats = {:?}  bulk pair stats = {:?}",
-                combined_stats(&int_pair),
-                combined_stats(&bulk_pair),
-            );
-            int_pair.stop();
-            bulk_pair.stop();
             summary
         })
         .await

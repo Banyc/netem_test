@@ -63,10 +63,13 @@ impl TestScope {
 
     /// Spawn the bounded inner reaper into this scope and return its
     /// submission handle. The reaper actively drives (and unwraps) every
-    /// submitted child from the moment it is created — including during
-    /// setup, before [`Self::run`] begins — so a panicked child surfaces
-    /// via the reaper instead of being hidden until the scope is reaped.
-    /// Keep a sender clone alive for the channel to stay open.
+    /// submitted child from the moment it is created, so a panicked child
+    /// aborts the reaper immediately; the reaper's own `JoinError` is then
+    /// observed by [`Self::run`] as soon as it begins polling the scope.
+    /// Setup should therefore happen inside `run`'s body (submitting dynamic
+    /// children through this handle) so a setup-time failure surfaces
+    /// immediately rather than waiting for the measurement body. Keep a
+    /// sender clone alive for the channel to stay open.
     pub(crate) fn submitter(&mut self, bound: usize) -> tokio::sync::mpsc::Sender<super::TestTask> {
         super::spawn_test_task_reaper(&mut self.tasks, bound)
     }

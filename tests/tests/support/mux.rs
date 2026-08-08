@@ -59,18 +59,15 @@ where
                 Ok(a) => a,
                 Err(_) => return,
             };
-            // Parked tasks owned by this outer task's scope: the extra-accept
-            // drainer loop (keeps driving `udp_listener`'s dispatcher for the
-            // server's lifetime). It is aborted when this JoinSet drops at
-            // scope end.
-            let mut parked = tokio::task::JoinSet::new();
-            // Keep driving `udp_listener`'s dispatcher for the lifetime of the
-            // server: `accept()` both establishes new connections and
-            // dispatches packets to existing ones. Without a background
-            // accept-loop, the dispatcher stops after the first connection
-            // and subsequent datagrams are never forwarded to it, so the
-            // reliable layer stalls.
-            parked.spawn({
+            // The extra-accept drainer loop keeps driving `udp_listener`'s
+            // dispatcher for the server's lifetime: `accept()` both
+            // establishes new connections and dispatches packets to existing
+            // ones. Without a background accept-loop, the dispatcher stops
+            // after the first connection and subsequent datagrams are never
+            // forwarded to it, so the reliable layer stalls. The drainer is
+            // pinned and selected alongside the session supervisor and
+            // handlers below, so an early drainer return ends the server.
+            let drainer = {
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
@@ -87,7 +84,8 @@ where
                         }
                     }
                 }
-            });
+            };
+            tokio::pin!(drainer);
 
             let read = accepted.read.into_async_read();
             let write = accepted.write.into_async_write();
@@ -116,6 +114,7 @@ where
             loop {
                 tokio::select! {
                     () = &mut supervisor => { break; } // rtp session drivers exited; stop accepting
+                    () = &mut drainer => { break; } // extra-accept drainer exited; stop the server
                     accepted = accepter.accept() => {
                         match accepted {
                             Ok((stream_read, stream_write)) => {
@@ -918,12 +917,15 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
             Ok(a) => a,
             Err(_) => return,
         };
-        // Parked tasks owned by this outer task's scope: the extra-accept
-        // drainer loop (keeps driving `udp_listener`'s dispatcher for the
-        // server's lifetime). It is aborted when this JoinSet drops at scope
-        // end.
-        let mut parked = tokio::task::JoinSet::new();
-        parked.spawn({
+        // The extra-accept drainer loop keeps driving `udp_listener`'s
+        // dispatcher for the server's lifetime: `accept()` both establishes
+        // new connections and dispatches packets to existing ones. Without a
+        // background accept-loop, the dispatcher stops after the first
+        // connection and subsequent datagrams are never forwarded to it, so
+        // the reliable layer stalls. The drainer is pinned and selected
+        // alongside the session supervisor and handlers below, so an early
+        // drainer return ends the server.
+        let drainer = {
             let listener = Arc::clone(&listener);
             async move {
                 loop {
@@ -942,7 +944,8 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                     }
                 }
             }
-        });
+        };
+        tokio::pin!(drainer);
 
         let read = accepted.read.into_async_read();
         let write = accepted.write.into_async_write();
@@ -970,6 +973,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         loop {
             tokio::select! {
                 () = &mut supervisor => { break; } // rtp session drivers exited; stop accepting
+                () = &mut drainer => { break; } // extra-accept drainer exited; stop the server
                 accepted = accepter.accept() => {
                     match accepted {
                         Ok((mut reader, mut writer)) => {

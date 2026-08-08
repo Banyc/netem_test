@@ -190,30 +190,42 @@ async fn run_rtp_sink_upload(
         .await
         .unwrap();
 
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let mut pump_tasks = tokio::task::JoinSet::new();
     pump_tasks.spawn(async move {
         let mut offset = 0usize;
         let start = Instant::now();
         while start.elapsed() < window {
-            match writer.write(&data[offset..]).await {
-                Ok(0) => break,
-                Ok(n) => offset = (offset + n) % data.len(),
-                Err(_) => break,
+            tokio::select! {
+                _ = stop_rx.changed() => break,
+                result = writer.write(&data[offset..]) => match result {
+                    Ok(0) => break,
+                    Ok(n) => offset = (offset + n) % data.len(),
+                    Err(_) => break,
+                },
             }
         }
     });
 
     let d = tasks
         .run(async {
-            tokio::time::sleep(window).await;
-            let d = delivered.load(Ordering::Relaxed);
-            // The pump ran its full window and completed; drain it so any
-            // panic surfaces. The parked server/keepalive tasks are aborted
-            // by the owning scope at scope end.
-            while let Some(result) = pump_tasks.join_next().await {
-                result.unwrap();
+            tokio::select! {
+                joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
+                    // The pump ended before the measurement window completed:
+                    // fail the test instead of measuring against a dead upload.
+                    joined.expect("pump task exists").unwrap();
+                    panic!("bulk pump ended before the measurement window completed");
+                }
+                _ = tokio::time::sleep(window) => {
+                    let d = delivered.load(Ordering::Relaxed);
+                    stop_tx.send(true).unwrap();
+                    // Epilog: join the pump so any panic surfaces.
+                    while let Some(result) = pump_tasks.join_next().await {
+                        result.unwrap();
+                    }
+                    d
+                }
             }
-            d
         })
         .await;
     (pair, d)

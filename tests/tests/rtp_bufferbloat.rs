@@ -79,15 +79,18 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
             .unwrap();
     let bulk_start = Instant::now();
     let data = cyclic_payload(64 * 1024 * 1024);
+    let (pump_stop_tx, mut pump_stop_rx) = tokio::sync::watch::channel(false);
     let mut pump_tasks = tokio::task::JoinSet::new();
     pump_tasks.spawn(async move {
         let mut offset = 0usize;
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(15) {
-            match writer.write(&data[offset..]).await {
-                Ok(0) => break,
-                Ok(n) => offset = (offset + n) % data.len(),
-                Err(_) => break,
+        loop {
+            tokio::select! {
+                _ = pump_stop_rx.changed() => break,
+                result = writer.write(&data[offset..]) => match result {
+                    Ok(0) => break,
+                    Ok(n) => offset = (offset + n) % data.len(),
+                    Err(_) => break,
+                },
             }
         }
     });
@@ -126,38 +129,50 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
 
     server_tasks
         .run(async {
-            let ping_sent = with_timeout(
-                Duration::from_secs(25),
-                "send sparse pings during bufferbloat",
-                send_timestamped_messages(
-                    &mut write,
-                    base,
-                    128,
-                    Duration::from_millis(500),
-                    Duration::from_secs(15),
-                ),
-            )
-            .await;
-
-            // Sample the queue length every 50 ms while the transfer runs.
-            let mut max_queue = 0usize;
-            let sample_window = Duration::from_secs(15);
-            let sample_start = Instant::now();
-            while sample_start.elapsed() < sample_window {
-                let q = pair.queue_len_c2s();
-                if q > max_queue {
-                    max_queue = q;
+            // Race the bulk pump against the measurement (sparse pings plus
+            // queue sampling): a premature pump completion fails the test
+            // instead of measuring against a dead upload. The pump runs
+            // until the watch signals shutdown after the measurement.
+            let (ping_sent, max_queue) = tokio::select! {
+                joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
+                    joined.expect("bulk pump exists").unwrap();
+                    panic!("bulk pump ended before the measurement completed");
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+                result = async {
+                    let ping_sent = with_timeout(
+                        Duration::from_secs(25),
+                        "send sparse pings during bufferbloat",
+                        send_timestamped_messages(
+                            &mut write,
+                            base,
+                            128,
+                            Duration::from_millis(500),
+                            Duration::from_secs(15),
+                        ),
+                    )
+                    .await;
 
+                    // Sample the queue length every 50 ms while the transfer runs.
+                    let mut max_queue = 0usize;
+                    let sample_window = Duration::from_secs(15);
+                    let sample_start = Instant::now();
+                    while sample_start.elapsed() < sample_window {
+                        let q = pair.queue_len_c2s();
+                        if q > max_queue {
+                            max_queue = q;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    (ping_sent, max_queue)
+                } => result,
+            };
+            pump_stop_tx.send(true).unwrap();
             // Give the final bulk bytes time to drain through the shaped
             // link before measuring elapsed goodput.
             tokio::time::sleep(Duration::from_secs(2)).await;
             let delivered_bytes = delivered.load(std::sync::atomic::Ordering::Relaxed);
             let elapsed = bulk_start.elapsed();
-            // The pump has completed its 15s window; drain it so any panic
-            // surfaces.
+            // Epilog: join the pump so any panic surfaces.
             while let Some(result) = pump_tasks.join_next().await {
                 result.unwrap();
             }

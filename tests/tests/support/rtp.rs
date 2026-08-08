@@ -231,11 +231,12 @@ async fn spawn_rtp_byte_sink_server_core(
                 Ok(a) => a,
                 Err(_) => return,
             };
-            // Keep driving the listener's dispatcher so packets keep flowing to
-            // the accepted connection. Extra incoming connections are accepted
-            // and ignored.
-            let mut drainer = tokio::task::JoinSet::new();
-            drainer.spawn({
+            // The extra-accept drainer loop keeps driving `udp_listener`'s
+            // dispatcher so packets keep flowing to the accepted connection;
+            // extra incoming connections are accepted and ignored. The
+            // drainer is pinned and selected alongside the session supervisor
+            // below, so an early drainer return ends the server.
+            let drainer = {
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
@@ -252,7 +253,8 @@ async fn spawn_rtp_byte_sink_server_core(
                         }
                     }
                 }
-            });
+            };
+            tokio::pin!(drainer);
             let mut read = accepted.read.into_async_read();
             // Hold the write half alive so the connection stays open while we
             // only receive.
@@ -266,6 +268,7 @@ async fn spawn_rtp_byte_sink_server_core(
             loop {
                 tokio::select! {
                     () = &mut supervisor => break, // session drivers exited; terminate the server
+                    () = &mut drainer => break, // extra-accept drainer exited; terminate the server
                     n = read.read(&mut buf) => {
                         match n {
                             Ok(0) => break,
@@ -389,8 +392,12 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
                 Ok(a) => a,
                 Err(_) => return,
             };
-            let mut drainer = tokio::task::JoinSet::new();
-            drainer.spawn({
+            // The extra-accept drainer loop keeps driving `udp_listener`'s
+            // dispatcher so packets keep flowing to the accepted connection;
+            // extra incoming connections are accepted and ignored. The
+            // drainer is pinned and selected alongside the session supervisor
+            // below, so an early drainer return ends the server.
+            let drainer = {
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
@@ -407,7 +414,8 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
                         }
                     }
                 }
-            });
+            };
+            tokio::pin!(drainer);
             let mut read = accepted.read.into_async_read();
             let _write = accepted.write;
             // The supervisor owns the session drivers; poll it from the read
@@ -422,6 +430,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
                 }
                 tokio::select! {
                     () = &mut supervisor => break, // session drivers exited; terminate the server
+                    () = &mut drainer => break, // extra-accept drainer exited; terminate the server
                     n = read.read(&mut buf[offset..]) => {
                         let n = match n {
                             Ok(n) => n,

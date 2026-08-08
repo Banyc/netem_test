@@ -21,8 +21,7 @@ use std::time::{Duration, Instant};
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::payload::cyclic_payload;
 use support::rtp::{
-    spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server, spawn_rtp_byte_sink_server_via,
-    spawn_rtp_echo_server_via,
+    spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via, spawn_rtp_echo_server_via,
 };
 use support::stats::{combined_stats, percentile, print_perf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -398,51 +397,61 @@ async fn shared_bneck_late_joiner_fairness() {
     let bin_width = Duration::from_millis(500);
 
     let mut tasks = support::TestScope::new();
+    // The whole scenario — sink servers, pairs, both bulk flows, and the
+    // late-joiner gap — runs inside one `run` body so the reaper is already
+    // polling: a setup-time failure surfaces immediately instead of waiting
+    // for the measurement body.
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
 
-    let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
-    let (sink_b_addr, delivered_b) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
-
-    let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
-    let pair_a = NetemPair::spawn_shared(
-        sink_a_addr,
-        flow_config(owd, 31),
-        flow_config(owd, 32),
-        Some(shaper.clone()),
-        None,
-    )
-    .unwrap();
-    let pair_b = NetemPair::spawn_shared(
-        sink_b_addr,
-        flow_config(owd, 33),
-        flow_config(owd, 34),
-        Some(shaper.clone()),
-        None,
-    )
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let bulk_stop = Arc::new(AtomicBool::new(false));
-    spawn_bulk_flow(
-        &task_tx,
-        pair_a.client_addr(),
-        Arc::clone(&payload),
-        total_run,
-        Arc::clone(&bulk_stop),
-    )
-    .await;
-    tokio::time::sleep(b_join).await;
-    spawn_bulk_flow(
-        &task_tx,
-        pair_b.client_addr(),
-        Arc::clone(&payload),
-        total_run - b_join,
-        Arc::clone(&bulk_stop),
-    )
-    .await;
-
-    let (bins_a, bins_b) = tasks
+    let (bins_a, bins_b, delivered_a, delivered_b, pair_a, pair_b) = tasks
         .run(async {
+            // The sink servers are spawned through the bounded handle (no
+            // `&mut TestScope` inside the run body).
+            let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+            let (sink_b_addr, delivered_b) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+
+            let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
+            let pair_a = NetemPair::spawn_shared(
+                sink_a_addr,
+                flow_config(owd, 31),
+                flow_config(owd, 32),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+            let pair_b = NetemPair::spawn_shared(
+                sink_b_addr,
+                flow_config(owd, 33),
+                flow_config(owd, 34),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let bulk_stop = Arc::new(AtomicBool::new(false));
+            spawn_bulk_flow(
+                &task_tx,
+                pair_a.client_addr(),
+                Arc::clone(&payload),
+                total_run,
+                Arc::clone(&bulk_stop),
+            )
+            .await;
+            tokio::time::sleep(b_join).await;
+            spawn_bulk_flow(
+                &task_tx,
+                pair_b.client_addr(),
+                Arc::clone(&payload),
+                total_run - b_join,
+                Arc::clone(&bulk_stop),
+            )
+            .await;
+
             // Sample both counters every 500 ms for the whole run.
             let mut bins_a = Vec::new();
             let mut bins_b = Vec::new();
@@ -463,7 +472,7 @@ async fn shared_bneck_late_joiner_fairness() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             pair_a.stop();
             pair_b.stop();
-            (bins_a, bins_b)
+            (bins_a, bins_b, delivered_a, delivered_b, pair_a, pair_b)
         })
         .await;
 
