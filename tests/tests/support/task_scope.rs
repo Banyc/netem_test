@@ -44,11 +44,26 @@ impl TestScope {
         self.tasks.spawn(task);
     }
 
+    /// Spawn a task that must stay alive for the whole [`TestScope::run`] body.
+    /// A normal completion while the body is still running panics the test
+    /// with a message naming the task (the wrapper turns the completion into
+    /// a panic); a panic inside the future propagates unchanged.
+    pub(crate) fn spawn_required(
+        &mut self,
+        name: &'static str,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.tasks.spawn(async move {
+            future.await;
+            panic!("required task '{name}' exited before the test body completed");
+        });
+    }
+
     pub(crate) async fn run<F: Future>(&mut self, body: F) -> F::Output {
         tokio::pin!(body);
         loop {
             tokio::select! {
-                value = &mut body => return value,
+                biased;
                 joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     // A background task exited before the body. Re-raise any
                     // panic it surfaced immediately; a normal completion is a
@@ -56,6 +71,15 @@ impl TestScope {
                     // its session closes) and is drained silently.
                     let joined = joined.expect("background task exists");
                     joined.expect("a background task panicked");
+                }
+                value = &mut body => {
+                    // The body completed. Drain tasks that exited in the same
+                    // poll cycle so a required task that ended right as the
+                    // body finished still fails the test.
+                    while let Some(joined) = self.tasks.try_join_next() {
+                        joined.expect("a background task panicked");
+                    }
+                    return value;
                 }
             }
         }

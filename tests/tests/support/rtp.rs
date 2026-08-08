@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
+use crate::support::{LATENCY_SAMPLE_CAPACITY, TestScope, try_send_observation};
 
 /// Spawn an `rtp` server that accepts one connection and echoes back
 /// everything it receives until the peer closes. Returns the server's
@@ -16,16 +16,19 @@ use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
 /// [`Listener::accept_without_handshake_with_mss`]. Use [`rtp::udp::NO_FEC_MSS`]
 /// for the default size.
 ///
-/// `tasks` owns the server and its per-connection echo handlers; the caller
-/// must keep it alive for the server's lifetime.
+/// `tasks` (a [`TestScope`]) owns the server and its per-connection echo
+/// handlers; the caller must keep it alive for the server's lifetime. The
+/// server task is registered as required, so an accept-loop exit before the
+/// test body completes fails the test instead of silently tearing down the
+/// server.
 pub async fn spawn_rtp_echo_server_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
-    tasks.spawn(async move {
+    tasks.spawn_required("rtp echo server", async move {
         let mut handlers = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -74,7 +77,7 @@ pub async fn spawn_rtp_echo_server_with_mss(
 
 /// Spawn an `rtp` echo server using the default MSS.
 pub async fn spawn_rtp_echo_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
 ) -> std::io::Result<std::net::SocketAddr> {
     spawn_rtp_echo_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await

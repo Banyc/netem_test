@@ -9,7 +9,9 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::support::{LATENCY_SAMPLE_CAPACITY, TestTask, submit_test_task, try_send_observation};
+use crate::support::{
+    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, submit_test_task, try_send_observation,
+};
 
 /// Spawn an rtp_mux server with interactive and bulk listeners. Accepted
 /// streams are classified by lane class: interactive-lane streams are treated
@@ -23,7 +25,7 @@ use crate::support::{LATENCY_SAMPLE_CAPACITY, TestTask, submit_test_task, try_se
 /// sender is the submission channel; keep it alive to hold the channel open
 /// and submit additional test tasks.
 pub async fn spawn_rtp_mux_latency_bulk_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -41,7 +43,9 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     let bulk_for_server = Arc::clone(&bulk_delivered);
     let task_tx =
         crate::support::spawn_test_task_reaper(tasks, crate::support::TEST_TASK_QUEUE_BOUND);
-    tasks.spawn({
+    // The serve loop must stay alive for the whole test body; an early exit
+    // fails the test instead of silently tearing down the server.
+    tasks.spawn_required("rtp_mux server serve loop", {
         let task_tx = task_tx.clone();
         async move {
             let spawner = rtp_mux::SessionSpawner::new({
@@ -71,7 +75,7 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
 }
 
 pub fn rtp_mux_connector(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
 ) -> rtp_mux::RtpMuxConnector {
@@ -90,7 +94,9 @@ pub fn rtp_mux_connector(
                 ..rtp_mux::ExplorerConfig::default()
             },
         });
-    tasks.spawn(driver);
+    // The connector driver must stay alive for the whole test body; an early
+    // exit would silently stall every connect/redial through the connector.
+    tasks.spawn_required("rtp_mux connector driver", driver);
     connector
 }
 
