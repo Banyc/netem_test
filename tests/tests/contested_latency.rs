@@ -104,7 +104,8 @@ async fn contested_rep(
     )
     .await
     .unwrap();
-    let (opener, _mux_spawner) = mux_client_connect(
+    let opener = mux_client_connect(
+        &mut tasks,
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );

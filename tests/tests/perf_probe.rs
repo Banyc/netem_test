@@ -14,10 +14,9 @@ use std::time::{Duration, Instant};
 
 use netem_test::NetemPair;
 use support::mux::{
-    mux_client_connect, mux_send_payload, mux_timed_echo_round_trip,
-    spawn_mux_over_rtp_counting_sink_server, spawn_mux_over_rtp_echo_server,
-    spawn_mux_over_rtp_echo_server_with_mss, spawn_mux_over_rtp_sink_server,
-    spawn_mux_over_rtp_sink_server_with_mss,
+    mux_send_payload, mux_timed_echo_round_trip, spawn_mux_over_rtp_counting_sink_server,
+    spawn_mux_over_rtp_echo_server, spawn_mux_over_rtp_echo_server_with_mss,
+    spawn_mux_over_rtp_sink_server, spawn_mux_over_rtp_sink_server_with_mss,
 };
 use support::payload::{payload, with_timeout};
 use support::presets::clean;
@@ -29,6 +28,39 @@ use support::stats::{combined_stats, print_median_worst, print_perf};
 use tokio::io::AsyncWriteExt;
 
 mod support;
+
+/// Connect a `mux` client whose session is intentionally torn down
+/// mid-body: each one-shot probe stops its pair (cutting the link) right
+/// after measuring, so the supervision drain must be transient rather
+/// than `spawn_required`. JoinErrors are unwrapped so a panicked
+/// supervision task still fails the test; a `MuxError` session-end is the
+/// expected teardown here, not a failure.
+fn mux_client_connect_transient<R, W>(
+    tasks: &mut support::TestScope,
+    read: R,
+    write: W,
+) -> mux::StreamOpener
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: false,
+    };
+    let mut spawner = tokio::task::JoinSet::new();
+    let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+    // Transient drain (see doc comment): unwrap JoinErrors so panics
+    // surface; a `MuxError` session-end ends the drain normally.
+    tasks.spawn(async move {
+        while let Some(result) = spawner.join_next().await {
+            result.expect("mux supervision task panicked");
+            break;
+        }
+    });
+    opener
+}
 
 /// Number of iterations for the ceiling probes. Reporting the median (and
 /// worst) of several runs smooths out occasional warm-up / tail-visibility
@@ -147,6 +179,7 @@ async fn probe_mux_sink_4mib_direct() {
     // Pre-spawn one one-shot mux sink server per iteration; each accepts its
     // first (and only) RTP connection during that iteration and its task
     // completes once the client closes the session afterwards.
+    let task_tx = support::spawn_test_task_reaper(&mut tasks, support::TEST_TASK_QUEUE_BOUND);
     let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
         let (server_addr, received) = spawn_mux_over_rtp_sink_server(&mut tasks.tasks, false)
@@ -160,7 +193,29 @@ async fn probe_mux_sink_4mib_direct() {
             for (server_addr, mut received) in servers {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-                let (opener, _spawner) = mux_client_connect(read, write);
+                let config = mux::MuxConfig {
+                    initiation: mux::Initiation::Client,
+                    heartbeat_interval: Duration::from_secs(5),
+                    frame_reassembly: false,
+                };
+                let mut spawner = tokio::task::JoinSet::new();
+                let (opener, _accepter) =
+                    mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+                // Transient supervision drain submitted to the test-owned
+                // reaper: the session is intentionally torn down mid-body
+                // (pair.stop() cuts the link after each one-shot probe), so
+                // the drain must not be required. The reaper unwraps every
+                // completion, so a panicked supervision task still fails the
+                // test; a MuxError session-end is the expected teardown.
+                support::submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        while let Some(result) = spawner.join_next().await {
+                            result.expect("mux supervision task panicked");
+                            break;
+                        }
+                    }),
+                );
 
                 let elapsed = with_timeout(
                     Duration::from_secs(60),
@@ -202,6 +257,7 @@ async fn probe_mux_sink_4mib_mss8k() {
 
     // Pre-spawn one one-shot mux sink server per iteration; each accepts its
     // first (and only) RTP connection during that iteration.
+    let task_tx = support::spawn_test_task_reaper(&mut tasks, support::TEST_TASK_QUEUE_BOUND);
     let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
         let (server_addr, received) =
@@ -217,7 +273,29 @@ async fn probe_mux_sink_4mib_mss8k() {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write, _supervisor) =
                     rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
-                let (opener, _spawner) = mux_client_connect(read, write);
+                let config = mux::MuxConfig {
+                    initiation: mux::Initiation::Client,
+                    heartbeat_interval: Duration::from_secs(5),
+                    frame_reassembly: false,
+                };
+                let mut spawner = tokio::task::JoinSet::new();
+                let (opener, _accepter) =
+                    mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+                // Transient supervision drain submitted to the test-owned
+                // reaper: the session is intentionally torn down mid-body
+                // (pair.stop() cuts the link after each one-shot probe), so
+                // the drain must not be required. The reaper unwraps every
+                // completion, so a panicked supervision task still fails the
+                // test; a MuxError session-end is the expected teardown.
+                support::submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        while let Some(result) = spawner.join_next().await {
+                            result.expect("mux supervision task panicked");
+                            break;
+                        }
+                    }),
+                );
 
                 let elapsed = with_timeout(
                     Duration::from_secs(60),
@@ -264,6 +342,7 @@ async fn probe_mux_echo_1mib_direct() {
 
     // Pre-spawn one one-shot mux echo server per iteration; each accepts its
     // first (and only) RTP connection during that iteration.
+    let task_tx = support::spawn_test_task_reaper(&mut tasks, support::TEST_TASK_QUEUE_BOUND);
     let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
         let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks.tasks, false)
@@ -277,7 +356,29 @@ async fn probe_mux_echo_1mib_direct() {
             for server_addr in servers {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-                let (opener, _spawner) = mux_client_connect(read, write);
+                let config = mux::MuxConfig {
+                    initiation: mux::Initiation::Client,
+                    heartbeat_interval: Duration::from_secs(5),
+                    frame_reassembly: false,
+                };
+                let mut spawner = tokio::task::JoinSet::new();
+                let (opener, _accepter) =
+                    mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+                // Transient supervision drain submitted to the test-owned
+                // reaper: the session is intentionally torn down mid-body
+                // (pair.stop() cuts the link after each one-shot probe), so
+                // the drain must not be required. The reaper unwraps every
+                // completion, so a panicked supervision task still fails the
+                // test; a MuxError session-end is the expected teardown.
+                support::submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        while let Some(result) = spawner.join_next().await {
+                            result.expect("mux supervision task panicked");
+                            break;
+                        }
+                    }),
+                );
 
                 let (got, elapsed) = with_timeout(
                     Duration::from_secs(60),
@@ -316,6 +417,7 @@ async fn probe_mux_echo_1mib_mss8k() {
 
     // Pre-spawn one one-shot mux echo server per iteration; each accepts its
     // first (and only) RTP connection during that iteration.
+    let task_tx = support::spawn_test_task_reaper(&mut tasks, support::TEST_TASK_QUEUE_BOUND);
     let mut servers = Vec::new();
     for _ in 0..PROBE_ITERS {
         let server_addr =
@@ -331,7 +433,29 @@ async fn probe_mux_echo_1mib_mss8k() {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write, _supervisor) =
                     rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
-                let (opener, _spawner) = mux_client_connect(read, write);
+                let config = mux::MuxConfig {
+                    initiation: mux::Initiation::Client,
+                    heartbeat_interval: Duration::from_secs(5),
+                    frame_reassembly: false,
+                };
+                let mut spawner = tokio::task::JoinSet::new();
+                let (opener, _accepter) =
+                    mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+                // Transient supervision drain submitted to the test-owned
+                // reaper: the session is intentionally torn down mid-body
+                // (pair.stop() cuts the link after each one-shot probe), so
+                // the drain must not be required. The reaper unwraps every
+                // completion, so a panicked supervision task still fails the
+                // test; a MuxError session-end is the expected teardown.
+                support::submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        while let Some(result) = spawner.join_next().await {
+                            result.expect("mux supervision task panicked");
+                            break;
+                        }
+                    }),
+                );
 
                 let (got, elapsed) = with_timeout(
                     Duration::from_secs(60),
@@ -386,7 +510,7 @@ async fn probe_hostile_goodput_30s() {
     let pair_ref = &pair;
     let (read, write, _supervisor) =
         rtp_connect_with_mss(pair.client_addr(), false, LOOPBACK_MSS).await;
-    let (opener, _spawner) = mux_client_connect(read, write);
+    let opener = mux_client_connect_transient(&mut tasks, read, write);
 
     // Open the stream under a generous timeout before we start the clock.
     let (stream_read, mut stream_write) = with_timeout(

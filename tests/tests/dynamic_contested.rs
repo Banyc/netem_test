@@ -190,7 +190,8 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     )
     .await
     .unwrap();
-    let (opener, _mux_spawner) = mux_client_connect(
+    let opener = mux_client_connect(
+        &mut tasks,
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
@@ -309,7 +310,7 @@ async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTraf
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -422,7 +423,7 @@ async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTraffi
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -575,7 +576,7 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -714,7 +715,7 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -871,7 +872,7 @@ async fn dyn_dual_msg_channel_rep(
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -1245,7 +1246,7 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -1300,7 +1301,7 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -1361,7 +1362,8 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     )
     .await
     .unwrap();
-    let (opener, _mux_spawner) = mux_client_connect(
+    let opener = mux_client_connect(
+        &mut tasks,
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
@@ -1569,7 +1571,7 @@ async fn dyn_dual_auto_small_first_migrating_rep(
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),
@@ -1678,7 +1680,7 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
     .unwrap();
     let bulk_pair =
         NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter, _spawner) = dual_mux_client_connect(
+    let (opener, _accepter) = dual_mux_client_connect(
         &mut tasks,
         int_pair.client_addr(),
         bulk_pair.client_addr(),

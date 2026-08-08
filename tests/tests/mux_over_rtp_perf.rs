@@ -42,7 +42,7 @@ async fn mux_over_rtp_lossy_perf_smoke() {
     let s2c = lossy_400kib_per_sec();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-    let (opener, _spawner) = mux_client_connect(read, write);
+    let opener = mux_client_connect(&mut tasks, read, write);
 
     let payload = payload(1024);
     tasks
@@ -88,7 +88,7 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
     let s2c = lossy_400kib_per_sec();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-    let (opener, _spawner) = mux_client_connect(read, write);
+    let opener = mux_client_connect(&mut tasks, read, write);
 
     let payload = payload(400 * 1024);
     tasks
@@ -154,7 +154,7 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
     };
     let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-    let (opener, _spawner) = mux_client_connect(read, write);
+    let opener = mux_client_connect(&mut tasks, read, write);
 
     // Send the bulk 400 KiB payload on one stream, then after a short delay
     // send the small interactive payload on a second stream. The opener's
@@ -264,7 +264,7 @@ async fn mux_over_rtp_400mib_hostile_perf() {
     let impaired = hostile_fat_pipe();
     let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
     let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
-    let (opener, _spawner) = mux_client_connect(read, write);
+    let opener = mux_client_connect(&mut tasks, read, write);
     let chunk = cyclic_payload(1024 * 1024);
     let repeat = TARGET_BYTES.div_ceil(chunk.len());
     let sent = chunk.len() * repeat;

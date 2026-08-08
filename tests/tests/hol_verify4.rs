@@ -90,7 +90,8 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     )
     .await
     .unwrap();
-    let (opener, mut spawner) = mux_client_connect(
+    let opener = mux_client_connect(
+        &mut tasks,
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
@@ -131,10 +132,12 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
         })
         .await;
 
-    // Wait for the mux supervision tasks to settle before stopping the pair.
-    // This ends the client session, after which the server task completes;
-    // that happens outside the raced body, so it is not an early exit.
-    spawner.shutdown().await;
+    // End the client session so the server-side sink stops counting before
+    // the pair is stopped. The required drain task completes (unobserved)
+    // once the session ends, after the raced body returned; if the session
+    // has not ended yet, scope drop aborts it. That is outside the raced
+    // body, so it is not an early exit.
+    drop(opener);
     pair.stop();
 
     let total = delivered.load(Ordering::Relaxed);

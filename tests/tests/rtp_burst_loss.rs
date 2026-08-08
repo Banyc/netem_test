@@ -257,7 +257,8 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     )
     .await
     .unwrap();
-    let (opener, _spawner) = mux_client_connect(
+    let opener = mux_client_connect(
+        &mut tasks,
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );

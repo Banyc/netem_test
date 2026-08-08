@@ -12,7 +12,7 @@ use rtp::FecTuning;
 use rtp::FrameMode;
 
 use super::stats::SinkProgress;
-use crate::support::{LATENCY_SAMPLE_CAPACITY, try_send_observation};
+use crate::support::{LATENCY_SAMPLE_CAPACITY, TestScope, try_send_observation};
 
 /// Spawn an `rtp` server that accepts one connection and runs a `mux` server
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
@@ -106,15 +106,38 @@ where
             let (_opener, mut accepter) =
                 mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
 
-            // Per-stream handlers owned by this accept loop's scope. They are
-            // drained once the accept loop ends (peer closed), unwrapping so
-            // panics surface; any still-running handlers are aborted when the
-            // local JoinSet drops at scope end.
+            // Per-stream handlers owned by this accept loop's scope. The loop
+            // below polls acceptance, per-stream handler completion, and mux
+            // session completion together, so a panicked handler or session
+            // surfaces immediately instead of only once the accept loop ends;
+            // any still-running handlers are aborted when the local JoinSet
+            // drops at scope end.
             let mut handlers = tokio::task::JoinSet::new();
-            while let Ok((stream_read, stream_write)) = accepter.accept().await {
-                let handle_stream = &handle_stream;
-                handlers.spawn(handle_stream(stream_read, stream_write));
+            loop {
+                tokio::select! {
+                    accepted = accepter.accept() => {
+                        match accepted {
+                            Ok((stream_read, stream_write)) => {
+                                let handle_stream = &handle_stream;
+                                handlers.spawn(handle_stream(stream_read, stream_write));
+                            }
+                            Err(_) => break, // peer closed; stop accepting
+                        }
+                    }
+                    Some(joined) = handlers.join_next(), if !handlers.is_empty() => {
+                        // A per-stream handler ended: unwrap so a panic
+                        // surfaces now; a normal completion just ends it.
+                        joined.unwrap();
+                    }
+                    Some(joined) = spawner.join_next() => {
+                        // The mux session ended: unwrap (re-raising a panic)
+                        // and stop accepting.
+                        joined.unwrap();
+                        break;
+                    }
+                }
             }
+            // Drain any remaining handler/supervision joins so panics surface.
             while let Some(result) = handlers.join_next().await {
                 result.unwrap();
             }
@@ -336,8 +359,12 @@ pub async fn send_timestamped_messages(
 }
 
 /// Wrap a reliable byte-stream pair in a `mux` client and return the stream
-/// opener plus the supervision `JoinSet` (kept alive for the test duration).
-pub fn mux_client_connect<R, W>(read: R, write: W) -> (mux::StreamOpener, JoinSet<mux::MuxError>)
+/// opener. The mux supervision `JoinSet` is drained by a required scope task:
+/// the session must survive the whole test body, a panicked supervision task
+/// surfaces immediately, and the session ending before the body completes is
+/// a panic. Callers that intentionally end the session mid-body must use an
+/// ordinary-spawn drain instead (see `perf_probe`).
+pub fn mux_client_connect<R, W>(tasks: &mut TestScope, read: R, write: W) -> mux::StreamOpener
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -349,7 +376,13 @@ where
     };
     let mut spawner = JoinSet::new();
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
-    (opener, spawner)
+    tasks.spawn_required("mux client session", async move {
+        while let Some(result) = spawner.join_next().await {
+            let err = result.expect("mux supervision task panicked");
+            panic!("mux client session ended before the test body: {err:?}");
+        }
+    });
+    opener
 }
 
 /// Open a mux stream, write `payload`, shut the stream down, and read the
@@ -925,14 +958,22 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         let (_opener, mut accepter) =
             mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
 
-        // Per-stream sink tasks owned by this accept loop's scope; drained
-        // (with unwrap) once the accept loop ends so panics surface.
+        // Per-stream sink tasks owned by this accept loop's scope. The loop
+        // below polls acceptance, per-stream handler completion, and mux
+        // session completion together, so a panicked handler or session
+        // surfaces immediately instead of only once the accept loop ends;
+        // any still-running handlers are aborted when this JoinSet drops at
+        // scope end.
         let mut handlers = tokio::task::JoinSet::new();
-        while let Ok((mut reader, mut writer)) = accepter.accept().await {
-            let tx = tx.clone();
-            let bulk = Arc::clone(&bulk_delivered_for_server);
-            handlers.spawn(async move {
-                let mut tag = [0u8; 1];
+        loop {
+            tokio::select! {
+                accepted = accepter.accept() => {
+                    match accepted {
+                        Ok((mut reader, mut writer)) => {
+                            let tx = tx.clone();
+                            let bulk = Arc::clone(&bulk_delivered_for_server);
+                            handlers.spawn(async move {
+                                let mut tag = [0u8; 1];
                 if reader.read_exact(&mut tag).await.is_err() {
                     let _ = writer.shutdown();
                     return;
@@ -997,9 +1038,25 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                         }
                     }
                 }
-                let _ = writer.shutdown();
-            });
+                                let _ = writer.shutdown();
+                            });
+                        }
+                        Err(_) => break, // peer closed; stop accepting
+                    }
+                }
+                Some(joined) = handlers.join_next(), if !handlers.is_empty() => {
+                    // A per-stream handler ended: unwrap so a panic surfaces now.
+                    joined.unwrap();
+                }
+                Some(joined) = spawner.join_next() => {
+                    // The mux session ended: unwrap (re-raising a panic) and
+                    // stop accepting.
+                    joined.unwrap();
+                    break;
+                }
+            }
         }
+        // Drain any remaining handler/supervision joins so panics surface.
         while let Some(result) = handlers.join_next().await {
             result.unwrap();
         }
