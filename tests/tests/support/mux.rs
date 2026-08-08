@@ -32,7 +32,7 @@ use crate::support::{LATENCY_SAMPLE_CAPACITY, TestScope, try_send_observation};
 /// to put `accept()` in a loop to drive the packet dispatch among the
 /// sub-connections").
 pub async fn spawn_mux_over_rtp_server_with_mss<F, Fut>(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     mss: usize,
     handle_stream: F,
@@ -154,7 +154,7 @@ where
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
 /// echoed back. Returns the rtp server's listening address.
 pub async fn spawn_mux_over_rtp_echo_server_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
@@ -183,7 +183,7 @@ pub async fn spawn_mux_over_rtp_echo_server_with_mss(
 
 /// Spawn a mux-over-RTP echo server using the default MSS.
 pub async fn spawn_mux_over_rtp_echo_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
 ) -> std::io::Result<std::net::SocketAddr> {
     spawn_mux_over_rtp_echo_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
@@ -196,7 +196,7 @@ pub async fn spawn_mux_over_rtp_echo_server(
 /// is shut down. Returns the rtp server's listening address and the receiver
 /// for completed payloads.
 pub async fn spawn_mux_over_rtp_sink_server_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
@@ -223,7 +223,7 @@ pub async fn spawn_mux_over_rtp_sink_server_with_mss(
 
 /// Spawn a mux-over-RTP sink server using the default MSS.
 pub async fn spawn_mux_over_rtp_sink_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
     spawn_mux_over_rtp_sink_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
@@ -244,7 +244,7 @@ pub async fn spawn_mux_over_rtp_sink_server(
 /// acknowledged, avoiding the RTP layer's proactive broken-pipe heuristic that
 /// fires on quiet unidirectional streams.
 pub async fn spawn_mux_msg_latency_sink(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
@@ -253,7 +253,7 @@ pub async fn spawn_mux_msg_latency_sink(
 
 /// [`spawn_mux_msg_latency_sink`] with a custom RTP MSS.
 pub async fn spawn_mux_msg_latency_sink_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -378,7 +378,7 @@ where
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
     tasks.spawn_required("mux client session", async move {
         while let Some(result) = spawner.join_next().await {
-            let err = result.expect("mux supervision task panicked");
+            let err = result.unwrap();
             panic!("mux client session ended before the test body: {err:?}");
         }
     });
@@ -500,7 +500,7 @@ pub async fn mux_send_repeated(
 /// the transfer is still alive reflects true goodput without an inflated
 /// delivery snapshot.
 pub async fn spawn_mux_over_rtp_counting_sink_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
@@ -547,7 +547,7 @@ pub async fn spawn_mux_over_rtp_counting_sink_server(
 
 /// Convenience wrapper using the default RTP MSS.
 pub async fn spawn_mux_over_rtp_counting_sink_server_default(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
     spawn_mux_over_rtp_counting_sink_server(tasks, fec, rtp::udp::NO_FEC_MSS).await
@@ -567,7 +567,7 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_default(
 /// interactive ping stream and a competing bulk sink stream on the same mux
 /// connection while using a single server address.
 pub async fn spawn_mux_latency_bulk_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -672,7 +672,7 @@ pub async fn spawn_mux_latency_bulk_server(
 
 /// Like [`spawn_mux_latency_bulk_server`] but with a custom RTP MSS.
 pub async fn spawn_mux_sized_latency_bulk_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -777,7 +777,7 @@ pub async fn spawn_mux_sized_latency_bulk_server(
 /// stream (3 MiB state-sync followed by 200 B delta frames); all other
 /// streams are bulk.
 pub async fn spawn_mux_gaming_latency_bulk_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -887,7 +887,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
 /// but the server uses `frame_reassembly: true` and each RTP connection is
 /// accepted in frame-delivery mode.
 pub async fn spawn_mux_frame_delivery_latency_bulk_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(

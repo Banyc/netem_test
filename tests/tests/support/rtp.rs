@@ -86,30 +86,37 @@ pub async fn spawn_rtp_echo_server(
 /// Connect an `rtp` client to a proxy's client-side address and return the
 /// resulting reliable byte-stream halves. Pass [`NetemPair::client_addr`] as
 /// `proxy_client_addr`; `fec` must match the server's FEC setting.
+///
+/// `tasks` owns the rtp session supervisor: it is awaited by a REQUIRED
+/// scope task, so the session must stay alive for the whole test body — a
+/// session that ends early fails the test. Callers that intentionally tear
+/// the connection down mid-body must not use this helper (see
+/// `perf_probe::rtp_connect_transient`).
 pub async fn rtp_connect(
+    tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> (
-    impl AsyncRead + Unpin + Send,
-    impl AsyncWrite + Unpin + Send,
-    rtp::socket::SessionHandle,
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
 ) {
-    rtp_connect_with_mss(proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
+    rtp_connect_with_mss(tasks, proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Connect an `rtp` client with a custom MSS.
 ///
 /// `mss` is passed to [`rtp::udp::connect_with`] via a custom
 /// [`rtp::udp::MssConfig`]; `proxy_client_addr` should be
-/// [`NetemPair::client_addr`].
+/// [`NetemPair::client_addr`]. The supervisor is awaited by a required scope
+/// task like [`rtp_connect`].
 pub async fn rtp_connect_with_mss(
+    tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
 ) -> (
-    impl AsyncRead + Unpin + Send,
-    impl AsyncWrite + Unpin + Send,
-    rtp::socket::SessionHandle,
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
 ) {
     let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
@@ -123,14 +130,14 @@ pub async fn rtp_connect_with_mss(
     )
     .await
     .unwrap();
-    (
-        connected.read.into_async_read(),
-        connected.write.into_async_write(),
-        // The supervisor owns the session drivers; dropping it aborts the
-        // session, so return it for the caller to hold while the halves are
-        // in use.
-        connected.supervisor,
-    )
+    let read = connected.read.into_async_read();
+    let write = connected.write.into_async_write();
+    // The supervisor owns the session drivers; poll it from a required scope
+    // task so the session ending before the test body completes is a panic.
+    tasks.spawn_required("rtp client session", async move {
+        let _ = connected.supervisor.await;
+    });
+    (read, write)
 }
 
 /// Write `payload` through `write`, shut the writer down, and read the full
@@ -161,7 +168,7 @@ where
 /// successful read. This lets tests observe live goodput without waiting for an
 /// EOF.
 pub async fn spawn_rtp_byte_sink_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     spawn_rtp_byte_sink_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
@@ -169,7 +176,7 @@ pub async fn spawn_rtp_byte_sink_server(
 
 /// Spawn an `rtp` byte sink server using a custom MSS.
 pub async fn spawn_rtp_byte_sink_server_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
@@ -262,7 +269,7 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
 /// so the `udp_listener` dispatcher keeps forwarding datagrams to the accepted
 /// connection for the server's lifetime.
 pub async fn spawn_rtp_msg_latency_sink(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
@@ -271,7 +278,7 @@ pub async fn spawn_rtp_msg_latency_sink(
 
 /// [`spawn_rtp_msg_latency_sink`] with a custom RTP MSS.
 pub async fn spawn_rtp_msg_latency_sink_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -377,7 +384,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
 /// through the returned write half and drops it (or aborts the writing task)
 /// when done; the read-keepalive task exits automatically when the peer closes.
 pub async fn spawn_rtp_bulk_upload(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
@@ -386,7 +393,7 @@ pub async fn spawn_rtp_bulk_upload(
 
 /// [`spawn_rtp_bulk_upload`] with a custom MSS.
 pub async fn spawn_rtp_bulk_upload_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,

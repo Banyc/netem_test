@@ -195,9 +195,11 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
-    // Hold the rtp session owner for the connection's lifetime; dropping it
-    // aborts the session.
-    let _rtp_supervisor = connected.supervisor;
+    // Hold the rtp session owner for the connection's lifetime; the session
+    // must survive the whole body, so poll it from a required scope task.
+    tasks.spawn_required("rtp client session", async move {
+        let _ = connected.supervisor.await;
+    });
 
     let (mut _lat_read, mut lat_write) = opener.open().await.unwrap();
     let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
@@ -1367,9 +1369,11 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
-    // Hold the rtp session owner for the connection's lifetime; dropping it
-    // aborts the session.
-    let _rtp_supervisor = connected.supervisor;
+    // Hold the rtp session owner for the connection's lifetime; the session
+    // must survive the whole body, so poll it from a required scope task.
+    tasks.spawn_required("rtp client session", async move {
+        let _ = connected.supervisor.await;
+    });
 
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));

@@ -11,8 +11,9 @@ use std::future::Future;
 /// remains the abort backstop for tasks still running when the body
 /// completes.
 ///
-/// The wrapped `JoinSet` is exposed so the support helpers that still take
-/// `&mut tokio::task::JoinSet<()>` can be driven with `&mut scope.tasks`.
+/// The wrapped `JoinSet` is exposed (via the `Deref` impls) so existing test
+/// code can keep calling `&mut tasks` / `tasks.spawn(..)` /
+/// `tasks.join_next()` unchanged.
 pub(crate) struct TestScope {
     pub(crate) tasks: tokio::task::JoinSet<()>,
 }
@@ -59,7 +60,7 @@ impl TestScope {
         });
     }
 
-    pub(crate) async fn run<F: Future>(&mut self, body: F) -> F::Output {
+    pub(crate) async fn run<F: Future>(mut self, body: F) -> F::Output {
         tokio::pin!(body);
         loop {
             tokio::select! {
@@ -70,14 +71,14 @@ impl TestScope {
                     // legitimate shutdown (e.g. a keepalive reader ending when
                     // its session closes) and is drained silently.
                     let joined = joined.expect("background task exists");
-                    joined.expect("a background task panicked");
+                    joined.unwrap();
                 }
                 value = &mut body => {
                     // The body completed. Drain tasks that exited in the same
                     // poll cycle so a required task that ended right as the
                     // body finished still fails the test.
                     while let Some(joined) = self.tasks.try_join_next() {
-                        joined.expect("a background task panicked");
+                        joined.unwrap();
                     }
                     return value;
                 }

@@ -33,7 +33,7 @@ async fn rtp_small_mss_clean_link_delivers_data() {
         .unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
+    let (read, write) = rtp_connect_with_mss(&mut tasks, pair.client_addr(), false, mss).await;
 
     let payload = b"netem-rtp-small-mss";
     tasks
@@ -66,7 +66,7 @@ async fn rtp_tiny_mss_survives_mild_loss() {
         .unwrap();
 
     let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
-    let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
+    let (read, write) = rtp_connect_with_mss(&mut tasks, pair.client_addr(), false, mss).await;
 
     let payload = payload(100 * 1024);
     tasks
@@ -101,7 +101,7 @@ async fn rtp_custom_mss_clean_link_delivers_200kib() {
         .unwrap();
 
     let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write, _supervisor) = rtp_connect_with_mss(pair.client_addr(), false, mss).await;
+    let (read, write) = rtp_connect_with_mss(&mut tasks, pair.client_addr(), false, mss).await;
 
     let payload = payload(200 * 1024);
     tasks

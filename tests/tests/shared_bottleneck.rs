@@ -35,6 +35,39 @@ mod support;
 /// delay is applied *after* the shared bottleneck.
 const OWD_MS: u64 = 50;
 
+/// Connect an `rtp` client whose session is intentionally torn down
+/// mid-body (`solo_pair.stop()` cuts the link before the contested phase), so
+/// the supervisor keepalive must be transient (ordinary spawn, ending when
+/// the connection closes) rather than `spawn_required`.
+async fn rtp_connect_transient(
+    tasks: &mut support::TestScope,
+    proxy_client_addr: std::net::SocketAddr,
+) -> (
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
+) {
+    let connected = rtp::udp::connect_with(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec: false,
+            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let read = connected.read.into_async_read();
+    let write = connected.write.into_async_write();
+    // The supervisor owns the session drivers; an ordinary spawn keeps it
+    // alive only until the session ends (the expected teardown here).
+    tasks.spawn(async move {
+        let _ = connected.supervisor.await;
+    });
+    (read, write)
+}
+
 /// Build a per-flow [`NetemConfig`] with the desired OWD and no per-flow
 /// rate. The actual bottleneck is supplied separately as a [`BottleneckShaper`].
 fn flow_config(owd: Duration, seed: u64) -> NetemConfig {
@@ -88,7 +121,7 @@ where
 /// caller drops it). `bulk_tasks` owns the pump task, which completes once
 /// `run_for` elapses and should be drained by the caller.
 async fn spawn_bulk_flow(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut support::TestScope,
     bulk_tasks: &mut tokio::task::JoinSet<()>,
     proxy_client_addr: std::net::SocketAddr,
     payload: Arc<Vec<u8>>,
@@ -150,7 +183,7 @@ async fn rr_under_bulk_ab(
     let solo_rr = with_timeout(
         Duration::from_secs(15),
         "solo rr setup",
-        rtp_connect(solo_pair.client_addr(), false),
+        rtp_connect_transient(&mut tasks, solo_pair.client_addr()),
     )
     .await;
     let solo_samples =
@@ -181,7 +214,7 @@ async fn rr_under_bulk_ab(
     let rr_conn = with_timeout(
         Duration::from_secs(15),
         "contested rr setup",
-        rtp_connect(rr_pair.client_addr(), false),
+        rtp_connect(&mut tasks, rr_pair.client_addr(), false),
     )
     .await;
 

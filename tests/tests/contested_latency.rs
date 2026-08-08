@@ -109,6 +109,11 @@ async fn contested_rep(
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
+    // The supervisor owns the session drivers; the connection must survive
+    // the whole body, so poll it from a required scope task.
+    tasks.spawn_required("rtp client session", async move {
+        let _ = connected.supervisor.await;
+    });
 
     // Open the ping stream and the bulk stream on the same mux connection.
     let (mut ping_read, mut ping_write) = opener.open().await.unwrap();

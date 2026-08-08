@@ -124,7 +124,6 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
                         pair_handlers.spawn(async move {
-                            let _spawner = pair_spawner;
                             // Per-stream handlers owned by the pair handler's
                             // scope; drained after the accept loop ends so
                             // panics surface.
@@ -223,9 +222,20 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                     Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
                                         joined.unwrap();
                                     }
+                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                        // The pair's mux session supervision ended: unwrap so a
+                                        // panicked supervision task cascades, and a normal
+                                        // MuxError session-end stops accepting.
+                                        joined.unwrap();
+                                        break;
+                                    }
                                 }
                             }
                             while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
+                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                            while let Some(result) = pair_spawner.join_next().await {
                                 result.unwrap();
                             }
                         });
@@ -346,7 +356,6 @@ pub async fn spawn_dual_msg_channel_server(
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
                         pair_handlers.spawn(async move {
-                            let _spawner = pair_spawner;
 
                             // Per-stream handlers owned by the pair handler's
                             // scope; drained when the pair ends.
@@ -424,9 +433,20 @@ pub async fn spawn_dual_msg_channel_server(
                                     Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
                                         joined.unwrap();
                                     }
+                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                        // The pair's mux session supervision ended: unwrap so a
+                                        // panicked supervision task cascades, and a normal
+                                        // MuxError session-end stops accepting.
+                                        joined.unwrap();
+                                        break;
+                                    }
                                 }
                             }
                             while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
+                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                            while let Some(result) = pair_spawner.join_next().await {
                                 result.unwrap();
                             }
                         });
@@ -546,7 +566,6 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
                         pair_handlers.spawn(async move {
-                            let _spawner = pair_spawner;
                             let mut mac = accepter.into_migrating_capable();
                             // Per-stream handlers owned by the pair handler's
                             // scope; drained after the accept loop ends.
@@ -580,9 +599,20 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
                                     Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
                                         joined.unwrap();
                                     }
+                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                        // The pair's mux session supervision ended: unwrap so a
+                                        // panicked supervision task cascades, and a normal
+                                        // MuxError session-end stops accepting.
+                                        joined.unwrap();
+                                        break;
+                                    }
                                 }
                             }
                             while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
+                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                            while let Some(result) = pair_spawner.join_next().await {
                                 result.unwrap();
                             }
                         });
@@ -777,7 +807,6 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
                         pair_handlers.spawn(async move {
-                            let _spawner = pair_spawner;
                             let mut mac = accepter.into_migrating_capable();
                             // Per-stream handlers owned by the pair handler's
                             // scope; drained after the accept loop ends.
@@ -811,9 +840,20 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
                                     Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
                                         joined.unwrap();
                                     }
+                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                        // The pair's mux session supervision ended: unwrap so a
+                                        // panicked supervision task cascades, and a normal
+                                        // MuxError session-end stops accepting.
+                                        joined.unwrap();
+                                        break;
+                                    }
                                 }
                             }
                             while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
+                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                            while let Some(result) = pair_spawner.join_next().await {
                                 result.unwrap();
                             }
                         });
@@ -955,24 +995,12 @@ pub async fn dual_mux_client_connect(
     let nonce = mux::PairingNonce::generate();
     let group = mux::GroupToken::generate();
 
-    let (int_reader, mut int_writer, int_supervisor) = rtp_connect(int_proxy_addr, fec).await;
-    // Hold the lane's rtp session for the whole connection; dropping the
-    // supervisor aborts it. The keepalive is transient: it ends when the
-    // session ends (a legitimate shutdown).
-    tasks.spawn(async move {
-        let _ = int_supervisor.await;
-    });
+    let (int_reader, mut int_writer) = rtp_connect(tasks, int_proxy_addr, fec).await;
     mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
 
-    let (bulk_reader, mut bulk_writer, bulk_supervisor) = rtp_connect(bulk_proxy_addr, fec).await;
-    // Hold the lane's rtp session for the whole connection; dropping the
-    // supervisor aborts it. The keepalive is transient: it ends when the
-    // session ends (a legitimate shutdown).
-    tasks.spawn(async move {
-        let _ = bulk_supervisor.await;
-    });
+    let (bulk_reader, mut bulk_writer) = rtp_connect(tasks, bulk_proxy_addr, fec).await;
     mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
         .await
         .map_err(mux::DualMuxError::LaneHello)?;
@@ -998,7 +1026,7 @@ pub async fn dual_mux_client_connect(
     // ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
         while let Some(result) = super_spawner.join_next().await {
-            let err = result.expect("dual-mux supervision task panicked");
+            let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
         }
     });
@@ -1055,7 +1083,7 @@ pub async fn dual_mux_client_connect_frame_reassembly(
     // and the session ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
         while let Some(result) = super_spawner.join_next().await {
-            let err = result.expect("dual-mux supervision task panicked");
+            let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
         }
     });
@@ -1092,12 +1120,7 @@ pub async fn dual_mux_client_connect_with_lane_modes(
             let (r, w) = rtp_frame_delivery_connect(tasks, addr, fec).await;
             Some((Box::new(r), Box::new(w)))
         } else {
-            let (r, w, supervisor) = rtp_connect(addr, fec).await;
-            // Hold the lane's rtp session for the whole connection.
-            // Keepalive is transient: it ends when the session ends.
-            tasks.spawn(async move {
-                let _ = supervisor.await;
-            });
+            let (r, w) = rtp_connect(tasks, addr, fec).await;
             Some((Box::new(r), Box::new(w)))
         }
     }
@@ -1144,7 +1167,7 @@ pub async fn dual_mux_client_connect_with_lane_modes(
     // and the session ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
         while let Some(result) = super_spawner.join_next().await {
-            let err = result.expect("dual-mux supervision task panicked");
+            let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
         }
     });
@@ -1323,7 +1346,6 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                         let bulk = Arc::clone(&bulk_for_main);
                         let tx = tx.clone();
                         pair_handlers.spawn(async move {
-                            let _spawner = pair_spawner;
                             let _cfg1 = cfg1;
                             let _cfg2 = cfg2;
                             // Per-stream handlers owned by the pair handler's
@@ -1423,9 +1445,20 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
                                     Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
                                         joined.unwrap();
                                     }
+                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                        // The pair's mux session supervision ended: unwrap so a
+                                        // panicked supervision task cascades, and a normal
+                                        // MuxError session-end stops accepting.
+                                        joined.unwrap();
+                                        break;
+                                    }
                                 }
                             }
                             while let Some(result) = stream_handlers.join_next().await {
+                                result.unwrap();
+                            }
+                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                            while let Some(result) = pair_spawner.join_next().await {
                                 result.unwrap();
                             }
                         });
@@ -1578,17 +1611,36 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
                         let tx = tx.clone();
                         let task_tx = task_tx_for_pair.clone();
                         pair_handlers.spawn(async move {
-                            let _spawner = pair_spawner;
-                            while let Ok((reader, writer, class)) = accepter.accept().await {
-                                spawn_tagged_stream_sink(
-                                    &task_tx,
-                                    reader,
-                                    writer,
-                                    tx.clone(),
-                                    Arc::clone(&bulk),
-                                    base,
-                                    class == mux::LaneClass::Interactive,
-                                );
+                            loop {
+                                tokio::select! {
+                                    accepted = accepter.accept() => {
+                                        match accepted {
+                                            Ok((reader, writer, class)) => {
+                                                spawn_tagged_stream_sink(
+                                                    &task_tx,
+                                                    reader,
+                                                    writer,
+                                                    tx.clone(),
+                                                    Arc::clone(&bulk),
+                                                    base,
+                                                    class == mux::LaneClass::Interactive,
+                                                );
+                                            }
+                                            Err(_) => break, // peer closed; stop accepting
+                                        }
+                                    }
+                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                        // The pair's mux session supervision ended: unwrap so a
+                                        // panicked supervision task cascades, and a normal
+                                        // MuxError session-end stops accepting.
+                                        joined.unwrap();
+                                        break;
+                                    }
+                                }
+                            }
+                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                            while let Some(result) = pair_spawner.join_next().await {
+                                result.unwrap();
                             }
                         });
                     }

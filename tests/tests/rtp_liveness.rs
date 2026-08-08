@@ -106,6 +106,11 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
 
         let mut read = connected.read.into_async_read();
         let mut write = connected.write.into_async_write();
+        // The supervisor owns the session drivers; the connection must
+        // survive the whole body, so poll it from a required scope task.
+        tasks.spawn_required("rtp client session", async move {
+            let _ = connected.supervisor.await;
+        });
 
         // Keep the read half alive so ACKs keep flowing; parked until the
         // connection closes, so the owning JoinSet aborts it at scope end.
@@ -326,6 +331,11 @@ fn rtp_permanent_hole_liveness_smoke() {
 
         let mut read = connected.read.into_async_read();
         let mut write = connected.write.into_async_write();
+        // The supervisor owns the session drivers; the connection must
+        // survive the whole body, so poll it from a required scope task.
+        tasks.spawn_required("rtp client session", async move {
+            let _ = connected.supervisor.await;
+        });
 
         // Keep the read half alive so ACKs keep flowing; parked until the
         // connection closes, so the owning JoinSet aborts it at scope end.

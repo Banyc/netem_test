@@ -2,16 +2,18 @@
 // Frame‑delivery adapter
 // ═══════════════════════════════════════════════════════════════════════════════
 
+use crate::support::TestScope;
+
 pub type RtpFrameReader = rtp::socket::FrameByteReader;
 pub type RtpFrameDeliveryWriter = rtp::socket::FrameByteWriter;
 
 /// Connect an rtp client using frame delivery.  Returns the frame-preserving
 /// reader and writer adapters that guarantee one-mux-frame-per-one-rtp-frame.
 ///
-/// `tasks` owns the rtp session-owner keepalive; the caller must keep it alive
-/// while the returned halves are in use and drop it to abort the session.
+/// `tasks` owns the rtp session-owner keepalive; the session must stay alive
+/// for the whole test body, so the keepalive is registered as required.
 pub async fn rtp_frame_delivery_connect(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
@@ -26,7 +28,7 @@ pub async fn rtp_frame_delivery_connect(
 
 /// Connect an rtp client using frame delivery with a custom MSS.
 pub async fn rtp_frame_delivery_connect_with_mss(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
@@ -41,7 +43,7 @@ pub async fn rtp_frame_delivery_connect_with_mss(
 }
 
 async fn rtp_frame_delivery_connect_with_mss_config(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: rtp::udp::MssConfig,
@@ -58,9 +60,9 @@ async fn rtp_frame_delivery_connect_with_mss_config(
     )
     .await
     .unwrap();
-    // Hold the rtp session owner for the connection's lifetime; dropping it
-    // aborts the session.
-    tasks.spawn(async move {
+    // Hold the rtp session owner for the connection's lifetime; the session
+    // must survive the whole test body, so the keepalive is required.
+    tasks.spawn_required("rtp client session", async move {
         let _ = connected.supervisor.await;
     });
     (connected.read, connected.write)

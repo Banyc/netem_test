@@ -42,7 +42,7 @@ const CHUNK: usize = 262_044;
 /// by the number of bytes read from each stream until `Ok(0)`/Err. There is
 /// no payload verification; all bytes are counted.
 async fn spawn_mux_bulk_sink(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut support::TestScope,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_server = Arc::clone(&delivered);
@@ -95,6 +95,11 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
+    // The supervisor owns the session drivers; the connection must survive
+    // the whole body, so poll it from a required scope task.
+    tasks.spawn_required("rtp client session", async move {
+        let _ = connected.supervisor.await;
+    });
 
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
 

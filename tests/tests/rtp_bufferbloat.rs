@@ -108,6 +108,11 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
     .unwrap();
     let mut write = connected.write.into_async_write();
     let mut read = connected.read.into_async_read();
+    // The supervisor owns the session drivers; the connection must survive
+    // the whole body, so poll it from a required scope task.
+    server_tasks.spawn_required("rtp client session", async move {
+        let _ = connected.supervisor.await;
+    });
     // Keep the read half alive so ACKs keep moving; parked until the
     // connection closes, so the owning JoinSet aborts it at scope end.
     server_tasks.spawn(async move {

@@ -41,7 +41,7 @@ async fn mux_over_rtp_lossy_perf_smoke() {
     let c2s = lossy_400kib_per_sec();
     let s2c = lossy_400kib_per_sec();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
     let opener = mux_client_connect(&mut tasks, read, write);
 
     let payload = payload(1024);
@@ -87,7 +87,7 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
     let c2s = lossy_400kib_per_sec();
     let s2c = lossy_400kib_per_sec();
     let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
     let opener = mux_client_connect(&mut tasks, read, write);
 
     let payload = payload(400 * 1024);
@@ -153,7 +153,7 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
         ..NetemConfig::default()
     };
     let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
-    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
     let opener = mux_client_connect(&mut tasks, read, write);
 
     // Send the bulk 400 KiB payload on one stream, then after a short delay
@@ -202,7 +202,7 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
                         .join_next()
                         .await
                         .expect("bulk send task ended without a result")
-                        .expect("bulk send task panicked")
+                        .unwrap()
                 },
             )
             .await;
@@ -263,7 +263,7 @@ async fn mux_over_rtp_400mib_hostile_perf() {
             .unwrap();
     let impaired = hostile_fat_pipe();
     let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
-    let (read, write, _supervisor) = rtp_connect(pair.client_addr(), false).await;
+    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
     let opener = mux_client_connect(&mut tasks, read, write);
     let chunk = cyclic_payload(1024 * 1024);
     let repeat = TARGET_BYTES.div_ceil(chunk.len());

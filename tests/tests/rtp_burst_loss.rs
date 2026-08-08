@@ -262,6 +262,11 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
         connected.read.into_async_read(),
         connected.write.into_async_write(),
     );
+    // The supervisor owns the session drivers; the connection must survive
+    // the whole body, so poll it from a required scope task.
+    tasks.spawn_required("rtp client session", async move {
+        let _ = connected.supervisor.await;
+    });
     let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
 
     // Keep the stream read half alive for the duration of the test so the mux
