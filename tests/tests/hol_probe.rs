@@ -498,20 +498,27 @@ async fn run_rtp_bulk_flow(
     active_for: Duration,
     load: BulkLoad,
 ) -> u64 {
-    // Owns the read-keepalive for the upload connection; aborted when this
-    // scope drops at the end of the flow.
+    // Races the ramp/write future against the keepalives scope so a panic
+    // in the upload's supervisor driver cascades into the caller; dropping
+    // the scope when `run` returns aborts any still-running keepalive.
     let mut keepalives = support::TestScope::new();
     let Ok(mut writer) = spawn_rtp_bulk_upload(&mut keepalives, proxy_client_addr, fec).await
     else {
         return 0;
     };
-    tokio::time::sleep(ramp).await;
-    match load {
-        BulkLoad::Saturating => {
-            saturating_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await
-        }
-        BulkLoad::Paced => paced_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await,
-    }
+    keepalives
+        .run(async {
+            tokio::time::sleep(ramp).await;
+            match load {
+                BulkLoad::Saturating => {
+                    saturating_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await
+                }
+                BulkLoad::Paced => {
+                    paced_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await
+                }
+            }
+        })
+        .await
 }
 
 fn print_hol_summary(label: &str, s: &HolSummary) {
