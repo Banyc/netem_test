@@ -8,6 +8,8 @@ use netem_test::{NetemConfig, NetemPair};
 pub struct PerFlowNetem {
     addr: std::net::SocketAddr,
     stop: Arc<AtomicBool>,
+    /// Handle of the main fan thread; `None` once joined.
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl PerFlowNetem {
@@ -21,12 +23,13 @@ impl PerFlowNetem {
         let addr = front.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_front = Arc::clone(&stop);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("netem-fan".into())
             .spawn(move || {
                 let front = Arc::new(front);
                 let mut flows: HashMap<std::net::SocketAddr, UdpSocket> = HashMap::new();
                 let mut pairs: Vec<NetemPair> = Vec::new();
+                let mut flow_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
                 let mut buf = [0u8; 65535];
                 while !stop_front.load(Ordering::Relaxed) {
                     match front.recv_from(&mut buf) {
@@ -42,7 +45,7 @@ impl PerFlowNetem {
                                 let back = sock.try_clone().unwrap();
                                 let front = Arc::clone(&front);
                                 let stop = Arc::clone(&stop_front);
-                                std::thread::Builder::new()
+                                let flow_thread = std::thread::Builder::new()
                                     .name("netem-fan-flow".into())
                                     .spawn(move || {
                                         let mut buf = [0u8; 65535];
@@ -61,6 +64,7 @@ impl PerFlowNetem {
                                         }
                                     })
                                     .unwrap();
+                                flow_threads.push(flow_thread);
                                 pairs.push(pair);
                                 sock
                             });
@@ -75,13 +79,29 @@ impl PerFlowNetem {
                 for pair in &pairs {
                     pair.stop();
                 }
+                for thread in flow_threads {
+                    thread.join().unwrap();
+                }
             })?;
-        Ok(Self { addr, stop })
+        Ok(Self {
+            addr,
+            stop,
+            thread: std::sync::Mutex::new(Some(thread)),
+        })
     }
     pub fn client_addr(&self) -> std::net::SocketAddr {
         self.addr
     }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+impl Drop for PerFlowNetem {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

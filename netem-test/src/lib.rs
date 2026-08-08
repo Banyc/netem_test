@@ -326,8 +326,8 @@ pub struct CountersSnapshot {
 
 // ───────────────────────────── the link ─────────────────────────────────
 
-/// A running emulated link. Dropping the handle does *not* stop the proxy
-/// thread; call [`NetemLink::stop`] for that.
+/// A running emulated link. Dropping the link stops the proxy thread and
+/// joins it (equivalent to calling [`NetemLink::stop`]).
 pub struct NetemLink {
     client_addr: SocketAddr,
     server_addr: SocketAddr,
@@ -335,6 +335,8 @@ pub struct NetemLink {
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
+    /// Handle of the spawned runner thread; `None` once joined.
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl NetemLink {
@@ -387,6 +389,7 @@ impl NetemLink {
             queue_len: Arc::clone(&queue_len),
             blackout: Arc::clone(&blackout),
             stop: Arc::clone(&stop),
+            thread: Mutex::new(None),
         };
 
         let runner = LinkRunner::new(RunnerConfig {
@@ -399,9 +402,10 @@ impl NetemLink {
             transport,
             clock: None,
         });
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("netem-link".into())
             .spawn(move || runner.run())?;
+        *link.thread.lock().unwrap() = Some(thread);
 
         Ok(link)
     }
@@ -442,9 +446,19 @@ impl NetemLink {
         self.blackout.store(on, Ordering::Relaxed);
     }
 
-    /// Signal the proxy thread to stop after the next iteration.
+    /// Signal the proxy thread to stop and wait for it to exit. Idempotent:
+    /// once joined, subsequent calls are no-ops.
     pub fn stop(&self) {
         *self.stop.lock().unwrap() = true;
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+impl Drop for NetemLink {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -804,8 +818,8 @@ impl LinkRunner {
 /// the real server) are impaired per `s2c` and forwarded back to the client
 /// whose address is learned from the first client→server packet.
 ///
-/// Dropping the handle does not stop the proxy threads; call
-/// [`NetemPair::stop`] for that.
+/// Dropping the link stops both proxy threads and joins them (equivalent to
+/// calling [`NetemPair::stop`]).
 pub struct NetemPair {
     client_addr: SocketAddr,
     server_addr: SocketAddr,
@@ -816,6 +830,10 @@ pub struct NetemPair {
     blackout_c2s: Arc<AtomicBool>,
     blackout_s2c: Arc<AtomicBool>,
     stop: Arc<Mutex<bool>>,
+    /// Handle of the c2s runner thread; `None` once joined.
+    thread_c2s: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Handle of the s2c runner thread; `None` once joined.
+    thread_s2c: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct NetemPairConfig {
@@ -961,6 +979,8 @@ impl NetemPair {
             blackout_c2s: Arc::clone(&blackout_c2s),
             blackout_s2c: Arc::clone(&blackout_s2c),
             stop: Arc::clone(&stop),
+            thread_c2s: Mutex::new(None),
+            thread_s2c: Mutex::new(None),
         };
 
         // Both sockets are shared between the two runners via `Arc`: each
@@ -985,9 +1005,10 @@ impl NetemPair {
                 clock: clock.clone(),
             },
         );
-        std::thread::Builder::new()
+        let c2s_thread = std::thread::Builder::new()
             .name("netem-c2s".into())
             .spawn(move || c2s_runner.run())?;
+        *pair.thread_c2s.lock().unwrap() = Some(c2s_thread);
 
         // s2c: recv on server_sock, send on client_sock to the learned client
         // address.
@@ -1006,9 +1027,10 @@ impl NetemPair {
                 clock,
             },
         );
-        std::thread::Builder::new()
+        let s2c_thread = std::thread::Builder::new()
             .name("netem-s2c".into())
             .spawn(move || s2c_runner.run())?;
+        *pair.thread_s2c.lock().unwrap() = Some(s2c_thread);
 
         Ok(pair)
     }
@@ -1085,9 +1107,22 @@ impl NetemPair {
         self.blackout_s2c.store(on, Ordering::Relaxed);
     }
 
-    /// Signal both proxy threads to stop after the next iteration.
+    /// Signal both proxy threads to stop and wait for them to exit.
+    /// Idempotent: once joined, subsequent calls are no-ops.
     pub fn stop(&self) {
         *self.stop.lock().unwrap() = true;
+        if let Some(thread) = self.thread_c2s.lock().unwrap().take() {
+            thread.join().unwrap();
+        }
+        if let Some(thread) = self.thread_s2c.lock().unwrap().take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+impl Drop for NetemPair {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
