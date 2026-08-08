@@ -83,6 +83,24 @@ pub(crate) fn submit_test_task(tx: &tokio::sync::mpsc::Sender<TestTask>, fut: Te
     }
 }
 
+/// Submit a REQUIRED test-owned task: like [`submit_test_task`] but wraps
+/// the future so that completing before the test body does panics the
+/// reaper (mirroring [`TestScope::spawn_required`] for the bounded
+/// submission handle, for helpers called inside `run` bodies).
+pub(crate) fn submit_test_task_required(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    name: &'static str,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            fut.await;
+            panic!("required task '{name}' exited before the test body completed");
+        }),
+    );
+}
+
 pub(crate) fn try_send_observation<T>(
     tx: &tokio::sync::mpsc::Sender<T>,
     value: T,

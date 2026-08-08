@@ -21,12 +21,14 @@ use std::time::{Duration, Instant};
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::payload::cyclic_payload;
 use support::rtp::{
-    rtp_connect, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server, spawn_rtp_echo_server,
+    spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server, spawn_rtp_byte_sink_server_via,
+    spawn_rtp_echo_server_via,
 };
 use support::stats::{combined_stats, percentile, print_perf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::support::payload::with_timeout;
+use crate::support::submit_test_task;
 
 mod support;
 
@@ -37,10 +39,10 @@ const OWD_MS: u64 = 50;
 
 /// Connect an `rtp` client whose session is intentionally torn down
 /// mid-body (`solo_pair.stop()` cuts the link before the contested phase), so
-/// the supervisor keepalive must be transient (ordinary spawn, ending when
-/// the connection closes) rather than `spawn_required`.
+/// the supervisor keepalive must be transient (ordinary submission, ending
+/// when the connection closes) rather than required.
 async fn rtp_connect_transient(
-    tasks: &mut support::TestScope,
+    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
     proxy_client_addr: std::net::SocketAddr,
 ) -> (
     impl AsyncRead + Unpin + Send + use<>,
@@ -60,9 +62,45 @@ async fn rtp_connect_transient(
     .unwrap();
     let read = connected.read.into_async_read();
     let write = connected.write.into_async_write();
-    // The supervisor owns the session drivers; an ordinary spawn keeps it
+    // The supervisor owns the session drivers; a transient submission keeps it
     // alive only until the session ends (the expected teardown here).
-    tasks.spawn(async move {
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let _ = connected.supervisor.await;
+        }),
+    );
+    (read, write)
+}
+
+/// Connect an `rtp` client whose session must survive the whole run body
+/// (`rr_pair` is only stopped at the very end of the contested phase), so the
+/// supervisor keepalive is submitted as REQUIRED: a session that ends early
+/// fails the test via the reaper.
+async fn rtp_connect_required(
+    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    proxy_client_addr: std::net::SocketAddr,
+) -> (
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
+) {
+    let connected = rtp::udp::connect_with(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec: false,
+            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            ..rtp::udp::ConnectConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let read = connected.read.into_async_read();
+    let write = connected.write.into_async_write();
+    // The supervisor owns the session drivers; submit it as REQUIRED so the
+    // contested rr session ending before the body completes fails the test.
+    crate::support::submit_test_task_required(tx, "rtp client session", async move {
         let _ = connected.supervisor.await;
     });
     (read, write)
@@ -117,31 +155,33 @@ where
 
 /// Run a bulk upload through one shared-shaper [`NetemPair`] for `run_for`.
 ///
-/// `tasks` owns the bulk upload's read-keepalive (parked; aborted when the
-/// caller drops it). `bulk_tasks` owns the pump task, which completes once
-/// `run_for` elapses and should be drained by the caller.
+/// `tx` (the bounded task-submission handle) owns the bulk upload's
+/// read-keepalive and the pump task; the pump completes once `run_for`
+/// elapses or `stop` is set and is drained by the reaper.
 async fn spawn_bulk_flow(
-    tasks: &mut support::TestScope,
-    bulk_tasks: &mut tokio::task::JoinSet<()>,
+    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
     proxy_client_addr: std::net::SocketAddr,
     payload: Arc<Vec<u8>>,
     run_for: Duration,
     stop: Arc<AtomicBool>,
 ) {
-    let Ok(mut writer) = spawn_rtp_bulk_upload(tasks, proxy_client_addr, false).await else {
+    let Ok(mut writer) = spawn_rtp_bulk_upload_via(tx, proxy_client_addr, false).await else {
         return;
     };
-    bulk_tasks.spawn(async move {
-        let start = Instant::now();
-        let mut offset = 0usize;
-        while start.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
-            match writer.write(&payload[offset..]).await {
-                Ok(0) => break,
-                Ok(n) => offset = (offset + n) % payload.len(),
-                Err(_) => break,
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let start = Instant::now();
+            let mut offset = 0usize;
+            while start.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
+                match writer.write(&payload[offset..]).await {
+                    Ok(0) => break,
+                    Ok(n) => offset = (offset + n) % payload.len(),
+                    Err(_) => break,
+                }
             }
-        }
-    });
+        }),
+    );
 }
 
 /// A/B scenario: sparse rr echo alone vs rr echo competing with a bulk upload,
@@ -168,70 +208,77 @@ async fn rr_under_bulk_ab(
     let warmup = Duration::from_secs(3);
 
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
 
-    // ── solo phase ────────────────────────────────────────────────────────
-    let echo_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
-    let solo_pair = NetemPair::spawn_shared(
-        echo_addr,
-        flow_config(owd, 11),
-        flow_config(owd, 12),
-        Some(BottleneckShaper::new(rate_bps, limit_bytes)),
-        None,
-    )
-    .unwrap();
-    let solo_rr = with_timeout(
-        Duration::from_secs(15),
-        "solo rr setup",
-        rtp_connect_transient(&mut tasks, solo_pair.client_addr()),
-    )
-    .await;
-    let solo_samples =
-        rr_echo_samples(solo_rr.0, solo_rr.1, msg_bytes, gap, solo_run, warmup).await;
-    solo_pair.stop();
-
-    // ── contested phase ───────────────────────────────────────────────────
-    let (sink_addr, delivered) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
-    let echo_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
-    let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
-    let bulk_pair = NetemPair::spawn_shared(
-        sink_addr,
-        flow_config(owd, 21),
-        flow_config(owd, 22),
-        Some(shaper.clone()),
-        None,
-    )
-    .unwrap();
-    let rr_pair = NetemPair::spawn_shared(
-        echo_addr,
-        flow_config(owd, 23),
-        flow_config(owd, 24),
-        Some(shaper.clone()),
-        None,
-    )
-    .unwrap();
-
-    let rr_conn = with_timeout(
-        Duration::from_secs(15),
-        "contested rr setup",
-        rtp_connect(&mut tasks, rr_pair.client_addr(), false),
-    )
-    .await;
-
-    let bulk_payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let bulk_stop = Arc::new(AtomicBool::new(false));
-    spawn_bulk_flow(
-        &mut tasks,
-        &mut bulk_tasks,
-        bulk_pair.client_addr(),
-        bulk_payload,
-        contested_run,
-        Arc::clone(&bulk_stop),
-    )
-    .await;
-
-    let (contested_samples, delivered_bytes) = tasks
+    // The whole flow — solo setup + 10 s measurement + teardown, then
+    // contested setup + measurement + teardown — runs inside one actively
+    // driven scope. Every dynamic child (echo/sink servers, session
+    // supervisors, the bulk pump) is submitted through the bounded `task_tx`
+    // handle, so the reaper actively drives them (and surfaces panics)
+    // throughout, including during the long solo measurement.
+    let (solo_samples, contested_samples, delivered_bytes, rr_pair) = tasks
         .run(async {
+            // solo phase
+            let echo_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
+            let solo_pair = NetemPair::spawn_shared(
+                echo_addr,
+                flow_config(owd, 11),
+                flow_config(owd, 12),
+                Some(BottleneckShaper::new(rate_bps, limit_bytes)),
+                None,
+            )
+            .unwrap();
+            let solo_rr = with_timeout(
+                Duration::from_secs(15),
+                "solo rr setup",
+                rtp_connect_transient(&task_tx, solo_pair.client_addr()),
+            )
+            .await;
+            let solo_samples =
+                rr_echo_samples(solo_rr.0, solo_rr.1, msg_bytes, gap, solo_run, warmup).await;
+            solo_pair.stop();
+
+            // contested phase
+            let (sink_addr, delivered) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+            let echo_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
+            let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
+            let bulk_pair = NetemPair::spawn_shared(
+                sink_addr,
+                flow_config(owd, 21),
+                flow_config(owd, 22),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+            let rr_pair = NetemPair::spawn_shared(
+                echo_addr,
+                flow_config(owd, 23),
+                flow_config(owd, 24),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+
+            let rr_conn = with_timeout(
+                Duration::from_secs(15),
+                "contested rr setup",
+                rtp_connect_required(&task_tx, rr_pair.client_addr()),
+            )
+            .await;
+
+            let bulk_payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let bulk_stop = Arc::new(AtomicBool::new(false));
+            spawn_bulk_flow(
+                &task_tx,
+                bulk_pair.client_addr(),
+                bulk_payload,
+                contested_run,
+                Arc::clone(&bulk_stop),
+            )
+            .await;
+
             let contested_samples =
                 rr_echo_samples(rr_conn.0, rr_conn.1, msg_bytes, gap, contested_run, warmup).await;
 
@@ -241,16 +288,9 @@ async fn rr_under_bulk_ab(
             let delivered_bytes = delivered.load(Ordering::Relaxed);
             bulk_pair.stop();
             rr_pair.stop();
-            (contested_samples, delivered_bytes)
+            (solo_samples, contested_samples, delivered_bytes, rr_pair)
         })
         .await;
-
-    // The bulk flow completed its run window; drain it so any panic surfaces.
-    // The keepalive/sink tasks may complete once the upload sessions end;
-    // that happens after the raced body, so it is not an early exit.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
     // ── analysis ──────────────────────────────────────────────────────────
     let mut solo = solo_samples;
     solo.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -358,7 +398,7 @@ async fn shared_bneck_late_joiner_fairness() {
     let bin_width = Duration::from_millis(500);
 
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
 
     let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
     let (sink_b_addr, delivered_b) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
@@ -384,8 +424,7 @@ async fn shared_bneck_late_joiner_fairness() {
     let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
     let bulk_stop = Arc::new(AtomicBool::new(false));
     spawn_bulk_flow(
-        &mut tasks,
-        &mut bulk_tasks,
+        &task_tx,
         pair_a.client_addr(),
         Arc::clone(&payload),
         total_run,
@@ -394,8 +433,7 @@ async fn shared_bneck_late_joiner_fairness() {
     .await;
     tokio::time::sleep(b_join).await;
     spawn_bulk_flow(
-        &mut tasks,
-        &mut bulk_tasks,
+        &task_tx,
         pair_b.client_addr(),
         Arc::clone(&payload),
         total_run - b_join,
@@ -428,14 +466,6 @@ async fn shared_bneck_late_joiner_fairness() {
             (bins_a, bins_b)
         })
         .await;
-
-    // Both flows completed their run windows; drain them so any panic
-    // surfaces. The keepalive/sink tasks may complete once the upload
-    // sessions end; that happens after the raced body, so it is not an
-    // early exit.
-    while let Some(result) = bulk_tasks.join_next().await {
-        result.unwrap();
-    }
 
     let total_a = delivered_a.load(Ordering::Relaxed);
     let total_b = delivered_b.load(Ordering::Relaxed);

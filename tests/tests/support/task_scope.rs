@@ -9,7 +9,8 @@ use std::future::Future;
 /// being observed only when the scope is dropped. Background tasks that end
 /// normally are drained silently (legitimate shutdowns); dropping the scope
 /// remains the abort backstop for tasks still running when the body
-/// completes.
+/// completes. [`Self::run`] reaps the scope, but the [`Self::submitter`]
+/// reaper covers tasks submitted through the handle even before `run`.
 ///
 /// The wrapped `JoinSet` is exposed (via the `Deref` impls) so existing test
 /// code can keep calling `&mut tasks` / `tasks.spawn(..)` /
@@ -58,6 +59,16 @@ impl TestScope {
             future.await;
             panic!("required task '{name}' exited before the test body completed");
         });
+    }
+
+    /// Spawn the bounded inner reaper into this scope and return its
+    /// submission handle. The reaper actively drives (and unwraps) every
+    /// submitted child from the moment it is created — including during
+    /// setup, before [`Self::run`] begins — so a panicked child surfaces
+    /// via the reaper instead of being hidden until the scope is reaped.
+    /// Keep a sender clone alive for the channel to stay open.
+    pub(crate) fn submitter(&mut self, bound: usize) -> tokio::sync::mpsc::Sender<super::TestTask> {
+        super::spawn_test_task_reaper(&mut self.tasks, bound)
     }
 
     pub(crate) async fn run<F: Future>(mut self, body: F) -> F::Output {

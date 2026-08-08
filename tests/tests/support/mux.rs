@@ -61,8 +61,8 @@ where
             };
             // Parked tasks owned by this outer task's scope: the extra-accept
             // drainer loop (keeps driving `udp_listener`'s dispatcher for the
-            // server's lifetime) and the rtp-supervisor keepalive. Both are
-            // aborted when this JoinSet drops at scope end.
+            // server's lifetime). It is aborted when this JoinSet drops at
+            // scope end.
             let mut parked = tokio::task::JoinSet::new();
             // Keep driving `udp_listener`'s dispatcher for the lifetime of the
             // server: `accept()` both establishes new connections and
@@ -91,11 +91,11 @@ where
 
             let read = accepted.read.into_async_read();
             let write = accepted.write.into_async_write();
-            // Hold the accepted lane's rtp session for its whole life;
-            // dropping it aborts the session.
-            parked.spawn(async move {
-                let _ = accepted.supervisor.await;
-            });
+            // The accepted lane's rtp session supervisor owns the session
+            // drivers; poll it from the select loop below so a panicked
+            // driver terminates the server instead of being silently dropped.
+            let supervisor = accepted.supervisor;
+            tokio::pin!(supervisor);
 
             let config = mux::MuxConfig {
                 initiation: mux::Initiation::Server,
@@ -115,6 +115,7 @@ where
             let mut handlers = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
+                    () = &mut supervisor => { break; } // rtp session drivers exited; stop accepting
                     accepted = accepter.accept() => {
                         match accepted {
                             Ok((stream_read, stream_write)) => {
@@ -377,7 +378,7 @@ where
     let mut spawner = JoinSet::new();
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
     tasks.spawn_required("mux client session", async move {
-        while let Some(result) = spawner.join_next().await {
+        if let Some(result) = spawner.join_next().await {
             let err = result.unwrap();
             panic!("mux client session ended before the test body: {err:?}");
         }
@@ -918,8 +919,9 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
             Err(_) => return,
         };
         // Parked tasks owned by this outer task's scope: the extra-accept
-        // drainer loop and the rtp-supervisor keepalive. Both are aborted
-        // when this JoinSet drops at scope end.
+        // drainer loop (keeps driving `udp_listener`'s dispatcher for the
+        // server's lifetime). It is aborted when this JoinSet drops at scope
+        // end.
         let mut parked = tokio::task::JoinSet::new();
         parked.spawn({
             let listener = Arc::clone(&listener);
@@ -944,11 +946,11 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
 
         let read = accepted.read.into_async_read();
         let write = accepted.write.into_async_write();
-        // Hold the accepted lane's rtp session for its whole life;
-        // dropping it aborts the session.
-        parked.spawn(async move {
-            let _ = accepted.supervisor.await;
-        });
+        // The accepted lane's rtp session supervisor owns the session
+        // drivers; poll it from the select loop below so a panicked driver
+        // terminates the server instead of being silently dropped.
+        let supervisor = accepted.supervisor;
+        tokio::pin!(supervisor);
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
@@ -967,6 +969,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         let mut handlers = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                () = &mut supervisor => { break; } // rtp session drivers exited; stop accepting
                 accepted = accepter.accept() => {
                     match accepted {
                         Ok((mut reader, mut writer)) => {
