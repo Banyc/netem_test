@@ -178,11 +178,9 @@ async fn contested_rep(
             stop_sampler.store(true, Ordering::Relaxed);
             // The sampler exits once the stop flag is set; join it so any
             // panic surfaces.
-            let queue_samples = loop {
-                match sampler_tasks.join_next().await {
-                    Some(result) => break result.unwrap(),
-                    None => break Vec::new(),
-                }
+            let queue_samples = match sampler_tasks.join_next().await {
+                Some(result) => result.unwrap(),
+                None => Vec::new(),
             };
 
             // Drain latency channel.

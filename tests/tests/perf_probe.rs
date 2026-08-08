@@ -51,9 +51,8 @@ where
     // Transient drain (see doc comment): unwrap JoinErrors so panics
     // surface; a `MuxError` session-end ends the drain normally.
     tasks.spawn(async move {
-        while let Some(result) = spawner.join_next().await {
+        if let Some(result) = spawner.join_next().await {
             result.unwrap();
-            break;
         }
     });
     opener
@@ -271,9 +270,8 @@ async fn probe_mux_sink_4mib_direct() {
                 support::submit_test_task(
                     &task_tx,
                     Box::pin(async move {
-                        while let Some(result) = spawner.join_next().await {
+                        if let Some(result) = spawner.join_next().await {
                             result.unwrap();
-                            break;
                         }
                     }),
                 );
@@ -357,9 +355,8 @@ async fn probe_mux_sink_4mib_mss8k() {
                 support::submit_test_task(
                     &task_tx,
                     Box::pin(async move {
-                        while let Some(result) = spawner.join_next().await {
+                        if let Some(result) = spawner.join_next().await {
                             result.unwrap();
-                            break;
                         }
                     }),
                 );
@@ -451,9 +448,8 @@ async fn probe_mux_echo_1mib_direct() {
                 support::submit_test_task(
                     &task_tx,
                     Box::pin(async move {
-                        while let Some(result) = spawner.join_next().await {
+                        if let Some(result) = spawner.join_next().await {
                             result.unwrap();
-                            break;
                         }
                     }),
                 );
@@ -533,9 +529,8 @@ async fn probe_mux_echo_1mib_mss8k() {
                 support::submit_test_task(
                     &task_tx,
                     Box::pin(async move {
-                        while let Some(result) = spawner.join_next().await {
+                        if let Some(result) = spawner.join_next().await {
                             result.unwrap();
-                            break;
                         }
                     }),
                 );
@@ -608,7 +603,7 @@ async fn probe_hostile_goodput_30s() {
 
     // Keep the write half busy and the read half open for the full window.
     // Parked for the window; the owning scope aborts it at scope end.
-    let _writer = tasks.spawn(async move {
+    tasks.spawn(async move {
         let _ = stream_write.write_all(&data).await;
     });
 

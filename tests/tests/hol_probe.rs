@@ -1035,7 +1035,7 @@ async fn hol_cap400_solo() {
         .await;
         runs.push(summary);
     }
-    assert_triple_run_gates(&label, &runs, 100.0, 400.0);
+    assert_triple_run_gates(label, &runs, 100.0, 400.0);
 }
 
 hol_test!(
@@ -1361,7 +1361,7 @@ async fn run_hol_probe_frame_delivery_shared(
     // immediately, and the session ending before the body completes is a
     // panic.
     tasks.spawn_required("mux client session", async move {
-        while let Some(result) = spawner.join_next().await {
+        if let Some(result) = spawner.join_next().await {
             let err = result.unwrap();
             panic!("mux client session ended before the test body: {err:?}");
         }
@@ -1863,7 +1863,7 @@ async fn run_frame_delivery_two_interactive(
     // immediately, and the session ending before the body completes is a
     // panic.
     tasks.spawn_required("mux client session", async move {
-        while let Some(result) = spawner.join_next().await {
+        if let Some(result) = spawner.join_next().await {
             let err = result.unwrap();
             panic!("mux client session ended before the test body: {err:?}");
         }
@@ -2003,7 +2003,7 @@ async fn hol_paced_bulk_median_p99_regression() {
         .await;
         runs.push(summary);
     }
-    assert_triple_run_gates(&label, &runs, 100.0, 400.0);
+    assert_triple_run_gates(label, &runs, 100.0, 400.0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

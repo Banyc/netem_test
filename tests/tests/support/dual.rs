@@ -1025,7 +1025,7 @@ pub async fn dual_mux_client_connect(
     // doc comment): a panicked lane surfaces immediately, and the session
     // ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
-        while let Some(result) = super_spawner.join_next().await {
+        if let Some(result) = super_spawner.join_next().await {
             let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
         }
@@ -1082,7 +1082,7 @@ pub async fn dual_mux_client_connect_frame_reassembly(
     // [`dual_mux_client_connect`]): a panicked lane surfaces immediately,
     // and the session ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
-        while let Some(result) = super_spawner.join_next().await {
+        if let Some(result) = super_spawner.join_next().await {
             let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
         }
@@ -1166,7 +1166,7 @@ pub async fn dual_mux_client_connect_with_lane_modes(
     // [`dual_mux_client_connect`]): a panicked lane surfaces immediately,
     // and the session ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
-        while let Some(result) = super_spawner.join_next().await {
+        if let Some(result) = super_spawner.join_next().await {
             let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
         }
