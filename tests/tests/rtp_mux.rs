@@ -13,10 +13,12 @@ use support::fan::PerFlowNetem;
 use support::payload::{payload, with_timeout};
 use support::presets::clean;
 use support::stats::combined_stats;
-use support::{LANE_EVENT_CAPACITY, TEST_TASK_QUEUE_BOUND, submit_test_task, try_send_observation};
+use support::{
+    LANE_EVENT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task, try_send_observation,
+};
 
 async fn spawn_echo_server(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TestScope,
 ) -> io::Result<(
     SocketAddr,
     SocketAddr,
@@ -31,7 +33,7 @@ async fn spawn_echo_server(
     // reaper, which selects between submissions and join_next() completions
     // and unwraps every completion so panics surface immediately.
     let task_tx = support::spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
-    tasks.spawn({
+    tasks.spawn_required("rtp_mux echo server", {
         let task_tx = task_tx.clone();
         async move {
             let spawner = rtp_mux::SessionSpawner::new({
@@ -64,7 +66,7 @@ async fn spawn_echo_server(
     Ok((interactive_addr, bulk_addr, lane_rx))
 }
 
-fn connector(tasks: &mut tokio::task::JoinSet<()>, bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
+fn connector(tasks: &mut TestScope, bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
     let bind: BindSelector = Arc::new(|addr| match addr {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
         SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
@@ -79,7 +81,7 @@ fn connector(tasks: &mut tokio::task::JoinSet<()>, bulk_proxy_addr: SocketAddr) 
             ..ExplorerConfig::default()
         },
     });
-    tasks.spawn(driver);
+    tasks.spawn_required("rtp_mux connector driver", driver);
     connector
 }
 
@@ -157,9 +159,7 @@ const PING_LEN: usize = 8;
 const PING_INTERVAL: Duration = Duration::from_millis(40);
 const CMD_DOWNLOAD: u8 = b'D';
 const CMD_PING: u8 = b'P';
-async fn spawn_cmd_server(
-    tasks: &mut tokio::task::JoinSet<()>,
-) -> io::Result<(SocketAddr, SocketAddr)> {
+async fn spawn_cmd_server(tasks: &mut TestScope) -> io::Result<(SocketAddr, SocketAddr)> {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
@@ -168,7 +168,7 @@ async fn spawn_cmd_server(
     // test-owned reaper, which selects between submissions and join_next()
     // completions and unwraps every completion so panics surface.
     let task_tx = support::spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
-    tasks.spawn({
+    tasks.spawn_required("rtp_mux cmd server", {
         let task_tx = task_tx.clone();
         async move {
             let spawner = rtp_mux::SessionSpawner::new({
@@ -776,7 +776,7 @@ async fn run_explorer_arm() -> ExplorerArm {
                 ..ExplorerConfig::default()
             },
         });
-        tasks.spawn(driver);
+        tasks.spawn_required("rtp_mux connector driver", driver);
         connector
     };
     let addr = interactive_fan.client_addr();
