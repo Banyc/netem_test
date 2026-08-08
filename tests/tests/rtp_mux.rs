@@ -264,7 +264,8 @@ async fn run_response_arm() -> ResponseArm {
             let (interactive_server, bulk_server) = spawn_cmd_server_via(&task_tx).await.unwrap();
             let interactive_pair =
                 NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
-            let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
+            let bulk_pair =
+                NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
             let connector = connector_via(&task_tx, bulk_pair.client_addr());
             let mut ping = connector
                 .connect_stream(interactive_pair.client_addr())
@@ -275,7 +276,8 @@ async fn run_response_arm() -> ResponseArm {
                 .connect_stream(interactive_pair.client_addr())
                 .await
                 .unwrap();
-            let mut download_tasks: tokio::task::JoinSet<(usize, f64)> = tokio::task::JoinSet::new();
+            let mut download_tasks: tokio::task::JoinSet<(usize, f64)> =
+                tokio::task::JoinSet::new();
             download_tasks.spawn(async move {
                 let started = std::time::Instant::now();
                 download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
@@ -445,7 +447,8 @@ async fn run_bidir_arm() -> BidirArm {
             let (interactive_server, bulk_server) = spawn_cmd_server_via(&task_tx).await.unwrap();
             let interactive_pair =
                 NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
-            let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
+            let bulk_pair =
+                NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
             let connector = connector_via(&task_tx, bulk_pair.client_addr());
             let mut ping = connector
                 .connect_stream(interactive_pair.client_addr())

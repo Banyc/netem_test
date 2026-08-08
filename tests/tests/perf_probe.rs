@@ -20,7 +20,9 @@ use support::mux::{
 };
 use support::payload::{payload, with_timeout};
 use support::presets::clean;
-use support::rtp::{rtp_echo_payload, spawn_rtp_echo_server_via, spawn_rtp_echo_server_with_mss_via};
+use support::rtp::{
+    rtp_echo_payload, spawn_rtp_echo_server_via, spawn_rtp_echo_server_with_mss_via,
+};
 use support::stats::{combined_stats, print_median_worst, print_perf};
 use tokio::io::AsyncWriteExt;
 
@@ -178,10 +180,9 @@ async fn probe_rtp_echo_4mib_mss8k() {
     let data = payload(BULK);
     let (samples, pair) = tasks
         .run(async {
-            let server_addr =
-                spawn_rtp_echo_server_with_mss_via(&task_tx, false, LOOPBACK_MSS)
-                    .await
-                    .unwrap();
+            let server_addr = spawn_rtp_echo_server_with_mss_via(&task_tx, false, LOOPBACK_MSS)
+                .await
+                .unwrap();
             let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
 
             // One-shot probes connect and tear down per iteration, so the
@@ -239,10 +240,9 @@ async fn probe_mux_sink_4mib_direct() {
         .run(async {
             let mut servers = Vec::new();
             for _ in 0..PROBE_ITERS {
-                let (server_addr, received) =
-                    spawn_mux_over_rtp_sink_server_via(&task_tx, false)
-                        .await
-                        .unwrap();
+                let (server_addr, received) = spawn_mux_over_rtp_sink_server_via(&task_tx, false)
+                    .await
+                    .unwrap();
                 servers.push((server_addr, received));
             }
 
@@ -607,13 +607,9 @@ async fn probe_hostile_goodput_30s() {
             // run-racing scope is consumed by `run`, and these sessions end
             // mid-body by design.
             let mut transient = support::TestScope::new();
-            let (read, write) = rtp_connect_transient(
-                &mut transient,
-                pair.client_addr(),
-                false,
-                LOOPBACK_MSS,
-            )
-            .await;
+            let (read, write) =
+                rtp_connect_transient(&mut transient, pair.client_addr(), false, LOOPBACK_MSS)
+                    .await;
             let opener = mux_client_connect_transient(&mut transient, read, write);
 
             // Open the stream under a generous timeout before we start the clock.

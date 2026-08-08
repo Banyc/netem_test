@@ -152,20 +152,18 @@ pub async fn rtp_connect(
     rtp_connect_with_mss(tasks, proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
 }
 
-/// Connect an `rtp` client with a custom MSS.
-///
-/// `mss` is passed to [`rtp::udp::connect_with`] via a custom
-/// [`rtp::udp::MssConfig`]; `proxy_client_addr` should be
-/// [`NetemPair::client_addr`]. The supervisor is awaited by a required scope
-/// task like [`rtp_connect`].
-pub async fn rtp_connect_with_mss(
-    tasks: &mut TestScope,
+/// Shared core for [`rtp_connect_with_mss`] and its `_via` variant: opens
+/// the connection and hands the required supervisor keepalive to
+/// `spawn_required` (either a [`TestScope`] spawn or the bounded reaper
+/// submission).
+async fn rtp_connect_core(
+    spawn_required: impl FnOnce(&'static str, TestTask),
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
 ) -> (
-    impl AsyncRead + Unpin + Send + use<>,
-    impl AsyncWrite + Unpin + Send + use<>,
+    rtp::socket::AsyncReadAdapter,
+    rtp::socket::AsyncWriteAdapter,
 ) {
     let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
@@ -181,12 +179,75 @@ pub async fn rtp_connect_with_mss(
     .unwrap();
     let read = connected.read.into_async_read();
     let write = connected.write.into_async_write();
-    // The supervisor owns the session drivers; poll it from a required scope
-    // task so the session ending before the test body completes is a panic.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
+    // The supervisor owns the session drivers; poll it from a required task
+    // so the session ending before the test body completes is a panic.
+    spawn_required(
+        "rtp client session",
+        Box::pin(async move {
+            let _ = connected.supervisor.await;
+        }),
+    );
     (read, write)
+}
+
+/// Connect an `rtp` client with a custom MSS.
+///
+/// `mss` is passed to [`rtp::udp::connect_with`] via a custom
+/// [`rtp::udp::MssConfig`]; `proxy_client_addr` should be
+/// [`NetemPair::client_addr`]. The supervisor is awaited by a required scope
+/// task like [`rtp_connect`].
+pub async fn rtp_connect_with_mss(
+    tasks: &mut TestScope,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+) -> (
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
+) {
+    rtp_connect_core(
+        |name, fut| tasks.spawn_required(name, fut),
+        proxy_client_addr,
+        fec,
+        mss,
+    )
+    .await
+}
+
+/// [`rtp_connect_with_mss`] through the bounded task-submission handle, for
+/// use inside [`TestScope::run`] bodies where `&mut TestScope` is
+/// unavailable. The supervisor keepalive is submitted as required through the
+/// handle.
+pub async fn rtp_connect_with_mss_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+) -> (
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
+) {
+    rtp_connect_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        proxy_client_addr,
+        fec,
+        mss,
+    )
+    .await
+}
+
+/// [`rtp_connect`] through the bounded task-submission handle, for use inside
+/// [`TestScope::run`] bodies where `&mut TestScope` is unavailable. The
+/// supervisor keepalive is submitted as required through the handle.
+pub async fn rtp_connect_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+) -> (
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
+) {
+    rtp_connect_with_mss_via(tx, proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Write `payload` through `write`, shut the writer down, and read the full
@@ -220,37 +281,33 @@ async fn spawn_rtp_byte_sink_server_core(
     spawn(Box::pin({
         let listener = Arc::clone(&listener);
         async move {
-            let accepted = match listener
+            // An accept failure is a scenario failure; panic so the root
+            // JoinError unwrap crashes the test.
+            let accepted = listener
                 .accept_without_handshake_with(rtp::udp::AcceptConfig {
                     fec,
                     mss: rtp::udp::MssConfig::Custom(mss),
                     ..rtp::udp::AcceptConfig::default()
                 })
                 .await
-            {
-                Ok(a) => a,
-                Err(_) => return,
-            };
+                .unwrap();
             // The extra-accept drainer loop keeps driving `udp_listener`'s
             // dispatcher so packets keep flowing to the accepted connection;
             // extra incoming connections are accepted and ignored. The
             // drainer is pinned and selected alongside the session supervisor
-            // below, so an early drainer return ends the server.
+            // below and only ends by panicking on an accept error.
             let drainer = {
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
-                        if listener
+                        listener
                             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                                 fec,
                                 mss: rtp::udp::MssConfig::Custom(mss),
                                 ..rtp::udp::AcceptConfig::default()
                             })
                             .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            .unwrap();
                     }
                 }
             };
@@ -268,7 +325,11 @@ async fn spawn_rtp_byte_sink_server_core(
             loop {
                 tokio::select! {
                     () = &mut supervisor => break, // session drivers exited; terminate the server
-                    () = &mut drainer => break, // extra-accept drainer exited; terminate the server
+                    () = &mut drainer => {
+                        // The required drainer ended early; panic instead of
+                        // silently ending the server.
+                        panic!("accept drainer finished before the server scenario completed");
+                    }
                     n = read.read(&mut buf) => {
                         match n {
                             Ok(0) => break,
@@ -366,9 +427,22 @@ pub async fn spawn_rtp_msg_latency_sink(
     spawn_rtp_msg_latency_sink_with_mss(tasks, fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
-/// [`spawn_rtp_msg_latency_sink`] with a custom RTP MSS.
-pub async fn spawn_rtp_msg_latency_sink_with_mss(
-    tasks: &mut TestScope,
+/// [`spawn_rtp_msg_latency_sink`] through the bounded task-submission handle,
+/// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
+/// unavailable.
+pub async fn spawn_rtp_msg_latency_sink_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    spawn_rtp_msg_latency_sink_with_mss_via(tx, fec, base, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Shared core for [`spawn_rtp_msg_latency_sink_with_mss`] and its `_via`
+/// variant: binds the listener and hands the latency-sink future to `spawn`
+/// (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_rtp_msg_latency_sink_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     base: Instant,
     mss: usize,
@@ -378,40 +452,36 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
 
-    tasks.spawn({
+    spawn(Box::pin({
         let listener = Arc::clone(&listener);
         async move {
-            let accepted = match listener
+            // An accept failure is a scenario failure; panic so the root
+            // JoinError unwrap crashes the test.
+            let accepted = listener
                 .accept_without_handshake_with(rtp::udp::AcceptConfig {
                     fec,
                     mss: rtp::udp::MssConfig::Custom(mss),
                     ..rtp::udp::AcceptConfig::default()
                 })
                 .await
-            {
-                Ok(a) => a,
-                Err(_) => return,
-            };
+                .unwrap();
             // The extra-accept drainer loop keeps driving `udp_listener`'s
             // dispatcher so packets keep flowing to the accepted connection;
             // extra incoming connections are accepted and ignored. The
             // drainer is pinned and selected alongside the session supervisor
-            // below, so an early drainer return ends the server.
+            // below and only ends by panicking on an accept error.
             let drainer = {
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
-                        if listener
+                        listener
                             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                                 fec,
                                 mss: rtp::udp::MssConfig::Custom(mss),
                                 ..rtp::udp::AcceptConfig::default()
                             })
                             .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            .unwrap();
                     }
                 }
             };
@@ -430,7 +500,11 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
                 }
                 tokio::select! {
                     () = &mut supervisor => break, // session drivers exited; terminate the server
-                    () = &mut drainer => break, // extra-accept drainer exited; terminate the server
+                    () = &mut drainer => {
+                        // The required drainer ended early; panic instead of
+                        // silently ending the server.
+                        panic!("accept drainer finished before the server scenario completed");
+                    }
                     n = read.read(&mut buf[offset..]) => {
                         let n = match n {
                             Ok(n) => n,
@@ -475,8 +549,30 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
                 }
             }
         }
-    });
+    }));
     Ok((addr, rx))
+}
+
+/// [`spawn_rtp_msg_latency_sink`] with a custom RTP MSS.
+pub async fn spawn_rtp_msg_latency_sink_with_mss(
+    tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    spawn_rtp_msg_latency_sink_core(|fut| tasks.spawn(fut), fec, base, mss).await
+}
+
+/// [`spawn_rtp_msg_latency_sink_with_mss`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_rtp_msg_latency_sink_with_mss_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    spawn_rtp_msg_latency_sink_core(|fut| submit_test_task(tx, fut), fec, base, mss).await
 }
 
 /// Shared core for [`spawn_rtp_bulk_upload_with_mss`] and its `_via`

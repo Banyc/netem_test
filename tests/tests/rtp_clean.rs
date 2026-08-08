@@ -97,7 +97,8 @@ async fn rtp_over_netem_latency_is_observable() {
             let server_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
 
             let latency_ms = 60;
-            let pair = NetemPair::spawn(server_addr, latency(latency_ms), latency(latency_ms)).unwrap();
+            let pair =
+                NetemPair::spawn(server_addr, latency(latency_ms), latency(latency_ms)).unwrap();
             let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
 
             let start = std::time::Instant::now();

@@ -53,12 +53,14 @@ use support::dual::{
 };
 use support::frame::rtp_frame_delivery_connect_via;
 use support::mux::{
-    mux_client_connect_via, send_timestamped_messages, spawn_mux_frame_delivery_latency_bulk_server_via,
-    spawn_mux_latency_bulk_server_via,
+    mux_client_connect_via, send_timestamped_messages,
+    spawn_mux_frame_delivery_latency_bulk_server_via, spawn_mux_latency_bulk_server_via,
 };
 use support::payload::{cyclic_payload, with_timeout};
 use support::presets::gilbert_elliott_loss;
-use support::rtp::{rtp_connect_with_mss_via, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server_via};
+use support::rtp::{
+    rtp_connect_with_mss_via, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server_via,
+};
 use support::rtp_mux::{rtp_mux_connector_via, spawn_rtp_mux_latency_bulk_server_via};
 use support::stats::{HolSummary, combined_stats, summarize};
 use support::{submit_test_task, submit_test_task_required};
@@ -242,28 +244,34 @@ async fn run_hol_probe(
             // Open the interactive `b'L'` stream and keep its read half alive.
             let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = rr_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = rr_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             // For Shared mode, open a second mux stream for the bulk flow.
             let mut shared_bulk_write = None;
             if matches!(bulk, BulkMode::Shared) {
                 let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
                 // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-                submit_test_task(&task_tx, Box::pin(async move {
-                    let mut buf = vec![0u8; 8 * 1024];
-                    while let Ok(n) = bulk_read.read(&mut buf).await {
-                        if n == 0 {
-                            break;
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 8 * 1024];
+                        while let Ok(n) = bulk_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
                         }
-                    }
-                }));
+                    }),
+                );
                 shared_bulk_write = Some(bulk_write);
             }
 
@@ -1366,24 +1374,30 @@ async fn run_hol_probe_frame_delivery_shared(
             });
             let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = rr_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = rr_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
             let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = bulk_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = bulk_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
             let active_for = run_for - BULK_RAMP;
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let rr_fut =
@@ -1623,14 +1637,17 @@ async fn run_hol_probe_dual_lane(
             let (mut rr_read, mut rr_write) =
                 opener.open(mux::LaneClass::Interactive).await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = rr_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = rr_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
             let body = async {
                 let sent =
                     run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)
@@ -1765,22 +1782,28 @@ async fn run_hol_probe_dual_lane_two_interactive(
             let (mut read_a, mut write_a) = opener.open_auto();
             let (mut read_b, mut write_b) = opener.open_auto();
             // Parked until the streams close; the owning JoinSet aborts them at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = read_a.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = read_a.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = read_b.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+                }),
+            );
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = read_b.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             let body = async {
                 if write_a.write_all(b"A").await.is_err() {
@@ -1936,22 +1959,28 @@ async fn run_frame_delivery_two_interactive(
             let (mut read_a, mut write_a) = opener.open().await.unwrap();
             let (mut read_b, mut write_b) = opener.open().await.unwrap();
             // Parked until the streams close; the owning JoinSet aborts them at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = read_a.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = read_a.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = read_b.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+                }),
+            );
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = read_b.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
             let _ = write_a.write_all(b"A").await;
             let _ = write_b.write_all(b"L").await;
             let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
@@ -2464,14 +2493,17 @@ async fn run_hol_probe_dual_lane_separate_listeners(
             let (mut rr_read, mut rr_write) =
                 opener.open(mux::LaneClass::Interactive).await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = rr_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = rr_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
             let body = async {
                 let sent =
                     run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)

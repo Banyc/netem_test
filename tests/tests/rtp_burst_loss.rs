@@ -260,9 +260,10 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     let (sent, mut samples) = tasks
         .run(async {
-            let (server_addr, mut latencies) = spawn_mux_msg_latency_sink_via(&task_tx, false, base)
-                .await
-                .unwrap();
+            let (server_addr, mut latencies) =
+                spawn_mux_msg_latency_sink_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
             let pair = NetemPair::spawn(
                 server_addr,
                 burst_loss_link(5.0, 3.0, OWD, 11),
@@ -278,15 +279,18 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
             // Keep the stream read half alive for the duration of the test so the mux
             // connection is not closed while we are only sending pings. Parked until
             // the connection closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                loop {
-                    match stream_read.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    loop {
+                        match stream_read.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             let sent = with_timeout(
                 Duration::from_secs(80),

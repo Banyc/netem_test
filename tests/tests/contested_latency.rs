@@ -109,22 +109,28 @@ async fn contested_rep(
             let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
 
             // Parked until the streams close; the owning JoinSet aborts them at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = ping_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = ping_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = bulk_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+                }),
+            );
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = bulk_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             // Bulk payload: 64 MiB cyclic buffer, enough to keep any cap busy.
             let payload = Arc::new(support::payload::cyclic_payload(64 * 1024 * 1024));

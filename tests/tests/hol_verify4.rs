@@ -24,7 +24,9 @@ use netem_test::{NetemConfig, NetemPair};
 use support::mux::{mux_client_connect_via, spawn_mux_over_rtp_server_with_mss_via};
 use support::payload::{cyclic_payload, with_timeout};
 use support::presets::burst_loss_link;
-use support::rtp::{rtp_connect_with_mss_via, spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via};
+use support::rtp::{
+    rtp_connect_with_mss_via, spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via,
+};
 use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -92,14 +94,17 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
             // Drain the stream read half in the background so flow-control ACKs keep
             // moving and the writer does not stall. Parked for the bulk window; the
             // owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = stream_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = stream_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             let payload = cyclic_payload(CHUNK);
             let start = Instant::now();
@@ -151,8 +156,9 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     let (elapsed, delivered_at_window, total) = tasks
         .run(async {
-            let (sink_addr, delivered) =
-                spawn_rtp_byte_sink_server_via(&task_tx, false).await.unwrap();
+            let (sink_addr, delivered) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
             let pair = NetemPair::spawn(sink_addr, c2s, s2c).unwrap();
 
             let mut writer = spawn_rtp_bulk_upload_via(&task_tx, pair.client_addr(), false)

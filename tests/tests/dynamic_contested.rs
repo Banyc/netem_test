@@ -178,36 +178,30 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
                     .unwrap();
             let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
             let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-            let pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
 
-            let (connected_read, connected_write) = rtp_connect_with_mss_via(
-                &task_tx,
-                pair.client_addr(),
-                false,
-                rtp::udp::NO_FEC_MSS,
-            )
-            .await;
+            let (connected_read, connected_write) =
+                rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
+                    .await;
             let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
 
             let (mut _lat_read, mut lat_write) = opener.open().await.unwrap();
             let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
 
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = _lat_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = _lat_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
@@ -229,14 +223,17 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
                 });
             }
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = bulk_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = bulk_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             let body = async {
                 let (small, burst, sent) =
@@ -320,14 +317,9 @@ async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTraf
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -454,14 +446,9 @@ async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTraffi
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -619,14 +606,9 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -779,14 +761,9 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -957,14 +934,9 @@ async fn dyn_dual_msg_channel_rep(
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -1362,14 +1334,9 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -1378,8 +1345,8 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
             )
             .await
             .unwrap();
-            let result = run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false)
-                .await;
+            let result =
+                run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false).await;
             (result, bulk_counter)
         })
         .await;
@@ -1426,14 +1393,9 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -1485,22 +1447,13 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
                     .unwrap();
             let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
             let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-            let pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
 
-            let (connected_read, connected_write) = rtp_connect_with_mss_via(
-                &task_tx,
-                pair.client_addr(),
-                false,
-                rtp::udp::NO_FEC_MSS,
-            )
-            .await;
+            let (connected_read, connected_write) =
+                rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
+                    .await;
             let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
 
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
@@ -1508,14 +1461,17 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
             let (_, mut bulk_write) = opener.open().await.unwrap();
             let (mut bulk_read, _) = opener.open().await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = bulk_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = bulk_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
             {
                 let payload = Arc::clone(&payload);
                 bulk_tasks.spawn(async move {
@@ -1536,14 +1492,17 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
 
             let (mut _game_read, mut game_write) = opener.open().await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-            submit_test_task(&task_tx, Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = _game_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = _game_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
                     }
-                }
-            }));
+                }),
+            );
 
             let mut sync_buf = Vec::with_capacity(GAMING_TAG.len() + GAMING_SYNC_BYTES);
             sync_buf.extend_from_slice(GAMING_TAG);
@@ -1712,14 +1671,9 @@ async fn dyn_dual_auto_small_first_migrating_rep(
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -1842,14 +1796,9 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
                 Some(s2c_shaper.clone()),
             )
             .unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(c2s_shaper),
-                Some(s2c_shaper),
-            )
-            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper))
+                    .unwrap();
             let (opener, _accepter) = dual_mux_client_connect_via(
                 &task_tx,
                 int_pair.client_addr(),

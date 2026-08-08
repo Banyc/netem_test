@@ -14,12 +14,12 @@ use tokio::task::JoinSet;
 use rtp::FecTuning;
 use rtp::FrameMode;
 
-use super::frame::rtp_frame_delivery_connect;
-use super::rtp::rtp_connect;
+use super::frame::{rtp_frame_delivery_connect, rtp_frame_delivery_connect_via};
+use super::rtp::{rtp_connect, rtp_connect_via};
 use super::rtp_mux::spawn_tagged_stream_sink;
 use crate::support::{
     LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestScope, TestTask,
-    spawn_test_task_reaper, try_send_observation,
+    spawn_test_task_reaper, submit_test_task_required, try_send_observation,
 };
 
 /// Server that accepts two RTP connections (lane‑hello paired) and handles
@@ -44,8 +44,12 @@ pub async fn spawn_dual_mux_sized_latency_bulk_server(
     spawn_dual_mux_latency_bulk_server_with_mss(tasks, fec, base, mss).await
 }
 
-async fn spawn_dual_mux_latency_bulk_server_with_mss(
-    tasks: &mut TestScope,
+/// Shared core for [`spawn_dual_mux_latency_bulk_server_with_mss`] and its
+/// `_via` variants: binds the listener and submits the parked accept loop and
+/// pairing task through `spawn_required` (either a [`TestScope`] required
+/// spawn or the bounded reaper submission).
+async fn spawn_dual_mux_latency_bulk_server_with_mss_core(
+    mut spawn_required: impl FnMut(&'static str, TestTask),
     fec: bool,
     base: Instant,
     mss: usize,
@@ -59,136 +63,407 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
 
     // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tasks.spawn_required("dual-mux server task", async move {
-        while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                fec,
-                mss: rtp::udp::MssConfig::Custom(mss),
-                ..rtp::udp::AcceptConfig::default()
-            })
-            .await
-        {
-            if accept_tx.send(accepted).await.is_err() {
-                break;
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            while let Ok(accepted) = listener_bg
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
+                    mss: rtp::udp::MssConfig::Custom(mss),
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
+                if accept_tx.send(accepted).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        }),
+    );
 
     // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tasks.spawn_required("dual-mux server task", async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
-        let config = mux::MuxConfig {
-            initiation: mux::Initiation::Server,
-            heartbeat_interval: Duration::from_secs(5),
-            frame_reassembly: false,
-        };
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Server,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
+            };
 
-        // Accepted-lane rtp-session keepalives owned by this task's scope;
-        // never drained (scope-drop abort).
-        let mut lane_keepers = JoinSet::new();
-        // Per-pair handlers owned by this task's scope; drained after the
-        // accept loop ends so panics surface.
-        let mut pair_handlers = JoinSet::new();
+            // Accepted-lane rtp-session keepalives owned by this task's scope;
+            // never drained (scope-drop abort).
+            let mut lane_keepers = JoinSet::new();
+            // Per-pair handlers owned by this task's scope; drained after the
+            // accept loop ends so panics surface.
+            let mut pair_handlers = JoinSet::new();
 
-        loop {
-            tokio::select! {
-                accepted = accept_rx.recv() => {
-                    match accepted {
-                        None => break, // all accept loops closed
-                        Some(accepted) => {
-            let reader = accepted.read.into_async_read();
-            let writer = accepted.write.into_async_write();
-            // Hold the accepted lane's rtp session for its whole life;
-            // dropping it aborts the session.
-            lane_keepers.spawn(async move {
-                let _ = accepted.supervisor.await;
-            });
+            loop {
+                tokio::select! {
+                    accepted = accept_rx.recv() => {
+                        match accepted {
+                            None => break, // all accept loops closed
+                            Some(accepted) => {
+                let reader = accepted.read.into_async_read();
+                let writer = accepted.write.into_async_write();
+                // Hold the accepted lane's rtp session for its whole life;
+                // dropping it aborts the session.
+                lane_keepers.spawn(async move {
+                    let _ = accepted.supervisor.await;
+                });
 
-            let result =
-                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
-                    .await;
+                let result =
+                    mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                        .await;
 
-            if let Ok((_class, nonce, pa)) = result {
-                let entries = pending.entry(nonce).or_default();
-                entries.push(pa);
-                if entries.len() == 2 {
-                    let pa2 = entries.pop().unwrap();
-                    let pa1 = entries.pop().unwrap();
-                    pending.remove(&nonce);
+                if let Ok((_class, nonce, pa)) = result {
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push(pa);
+                    if entries.len() == 2 {
+                        let pa2 = entries.pop().unwrap();
+                        let pa1 = entries.pop().unwrap();
+                        pending.remove(&nonce);
 
-                    let mut pair_spawner = JoinSet::new();
-                    if let Ok((_opener, mut accepter)) =
-                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                    {
-                        let bulk = Arc::clone(&bulk_for_main);
-                        let tx = tx.clone();
-                        pair_handlers.spawn(async move {
-                            // Per-stream handlers owned by the pair handler's
-                            // scope; drained after the accept loop ends so
-                            // panics surface.
-                            let mut stream_handlers = JoinSet::new();
-                            loop {
-                                tokio::select! {
-                                    accepted = accepter.accept() => {
-                                        match accepted {
-                                            Ok((mut reader, mut writer, _class)) => {
-                                let bulk = Arc::clone(&bulk);
-                                let tx = tx.clone();
-                                stream_handlers.spawn(async move {
-                                    let mut tag = [0u8; 1];
-                                    if reader.read_exact(&mut tag).await.is_err() {
-                                        let _ = writer.shutdown();
-                                        return;
-                                    }
-                                    if tag[0] == b'L' {
-                                        let mut buf = vec![0u8; 64 * 1024];
-                                        let mut offset = 0usize;
-                                        while let Ok(n) = reader.read(&mut buf[offset..]).await {
-                                            if n == 0 {
-                                                break;
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, mut accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
+                            pair_handlers.spawn(async move {
+                                // Per-stream handlers owned by the pair handler's
+                                // scope; drained after the accept loop ends so
+                                // panics surface.
+                                let mut stream_handlers = JoinSet::new();
+                                loop {
+                                    tokio::select! {
+                                        accepted = accepter.accept() => {
+                                            match accepted {
+                                                Ok((mut reader, mut writer, _class)) => {
+                                    let bulk = Arc::clone(&bulk);
+                                    let tx = tx.clone();
+                                    stream_handlers.spawn(async move {
+                                        let mut tag = [0u8; 1];
+                                        if reader.read_exact(&mut tag).await.is_err() {
+                                            let _ = writer.shutdown();
+                                            return;
+                                        }
+                                        if tag[0] == b'L' {
+                                            let mut buf = vec![0u8; 64 * 1024];
+                                            let mut offset = 0usize;
+                                            while let Ok(n) = reader.read(&mut buf[offset..]).await {
+                                                if n == 0 {
+                                                    break;
+                                                }
+                                                offset += n;
+                                                loop {
+                                                    if offset < 4 {
+                                                        break;
+                                                    }
+                                                    let frame_len = u32::from_le_bytes([
+                                                        buf[0], buf[1], buf[2], buf[3],
+                                                    ])
+                                                        as usize;
+                                                    if frame_len < 12 {
+                                                        break;
+                                                    }
+                                                    if offset < frame_len {
+                                                        break;
+                                                    }
+                                                    let payload_end = frame_len - 8;
+                                                    let sent_us = u64::from_le_bytes([
+                                                        buf[payload_end],
+                                                        buf[payload_end + 1],
+                                                        buf[payload_end + 2],
+                                                        buf[payload_end + 3],
+                                                        buf[payload_end + 4],
+                                                        buf[payload_end + 5],
+                                                        buf[payload_end + 6],
+                                                        buf[payload_end + 7],
+                                                    ]);
+                                                    let now_us = base.elapsed().as_micros() as u64;
+                                                    let latency_ms =
+                                                        now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                                    if !try_send_observation(
+                                                        &tx,
+                                                        latency_ms,
+                                                        "latency sample",
+                                                    ) {
+                                                        break;
+                                                    }
+                                                    buf.copy_within(frame_len..offset, 0);
+                                                    offset -= frame_len;
+                                                }
                                             }
-                                            offset += n;
+                                        } else {
+                                            let mut buf = vec![0u8; 64 * 1024];
+                                            let mut offset: u64 = 0;
                                             loop {
-                                                if offset < 4 {
-                                                    break;
+                                                match reader.read(&mut buf).await {
+                                                    Ok(0) | Err(_) => break,
+                                                    Ok(n) => {
+                                                        let mut ok = true;
+                                                        for (j, &actual) in buf[..n].iter().enumerate()
+                                                        {
+                                                            let expected =
+                                                                ((offset + j as u64) % 251) as u8;
+                                                            if actual != expected {
+                                                                ok = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if ok {
+                                                            offset += n as u64;
+                                                            bulk.fetch_add(n as u64, Ordering::Relaxed);
+                                                        }
+                                                    }
                                                 }
-                                                let frame_len = u32::from_le_bytes([
-                                                    buf[0], buf[1], buf[2], buf[3],
-                                                ])
-                                                    as usize;
-                                                if frame_len < 12 {
-                                                    break;
-                                                }
-                                                if offset < frame_len {
-                                                    break;
-                                                }
-                                                let payload_end = frame_len - 8;
-                                                let sent_us = u64::from_le_bytes([
-                                                    buf[payload_end],
-                                                    buf[payload_end + 1],
-                                                    buf[payload_end + 2],
-                                                    buf[payload_end + 3],
-                                                    buf[payload_end + 4],
-                                                    buf[payload_end + 5],
-                                                    buf[payload_end + 6],
-                                                    buf[payload_end + 7],
-                                                ]);
-                                                let now_us = base.elapsed().as_micros() as u64;
-                                                let latency_ms =
-                                                    now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                                                if !try_send_observation(
-                                                    &tx,
-                                                    latency_ms,
-                                                    "latency sample",
-                                                ) {
-                                                    break;
-                                                }
-                                                buf.copy_within(frame_len..offset, 0);
-                                                offset -= frame_len;
                                             }
                                         }
-                                    } else {
+                                        let _ = writer.shutdown();
+                                                    });
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
+                                            joined.unwrap();
+                                        }
+                                        Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                            // The pair's mux session supervision ended: unwrap so a
+                                            // panicked supervision task cascades, and a normal
+                                            // MuxError session-end stops accepting.
+                                            joined.unwrap();
+                                            break;
+                                        }
+                                    }
+                                }
+                                while let Some(result) = stream_handlers.join_next().await {
+                                    result.unwrap();
+                                }
+                                // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                                while let Some(result) = pair_spawner.join_next().await {
+                                    result.unwrap();
+                                }
+                            });
+                        }
+                    }
+                }
+                            }
+                        }
+                    }
+                    Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
+                        // A lane rtp-session keepalive ended (session closed):
+                        // unwrap so a panic surfaces immediately; a normal
+                        // completion is a legitimate shutdown.
+                        joined.unwrap();
+                    }
+                    Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
+                        // A pair handler ended: unwrap so a panic surfaces now.
+                        joined.unwrap();
+                    }
+                }
+            }
+            // Drain any remaining lane/session joins so panics surface.
+            while let Some(result) = lane_keepers.join_next().await {
+                result.unwrap();
+            }
+
+            while let Some(result) = pair_handlers.join_next().await {
+                result.unwrap();
+            }
+        }),
+    );
+
+    Ok((addr, rx, bulk_delivered))
+}
+
+async fn spawn_dual_mux_latency_bulk_server_with_mss(
+    tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_latency_bulk_server_with_mss_core(
+        |name, fut| tasks.spawn_required(name, fut),
+        fec,
+        base,
+        mss,
+    )
+    .await
+}
+
+/// [`spawn_dual_mux_latency_bulk_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
+/// submitted as required through the handle.
+pub async fn spawn_dual_mux_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_latency_bulk_server_with_mss_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        fec,
+        base,
+        rtp::udp::NO_FEC_MSS,
+    )
+    .await
+}
+
+/// [`spawn_dual_mux_sized_latency_bulk_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_dual_mux_sized_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_latency_bulk_server_with_mss_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        fec,
+        base,
+        mss,
+    )
+    .await
+}
+
+/// Dual‑mux server that accepts the bulk stream out‑of‑band as a raw lane
+/// stream, then drives a [`mux::DualMessageReceiver`] loop for latency
+/// messages. Latency is computed from the embedded send timestamp and
+/// pushed to the returned [`mpsc::Receiver`].
+pub async fn spawn_dual_msg_channel_server(
+    tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+    mode: mux::DeliveryMode,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_msg_channel_server_core(|name, fut| tasks.spawn_required(name, fut), fec, base, mode)
+        .await
+}
+
+/// [`spawn_dual_msg_channel_server`] through the bounded task-submission
+/// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
+/// is unavailable. The accept-loop and pairing tasks are submitted as
+/// required through the handle.
+pub async fn spawn_dual_msg_channel_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+    mode: mux::DeliveryMode,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_msg_channel_server_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        fec,
+        base,
+        mode,
+    )
+    .await
+}
+
+/// Shared core for [`spawn_dual_msg_channel_server`] and its `_via` variant:
+/// binds the listener and submits the parked accept loop and pairing task
+/// through `spawn_required` (either a [`TestScope`] required spawn or the
+/// bounded reaper submission).
+async fn spawn_dual_msg_channel_server_core(
+    mut spawn_required: impl FnMut(&'static str, TestTask),
+    fec: bool,
+    base: Instant,
+    mode: mux::DeliveryMode,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let addr = listener.local_addr();
+    let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+
+    let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
+
+    // Parked accept loop (aborted when `tasks` drops at scope end).
+    let listener_bg = Arc::clone(&listener);
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            while let Ok(accepted) = listener_bg
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
+
+                    mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
+                if accept_tx.send(accepted).await.is_err() {
+                    break;
+                }
+            }
+        }),
+    );
+
+    // Parked pairing task (aborted when `tasks` drops at scope end).
+    let bulk_for_main = Arc::clone(&bulk_delivered);
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Server,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
+            };
+
+            // Accepted-lane rtp-session keepalives owned by this task's scope;
+            // never drained (scope-drop abort).
+            let mut lane_keepers = JoinSet::new();
+            // Per-pair handlers owned by this task's scope; drained after the
+            // accept loop ends so panics surface.
+            let mut pair_handlers = JoinSet::new();
+
+            loop {
+                tokio::select! {
+                    accepted = accept_rx.recv() => {
+                        match accepted {
+                            None => break, // all accept loops closed
+                            Some(accepted) => {
+                let reader = accepted.read.into_async_read();
+                let writer = accepted.write.into_async_write();
+                // Hold the accepted lane's rtp session for its whole life;
+                // dropping it aborts the session.
+                lane_keepers.spawn(async move {
+                    let _ = accepted.supervisor.await;
+                });
+
+                let result =
+                    mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                        .await;
+
+                if let Ok((_class, nonce, pa)) = result {
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push(pa);
+                    if entries.len() == 2 {
+                        let pa2 = entries.pop().unwrap();
+                        let pa1 = entries.pop().unwrap();
+                        pending.remove(&nonce);
+
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, mut accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
+                            pair_handlers.spawn(async move {
+
+                                // Per-stream handlers owned by the pair handler's
+                                // scope; drained when the pair ends.
+                                let mut stream_handlers = JoinSet::new();
+
+                                let bulk = Arc::clone(&bulk);
+                                if let Ok((mut reader, writer, _class)) = accepter.accept().await {
+                                    stream_handlers.spawn(async move {
+                                        let _w = writer;
                                         let mut buf = vec![0u8; 64 * 1024];
                                         let mut offset: u64 = 0;
                                         loop {
@@ -196,8 +471,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                                 Ok(0) | Err(_) => break,
                                                 Ok(n) => {
                                                     let mut ok = true;
-                                                    for (j, &actual) in buf[..n].iter().enumerate()
-                                                    {
+                                                    for (j, &actual) in buf[..n].iter().enumerate() {
                                                         let expected =
                                                             ((offset + j as u64) % 251) as u8;
                                                         if actual != expected {
@@ -212,271 +486,97 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
                                                 }
                                             }
                                         }
-                                    }
-                                    let _ = writer.shutdown();
-                                                });
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
-                                        joined.unwrap();
-                                    }
-                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
-                                        // The pair's mux session supervision ended: unwrap so a
-                                        // panicked supervision task cascades, and a normal
-                                        // MuxError session-end stops accepting.
-                                        joined.unwrap();
-                                        break;
-                                    }
+                                    });
                                 }
-                            }
-                            while let Some(result) = stream_handlers.join_next().await {
-                                result.unwrap();
-                            }
-                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
-                            while let Some(result) = pair_spawner.join_next().await {
-                                result.unwrap();
-                            }
-                        });
-                    }
-                }
-            }
-                        }
-                    }
-                }
-                Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
-                    // A lane rtp-session keepalive ended (session closed):
-                    // unwrap so a panic surfaces immediately; a normal
-                    // completion is a legitimate shutdown.
-                    joined.unwrap();
-                }
-                Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
-                    // A pair handler ended: unwrap so a panic surfaces now.
-                    joined.unwrap();
-                }
-            }
-        }
-        // Drain any remaining lane/session joins so panics surface.
-        while let Some(result) = lane_keepers.join_next().await {
-            result.unwrap();
-        }
 
-        while let Some(result) = pair_handlers.join_next().await {
-            result.unwrap();
-        }
-    });
-
-    Ok((addr, rx, bulk_delivered))
-}
-
-/// Dual‑mux server that accepts the bulk stream out‑of‑band as a raw lane
-/// stream, then drives a [`mux::DualMessageReceiver`] loop for latency
-/// messages. Latency is computed from the embedded send timestamp and
-/// pushed to the returned [`mpsc::Receiver`].
-pub async fn spawn_dual_msg_channel_server(
-    tasks: &mut TestScope,
-    fec: bool,
-    base: Instant,
-    mode: mux::DeliveryMode,
-) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
-    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
-    let addr = listener.local_addr();
-    let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
-    let bulk_delivered = Arc::new(AtomicU64::new(0));
-
-    let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
-
-    // Parked accept loop (aborted when `tasks` drops at scope end).
-    let listener_bg = Arc::clone(&listener);
-    tasks.spawn_required("dual-mux server task", async move {
-        while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                fec,
-
-                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-
-                ..rtp::udp::AcceptConfig::default()
-            })
-            .await
-        {
-            if accept_tx.send(accepted).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Parked pairing task (aborted when `tasks` drops at scope end).
-    let bulk_for_main = Arc::clone(&bulk_delivered);
-    tasks.spawn_required("dual-mux server task", async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
-        let config = mux::MuxConfig {
-            initiation: mux::Initiation::Server,
-            heartbeat_interval: Duration::from_secs(5),
-            frame_reassembly: false,
-        };
-
-        // Accepted-lane rtp-session keepalives owned by this task's scope;
-        // never drained (scope-drop abort).
-        let mut lane_keepers = JoinSet::new();
-        // Per-pair handlers owned by this task's scope; drained after the
-        // accept loop ends so panics surface.
-        let mut pair_handlers = JoinSet::new();
-
-        loop {
-            tokio::select! {
-                accepted = accept_rx.recv() => {
-                    match accepted {
-                        None => break, // all accept loops closed
-                        Some(accepted) => {
-            let reader = accepted.read.into_async_read();
-            let writer = accepted.write.into_async_write();
-            // Hold the accepted lane's rtp session for its whole life;
-            // dropping it aborts the session.
-            lane_keepers.spawn(async move {
-                let _ = accepted.supervisor.await;
-            });
-
-            let result =
-                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
-                    .await;
-
-            if let Ok((_class, nonce, pa)) = result {
-                let entries = pending.entry(nonce).or_default();
-                entries.push(pa);
-                if entries.len() == 2 {
-                    let pa2 = entries.pop().unwrap();
-                    let pa1 = entries.pop().unwrap();
-                    pending.remove(&nonce);
-
-                    let mut pair_spawner = JoinSet::new();
-                    if let Ok((_opener, mut accepter)) =
-                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                    {
-                        let bulk = Arc::clone(&bulk_for_main);
-                        let tx = tx.clone();
-                        pair_handlers.spawn(async move {
-
-                            // Per-stream handlers owned by the pair handler's
-                            // scope; drained when the pair ends.
-                            let mut stream_handlers = JoinSet::new();
-
-                            let bulk = Arc::clone(&bulk);
-                            if let Ok((mut reader, writer, _class)) = accepter.accept().await {
-                                stream_handlers.spawn(async move {
-                                    let _w = writer;
-                                    let mut buf = vec![0u8; 64 * 1024];
-                                    let mut offset: u64 = 0;
-                                    loop {
-                                        match reader.read(&mut buf).await {
-                                            Ok(0) | Err(_) => break,
-                                            Ok(n) => {
-                                                let mut ok = true;
-                                                for (j, &actual) in buf[..n].iter().enumerate() {
-                                                    let expected =
-                                                        ((offset + j as u64) % 251) as u8;
-                                                    if actual != expected {
-                                                        ok = false;
+                                let mut receiver = mux::DualMessageReceiver::new(accepter, mode);
+                                loop {
+                                    tokio::select! {
+                                        msg = receiver.recv() => {
+                                            match msg {
+                                        Ok(Some(payload)) => {
+                                            if payload.len() >= 12 {
+                                                let frame_len = u32::from_le_bytes([
+                                                    payload[0], payload[1], payload[2], payload[3],
+                                                ])
+                                                    as usize;
+                                                if frame_len >= 12 && payload.len() >= frame_len {
+                                                    let payload_end = frame_len - 8;
+                                                    let sent_us = u64::from_le_bytes([
+                                                        payload[payload_end],
+                                                        payload[payload_end + 1],
+                                                        payload[payload_end + 2],
+                                                        payload[payload_end + 3],
+                                                        payload[payload_end + 4],
+                                                        payload[payload_end + 5],
+                                                        payload[payload_end + 6],
+                                                        payload[payload_end + 7],
+                                                    ]);
+                                                    let now_us = base.elapsed().as_micros() as u64;
+                                                    let latency_ms =
+                                                        now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                                    if !try_send_observation(
+                                                        &tx,
+                                                        latency_ms,
+                                                        "latency sample",
+                                                    ) {
                                                         break;
                                                     }
                                                 }
-                                                if ok {
-                                                    offset += n as u64;
-                                                    bulk.fetch_add(n as u64, Ordering::Relaxed);
-                                                }
                                             }
                                         }
-                                    }
-                                });
-                            }
-
-                            let mut receiver = mux::DualMessageReceiver::new(accepter, mode);
-                            loop {
-                                tokio::select! {
-                                    msg = receiver.recv() => {
-                                        match msg {
-                                    Ok(Some(payload)) => {
-                                        if payload.len() >= 12 {
-                                            let frame_len = u32::from_le_bytes([
-                                                payload[0], payload[1], payload[2], payload[3],
-                                            ])
-                                                as usize;
-                                            if frame_len >= 12 && payload.len() >= frame_len {
-                                                let payload_end = frame_len - 8;
-                                                let sent_us = u64::from_le_bytes([
-                                                    payload[payload_end],
-                                                    payload[payload_end + 1],
-                                                    payload[payload_end + 2],
-                                                    payload[payload_end + 3],
-                                                    payload[payload_end + 4],
-                                                    payload[payload_end + 5],
-                                                    payload[payload_end + 6],
-                                                    payload[payload_end + 7],
-                                                ]);
-                                                let now_us = base.elapsed().as_micros() as u64;
-                                                let latency_ms =
-                                                    now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                                                if !try_send_observation(
-                                                    &tx,
-                                                    latency_ms,
-                                                    "latency sample",
-                                                ) {
-                                                    break;
-                                                }
+                                        Ok(None) => break,
+                                        Err(_) => break,
                                             }
                                         }
-                                    }
-                                    Ok(None) => break,
-                                    Err(_) => break,
+                                        Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
+                                            joined.unwrap();
                                         }
-                                    }
-                                    Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
-                                        joined.unwrap();
-                                    }
-                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
-                                        // The pair's mux session supervision ended: unwrap so a
-                                        // panicked supervision task cascades, and a normal
-                                        // MuxError session-end stops accepting.
-                                        joined.unwrap();
-                                        break;
+                                        Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                            // The pair's mux session supervision ended: unwrap so a
+                                            // panicked supervision task cascades, and a normal
+                                            // MuxError session-end stops accepting.
+                                            joined.unwrap();
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            while let Some(result) = stream_handlers.join_next().await {
-                                result.unwrap();
-                            }
-                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
-                            while let Some(result) = pair_spawner.join_next().await {
-                                result.unwrap();
-                            }
-                        });
-                    }
-                }
-            }
+                                while let Some(result) = stream_handlers.join_next().await {
+                                    result.unwrap();
+                                }
+                                // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                                while let Some(result) = pair_spawner.join_next().await {
+                                    result.unwrap();
+                                }
+                            });
                         }
                     }
                 }
-                Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
-                    // A lane rtp-session keepalive ended (session closed):
-                    // unwrap so a panic surfaces immediately; a normal
-                    // completion is a legitimate shutdown.
-                    joined.unwrap();
-                }
-                Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
-                    // A pair handler ended: unwrap so a panic surfaces now.
-                    joined.unwrap();
+                            }
+                        }
+                    }
+                    Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
+                        // A lane rtp-session keepalive ended (session closed):
+                        // unwrap so a panic surfaces immediately; a normal
+                        // completion is a legitimate shutdown.
+                        joined.unwrap();
+                    }
+                    Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
+                        // A pair handler ended: unwrap so a panic surfaces now.
+                        joined.unwrap();
+                    }
                 }
             }
-        }
-        // Drain any remaining lane/session joins so panics surface.
-        while let Some(result) = lane_keepers.join_next().await {
-            result.unwrap();
-        }
+            // Drain any remaining lane/session joins so panics surface.
+            while let Some(result) = lane_keepers.join_next().await {
+                result.unwrap();
+            }
 
-        while let Some(result) = pair_handlers.join_next().await {
-            result.unwrap();
-        }
-    });
+            while let Some(result) = pair_handlers.join_next().await {
+                result.unwrap();
+            }
+        }),
+    );
 
     Ok((addr, rx, bulk_delivered))
 }
@@ -490,6 +590,40 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_migrating_latency_bulk_server_core(
+        |name, fut| tasks.spawn_required(name, fut),
+        fec,
+        base,
+    )
+    .await
+}
+
+/// [`spawn_dual_mux_migrating_latency_bulk_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
+/// submitted as required through the handle.
+pub async fn spawn_dual_mux_migrating_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_migrating_latency_bulk_server_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        fec,
+        base,
+    )
+    .await
+}
+
+/// Shared core for [`spawn_dual_mux_migrating_latency_bulk_server`] and its
+/// `_via` variant: binds the listener and submits the parked accept loop and
+/// pairing task through `spawn_required` (either a [`TestScope`] required
+/// spawn or the bounded reaper submission).
+async fn spawn_dual_mux_migrating_latency_bulk_server_core(
+    mut spawn_required: impl FnMut(&'static str, TestTask),
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
@@ -499,150 +633,156 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
 
     // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tasks.spawn_required("dual-mux server task", async move {
-        while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                fec,
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            while let Ok(accepted) = listener_bg
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
 
-                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                    mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
 
-                ..rtp::udp::AcceptConfig::default()
-            })
-            .await
-        {
-            if accept_tx.send(accepted).await.is_err() {
-                break;
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
+                if accept_tx.send(accepted).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        }),
+    );
 
     // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tasks.spawn_required("dual-mux server task", async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
-        let config = mux::MuxConfig {
-            initiation: mux::Initiation::Server,
-            heartbeat_interval: Duration::from_secs(5),
-            frame_reassembly: false,
-        };
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Server,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
+            };
 
-        // Accepted-lane rtp-session keepalives owned by this task's scope;
-        // never drained (scope-drop abort).
-        let mut lane_keepers = JoinSet::new();
-        // Per-pair handlers owned by this task's scope; drained after the
-        // accept loop ends so panics surface.
-        let mut pair_handlers = JoinSet::new();
+            // Accepted-lane rtp-session keepalives owned by this task's scope;
+            // never drained (scope-drop abort).
+            let mut lane_keepers = JoinSet::new();
+            // Per-pair handlers owned by this task's scope; drained after the
+            // accept loop ends so panics surface.
+            let mut pair_handlers = JoinSet::new();
 
-        loop {
-            tokio::select! {
-                accepted = accept_rx.recv() => {
-                    match accepted {
-                        None => break, // all accept loops closed
-                        Some(accepted) => {
-            let reader = accepted.read.into_async_read();
-            let writer = accepted.write.into_async_write();
-            // Hold the accepted lane's rtp session for its whole life;
-            // dropping it aborts the session.
-            lane_keepers.spawn(async move {
-                let _ = accepted.supervisor.await;
-            });
+            loop {
+                tokio::select! {
+                    accepted = accept_rx.recv() => {
+                        match accepted {
+                            None => break, // all accept loops closed
+                            Some(accepted) => {
+                let reader = accepted.read.into_async_read();
+                let writer = accepted.write.into_async_write();
+                // Hold the accepted lane's rtp session for its whole life;
+                // dropping it aborts the session.
+                lane_keepers.spawn(async move {
+                    let _ = accepted.supervisor.await;
+                });
 
-            let result =
-                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
-                    .await;
+                let result =
+                    mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                        .await;
 
-            if let Ok((_class, nonce, pa)) = result {
-                let entries = pending.entry(nonce).or_default();
-                entries.push(pa);
-                if entries.len() == 2 {
-                    let pa2 = entries.pop().unwrap();
-                    let pa1 = entries.pop().unwrap();
-                    pending.remove(&nonce);
+                if let Ok((_class, nonce, pa)) = result {
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push(pa);
+                    if entries.len() == 2 {
+                        let pa2 = entries.pop().unwrap();
+                        let pa1 = entries.pop().unwrap();
+                        pending.remove(&nonce);
 
-                    let mut pair_spawner = JoinSet::new();
-                    if let Ok((_opener, accepter)) =
-                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                    {
-                        let bulk = Arc::clone(&bulk_for_main);
-                        let tx = tx.clone();
-                        pair_handlers.spawn(async move {
-                            let mut mac = accepter.into_migrating_capable();
-                            // Per-stream handlers owned by the pair handler's
-                            // scope; drained after the accept loop ends.
-                            let mut stream_handlers = JoinSet::new();
-                            loop {
-                                tokio::select! {
-                                    accepted = mac.accept() => {
-                                        match accepted {
-                                    Ok(mux::AcceptedStream::Migrating {
-                                        reader, writer, ..
-                                    }) => {
-                                        let bulk = Arc::clone(&bulk);
-                                        let tx = tx.clone();
-                                        stream_handlers.spawn(handle_latency_bulk_stream(
-                                            reader, writer, base, bulk, tx,
-                                        ));
-                                    }
-                                    Ok(mux::AcceptedStream::MigratingDuplex { .. }) => {
-                                        unreachable!("duplex accept mode is not used here")
-                                    }
-                                    Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
-                                        let bulk = Arc::clone(&bulk);
-                                        let tx = tx.clone();
-                                        stream_handlers.spawn(handle_latency_bulk_stream(
-                                            reader, writer, base, bulk, tx,
-                                        ));
-                                    }
-                                    Err(_) => break,
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
+                            pair_handlers.spawn(async move {
+                                let mut mac = accepter.into_migrating_capable();
+                                // Per-stream handlers owned by the pair handler's
+                                // scope; drained after the accept loop ends.
+                                let mut stream_handlers = JoinSet::new();
+                                loop {
+                                    tokio::select! {
+                                        accepted = mac.accept() => {
+                                            match accepted {
+                                        Ok(mux::AcceptedStream::Migrating {
+                                            reader, writer, ..
+                                        }) => {
+                                            let bulk = Arc::clone(&bulk);
+                                            let tx = tx.clone();
+                                            stream_handlers.spawn(handle_latency_bulk_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
+                                        }
+                                        Ok(mux::AcceptedStream::MigratingDuplex { .. }) => {
+                                            unreachable!("duplex accept mode is not used here")
+                                        }
+                                        Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
+                                            let bulk = Arc::clone(&bulk);
+                                            let tx = tx.clone();
+                                            stream_handlers.spawn(handle_latency_bulk_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
+                                        }
+                                        Err(_) => break,
+                                            }
+                                        }
+                                        Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
+                                            joined.unwrap();
+                                        }
+                                        Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                            // The pair's mux session supervision ended: unwrap so a
+                                            // panicked supervision task cascades, and a normal
+                                            // MuxError session-end stops accepting.
+                                            joined.unwrap();
+                                            break;
                                         }
                                     }
-                                    Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
-                                        joined.unwrap();
-                                    }
-                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
-                                        // The pair's mux session supervision ended: unwrap so a
-                                        // panicked supervision task cascades, and a normal
-                                        // MuxError session-end stops accepting.
-                                        joined.unwrap();
-                                        break;
-                                    }
                                 }
-                            }
-                            while let Some(result) = stream_handlers.join_next().await {
-                                result.unwrap();
-                            }
-                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
-                            while let Some(result) = pair_spawner.join_next().await {
-                                result.unwrap();
-                            }
-                        });
-                    }
-                }
-            }
+                                while let Some(result) = stream_handlers.join_next().await {
+                                    result.unwrap();
+                                }
+                                // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                                while let Some(result) = pair_spawner.join_next().await {
+                                    result.unwrap();
+                                }
+                            });
                         }
                     }
                 }
-                Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
-                    // A lane rtp-session keepalive ended (session closed):
-                    // unwrap so a panic surfaces immediately; a normal
-                    // completion is a legitimate shutdown.
-                    joined.unwrap();
-                }
-                Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
-                    // A pair handler ended: unwrap so a panic surfaces now.
-                    joined.unwrap();
+                            }
+                        }
+                    }
+                    Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
+                        // A lane rtp-session keepalive ended (session closed):
+                        // unwrap so a panic surfaces immediately; a normal
+                        // completion is a legitimate shutdown.
+                        joined.unwrap();
+                    }
+                    Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
+                        // A pair handler ended: unwrap so a panic surfaces now.
+                        joined.unwrap();
+                    }
                 }
             }
-        }
-        // Drain any remaining lane/session joins so panics surface.
-        while let Some(result) = lane_keepers.join_next().await {
-            result.unwrap();
-        }
+            // Drain any remaining lane/session joins so panics surface.
+            while let Some(result) = lane_keepers.join_next().await {
+                result.unwrap();
+            }
 
-        while let Some(result) = pair_handlers.join_next().await {
-            result.unwrap();
-        }
-    });
+            while let Some(result) = pair_handlers.join_next().await {
+                result.unwrap();
+            }
+        }),
+    );
 
     Ok((addr, rx, bulk_delivered))
 }
@@ -731,6 +871,40 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_gaming_latency_bulk_server_core(
+        |name, fut| tasks.spawn_required(name, fut),
+        fec,
+        base,
+    )
+    .await
+}
+
+/// [`spawn_dual_mux_gaming_latency_bulk_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
+/// submitted as required through the handle.
+pub async fn spawn_dual_mux_gaming_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
+    spawn_dual_mux_gaming_latency_bulk_server_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        fec,
+        base,
+    )
+    .await
+}
+
+/// Shared core for [`spawn_dual_mux_gaming_latency_bulk_server`] and its
+/// `_via` variant: binds the listener and submits the parked accept loop and
+/// pairing task through `spawn_required` (either a [`TestScope`] required
+/// spawn or the bounded reaper submission).
+async fn spawn_dual_mux_gaming_latency_bulk_server_core(
+    mut spawn_required: impl FnMut(&'static str, TestTask),
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
     let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
@@ -740,150 +914,156 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
 
     // Parked accept loop (aborted when `tasks` drops at scope end).
     let listener_bg = Arc::clone(&listener);
-    tasks.spawn_required("dual-mux server task", async move {
-        while let Ok(accepted) = listener_bg
-            .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                fec,
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            while let Ok(accepted) = listener_bg
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
 
-                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                    mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
 
-                ..rtp::udp::AcceptConfig::default()
-            })
-            .await
-        {
-            if accept_tx.send(accepted).await.is_err() {
-                break;
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+            {
+                if accept_tx.send(accepted).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        }),
+    );
 
     // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
-    tasks.spawn_required("dual-mux server task", async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
-        let config = mux::MuxConfig {
-            initiation: mux::Initiation::Server,
-            heartbeat_interval: Duration::from_secs(5),
-            frame_reassembly: false,
-        };
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Server,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
+            };
 
-        // Accepted-lane rtp-session keepalives owned by this task's scope;
-        // never drained (scope-drop abort).
-        let mut lane_keepers = JoinSet::new();
-        // Per-pair handlers owned by this task's scope; drained after the
-        // accept loop ends so panics surface.
-        let mut pair_handlers = JoinSet::new();
+            // Accepted-lane rtp-session keepalives owned by this task's scope;
+            // never drained (scope-drop abort).
+            let mut lane_keepers = JoinSet::new();
+            // Per-pair handlers owned by this task's scope; drained after the
+            // accept loop ends so panics surface.
+            let mut pair_handlers = JoinSet::new();
 
-        loop {
-            tokio::select! {
-                accepted = accept_rx.recv() => {
-                    match accepted {
-                        None => break, // all accept loops closed
-                        Some(accepted) => {
-            let reader = accepted.read.into_async_read();
-            let writer = accepted.write.into_async_write();
-            // Hold the accepted lane's rtp session for its whole life;
-            // dropping it aborts the session.
-            lane_keepers.spawn(async move {
-                let _ = accepted.supervisor.await;
-            });
+            loop {
+                tokio::select! {
+                    accepted = accept_rx.recv() => {
+                        match accepted {
+                            None => break, // all accept loops closed
+                            Some(accepted) => {
+                let reader = accepted.read.into_async_read();
+                let writer = accepted.write.into_async_write();
+                // Hold the accepted lane's rtp session for its whole life;
+                // dropping it aborts the session.
+                lane_keepers.spawn(async move {
+                    let _ = accepted.supervisor.await;
+                });
 
-            let result =
-                mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
-                    .await;
+                let result =
+                    mux::begin_lane_pairing(reader, writer, config.clone(), Duration::from_secs(3))
+                        .await;
 
-            if let Ok((_class, nonce, pa)) = result {
-                let entries = pending.entry(nonce).or_default();
-                entries.push(pa);
-                if entries.len() == 2 {
-                    let pa2 = entries.pop().unwrap();
-                    let pa1 = entries.pop().unwrap();
-                    pending.remove(&nonce);
+                if let Ok((_class, nonce, pa)) = result {
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push(pa);
+                    if entries.len() == 2 {
+                        let pa2 = entries.pop().unwrap();
+                        let pa1 = entries.pop().unwrap();
+                        pending.remove(&nonce);
 
-                    let mut pair_spawner = JoinSet::new();
-                    if let Ok((_opener, accepter)) =
-                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                    {
-                        let bulk = Arc::clone(&bulk_for_main);
-                        let tx = tx.clone();
-                        pair_handlers.spawn(async move {
-                            let mut mac = accepter.into_migrating_capable();
-                            // Per-stream handlers owned by the pair handler's
-                            // scope; drained after the accept loop ends.
-                            let mut stream_handlers = JoinSet::new();
-                            loop {
-                                tokio::select! {
-                                    accepted = mac.accept() => {
-                                        match accepted {
-                                    Ok(mux::AcceptedStream::Migrating {
-                                        reader, writer, ..
-                                    }) => {
-                                        let bulk = Arc::clone(&bulk);
-                                        let tx = tx.clone();
-                                        stream_handlers.spawn(handle_gaming_stream(
-                                            reader, writer, base, bulk, tx,
-                                        ));
-                                    }
-                                    Ok(mux::AcceptedStream::MigratingDuplex { .. }) => {
-                                        unreachable!("duplex accept mode is not used here")
-                                    }
-                                    Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
-                                        let bulk = Arc::clone(&bulk);
-                                        let tx = tx.clone();
-                                        stream_handlers.spawn(handle_gaming_stream(
-                                            reader, writer, base, bulk, tx,
-                                        ));
-                                    }
-                                    Err(_) => break,
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
+                            pair_handlers.spawn(async move {
+                                let mut mac = accepter.into_migrating_capable();
+                                // Per-stream handlers owned by the pair handler's
+                                // scope; drained after the accept loop ends.
+                                let mut stream_handlers = JoinSet::new();
+                                loop {
+                                    tokio::select! {
+                                        accepted = mac.accept() => {
+                                            match accepted {
+                                        Ok(mux::AcceptedStream::Migrating {
+                                            reader, writer, ..
+                                        }) => {
+                                            let bulk = Arc::clone(&bulk);
+                                            let tx = tx.clone();
+                                            stream_handlers.spawn(handle_gaming_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
+                                        }
+                                        Ok(mux::AcceptedStream::MigratingDuplex { .. }) => {
+                                            unreachable!("duplex accept mode is not used here")
+                                        }
+                                        Ok(mux::AcceptedStream::Plain { reader, writer, .. }) => {
+                                            let bulk = Arc::clone(&bulk);
+                                            let tx = tx.clone();
+                                            stream_handlers.spawn(handle_gaming_stream(
+                                                reader, writer, base, bulk, tx,
+                                            ));
+                                        }
+                                        Err(_) => break,
+                                            }
+                                        }
+                                        Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
+                                            joined.unwrap();
+                                        }
+                                        Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                            // The pair's mux session supervision ended: unwrap so a
+                                            // panicked supervision task cascades, and a normal
+                                            // MuxError session-end stops accepting.
+                                            joined.unwrap();
+                                            break;
                                         }
                                     }
-                                    Some(joined) = stream_handlers.join_next(), if !stream_handlers.is_empty() => {
-                                        joined.unwrap();
-                                    }
-                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
-                                        // The pair's mux session supervision ended: unwrap so a
-                                        // panicked supervision task cascades, and a normal
-                                        // MuxError session-end stops accepting.
-                                        joined.unwrap();
-                                        break;
-                                    }
                                 }
-                            }
-                            while let Some(result) = stream_handlers.join_next().await {
-                                result.unwrap();
-                            }
-                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
-                            while let Some(result) = pair_spawner.join_next().await {
-                                result.unwrap();
-                            }
-                        });
-                    }
-                }
-            }
+                                while let Some(result) = stream_handlers.join_next().await {
+                                    result.unwrap();
+                                }
+                                // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                                while let Some(result) = pair_spawner.join_next().await {
+                                    result.unwrap();
+                                }
+                            });
                         }
                     }
                 }
-                Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
-                    // A lane rtp-session keepalive ended (session closed):
-                    // unwrap so a panic surfaces immediately; a normal
-                    // completion is a legitimate shutdown.
-                    joined.unwrap();
-                }
-                Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
-                    // A pair handler ended: unwrap so a panic surfaces now.
-                    joined.unwrap();
+                            }
+                        }
+                    }
+                    Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
+                        // A lane rtp-session keepalive ended (session closed):
+                        // unwrap so a panic surfaces immediately; a normal
+                        // completion is a legitimate shutdown.
+                        joined.unwrap();
+                    }
+                    Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
+                        // A pair handler ended: unwrap so a panic surfaces now.
+                        joined.unwrap();
+                    }
                 }
             }
-        }
-        // Drain any remaining lane/session joins so panics surface.
-        while let Some(result) = lane_keepers.join_next().await {
-            result.unwrap();
-        }
+            // Drain any remaining lane/session joins so panics surface.
+            while let Some(result) = lane_keepers.join_next().await {
+                result.unwrap();
+            }
 
-        while let Some(result) = pair_handlers.join_next().await {
-            result.unwrap();
-        }
-    });
+            while let Some(result) = pair_handlers.join_next().await {
+                result.unwrap();
+            }
+        }),
+    );
 
     Ok((addr, rx, bulk_delivered))
 }
@@ -1033,6 +1213,63 @@ pub async fn dual_mux_client_connect(
     Ok((opener, accepter))
 }
 
+/// [`dual_mux_client_connect`] through the bounded task-submission handle,
+/// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
+/// unavailable. The lane rtp sessions ride `rtp_connect_via` and the
+/// dual-lane supervision is submitted as required through the handle.
+pub async fn dual_mux_client_connect_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
+    fec: bool,
+) -> Result<(mux::DualStreamOpener, mux::DualStreamAccepter), mux::DualMuxError> {
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: false,
+    };
+    let nonce = mux::PairingNonce::generate();
+    let group = mux::GroupToken::generate();
+
+    let (int_reader, mut int_writer) = rtp_connect_via(tx, int_proxy_addr, fec).await;
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+
+    let (bulk_reader, mut bulk_writer) = rtp_connect_via(tx, bulk_proxy_addr, fec).await;
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+
+    let mut int_spawner = JoinSet::new();
+    let (int_opener, int_accepter) =
+        mux::spawn_mux_no_reconnection(int_reader, int_writer, config.clone(), &mut int_spawner);
+    let mut bulk_spawner = JoinSet::new();
+    let (bulk_opener, bulk_accepter) =
+        mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
+    let mut super_spawner = JoinSet::new();
+    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+        int_opener,
+        int_accepter,
+        int_spawner,
+        bulk_opener,
+        bulk_accepter,
+        bulk_spawner,
+        &mut super_spawner,
+    );
+    // The dual-lane supervision is drained by a required task submitted
+    // through the handle (see [`dual_mux_client_connect`]): a panicked lane
+    // surfaces immediately, and the session ending before the test body
+    // completes is a panic.
+    submit_test_task_required(tx, "dual-mux client session", async move {
+        if let Some(result) = super_spawner.join_next().await {
+            let err = result.unwrap();
+            panic!("dual-mux client session ended before the test body: {err:?}");
+        }
+    });
+    Ok((opener, accepter))
+}
+
 /// Connect a dual-mux client with frame reassembly enabled on both lanes.
 /// Each lane rides its own frame-delivery RTP connection. The dual-lane
 /// supervision `JoinSet` is drained by a required scope task (see
@@ -1082,6 +1319,66 @@ pub async fn dual_mux_client_connect_frame_reassembly(
     // [`dual_mux_client_connect`]): a panicked lane surfaces immediately,
     // and the session ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
+        if let Some(result) = super_spawner.join_next().await {
+            let err = result.unwrap();
+            panic!("dual-mux client session ended before the test body: {err:?}");
+        }
+    });
+    Ok((opener, accepter))
+}
+
+/// [`dual_mux_client_connect_frame_reassembly`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable. The lane frame-delivery rtp sessions
+/// ride `rtp_frame_delivery_connect_via` and the dual-lane supervision is
+/// submitted as required through the handle.
+pub async fn dual_mux_client_connect_frame_reassembly_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
+    fec: bool,
+) -> Result<(mux::DualStreamOpener, mux::DualStreamAccepter), mux::DualMuxError> {
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: true,
+    };
+    let nonce = mux::PairingNonce::generate();
+    let group = mux::GroupToken::generate();
+
+    let (int_reader, mut int_writer) =
+        rtp_frame_delivery_connect_via(tx, int_proxy_addr, fec).await;
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+
+    let (bulk_reader, mut bulk_writer) =
+        rtp_frame_delivery_connect_via(tx, bulk_proxy_addr, fec).await;
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+
+    let mut int_spawner = JoinSet::new();
+    let (int_opener, int_accepter) =
+        mux::spawn_mux_no_reconnection(int_reader, int_writer, config.clone(), &mut int_spawner);
+    let mut bulk_spawner = JoinSet::new();
+    let (bulk_opener, bulk_accepter) =
+        mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
+    let mut super_spawner = JoinSet::new();
+    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+        int_opener,
+        int_accepter,
+        int_spawner,
+        bulk_opener,
+        bulk_accepter,
+        bulk_spawner,
+        &mut super_spawner,
+    );
+    // The dual-lane supervision is drained by a required task submitted
+    // through the handle (see [`dual_mux_client_connect`]): a panicked lane
+    // surfaces immediately, and the session ending before the test body
+    // completes is a panic.
+    submit_test_task_required(tx, "dual-mux client session", async move {
         if let Some(result) = super_spawner.join_next().await {
             let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
@@ -1166,6 +1463,96 @@ pub async fn dual_mux_client_connect_with_lane_modes(
     // [`dual_mux_client_connect`]): a panicked lane surfaces immediately,
     // and the session ending before the test body completes is a panic.
     tasks.spawn_required("dual-mux client session", async move {
+        if let Some(result) = super_spawner.join_next().await {
+            let err = result.unwrap();
+            panic!("dual-mux client session ended before the test body: {err:?}");
+        }
+    });
+    Ok((opener, accepter))
+}
+
+/// [`dual_mux_client_connect_with_lane_modes`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable. The lane rtp sessions ride
+/// `rtp_connect_via` / `rtp_frame_delivery_connect_via` and the dual-lane
+/// supervision is submitted as required through the handle.
+pub async fn dual_mux_client_connect_with_lane_modes_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
+    fec: bool,
+    interactive_frame: bool,
+    bulk_frame: bool,
+) -> Result<(mux::DualStreamOpener, mux::DualStreamAccepter), mux::DualMuxError> {
+    let int_config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: interactive_frame,
+    };
+    let bulk_config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: bulk_frame,
+    };
+    type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+    type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+    async fn connect_lane(
+        tx: &tokio::sync::mpsc::Sender<TestTask>,
+        addr: std::net::SocketAddr,
+        fec: bool,
+        frame: bool,
+    ) -> Option<(BoxedRead, BoxedWrite)> {
+        if frame {
+            let (r, w) = rtp_frame_delivery_connect_via(tx, addr, fec).await;
+            Some((Box::new(r), Box::new(w)))
+        } else {
+            let (r, w) = rtp_connect_via(tx, addr, fec).await;
+            Some((Box::new(r), Box::new(w)))
+        }
+    }
+    let mut super_spawner = JoinSet::new();
+    let nonce = mux::PairingNonce::generate();
+    let group = mux::GroupToken::generate();
+    let Some((int_reader, mut int_writer)) =
+        connect_lane(tx, int_proxy_addr, fec, interactive_frame).await
+    else {
+        return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+    };
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+    let Some((bulk_reader, mut bulk_writer)) =
+        connect_lane(tx, bulk_proxy_addr, fec, bulk_frame).await
+    else {
+        return Err(mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+    };
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+    let mut int_spawner = JoinSet::new();
+    let (int_opener, int_accepter) =
+        mux::spawn_mux_no_reconnection(int_reader, int_writer, int_config, &mut int_spawner);
+    let mut bulk_spawner = JoinSet::new();
+    let (bulk_opener, bulk_accepter) =
+        mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, bulk_config, &mut bulk_spawner);
+    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+        int_opener,
+        int_accepter,
+        int_spawner,
+        bulk_opener,
+        bulk_accepter,
+        bulk_spawner,
+        &mut super_spawner,
+    );
+    // The dual-lane supervision is drained by a required task submitted
+    // through the handle (see [`dual_mux_client_connect`]): a panicked lane
+    // surfaces immediately, and the session ending before the test body
+    // completes is a panic.
+    submit_test_task_required(tx, "dual-mux client session", async move {
         if let Some(result) = super_spawner.join_next().await {
             let err = result.unwrap();
             panic!("dual-mux client session ended before the test body: {err:?}");
@@ -1515,6 +1902,72 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     Arc<AtomicU64>,
     mpsc::Sender<TestTask>,
 )> {
+    // Tagged-stream sink tasks spawned by the pairing handler are submitted
+    // through a bounded channel feeding one test-owned reaper (spawned into
+    // `tasks`), which selects between submissions and join_next() completions
+    // and unwraps every completion so panics surface immediately.
+    let task_tx = spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
+    spawn_dual_mux_latency_bulk_server_two_listeners_core(
+        |name, fut| tasks.spawn_required(name, fut),
+        task_tx.clone(),
+        fec,
+        base,
+        interactive_frame,
+        bulk_frame,
+    )
+    .await
+}
+
+/// [`spawn_dual_mux_latency_bulk_server_two_listeners`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
+/// submitted as required through the handle; the returned sender is a clone
+/// of the caller's submission handle (which also feeds the reaper the
+/// tagged-stream sink tasks go through).
+pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+    interactive_frame: bool,
+    bulk_frame: bool,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+    mpsc::Sender<TestTask>,
+)> {
+    spawn_dual_mux_latency_bulk_server_two_listeners_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        tx.clone(),
+        fec,
+        base,
+        interactive_frame,
+        bulk_frame,
+    )
+    .await
+}
+
+/// Shared core for [`spawn_dual_mux_latency_bulk_server_two_listeners`] and
+/// its `_via` variant: binds both listeners and submits the parked accept
+/// loops and pairing task through `spawn_required` (either a [`TestScope`]
+/// required spawn or the bounded reaper submission). `task_tx` is the bounded
+/// submission channel the pairing handler uses for tagged-stream sink tasks;
+/// it is returned so callers can keep it alive.
+async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
+    mut spawn_required: impl FnMut(&'static str, TestTask),
+    task_tx: mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+    interactive_frame: bool,
+    bulk_frame: bool,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+    mpsc::Sender<TestTask>,
+)> {
     let int_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let bulk_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let int_addr = int_listener.local_addr();
@@ -1522,12 +1975,6 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
-
-    // Tagged-stream sink tasks spawned by the pairing handler are submitted
-    // through a bounded channel feeding one test-owned reaper (spawned into
-    // `tasks`), which selects between submissions and join_next() completions
-    // and unwraps every completion so panics surface immediately.
-    let task_tx = spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
 
     // Parked accept loops (aborted when `tasks` drops at scope end).
     for (listener, lane_frame) in [
@@ -1540,135 +1987,141 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
             heartbeat_interval: Duration::from_secs(5),
             frame_reassembly: lane_frame,
         };
-        tasks.spawn_required("dual-mux server task", async move {
-            loop {
-                let fd = if lane_frame {
-                    FrameMode::enabled()
-                } else {
-                    FrameMode::default()
-                };
-                match listener
-                    .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                        fec,
-                        mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-                        fec_tuning: FecTuning::default(),
-                        frame_delivery: fd,
-                        ..rtp::udp::AcceptConfig::default()
-                    })
-                    .await
-                {
-                    Ok(accepted) => {
-                        if accept_tx.send((accepted, config.clone())).await.is_err() {
-                            break;
+        spawn_required(
+            "dual-mux server task",
+            Box::pin(async move {
+                loop {
+                    let fd = if lane_frame {
+                        FrameMode::enabled()
+                    } else {
+                        FrameMode::default()
+                    };
+                    match listener
+                        .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                            fec,
+                            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                            fec_tuning: FecTuning::default(),
+                            frame_delivery: fd,
+                            ..rtp::udp::AcceptConfig::default()
+                        })
+                        .await
+                    {
+                        Ok(accepted) => {
+                            if accept_tx.send((accepted, config.clone())).await.is_err() {
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-        });
+            }),
+        );
     }
 
     // Parked pairing task (aborted when `tasks` drops at scope end).
     let bulk_for_main = Arc::clone(&bulk_delivered);
     let task_tx_for_pair = task_tx.clone();
-    tasks.spawn_required("dual-mux server task", async move {
-        let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
+    spawn_required(
+        "dual-mux server task",
+        Box::pin(async move {
+            let mut pending: HashMap<mux::PairingNonce, Vec<mux::UnpairedLane>> = HashMap::new();
 
-        // Accepted-lane rtp-session keepalives owned by this task's scope;
-        // never drained (scope-drop abort).
-        let mut lane_keepers = JoinSet::new();
-        // Per-pair handlers owned by this task's scope; drained after the
-        // accept loop ends so panics surface.
-        let mut pair_handlers = JoinSet::new();
+            // Accepted-lane rtp-session keepalives owned by this task's scope;
+            // never drained (scope-drop abort).
+            let mut lane_keepers = JoinSet::new();
+            // Per-pair handlers owned by this task's scope; drained after the
+            // accept loop ends so panics surface.
+            let mut pair_handlers = JoinSet::new();
 
-        loop {
-            tokio::select! {
-                accepted = accept_rx.recv() => {
-                    match accepted {
-                        None => break, // all accept loops closed
-                        Some((accepted, config)) => {
-            let reader = accepted.read.into_async_read();
-            let writer = accepted.write.into_async_write();
-            // Hold the accepted lane's rtp session for its whole life;
-            // dropping it aborts the session.
-            lane_keepers.spawn(async move {
-                let _ = accepted.supervisor.await;
-            });
-            if let Ok((_class, nonce, pa)) =
-                mux::begin_lane_pairing(reader, writer, config, Duration::from_secs(3)).await
-            {
-                let entries = pending.entry(nonce).or_default();
-                entries.push(pa);
-                if entries.len() == 2 {
-                    let pa2 = entries.pop().unwrap();
-                    let pa1 = entries.pop().unwrap();
-                    pending.remove(&nonce);
-                    let mut pair_spawner = JoinSet::new();
-                    if let Ok((_opener, mut accepter)) =
-                        mux::complete_pairing(pa1, pa2, &mut pair_spawner)
-                    {
-                        let bulk = Arc::clone(&bulk_for_main);
-                        let tx = tx.clone();
-                        let task_tx = task_tx_for_pair.clone();
-                        pair_handlers.spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    accepted = accepter.accept() => {
-                                        match accepted {
-                                            Ok((reader, writer, class)) => {
-                                                spawn_tagged_stream_sink(
-                                                    &task_tx,
-                                                    reader,
-                                                    writer,
-                                                    tx.clone(),
-                                                    Arc::clone(&bulk),
-                                                    base,
-                                                    class == mux::LaneClass::Interactive,
-                                                );
+            loop {
+                tokio::select! {
+                    accepted = accept_rx.recv() => {
+                        match accepted {
+                            None => break, // all accept loops closed
+                            Some((accepted, config)) => {
+                let reader = accepted.read.into_async_read();
+                let writer = accepted.write.into_async_write();
+                // Hold the accepted lane's rtp session for its whole life;
+                // dropping it aborts the session.
+                lane_keepers.spawn(async move {
+                    let _ = accepted.supervisor.await;
+                });
+                if let Ok((_class, nonce, pa)) =
+                    mux::begin_lane_pairing(reader, writer, config, Duration::from_secs(3)).await
+                {
+                    let entries = pending.entry(nonce).or_default();
+                    entries.push(pa);
+                    if entries.len() == 2 {
+                        let pa2 = entries.pop().unwrap();
+                        let pa1 = entries.pop().unwrap();
+                        pending.remove(&nonce);
+                        let mut pair_spawner = JoinSet::new();
+                        if let Ok((_opener, mut accepter)) =
+                            mux::complete_pairing(pa1, pa2, &mut pair_spawner)
+                        {
+                            let bulk = Arc::clone(&bulk_for_main);
+                            let tx = tx.clone();
+                            let task_tx = task_tx_for_pair.clone();
+                            pair_handlers.spawn(async move {
+                                loop {
+                                    tokio::select! {
+                                        accepted = accepter.accept() => {
+                                            match accepted {
+                                                Ok((reader, writer, class)) => {
+                                                    spawn_tagged_stream_sink(
+                                                        &task_tx,
+                                                        reader,
+                                                        writer,
+                                                        tx.clone(),
+                                                        Arc::clone(&bulk),
+                                                        base,
+                                                        class == mux::LaneClass::Interactive,
+                                                    );
+                                                }
+                                                Err(_) => break, // peer closed; stop accepting
                                             }
-                                            Err(_) => break, // peer closed; stop accepting
+                                        }
+                                        Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
+                                            // The pair's mux session supervision ended: unwrap so a
+                                            // panicked supervision task cascades, and a normal
+                                            // MuxError session-end stops accepting.
+                                            joined.unwrap();
+                                            break;
                                         }
                                     }
-                                    Some(joined) = pair_spawner.join_next(), if !pair_spawner.is_empty() => {
-                                        // The pair's mux session supervision ended: unwrap so a
-                                        // panicked supervision task cascades, and a normal
-                                        // MuxError session-end stops accepting.
-                                        joined.unwrap();
-                                        break;
-                                    }
                                 }
-                            }
-                            // Drain the pair's mux supervision tasks, unwrapping so panics surface.
-                            while let Some(result) = pair_spawner.join_next().await {
-                                result.unwrap();
-                            }
-                        });
-                    }
-                }
-            }
+                                // Drain the pair's mux supervision tasks, unwrapping so panics surface.
+                                while let Some(result) = pair_spawner.join_next().await {
+                                    result.unwrap();
+                                }
+                            });
                         }
                     }
                 }
-                Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
-                    // A lane rtp-session keepalive ended (session closed):
-                    // unwrap so a panic surfaces immediately; a normal
-                    // completion is a legitimate shutdown.
-                    joined.unwrap();
-                }
-                Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
-                    // A pair handler ended: unwrap so a panic surfaces now.
-                    joined.unwrap();
+                            }
+                        }
+                    }
+                    Some(joined) = lane_keepers.join_next(), if !lane_keepers.is_empty() => {
+                        // A lane rtp-session keepalive ended (session closed):
+                        // unwrap so a panic surfaces immediately; a normal
+                        // completion is a legitimate shutdown.
+                        joined.unwrap();
+                    }
+                    Some(joined) = pair_handlers.join_next(), if !pair_handlers.is_empty() => {
+                        // A pair handler ended: unwrap so a panic surfaces now.
+                        joined.unwrap();
+                    }
                 }
             }
-        }
-        // Drain any remaining lane/session joins so panics surface.
-        while let Some(result) = lane_keepers.join_next().await {
-            result.unwrap();
-        }
+            // Drain any remaining lane/session joins so panics surface.
+            while let Some(result) = lane_keepers.join_next().await {
+                result.unwrap();
+            }
 
-        while let Some(result) = pair_handlers.join_next().await {
-            result.unwrap();
-        }
-    });
+            while let Some(result) = pair_handlers.join_next().await {
+                result.unwrap();
+            }
+        }),
+    );
     Ok((int_addr, bulk_addr, rx, bulk_delivered, task_tx))
 }

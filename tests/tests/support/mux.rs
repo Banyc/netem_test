@@ -12,27 +12,16 @@ use rtp::FecTuning;
 use rtp::FrameMode;
 
 use super::stats::SinkProgress;
-use crate::support::{LATENCY_SAMPLE_CAPACITY, TestScope, try_send_observation};
+use crate::support::{
+    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, submit_test_task, submit_test_task_required,
+    try_send_observation,
+};
 
-/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
-/// on top of the resulting reliable byte stream. Each accepted mux stream is
-/// handed to `handle_stream`, which owns its read/write halves. Returns the
-/// rtp server's listening address.
-///
-/// `mss` is passed to the RTP accept helpers; use [`rtp::udp::NO_FEC_MSS`] for
-/// the default size.
-///
-/// The listener is wrapped in an [`Arc`] so a background `accept()`-loop can
-/// keep driving `udp_listener`'s dispatcher for the server's lifetime:
-/// `accept()` both establishes new connections *and* dispatches packets to
-/// existing ones (via `try_send` to their per-conn channels). Without a
-/// background accept-loop, the dispatcher stops after the first connection
-/// and subsequent datagrams are never forwarded to it, so the reliable
-/// layer stalls. This is required by `udp_listener`'s docs ("You still need
-/// to put `accept()` in a loop to drive the packet dispatch among the
-/// sub-connections").
-pub async fn spawn_mux_over_rtp_server_with_mss<F, Fut>(
-    tasks: &mut TestScope,
+/// Shared core for [`spawn_mux_over_rtp_server_with_mss`] and its `_via`
+/// variant: binds the listener and hands the accept-loop future to `spawn`
+/// (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_over_rtp_server_core<F, Fut>(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     mss: usize,
     handle_stream: F,
@@ -44,21 +33,20 @@ where
     let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
-    tasks.spawn({
+    spawn(Box::pin({
         let listener = Arc::clone(&listener);
         async move {
             // First (and only) rtp connection.
-            let accepted = match listener
+            // An accept failure is a scenario failure; panic so the root
+            // JoinError unwrap crashes the test.
+            let accepted = listener
                 .accept_without_handshake_with(rtp::udp::AcceptConfig {
                     fec,
                     mss: rtp::udp::MssConfig::Custom(mss),
                     ..rtp::udp::AcceptConfig::default()
                 })
                 .await
-            {
-                Ok(a) => a,
-                Err(_) => return,
-            };
+                .unwrap();
             // The extra-accept drainer loop keeps driving `udp_listener`'s
             // dispatcher for the server's lifetime: `accept()` both
             // establishes new connections and dispatches packets to existing
@@ -66,22 +54,19 @@ where
             // after the first connection and subsequent datagrams are never
             // forwarded to it, so the reliable layer stalls. The drainer is
             // pinned and selected alongside the session supervisor and
-            // handlers below, so an early drainer return ends the server.
+            // handlers below and only ends by panicking on an accept error.
             let drainer = {
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
-                        if listener
+                        listener
                             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                                 fec,
                                 mss: rtp::udp::MssConfig::Custom(mss),
                                 ..rtp::udp::AcceptConfig::default()
                             })
                             .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            .unwrap();
                     }
                 }
             };
@@ -114,7 +99,11 @@ where
             loop {
                 tokio::select! {
                     () = &mut supervisor => { break; } // rtp session drivers exited; stop accepting
-                    () = &mut drainer => { break; } // extra-accept drainer exited; stop the server
+                    () = &mut drainer => {
+                        // The required drainer ended early; panic instead of
+                        // silently ending the server.
+                        panic!("accept drainer finished before the server scenario completed");
+                    }
                     accepted = accepter.accept() => {
                         match accepted {
                             Ok((stream_read, stream_write)) => {
@@ -146,20 +135,66 @@ where
                 result.unwrap();
             }
         }
-    });
+    }));
     Ok(addr)
 }
 
 /// Spawn an `rtp` server that accepts one connection and runs a `mux` server
 /// on top of the resulting reliable byte stream. Each accepted mux stream is
-/// echoed back. Returns the rtp server's listening address.
-pub async fn spawn_mux_over_rtp_echo_server_with_mss(
+/// handed to `handle_stream`, which owns its read/write halves. Returns the
+/// rtp server's listening address.
+///
+/// `mss` is passed to the RTP accept helpers; use [`rtp::udp::NO_FEC_MSS`] for
+/// the default size.
+///
+/// The listener is wrapped in an [`Arc`] so a background `accept()`-loop can
+/// keep driving `udp_listener`'s dispatcher for the server's lifetime:
+/// `accept()` both establishes new connections *and* dispatches packets to
+/// existing ones (via `try_send` to their per-conn channels). Without a
+/// background accept-loop, the dispatcher stops after the first connection
+/// and subsequent datagrams are never forwarded to it, so the reliable
+/// layer stalls. This is required by `udp_listener`'s docs ("You still need
+/// to put `accept()` in a loop to drive the packet dispatch among the
+/// sub-connections").
+pub async fn spawn_mux_over_rtp_server_with_mss<F, Fut>(
     tasks: &mut TestScope,
     fec: bool,
     mss: usize,
+    handle_stream: F,
+) -> std::io::Result<std::net::SocketAddr>
+where
+    F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    spawn_mux_over_rtp_server_core(|fut| tasks.spawn(fut), fec, mss, handle_stream).await
+}
+
+/// [`spawn_mux_over_rtp_server_with_mss`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_over_rtp_server_with_mss_via<F, Fut>(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    mss: usize,
+    handle_stream: F,
+) -> std::io::Result<std::net::SocketAddr>
+where
+    F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    spawn_mux_over_rtp_server_core(|fut| submit_test_task(tx, fut), fec, mss, handle_stream).await
+}
+
+/// Shared core for [`spawn_mux_over_rtp_echo_server_with_mss`] and its `_via`
+/// variant: spawns the mux-over-RTP server with an echo handler via `spawn`
+/// (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_over_rtp_echo_server_core(
+    spawn: impl FnOnce(TestTask),
+    fec: bool,
+    mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
-    spawn_mux_over_rtp_server_with_mss(
-        tasks,
+    spawn_mux_over_rtp_server_core(
+        spawn,
         fec,
         mss,
         |mut stream_read, mut stream_write| async move {
@@ -181,6 +216,28 @@ pub async fn spawn_mux_over_rtp_echo_server_with_mss(
     .await
 }
 
+/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
+/// on top of the resulting reliable byte stream. Each accepted mux stream is
+/// echoed back. Returns the rtp server's listening address.
+pub async fn spawn_mux_over_rtp_echo_server_with_mss(
+    tasks: &mut TestScope,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<std::net::SocketAddr> {
+    spawn_mux_over_rtp_echo_server_core(|fut| tasks.spawn(fut), fec, mss).await
+}
+
+/// [`spawn_mux_over_rtp_echo_server_with_mss`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_over_rtp_echo_server_with_mss_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<std::net::SocketAddr> {
+    spawn_mux_over_rtp_echo_server_core(|fut| submit_test_task(tx, fut), fec, mss).await
+}
+
 /// Spawn a mux-over-RTP echo server using the default MSS.
 pub async fn spawn_mux_over_rtp_echo_server(
     tasks: &mut TestScope,
@@ -189,20 +246,27 @@ pub async fn spawn_mux_over_rtp_echo_server(
     spawn_mux_over_rtp_echo_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
 }
 
-/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
-/// on top of the resulting reliable byte stream. Each accepted mux stream is
-/// read to EOF into a `Vec<u8>` and sent on the returned channel (capacity
-/// 16) if the read succeeded or the buffer is non-empty, then the write half
-/// is shut down. Returns the rtp server's listening address and the receiver
-/// for completed payloads.
-pub async fn spawn_mux_over_rtp_sink_server_with_mss(
-    tasks: &mut TestScope,
+/// [`spawn_mux_over_rtp_echo_server`] through the bounded task-submission
+/// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
+/// is unavailable.
+pub async fn spawn_mux_over_rtp_echo_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    spawn_mux_over_rtp_echo_server_with_mss_via(tx, fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Shared core for [`spawn_mux_over_rtp_sink_server_with_mss`] and its `_via`
+/// variant: spawns the mux-over-RTP server with a sink handler via `spawn`
+/// (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_over_rtp_sink_server_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        tasks,
+    let addr = spawn_mux_over_rtp_server_core(
+        spawn,
         fec,
         mss,
         move |mut stream_read, mut stream_write| {
@@ -221,12 +285,47 @@ pub async fn spawn_mux_over_rtp_sink_server_with_mss(
     Ok((addr, rx))
 }
 
+/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
+/// on top of the resulting reliable byte stream. Each accepted mux stream is
+/// read to EOF into a `Vec<u8>` and sent on the returned channel (capacity
+/// 16) if the read succeeded or the buffer is non-empty, then the write half
+/// is shut down. Returns the rtp server's listening address and the receiver
+/// for completed payloads.
+pub async fn spawn_mux_over_rtp_sink_server_with_mss(
+    tasks: &mut TestScope,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
+    spawn_mux_over_rtp_sink_server_core(|fut| tasks.spawn(fut), fec, mss).await
+}
+
+/// [`spawn_mux_over_rtp_sink_server_with_mss`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_over_rtp_sink_server_with_mss_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
+    spawn_mux_over_rtp_sink_server_core(|fut| submit_test_task(tx, fut), fec, mss).await
+}
+
 /// Spawn a mux-over-RTP sink server using the default MSS.
 pub async fn spawn_mux_over_rtp_sink_server(
     tasks: &mut TestScope,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
     spawn_mux_over_rtp_sink_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// [`spawn_mux_over_rtp_sink_server`] through the bounded task-submission
+/// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
+/// is unavailable.
+pub async fn spawn_mux_over_rtp_sink_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
+    spawn_mux_over_rtp_sink_server_with_mss_via(tx, fec, rtp::udp::NO_FEC_MSS).await
 }
 
 /// Spawn a mux-over-RTP server that accepts one connection and parses a simple
@@ -251,16 +350,29 @@ pub async fn spawn_mux_msg_latency_sink(
     spawn_mux_msg_latency_sink_with_mss(tasks, fec, base, rtp::udp::NO_FEC_MSS).await
 }
 
-/// [`spawn_mux_msg_latency_sink`] with a custom RTP MSS.
-pub async fn spawn_mux_msg_latency_sink_with_mss(
-    tasks: &mut TestScope,
+/// [`spawn_mux_msg_latency_sink`] through the bounded task-submission handle,
+/// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
+/// unavailable.
+pub async fn spawn_mux_msg_latency_sink_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    spawn_mux_msg_latency_sink_with_mss_via(tx, fec, base, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Shared core for [`spawn_mux_msg_latency_sink_with_mss`] and its `_via`
+/// variant: spawns the mux-over-RTP server with a latency-sink handler via
+/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_msg_latency_sink_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     base: Instant,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        tasks,
+    let addr = spawn_mux_over_rtp_server_core(
+        spawn,
         fec,
         mss,
         move |mut stream_read, mut stream_write| {
@@ -315,6 +427,28 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
     Ok((addr, rx))
 }
 
+/// [`spawn_mux_msg_latency_sink`] with a custom RTP MSS.
+pub async fn spawn_mux_msg_latency_sink_with_mss(
+    tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    spawn_mux_msg_latency_sink_core(|fut| tasks.spawn(fut), fec, base, mss).await
+}
+
+/// [`spawn_mux_msg_latency_sink_with_mss`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_msg_latency_sink_with_mss_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
+    spawn_mux_msg_latency_sink_core(|fut| submit_test_task(tx, fut), fec, base, mss).await
+}
+
 /// Send timestamped messages through a reliable byte-stream write half.
 ///
 /// Each message is framed as `[4-byte LE total frame length][payload][8-byte
@@ -358,13 +492,15 @@ pub async fn send_timestamped_messages(
     sent
 }
 
-/// Wrap a reliable byte-stream pair in a `mux` client and return the stream
-/// opener. The mux supervision `JoinSet` is drained by a required scope task:
-/// the session must survive the whole test body, a panicked supervision task
-/// surfaces immediately, and the session ending before the body completes is
-/// a panic. Callers that intentionally end the session mid-body must use an
-/// ordinary-spawn drain instead (see `perf_probe`).
-pub fn mux_client_connect<R, W>(tasks: &mut TestScope, read: R, write: W) -> mux::StreamOpener
+/// Shared core for [`mux_client_connect`] and its `_via` variant: wraps the
+/// reliable byte-stream pair in a `mux` client and hands the supervision
+/// drain future to `spawn_required` (either a [`TestScope`] spawn or the
+/// bounded reaper submission).
+fn mux_client_connect_core<R, W>(
+    spawn_required: impl FnOnce(&'static str, TestTask),
+    read: R,
+    write: W,
+) -> mux::StreamOpener
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -376,13 +512,49 @@ where
     };
     let mut spawner = JoinSet::new();
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
-    tasks.spawn_required("mux client session", async move {
-        if let Some(result) = spawner.join_next().await {
-            let err = result.unwrap();
-            panic!("mux client session ended before the test body: {err:?}");
-        }
-    });
+    spawn_required(
+        "mux client session",
+        Box::pin(async move {
+            if let Some(result) = spawner.join_next().await {
+                let err = result.unwrap();
+                panic!("mux client session ended before the test body: {err:?}");
+            }
+        }),
+    );
     opener
+}
+
+/// Wrap a reliable byte-stream pair in a `mux` client and return the stream
+/// opener. The mux supervision `JoinSet` is drained by a required scope task:
+/// the session must survive the whole test body, a panicked supervision task
+/// surfaces immediately, and the session ending before the body completes is
+/// a panic. Callers that intentionally end the session mid-body must use an
+/// ordinary-spawn drain instead (see `perf_probe`).
+pub fn mux_client_connect<R, W>(tasks: &mut TestScope, read: R, write: W) -> mux::StreamOpener
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    mux_client_connect_core(|name, fut| tasks.spawn_required(name, fut), read, write)
+}
+
+/// [`mux_client_connect`] through the bounded task-submission handle, for use
+/// inside [`TestScope::run`] bodies where `&mut TestScope` is unavailable.
+/// The supervision drain is submitted as required through the handle.
+pub fn mux_client_connect_via<R, W>(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    read: R,
+    write: W,
+) -> mux::StreamOpener
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    mux_client_connect_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        read,
+        write,
+    )
 }
 
 /// Open a mux stream, write `payload`, shut the stream down, and read the
@@ -489,23 +661,16 @@ pub async fn mux_send_repeated(
     start.elapsed()
 }
 
-/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
-/// on top of it. Each accepted mux stream is read chunk-by-chunk into a 64 KiB
-/// buffer and verified against the deterministic payload pattern. Verified
-/// bytes are atomically added to the returned [`SinkProgress::delivered`];
-/// a mismatch sets [`SinkProgress::corrupt`] and stops counting that stream.
-///
-/// This sink is intentionally kept mid-flight: it does *not* buffer the full
-/// payload or read to EOF, so a snapshot of `delivered_bytes()` taken while
-/// the transfer is still alive reflects true goodput without an inflated
-/// delivery snapshot.
-pub async fn spawn_mux_over_rtp_counting_sink_server(
-    tasks: &mut TestScope,
+/// Shared core for [`spawn_mux_over_rtp_counting_sink_server`] and its `_via`
+/// variant: spawns the mux-over-RTP server with a counting-sink handler via
+/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_over_rtp_counting_sink_server_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
     let progress = Arc::new(SinkProgress::new());
-    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, mss, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, {
         let progress = Arc::clone(&progress);
         move |mut stream_read, mut stream_write| {
             let progress = Arc::clone(&progress);
@@ -545,6 +710,35 @@ pub async fn spawn_mux_over_rtp_counting_sink_server(
     Ok((addr, progress))
 }
 
+/// Spawn an `rtp` server that accepts one connection and runs a `mux` server
+/// on top of it. Each accepted mux stream is read chunk-by-chunk into a 64 KiB
+/// buffer and verified against the deterministic payload pattern. Verified
+/// bytes are atomically added to the returned [`SinkProgress::delivered`];
+/// a mismatch sets [`SinkProgress::corrupt`] and stops counting that stream.
+///
+/// This sink is intentionally kept mid-flight: it does *not* buffer the full
+/// payload or read to EOF, so a snapshot of `delivered_bytes()` taken while
+/// the transfer is still alive reflects true goodput without an inflated
+/// delivery snapshot.
+pub async fn spawn_mux_over_rtp_counting_sink_server(
+    tasks: &mut TestScope,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
+    spawn_mux_over_rtp_counting_sink_server_core(|fut| tasks.spawn(fut), fec, mss).await
+}
+
+/// [`spawn_mux_over_rtp_counting_sink_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_over_rtp_counting_sink_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
+    spawn_mux_over_rtp_counting_sink_server_core(|fut| submit_test_task(tx, fut), fec, mss).await
+}
+
 /// Convenience wrapper using the default RTP MSS.
 pub async fn spawn_mux_over_rtp_counting_sink_server_default(
     tasks: &mut TestScope,
@@ -553,21 +747,21 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_default(
     spawn_mux_over_rtp_counting_sink_server(tasks, fec, rtp::udp::NO_FEC_MSS).await
 }
 
-/// Spawn a mux-over-RTP server that accepts one connection and classifies each
-/// accepted mux stream by its first byte.
-///
-/// * `b'L'`: timestamped latency frames (`[4 LE total len][payload][8 LE
-///   micros since base]`). One-way latency in milliseconds is pushed into the
-///   returned unbounded channel.
-/// * any other byte: deterministic bulk byte sink. Bytes after the tag are
-///   verified against the `(offset % 251)` pattern and counted in the returned
-///   [`AtomicU64`]; they are then discarded.
-///
-/// This combined server lets HOL and contested-latency scenarios open an
-/// interactive ping stream and a competing bulk sink stream on the same mux
-/// connection while using a single server address.
-pub async fn spawn_mux_latency_bulk_server(
-    tasks: &mut TestScope,
+/// [`spawn_mux_over_rtp_counting_sink_server_default`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_over_rtp_counting_sink_server_default_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
+    spawn_mux_over_rtp_counting_sink_server_via(tx, fec, rtp::udp::NO_FEC_MSS).await
+}
+
+/// Shared core for [`spawn_mux_latency_bulk_server`] and its `_via` variant:
+/// spawns the mux-over-RTP server with a tag-classifying handler via `spawn`
+/// (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_latency_bulk_server_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -577,7 +771,7 @@ pub async fn spawn_mux_latency_bulk_server(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -670,9 +864,51 @@ pub async fn spawn_mux_latency_bulk_server(
     Ok((addr, rx, bulk_delivered))
 }
 
-/// Like [`spawn_mux_latency_bulk_server`] but with a custom RTP MSS.
-pub async fn spawn_mux_sized_latency_bulk_server(
+/// Spawn a mux-over-RTP server that accepts one connection and classifies each
+/// accepted mux stream by its first byte.
+///
+/// * `b'L'`: timestamped latency frames (`[4 LE total len][payload][8 LE
+///   micros since base]`). One-way latency in milliseconds is pushed into the
+///   returned unbounded channel.
+/// * any other byte: deterministic bulk byte sink. Bytes after the tag are
+///   verified against the `(offset % 251)` pattern and counted in the returned
+///   [`AtomicU64`]; they are then discarded.
+///
+/// This combined server lets HOL and contested-latency scenarios open an
+/// interactive ping stream and a competing bulk sink stream on the same mux
+/// connection while using a single server address.
+pub async fn spawn_mux_latency_bulk_server(
     tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_latency_bulk_server_core(|fut| tasks.spawn(fut), fec, base).await
+}
+
+/// [`spawn_mux_latency_bulk_server`] through the bounded task-submission
+/// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
+/// is unavailable.
+pub async fn spawn_mux_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base).await
+}
+
+/// Shared core for [`spawn_mux_sized_latency_bulk_server`] and its `_via`
+/// variant: spawns the mux-over-RTP server with a tag-classifying handler via
+/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_sized_latency_bulk_server_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     base: Instant,
     mss: usize,
@@ -683,7 +919,7 @@ pub async fn spawn_mux_sized_latency_bulk_server(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, mss, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -773,11 +1009,42 @@ pub async fn spawn_mux_sized_latency_bulk_server(
     Ok((addr, rx, bulk_delivered))
 }
 
-/// Single‑mux gaming server: the first stream tagged `b'G'` is the game
-/// stream (3 MiB state-sync followed by 200 B delta frames); all other
-/// streams are bulk.
-pub async fn spawn_mux_gaming_latency_bulk_server(
+/// Like [`spawn_mux_latency_bulk_server`] but with a custom RTP MSS.
+pub async fn spawn_mux_sized_latency_bulk_server(
     tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_sized_latency_bulk_server_core(|fut| tasks.spawn(fut), fec, base, mss).await
+}
+
+/// [`spawn_mux_sized_latency_bulk_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_sized_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+    mss: usize,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_sized_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base, mss).await
+}
+
+/// Shared core for [`spawn_mux_gaming_latency_bulk_server`] and its `_via`
+/// variant: spawns the mux-over-RTP server with a gaming tag-classifying
+/// handler via `spawn` (either a [`TestScope`] spawn or the bounded reaper
+/// submission).
+async fn spawn_mux_gaming_latency_bulk_server_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -787,7 +1054,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_with_mss(tasks, fec, rtp::udp::NO_FEC_MSS, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -881,13 +1148,41 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
     Ok((addr, rx, bulk_delivered))
 }
 
-/// Spawn a frame-delivery RTP server that accepts one connection, wraps it
-/// in a frame-reassembly mux server, and handles latency/bulk streams.
-/// Returns `(addr, lat_rx, bulk_counter)` like [`spawn_mux_latency_bulk_server`]
-/// but the server uses `frame_reassembly: true` and each RTP connection is
-/// accepted in frame-delivery mode.
-pub async fn spawn_mux_frame_delivery_latency_bulk_server(
+/// Single‑mux gaming server: the first stream tagged `b'G'` is the game
+/// stream (3 MiB state-sync followed by 200 B delta frames); all other
+/// streams are bulk.
+pub async fn spawn_mux_gaming_latency_bulk_server(
     tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_gaming_latency_bulk_server_core(|fut| tasks.spawn(fut), fec, base).await
+}
+
+/// [`spawn_mux_gaming_latency_bulk_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_gaming_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_gaming_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base).await
+}
+
+/// Shared core for [`spawn_mux_frame_delivery_latency_bulk_server`] and its
+/// `_via` variant: binds the listener and hands the accept-loop future to
+/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+async fn spawn_mux_frame_delivery_latency_bulk_server_core(
+    spawn: impl FnOnce(TestTask),
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -903,8 +1198,10 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     let fd = FrameMode::enabled();
     let listener_accept = Arc::clone(&listener);
     let bulk_delivered_for_server = Arc::clone(&bulk_delivered);
-    tasks.spawn(async move {
-        let accepted = match listener_accept
+    spawn(Box::pin(async move {
+        // An accept failure is a scenario failure; panic so the root
+        // JoinError unwrap crashes the test.
+        let accepted = listener_accept
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
                 mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
@@ -913,23 +1210,20 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                 ..rtp::udp::AcceptConfig::default()
             })
             .await
-        {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+            .unwrap();
         // The extra-accept drainer loop keeps driving `udp_listener`'s
         // dispatcher for the server's lifetime: `accept()` both establishes
         // new connections and dispatches packets to existing ones. Without a
         // background accept-loop, the dispatcher stops after the first
         // connection and subsequent datagrams are never forwarded to it, so
         // the reliable layer stalls. The drainer is pinned and selected
-        // alongside the session supervisor and handlers below, so an early
-        // drainer return ends the server.
+        // alongside the session supervisor and handlers below and only ends
+        // by panicking on an accept error.
         let drainer = {
             let listener = Arc::clone(&listener);
             async move {
                 loop {
-                    if listener
+                    listener
                         .accept_without_handshake_with(rtp::udp::AcceptConfig {
                             fec,
                             mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
@@ -938,10 +1232,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
                             ..rtp::udp::AcceptConfig::default()
                         })
                         .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                        .unwrap();
                 }
             }
         };
@@ -973,7 +1264,11 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         loop {
             tokio::select! {
                 () = &mut supervisor => { break; } // rtp session drivers exited; stop accepting
-                () = &mut drainer => { break; } // extra-accept drainer exited; stop the server
+                () = &mut drainer => {
+                    // The required drainer ended early; panic instead of
+                    // silently ending the server.
+                    panic!("accept drainer finished before the server scenario completed");
+                }
                 accepted = accepter.accept() => {
                     match accepted {
                         Ok((mut reader, mut writer)) => {
@@ -1071,7 +1366,40 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         while let Some(result) = spawner.join_next().await {
             result.unwrap();
         }
-    });
+    }));
 
     Ok((addr, rx, bulk_delivered))
+}
+
+/// Spawn a frame-delivery RTP server that accepts one connection, wraps it
+/// in a frame-reassembly mux server, and handles latency/bulk streams.
+/// Returns `(addr, lat_rx, bulk_counter)` like [`spawn_mux_latency_bulk_server`]
+/// but the server uses `frame_reassembly: true` and each RTP connection is
+/// accepted in frame-delivery mode.
+pub async fn spawn_mux_frame_delivery_latency_bulk_server(
+    tasks: &mut TestScope,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_frame_delivery_latency_bulk_server_core(|fut| tasks.spawn(fut), fec, base).await
+}
+
+/// [`spawn_mux_frame_delivery_latency_bulk_server`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn spawn_mux_frame_delivery_latency_bulk_server_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_frame_delivery_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base)
+        .await
 }

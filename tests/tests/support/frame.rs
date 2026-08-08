@@ -2,7 +2,7 @@
 // Frame‑delivery adapter
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::support::TestScope;
+use crate::support::{TestScope, TestTask, submit_test_task_required};
 
 pub type RtpFrameReader = rtp::socket::FrameByteReader;
 pub type RtpFrameDeliveryWriter = rtp::socket::FrameByteWriter;
@@ -26,6 +26,24 @@ pub async fn rtp_frame_delivery_connect(
     .await
 }
 
+/// [`rtp_frame_delivery_connect`] through the bounded task-submission handle,
+/// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
+/// unavailable. The supervisor keepalive is submitted as required through the
+/// handle.
+pub async fn rtp_frame_delivery_connect_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    rtp_frame_delivery_connect_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        proxy_client_addr,
+        fec,
+        rtp::udp::MssConfig::Default,
+    )
+    .await
+}
+
 /// Connect an rtp client using frame delivery with a custom MSS.
 pub async fn rtp_frame_delivery_connect_with_mss(
     tasks: &mut TestScope,
@@ -42,8 +60,45 @@ pub async fn rtp_frame_delivery_connect_with_mss(
     .await
 }
 
+/// [`rtp_frame_delivery_connect_with_mss`] through the bounded
+/// task-submission handle, for use inside [`TestScope::run`] bodies where
+/// `&mut TestScope` is unavailable.
+pub async fn rtp_frame_delivery_connect_with_mss_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    rtp_frame_delivery_connect_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        proxy_client_addr,
+        fec,
+        rtp::udp::MssConfig::Custom(mss),
+    )
+    .await
+}
+
 async fn rtp_frame_delivery_connect_with_mss_config(
     tasks: &mut TestScope,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: rtp::udp::MssConfig,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    rtp_frame_delivery_connect_core(
+        |name, fut| tasks.spawn_required(name, fut),
+        proxy_client_addr,
+        fec,
+        mss,
+    )
+    .await
+}
+
+/// Shared core for [`rtp_frame_delivery_connect_with_mss_config`] and the
+/// `_via` variants: opens the connection and hands the required supervisor
+/// keepalive to `spawn_required` (either a [`TestScope`] spawn or the bounded
+/// reaper submission).
+async fn rtp_frame_delivery_connect_core(
+    spawn_required: impl FnOnce(&'static str, TestTask),
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: rtp::udp::MssConfig,
@@ -62,8 +117,11 @@ async fn rtp_frame_delivery_connect_with_mss_config(
     .unwrap();
     // Hold the rtp session owner for the connection's lifetime; the session
     // must survive the whole test body, so the keepalive is required.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
+    spawn_required(
+        "rtp client session",
+        Box::pin(async move {
+            let _ = connected.supervisor.await;
+        }),
+    );
     (connected.read, connected.write)
 }
