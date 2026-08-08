@@ -26,33 +26,37 @@ mod support;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "raw bidirectional UDP echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn netem_pair_raw_udp_echo_clean_link() {
-    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let echo_addr = echo.local_addr().unwrap();
     let mut tasks = support::TestScope::new();
-    tasks.spawn(async move {
-        let mut buf = [0u8; 64];
-        while let Ok((n, from)) = echo.recv_from(&mut buf).await {
-            let _ = echo.send_to(&buf[..n], from).await;
-        }
-    });
-
-    let pair = NetemPair::spawn(echo_addr, clean(), clean()).unwrap();
-    let proxy_addr = pair.client_addr();
-
-    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let echo_addr = echo.local_addr().unwrap();
+            support::submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+                        let _ = echo.send_to(&buf[..n], from).await;
+                    }
+                }),
+            );
+
+            let pair = NetemPair::spawn(echo_addr, clean(), clean()).unwrap();
+            let proxy_addr = pair.client_addr();
+
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             client.send_to(b"bidir-hello", proxy_addr).await.unwrap();
             let mut buf = [0u8; 64];
             let n = with_timeout(Duration::from_secs(2), "raw echo", client.recv(&mut buf))
                 .await
                 .unwrap();
             assert_eq!(&buf[..n], b"bidir-hello");
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert!(
         stats.forwarded >= 2,
         "both directions should forward, got {stats:?}"
@@ -66,23 +70,27 @@ async fn netem_pair_raw_udp_echo_clean_link() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "raw bidirectional UDP echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn netem_pair_raw_udp_latency_is_observable() {
-    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let echo_addr = echo.local_addr().unwrap();
     let mut tasks = support::TestScope::new();
-    tasks.spawn(async move {
-        let mut buf = [0u8; 64];
-        while let Ok((n, from)) = echo.recv_from(&mut buf).await {
-            let _ = echo.send_to(&buf[..n], from).await;
-        }
-    });
-
-    let one_way = Duration::from_millis(60);
-    let pair = NetemPair::spawn(echo_addr, latency(60), latency(60)).unwrap();
-    let proxy_addr = pair.client_addr();
-
-    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let echo_addr = echo.local_addr().unwrap();
+            support::submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+                        let _ = echo.send_to(&buf[..n], from).await;
+                    }
+                }),
+            );
+
+            let one_way = Duration::from_millis(60);
+            let pair = NetemPair::spawn(echo_addr, latency(60), latency(60)).unwrap();
+            let proxy_addr = pair.client_addr();
+
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let start = std::time::Instant::now();
             client.send_to(b"ping", proxy_addr).await.unwrap();
             let mut buf = [0u8; 64];
@@ -100,8 +108,7 @@ async fn netem_pair_raw_udp_latency_is_observable() {
                 elapsed >= one_way,
                 "round trip {elapsed:?} should be >= one-way latency {one_way:?}",
             );
+            pair.stop();
         })
         .await;
-
-    pair.stop();
 }

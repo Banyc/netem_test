@@ -16,7 +16,7 @@ use std::time::Duration;
 use netem_test::NetemPair;
 use support::payload::{payload, with_timeout};
 use support::presets::{clean, mild_loss};
-use support::rtp::{rtp_connect_with_mss, spawn_rtp_echo_server_with_mss};
+use support::rtp::{rtp_connect_with_mss_via, spawn_rtp_echo_server_with_mss_via};
 use support::stats::combined_stats;
 
 mod support;
@@ -27,17 +27,19 @@ mod support;
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_small_mss_clean_link_delivers_data() {
     let mut tasks = support::TestScope::new();
-    let mss = 512;
-    let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
-        .await
-        .unwrap();
-
-    let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect_with_mss(&mut tasks, pair.client_addr(), false, mss).await;
-
-    let payload = b"netem-rtp-small-mss";
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let mss = 512;
+            let server_addr = spawn_rtp_echo_server_with_mss_via(&task_tx, false, mss)
+                .await
+                .unwrap();
+
+            let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+            let (read, write) = rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, mss)
+                .await;
+
+            let payload = b"netem-rtp-small-mss";
             let got = with_timeout(
                 Duration::from_secs(10),
                 "rtp small-mss clean echo",
@@ -45,11 +47,11 @@ async fn rtp_small_mss_clean_link_delivers_data() {
             )
             .await;
             assert_eq!(got, payload);
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert_eq!(stats.dropped, 0, "clean link should not drop");
     assert!(stats.forwarded > 0, "proxy should forward packets");
 }
@@ -60,17 +62,19 @@ async fn rtp_small_mss_clean_link_delivers_data() {
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_tiny_mss_survives_mild_loss() {
     let mut tasks = support::TestScope::new();
-    let mss = 256;
-    let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
-        .await
-        .unwrap();
-
-    let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
-    let (read, write) = rtp_connect_with_mss(&mut tasks, pair.client_addr(), false, mss).await;
-
-    let payload = payload(100 * 1024);
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let mss = 256;
+            let server_addr = spawn_rtp_echo_server_with_mss_via(&task_tx, false, mss)
+                .await
+                .unwrap();
+
+            let pair = NetemPair::spawn(server_addr, mild_loss(), mild_loss()).unwrap();
+            let (read, write) = rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, mss)
+                .await;
+
+            let payload = payload(100 * 1024);
             let got = with_timeout(
                 Duration::from_secs(60),
                 "rtp tiny-mss lossy 100KiB echo",
@@ -78,11 +82,11 @@ async fn rtp_tiny_mss_survives_mild_loss() {
             )
             .await;
             assert_eq!(got, payload, "reliable layer must recover all 100KiB");
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert!(
         stats.dropped > 0,
         "proxy should have dropped some packets, got {stats:?}"
@@ -95,17 +99,19 @@ async fn rtp_tiny_mss_survives_mild_loss() {
 #[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_custom_mss_clean_link_delivers_200kib() {
     let mut tasks = support::TestScope::new();
-    let mss = 1024;
-    let server_addr = spawn_rtp_echo_server_with_mss(&mut tasks, false, mss)
-        .await
-        .unwrap();
-
-    let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect_with_mss(&mut tasks, pair.client_addr(), false, mss).await;
-
-    let payload = payload(200 * 1024);
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let mss = 1024;
+            let server_addr = spawn_rtp_echo_server_with_mss_via(&task_tx, false, mss)
+                .await
+                .unwrap();
+
+            let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+            let (read, write) = rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, mss)
+                .await;
+
+            let payload = payload(200 * 1024);
             let got = with_timeout(
                 Duration::from_secs(30),
                 "rtp custom-mss clean 200KiB echo",
@@ -116,11 +122,11 @@ async fn rtp_custom_mss_clean_link_delivers_200kib() {
                 got, payload,
                 "custom-mss clean 200KiB delivery must be byte-exact"
             );
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert_eq!(
         stats.dropped, 0,
         "clean link should not drop, got {stats:?}"

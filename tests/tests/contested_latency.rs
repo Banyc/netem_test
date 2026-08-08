@@ -45,10 +45,12 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::mux::{mux_client_connect, spawn_mux_latency_bulk_server};
+use support::mux::{mux_client_connect_via, spawn_mux_latency_bulk_server_via};
 use support::payload::with_timeout;
 use support::presets::hostile_real_link;
+use support::rtp::rtp_connect_with_mss_via;
 use support::stats::percentile;
+use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -86,84 +88,69 @@ async fn contested_rep(
 ) -> ContestedRepResult {
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (server_addr, mut latencies, bulk_counter) =
-        spawn_mux_latency_bulk_server(&mut tasks, fec, base)
-            .await
-            .unwrap();
-    let pair = Arc::new(NetemPair::spawn(server_addr, c2s, s2c).unwrap());
-
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &pair.client_addr().to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            fec,
-            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let opener = mux_client_connect(
-        &mut tasks,
-        connected.read.into_async_read(),
-        connected.write.into_async_write(),
-    );
-    // The supervisor owns the session drivers; the connection must survive
-    // the whole body, so poll it from a required scope task.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
-
-    // Open the ping stream and the bulk stream on the same mux connection.
-    let (mut ping_read, mut ping_write) = opener.open().await.unwrap();
-    let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
-
-    // Parked until the streams close; the owning JoinSet aborts them at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = ping_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = bulk_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-
-    // Bulk payload: 64 MiB cyclic buffer, enough to keep any cap busy.
-    let payload = Arc::new(support::payload::cyclic_payload(64 * 1024 * 1024));
-
-    // Start queue-length sampler on the LOADED pair.
-    let stop_sampler = Arc::new(AtomicBool::new(false));
-    let stop_sampler_for_task = Arc::clone(&stop_sampler);
-    let sampler_pair = Arc::clone(&pair);
-    let mut sampler_tasks = tokio::task::JoinSet::new();
-    sampler_tasks.spawn(async move {
-        let mut samples = Vec::new();
-        let start = Instant::now();
-        while !stop_sampler_for_task.load(Ordering::Relaxed) {
-            tokio::time::sleep(QUEUE_SAMPLE_INTERVAL).await;
-            samples.push(sampler_pair.queue_len_c2s());
-            if start.elapsed() >= straggler + Duration::from_secs(2) {
-                break;
-            }
-        }
-        // Don't stop the pair — the caller does it.
-        samples
-    });
-
-    // Run bulk and ping concurrently. Ping runs for the full window;
-    // bulk sleeps BULK_RAMP (1.5s) so the ping has a solo baseline
-    // before congestion builds.
-    let result = tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
         .run(async {
+            // The whole scenario — server startup, connection setup,
+            // measurement, teardown — runs inside the actively-reaped body.
+            let (server_addr, mut latencies, bulk_counter) =
+                spawn_mux_latency_bulk_server_via(&task_tx, fec, base)
+                    .await
+                    .unwrap();
+            let pair = Arc::new(NetemPair::spawn(server_addr, c2s, s2c).unwrap());
+
+            let (connected_read, connected_write) =
+                rtp_connect_with_mss_via(&task_tx, pair.client_addr(), fec, rtp::udp::NO_FEC_MSS)
+                    .await;
+            let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+
+            // Open the ping stream and the bulk stream on the same mux connection.
+            let (mut ping_read, mut ping_write) = opener.open().await.unwrap();
+            let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
+
+            // Parked until the streams close; the owning JoinSet aborts them at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = ping_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = bulk_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
+            // Bulk payload: 64 MiB cyclic buffer, enough to keep any cap busy.
+            let payload = Arc::new(support::payload::cyclic_payload(64 * 1024 * 1024));
+
+            // Start queue-length sampler on the LOADED pair.
+            let stop_sampler = Arc::new(AtomicBool::new(false));
+            let stop_sampler_for_task = Arc::clone(&stop_sampler);
+            let sampler_pair = Arc::clone(&pair);
+            let mut sampler_tasks = tokio::task::JoinSet::new();
+            sampler_tasks.spawn(async move {
+                let mut samples = Vec::new();
+                let start = Instant::now();
+                while !stop_sampler_for_task.load(Ordering::Relaxed) {
+                    tokio::time::sleep(QUEUE_SAMPLE_INTERVAL).await;
+                    samples.push(sampler_pair.queue_len_c2s());
+                    if start.elapsed() >= straggler + Duration::from_secs(2) {
+                        break;
+                    }
+                }
+                // Don't stop the pair — the caller does it.
+                samples
+            });
+
+            // Run bulk and ping concurrently. Ping runs for the full window;
+            // bulk sleeps BULK_RAMP (1.5s) so the ping has a solo baseline
+            // before congestion builds.
             let ping_window = straggler + BULK_RAMP;
             let ping_fut =
                 send_tagged_pings(&mut ping_write, base, PING_BYTES, cadence, ping_window);
@@ -190,6 +177,7 @@ async fn contested_rep(
             }
 
             let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
+            pair.stop();
             ContestedRepResult {
                 sent,
                 received: samples.len() as u64,
@@ -199,10 +187,7 @@ async fn contested_rep(
                 bulk_secs: straggler.as_secs_f64(),
             }
         })
-        .await;
-
-    pair.stop();
-    result
+        .await
 }
 
 /// Send `b'L'`-tagged timestamped ping messages through a mux stream.

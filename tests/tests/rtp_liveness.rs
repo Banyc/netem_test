@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::mux::send_timestamped_messages;
-use support::rtp::spawn_rtp_msg_latency_sink;
+use support::rtp::{rtp_connect_with_mss_via, spawn_rtp_msg_latency_sink_via};
+use support::{submit_test_task, submit_test_task_required};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -74,144 +75,154 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let base = Instant::now();
-        let start = Instant::now();
         let mut tasks = support::TestScope::new();
-
-        let (server_addr, mut latency_rx) =
-            spawn_rtp_msg_latency_sink(&mut tasks, false, base).await.unwrap();
-
-        let c2s = NetemConfig {
-            max_datagram_size: MAX_DATAGRAM,
-            latency: OWD,
-            ..NetemConfig::default()
-        };
-        let s2c = NetemConfig {
-            latency: OWD,
-            ..NetemConfig::default()
-        };
-        let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
-        let connected = rtp::udp::connect_with(
-            "0.0.0.0:0",
-            &pair.client_addr().to_string(),
-            rtp::udp::ConnectConfig {
-                handshake: false,
-                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-                ..rtp::udp::ConnectConfig::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut read = connected.read.into_async_read();
-        let mut write = connected.write.into_async_write();
-        // The supervisor owns the session drivers; the connection must
-        // survive the whole body, so poll it from a required scope task.
-        tasks.spawn_required("rtp client session", async move {
-            let _ = connected.supervisor.await;
-        });
-
-        // Keep the read half alive so ACKs keep flowing; parked until the
-        // connection closes, so the owning JoinSet aborts it at scope end.
-        tasks.spawn(async move {
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = read.read(&mut buf).await;
-                match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        });
-
-        let sent = send_timestamped_messages(
-            &mut write,
-            base,
-            MSG_BYTES,
-            MSG_INTERVAL,
-            Duration::from_millis(500),
-        )
-        .await;
-        assert!(sent > 0, "initial handshake message must be delivered");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        let mut pre_hole_frames = 0u64;
-        while latency_rx.try_recv().is_ok() {
-            pre_hole_frames += 1;
-        }
-        assert!(
-            pre_hole_frames > 0,
-            "server must have received the initial handshake frame"
-        );
-
-        let hole_payload = support::payload::payload(1024);
-        let _ = write.write_all(&hole_payload).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let s2c_before = pair.stats_s2c().forwarded;
-        let c2s_before = pair.stats_c2s();
-
-        let (write_error, heartbeat_count, reverse_traffic) = tasks
+        let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+        let (
+            write_error,
+            heartbeat_count,
+            reverse_traffic,
+            termination_time,
+            c2s_after,
+            s2c_after,
+            elapsed,
+            pre_hole_frames,
+            s2c_before,
+            c2s_before,
+            mut latency_rx,
+        ) = tasks
             .run(async {
+                let base = Instant::now();
+                let start = Instant::now();
+
+                let (server_addr, mut latency_rx) =
+                    spawn_rtp_msg_latency_sink_via(&task_tx, false, base).await.unwrap();
+
+                let c2s = NetemConfig {
+                    max_datagram_size: MAX_DATAGRAM,
+                    latency: OWD,
+                    ..NetemConfig::default()
+                };
+                let s2c = NetemConfig {
+                    latency: OWD,
+                    ..NetemConfig::default()
+                };
+                let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+                let (mut read, mut write) = rtp_connect_with_mss_via(
+                    &task_tx,
+                    pair.client_addr(),
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                )
+                .await;
+
+                // Keep the read half alive so ACKs keep flowing; parked until the
+                // connection closes, so the owning JoinSet aborts it at scope end.
+                submit_test_task(&task_tx, Box::pin(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = read.read(&mut buf).await;
+                        match n {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }));
+
+                let sent = send_timestamped_messages(
+                    &mut write,
+                    base,
+                    MSG_BYTES,
+                    MSG_INTERVAL,
+                    Duration::from_millis(500),
+                )
+                .await;
+                assert!(sent > 0, "initial handshake message must be delivered");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                let mut pre_hole_frames = 0u64;
+                while latency_rx.try_recv().is_ok() {
+                    pre_hole_frames += 1;
+                }
+                assert!(
+                    pre_hole_frames > 0,
+                    "server must have received the initial handshake frame"
+                );
+
+                let hole_payload = support::payload::payload(1024);
+                let _ = write.write_all(&hole_payload).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                let s2c_before = pair.stats_s2c().forwarded;
+                let c2s_before = pair.stats_c2s();
+
                 let mut heartbeat_count = 0u64;
                 let mut write_error: Option<std::io::ErrorKind> = None;
                 let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
 
                 loop {
                     if start.elapsed() >= MAX_DURATION {
-                panic!(
-                    "Connection stayed alive >{:?} without cumulative progress; \
-                     delivered {} post-hole frames",
-                    MAX_DURATION, heartbeat_count,
-                );
-            }
+                        panic!(
+                            "Connection stayed alive >{:?} without cumulative progress; \
+                             delivered {} post-hole frames",
+                            MAX_DURATION, heartbeat_count,
+                        );
+                    }
 
-            reverse_traffic.observe(pair.stats_s2c().forwarded, Instant::now());
+                    reverse_traffic.observe(pair.stats_s2c().forwarded, Instant::now());
 
-            let mut buf = Vec::with_capacity(MSG_BYTES + 12);
-            buf.extend_from_slice(&((MSG_BYTES + 12) as u32).to_le_bytes());
-            buf.extend_from_slice(&support::payload::payload(MSG_BYTES));
-            buf.extend_from_slice(&base.elapsed().as_micros().to_le_bytes());
+                    let mut buf = Vec::with_capacity(MSG_BYTES + 12);
+                    buf.extend_from_slice(&((MSG_BYTES + 12) as u32).to_le_bytes());
+                    buf.extend_from_slice(&support::payload::payload(MSG_BYTES));
+                    buf.extend_from_slice(&base.elapsed().as_micros().to_le_bytes());
 
-            let res = tokio::time::timeout(Duration::from_secs(2), write.write_all(&buf)).await;
-            match res {
-                Ok(Ok(())) => {
-                    heartbeat_count += 1;
-                    tokio::time::sleep(MSG_INTERVAL).await;
-                }
-                Ok(Err(e)) => {
-                    write_error = Some(e.kind());
-                    eprintln!(
-                        "[rtp_liveness] write failed with {:?} after {} heartbeats",
-                        e.kind(),
-                        heartbeat_count,
-                    );
-                    break;
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[rtp_liveness] write timed out after {} heartbeats; \
-                         BrokenPipe did not fire within 2s",
-                        heartbeat_count,
-                    );
-                    break;
-                }
-            }
+                    let res =
+                        tokio::time::timeout(Duration::from_secs(2), write.write_all(&buf)).await;
+                    match res {
+                        Ok(Ok(())) => {
+                            heartbeat_count += 1;
+                            tokio::time::sleep(MSG_INTERVAL).await;
+                        }
+                        Ok(Err(e)) => {
+                            write_error = Some(e.kind());
+                            eprintln!(
+                                "[rtp_liveness] write failed with {:?} after {} heartbeats",
+                                e.kind(),
+                                heartbeat_count,
+                            );
+                            break;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[rtp_liveness] write timed out after {} heartbeats; \
+                                 BrokenPipe did not fire within 2s",
+                                heartbeat_count,
+                            );
+                            break;
+                        }
+                    }
                 }
 
-                (write_error, heartbeat_count, reverse_traffic)
+                let termination_time = Instant::now();
+                let c2s_after = pair.stats_c2s();
+                let s2c_after = pair.stats_s2c();
+                pair.stop();
+                let elapsed = start.elapsed();
+                (
+                    write_error,
+                    heartbeat_count,
+                    reverse_traffic,
+                    termination_time,
+                    c2s_after,
+                    s2c_after,
+                    elapsed,
+                    pre_hole_frames,
+                    s2c_before,
+                    c2s_before,
+                    latency_rx,
+                )
             })
             .await;
-
-        let termination_time = Instant::now();
-
-        let c2s_after = pair.stats_c2s();
-        let s2c_after = pair.stats_s2c();
-
-        pair.stop();
-
-        let elapsed = start.elapsed();
 
         let mut server_frames = 0u64;
         while latency_rx.try_recv().is_ok() {
@@ -290,149 +301,175 @@ fn rtp_permanent_hole_liveness_smoke() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let base = Instant::now();
-        let start = Instant::now();
         let mut tasks = support::TestScope::new();
-
-        let (server_addr, mut latency_rx) = spawn_rtp_msg_latency_sink(&mut tasks, false, base)
-            .await
-            .unwrap();
-
-        let c2s = NetemConfig {
-            max_datagram_size: MAX_DATAGRAM,
-            latency: OWD,
-            ..NetemConfig::default()
-        };
-        let s2c = NetemConfig {
-            latency: OWD,
-            ..NetemConfig::default()
-        };
-        let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
-        let watchdog_tuning = rtp::WatchdogTuning::new(
-            1,
-            Duration::from_millis(1500),
-            Duration::from_millis(1500),
-            Duration::from_secs(3),
-        );
-
-        let connected = rtp::udp::connect_with(
-            "0.0.0.0:0",
-            &pair.client_addr().to_string(),
-            rtp::udp::ConnectConfig {
-                handshake: false,
-                mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-                watchdog: Some(watchdog_tuning),
-                ..rtp::udp::ConnectConfig::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut read = connected.read.into_async_read();
-        let mut write = connected.write.into_async_write();
-        // The supervisor owns the session drivers; the connection must
-        // survive the whole body, so poll it from a required scope task.
-        tasks.spawn_required("rtp client session", async move {
-            let _ = connected.supervisor.await;
-        });
-
-        // Keep the read half alive so ACKs keep flowing; parked until the
-        // connection closes, so the owning JoinSet aborts it at scope end.
-        tasks.spawn(async move {
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = read.read(&mut buf).await;
-                match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        });
-
-        let sent = send_timestamped_messages(
-            &mut write,
-            base,
-            MSG_BYTES,
-            MSG_INTERVAL,
-            Duration::from_millis(500),
-        )
-        .await;
-        assert!(sent > 0, "initial handshake message must be delivered");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let mut pre_hole_frames = 0u64;
-        while latency_rx.try_recv().is_ok() {
-            pre_hole_frames += 1;
-        }
-        assert!(
-            pre_hole_frames > 0,
-            "server must have received the initial handshake frame"
-        );
-
-        let hole_payload = support::payload::payload(1024);
-        let _ = write.write_all(&hole_payload).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let s2c_before = pair.stats_s2c().forwarded;
-        let c2s_before = pair.stats_c2s();
-
-        let max_duration = Duration::from_secs(5);
-        let post_hole_interval = Duration::from_millis(100);
-        let msg = support::payload::payload(MSG_BYTES);
-
-        let (write_error, post_hole_writes) = tasks
+        let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+        let (
+            write_error,
+            post_hole_writes,
+            c2s_after,
+            s2c_after,
+            elapsed,
+            pre_hole_frames,
+            s2c_before,
+            c2s_before,
+            max_duration,
+            mut latency_rx,
+        ) = tasks
             .run(async {
+                let base = Instant::now();
+                let start = Instant::now();
+
+                let (server_addr, mut latency_rx) =
+                    spawn_rtp_msg_latency_sink_via(&task_tx, false, base).await.unwrap();
+
+                let c2s = NetemConfig {
+                    max_datagram_size: MAX_DATAGRAM,
+                    latency: OWD,
+                    ..NetemConfig::default()
+                };
+                let s2c = NetemConfig {
+                    latency: OWD,
+                    ..NetemConfig::default()
+                };
+                let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+                let watchdog_tuning = rtp::WatchdogTuning::new(
+                    1,
+                    Duration::from_millis(1500),
+                    Duration::from_millis(1500),
+                    Duration::from_secs(3),
+                );
+
+                // The watchdog tuning is part of the connect config, so the
+                // connection is opened inline (the `_via` connect helpers only
+                // accept the default config); the supervisor keepalive is
+                // submitted as REQUIRED through the handle, matching the
+                // original `spawn_required` registration.
+                let connected = rtp::udp::connect_with(
+                    "0.0.0.0:0",
+                    &pair.client_addr().to_string(),
+                    rtp::udp::ConnectConfig {
+                        handshake: false,
+                        mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                        watchdog: Some(watchdog_tuning),
+                        ..rtp::udp::ConnectConfig::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+                let mut read = connected.read.into_async_read();
+                let mut write = connected.write.into_async_write();
+                // The supervisor owns the session drivers; the connection must
+                // survive the whole body, so poll it from a required task
+                // submitted through the handle.
+                submit_test_task_required(&task_tx, "rtp client session", async move {
+                    let _ = connected.supervisor.await;
+                });
+
+                // Keep the read half alive so ACKs keep flowing; parked until the
+                // connection closes, so the owning JoinSet aborts it at scope end.
+                submit_test_task(&task_tx, Box::pin(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = read.read(&mut buf).await;
+                        match n {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }));
+
+                let sent = send_timestamped_messages(
+                    &mut write,
+                    base,
+                    MSG_BYTES,
+                    MSG_INTERVAL,
+                    Duration::from_millis(500),
+                )
+                .await;
+                assert!(sent > 0, "initial handshake message must be delivered");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                let mut pre_hole_frames = 0u64;
+                while latency_rx.try_recv().is_ok() {
+                    pre_hole_frames += 1;
+                }
+                assert!(
+                    pre_hole_frames > 0,
+                    "server must have received the initial handshake frame"
+                );
+
+                let hole_payload = support::payload::payload(1024);
+                let _ = write.write_all(&hole_payload).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let s2c_before = pair.stats_s2c().forwarded;
+                let c2s_before = pair.stats_c2s();
+
+                let max_duration = Duration::from_secs(5);
+                let post_hole_interval = Duration::from_millis(100);
+                let msg = support::payload::payload(MSG_BYTES);
+
                 let mut post_hole_writes = 0u64;
                 let mut write_error: Option<std::io::ErrorKind> = None;
                 let mut reverse_traffic = ReverseTrafficTracker::new(s2c_before, Instant::now());
 
                 loop {
                     if start.elapsed() >= max_duration {
-                panic!(
-                    "Connection stayed alive >{:?} without cumulative progress; \
-                 delivered {} post-hole writes",
-                    max_duration, post_hole_writes,
-                );
-            }
+                        panic!(
+                            "Connection stayed alive >{:?} without cumulative progress; \
+                             delivered {} post-hole writes",
+                            max_duration, post_hole_writes,
+                        );
+                    }
 
-            reverse_traffic.observe(pair.stats_s2c().forwarded, Instant::now());
+                    reverse_traffic.observe(pair.stats_s2c().forwarded, Instant::now());
 
-            let res = tokio::time::timeout(Duration::from_secs(2), write.write_all(&msg)).await;
-            match res {
-                Ok(Ok(())) => {
-                    post_hole_writes += 1;
-                    tokio::time::sleep(post_hole_interval).await;
-                }
-                Ok(Err(e)) => {
-                    write_error = Some(e.kind());
-                    eprintln!(
-                        "[rtp_liveness_smoke] write failed with {:?} after {} post-hole writes",
-                        e.kind(),
-                        post_hole_writes,
-                    );
-                    break;
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[rtp_liveness_smoke] write timed out after {} post-hole writes",
-                        post_hole_writes,
-                    );
-                    break;
-                }
-            }
+                    let res =
+                        tokio::time::timeout(Duration::from_secs(2), write.write_all(&msg)).await;
+                    match res {
+                        Ok(Ok(())) => {
+                            post_hole_writes += 1;
+                            tokio::time::sleep(post_hole_interval).await;
+                        }
+                        Ok(Err(e)) => {
+                            write_error = Some(e.kind());
+                            eprintln!(
+                                "[rtp_liveness_smoke] write failed with {:?} after {} post-hole writes",
+                                e.kind(),
+                                post_hole_writes,
+                            );
+                            break;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[rtp_liveness_smoke] write timed out after {} post-hole writes",
+                                post_hole_writes,
+                            );
+                            break;
+                        }
+                    }
                 }
 
-                (write_error, post_hole_writes)
+                let c2s_after = pair.stats_c2s();
+                let s2c_after = pair.stats_s2c();
+                pair.stop();
+                let elapsed = start.elapsed();
+                (
+                    write_error,
+                    post_hole_writes,
+                    c2s_after,
+                    s2c_after,
+                    elapsed,
+                    pre_hole_frames,
+                    s2c_before,
+                    c2s_before,
+                    max_duration,
+                    latency_rx,
+                )
             })
             .await;
-
-        let c2s_after = pair.stats_c2s();
-        let s2c_after = pair.stats_s2c();
-
-        pair.stop();
-
-        let elapsed = start.elapsed();
 
         let mut server_frames = 0u64;
         while latency_rx.try_recv().is_ok() {

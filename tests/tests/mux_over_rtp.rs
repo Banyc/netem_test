@@ -14,10 +14,12 @@
 use std::time::Duration;
 
 use netem_test::{NetemConfig, NetemPair};
-use support::mux::{mux_client_connect, mux_echo_round_trip, spawn_mux_over_rtp_echo_server};
+use support::mux::{
+    mux_client_connect_via, mux_echo_round_trip, spawn_mux_over_rtp_echo_server_via,
+};
 use support::payload::with_timeout;
 use support::presets::clean;
-use support::rtp::rtp_connect;
+use support::rtp::rtp_connect_via;
 use support::stats::combined_stats;
 
 mod support;
@@ -28,17 +30,18 @@ mod support;
 #[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_over_netem_clean_link_echoes() {
     let mut tasks = support::TestScope::new();
-    let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
-        .await
-        .unwrap();
-
-    let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-    let opener = mux_client_connect(&mut tasks, read, write);
-
-    let payload = b"mux-rtp-netem";
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let server_addr = spawn_mux_over_rtp_echo_server_via(&task_tx, false)
+                .await
+                .unwrap();
+
+            let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+            let opener = mux_client_connect_via(&task_tx, read, write);
+
+            let payload = b"mux-rtp-netem";
             let got = with_timeout(
                 Duration::from_secs(15),
                 "mux-over-rtp clean echo",
@@ -46,11 +49,11 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
             )
             .await;
             assert_eq!(got, payload);
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert_eq!(stats.dropped, 0, "clean link should not drop");
     assert!(stats.forwarded > 0, "proxy should forward packets");
 }
@@ -63,22 +66,23 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
 #[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_survives_netem_latency() {
     let mut tasks = support::TestScope::new();
-    let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
-        .await
-        .unwrap();
-
-    let impaired = NetemConfig {
-        latency: Duration::from_millis(20),
-        seed: 42,
-        ..NetemConfig::default()
-    };
-    let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-    let opener = mux_client_connect(&mut tasks, read, write);
-
-    let payload = b"mux-over-rtp-through-netem";
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let server_addr = spawn_mux_over_rtp_echo_server_via(&task_tx, false)
+                .await
+                .unwrap();
+
+            let impaired = NetemConfig {
+                latency: Duration::from_millis(20),
+                seed: 42,
+                ..NetemConfig::default()
+            };
+            let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+            let opener = mux_client_connect_via(&task_tx, read, write);
+
+            let payload = b"mux-over-rtp-through-netem";
             let got = with_timeout(
                 Duration::from_secs(15),
                 "mux-over-rtp latency echo",
@@ -86,10 +90,10 @@ async fn mux_over_rtp_survives_netem_latency() {
             )
             .await;
             assert_eq!(got, payload, "mux stream must deliver all data intact");
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert!(stats.forwarded > 0, "proxy should forward packets");
 }

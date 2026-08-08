@@ -21,10 +21,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::mux::{mux_client_connect, spawn_mux_over_rtp_server_with_mss};
+use support::mux::{mux_client_connect_via, spawn_mux_over_rtp_server_with_mss_via};
 use support::payload::{cyclic_payload, with_timeout};
 use support::presets::burst_loss_link;
-use support::rtp::{spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server};
+use support::rtp::{rtp_connect_with_mss_via, spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via};
+use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -42,12 +43,12 @@ const CHUNK: usize = 262_044;
 /// by the number of bytes read from each stream until `Ok(0)`/Err. There is
 /// no payload verification; all bytes are counted.
 async fn spawn_mux_bulk_sink(
-    tasks: &mut support::TestScope,
+    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_server = Arc::clone(&delivered);
-    let addr = spawn_mux_over_rtp_server_with_mss(
-        tasks,
+    let addr = spawn_mux_over_rtp_server_with_mss_via(
+        tx,
         false,
         rtp::udp::NO_FEC_MSS,
         move |mut stream_read, mut stream_write| {
@@ -75,50 +76,33 @@ async fn spawn_mux_bulk_sink(
 /// server-side sink.
 async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     let mut tasks = support::TestScope::new();
-    let (server_addr, delivered) = spawn_mux_bulk_sink(&mut tasks).await.unwrap();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &pair.client_addr().to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            fec: false,
-            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let opener = mux_client_connect(
-        &mut tasks,
-        connected.read.into_async_read(),
-        connected.write.into_async_write(),
-    );
-    // The supervisor owns the session drivers; the connection must survive
-    // the whole body, so poll it from a required scope task.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
-
-    let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
-
-    // Drain the stream read half in the background so flow-control ACKs keep
-    // moving and the writer does not stall. Parked for the bulk window; the
-    // owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = stream_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-
-    let payload = cyclic_payload(CHUNK);
-    let start = Instant::now();
-    let (elapsed, delivered_at_window) = tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let (elapsed, delivered_at_window, total) = tasks
         .run(async {
+            let (server_addr, delivered) = spawn_mux_bulk_sink(&task_tx).await.unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+            let (connected_read, connected_write) =
+                rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
+                    .await;
+            let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+
+            let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+
+            // Drain the stream read half in the background so flow-control ACKs keep
+            // moving and the writer does not stall. Parked for the bulk window; the
+            // owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = stream_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
+            let payload = cyclic_payload(CHUNK);
+            let start = Instant::now();
             let stop = Arc::new(AtomicBool::new(false));
             while !stop.load(Ordering::Relaxed) {
                 if start.elapsed() >= BULK_WINDOW {
@@ -133,19 +117,20 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
             let elapsed = start.elapsed();
             let delivered_at_window = delivered.load(Ordering::Relaxed);
             let _ = stream_write.shutdown();
-            (elapsed, delivered_at_window)
+
+            // End the client session so the server-side sink stops counting before
+            // the pair is stopped. The required drain task completes (unobserved)
+            // once the session ends, after the raced body returned; if the session
+            // has not ended yet, scope drop aborts it. That is outside the raced
+            // body, so it is not an early exit.
+            drop(opener);
+            pair.stop();
+
+            let total = delivered.load(Ordering::Relaxed);
+            (elapsed, delivered_at_window, total)
         })
         .await;
 
-    // End the client session so the server-side sink stops counting before
-    // the pair is stopped. The required drain task completes (unobserved)
-    // once the session ends, after the raced body returned; if the session
-    // has not ended yet, scope drop aborts it. That is outside the raced
-    // body, so it is not an early exit.
-    drop(opener);
-    pair.stop();
-
-    let total = delivered.load(Ordering::Relaxed);
     let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
     let mibps_window =
         delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
@@ -163,36 +148,40 @@ async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 /// delivered at the server-side sink.
 async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     let mut tasks = support::TestScope::new();
-    let (sink_addr, delivered) = spawn_rtp_byte_sink_server(&mut tasks, false).await.unwrap();
-    let pair = NetemPair::spawn(sink_addr, c2s, s2c).unwrap();
-
-    let mut writer = spawn_rtp_bulk_upload(&mut tasks, pair.client_addr(), false)
-        .await
-        .unwrap();
-    let payload = cyclic_payload(CHUNK);
-    let start = Instant::now();
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let (elapsed, delivered_at_window, total) = tasks
         .run(async {
+            let (sink_addr, delivered) =
+                spawn_rtp_byte_sink_server_via(&task_tx, false).await.unwrap();
+            let pair = NetemPair::spawn(sink_addr, c2s, s2c).unwrap();
+
+            let mut writer = spawn_rtp_bulk_upload_via(&task_tx, pair.client_addr(), false)
+                .await
+                .unwrap();
+            let payload = cyclic_payload(CHUNK);
+            let start = Instant::now();
             while start.elapsed() < BULK_WINDOW {
                 match writer.write_all(&payload[..CHUNK]).await {
                     Ok(()) => {}
                     Err(_) => break,
                 }
             }
+            let elapsed = start.elapsed();
+            let delivered_at_window = delivered.load(Ordering::Relaxed);
+
+            // Explicitly drop the writer so the server sees EOF and stops counting.
+            // The server task then completes; that happens outside the raced body
+            // (after the body's own teardown below), so it is not an early exit.
+            drop(writer);
+            // Give stragglers time to drain before stopping the proxy.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            pair.stop();
+
+            let total = delivered.load(Ordering::Relaxed);
+            (elapsed, delivered_at_window, total)
         })
         .await;
-    let elapsed = start.elapsed();
-    let delivered_at_window = delivered.load(Ordering::Relaxed);
 
-    // Explicitly drop the writer so the server sees EOF and stops counting.
-    // The server task then completes; that happens outside the raced body,
-    // so it is not an early exit.
-    drop(writer);
-    // Give stragglers time to drain before stopping the proxy.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    pair.stop();
-
-    let total = delivered.load(Ordering::Relaxed);
     let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
     let mibps_window =
         delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);

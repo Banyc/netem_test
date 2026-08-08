@@ -13,12 +13,10 @@ use support::fan::PerFlowNetem;
 use support::payload::{payload, with_timeout};
 use support::presets::clean;
 use support::stats::combined_stats;
-use support::{
-    LANE_EVENT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task, try_send_observation,
-};
+use support::{LANE_EVENT_CAPACITY, submit_test_task, try_send_observation};
 
-async fn spawn_echo_server(
-    tasks: &mut TestScope,
+async fn spawn_echo_server_via(
+    task_tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
 ) -> io::Result<(
     SocketAddr,
     SocketAddr,
@@ -31,9 +29,8 @@ async fn spawn_echo_server(
     // Session futures spawned by the SessionSpawner and the per-stream echo
     // tasks are submitted through a bounded channel feeding one test-owned
     // reaper, which selects between submissions and join_next() completions
-    // and unwraps every completion so panics surface immediately.
-    let task_tx = support::spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
-    tasks.spawn_required("rtp_mux echo server", {
+    // and unwraps every completion so panics surface.
+    support::submit_test_task_required(task_tx, "rtp_mux echo server", {
         let task_tx = task_tx.clone();
         async move {
             let spawner = rtp_mux::SessionSpawner::new({
@@ -66,7 +63,10 @@ async fn spawn_echo_server(
     Ok((interactive_addr, bulk_addr, lane_rx))
 }
 
-fn connector(tasks: &mut TestScope, bulk_proxy_addr: SocketAddr) -> RtpMuxConnector {
+fn connector_via(
+    task_tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    bulk_proxy_addr: SocketAddr,
+) -> RtpMuxConnector {
     let bind: BindSelector = Arc::new(|addr| match addr {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
         SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
@@ -81,7 +81,7 @@ fn connector(tasks: &mut TestScope, bulk_proxy_addr: SocketAddr) -> RtpMuxConnec
             ..ExplorerConfig::default()
         },
     });
-    tasks.spawn_required("rtp_mux connector driver", driver);
+    support::submit_test_task_required(task_tx, "rtp_mux connector driver", driver);
     connector
 }
 
@@ -108,15 +108,16 @@ async fn echo_round_trip(
 #[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams() {
     let mut tasks = support::TestScope::new();
-    let (interactive_server, bulk_server, mut accepted_lanes) =
-        spawn_echo_server(&mut tasks).await.unwrap();
-    let interactive_pair = NetemPair::spawn(interactive_server, clean(), clean()).unwrap();
-    let bulk_pair = NetemPair::spawn(bulk_server, clean(), clean()).unwrap();
-    let connector = connector(&mut tasks, bulk_pair.client_addr());
-    let interactive_payload = payload(64 * 1024);
-    let bulk_payload = payload(512 * 1024);
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (interactive_server, bulk_server, mut accepted_lanes) =
+                spawn_echo_server_via(&task_tx).await.unwrap();
+            let interactive_pair = NetemPair::spawn(interactive_server, clean(), clean()).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_server, clean(), clean()).unwrap();
+            let connector = connector_via(&task_tx, bulk_pair.client_addr());
+            let interactive_payload = payload(64 * 1024);
+            let bulk_payload = payload(512 * 1024);
             let (interactive_echo, bulk_echo) = with_timeout(
                 Duration::from_secs(30),
                 "rtp_mux clean dual-lane echo",
@@ -148,10 +149,10 @@ async fn rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams() {
             );
             assert!(combined_stats(&interactive_pair).forwarded > 0);
             assert!(combined_stats(&bulk_pair).forwarded > 0);
+            interactive_pair.stop();
+            bulk_pair.stop();
         })
         .await;
-    interactive_pair.stop();
-    bulk_pair.stop();
 }
 
 const DOWNLOAD_LEN: usize = 8 * 1024 * 1024;
@@ -159,7 +160,9 @@ const PING_LEN: usize = 8;
 const PING_INTERVAL: Duration = Duration::from_millis(40);
 const CMD_DOWNLOAD: u8 = b'D';
 const CMD_PING: u8 = b'P';
-async fn spawn_cmd_server(tasks: &mut TestScope) -> io::Result<(SocketAddr, SocketAddr)> {
+async fn spawn_cmd_server_via(
+    task_tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+) -> io::Result<(SocketAddr, SocketAddr)> {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
@@ -167,8 +170,7 @@ async fn spawn_cmd_server(tasks: &mut TestScope) -> io::Result<(SocketAddr, Sock
     // handler tasks are submitted through a bounded channel feeding one
     // test-owned reaper, which selects between submissions and join_next()
     // completions and unwraps every completion so panics surface.
-    let task_tx = support::spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
-    tasks.spawn_required("rtp_mux cmd server", {
+    support::submit_test_task_required(task_tx, "rtp_mux cmd server", {
         let task_tx = task_tx.clone();
         async move {
             let spawner = rtp_mux::SessionSpawner::new({
@@ -256,36 +258,37 @@ struct ResponseArm {
 }
 async fn run_response_arm() -> ResponseArm {
     let mut tasks = support::TestScope::new();
-    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
-    let interactive_pair =
-        NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
-    let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
-    let connector = connector(&mut tasks, bulk_pair.client_addr());
-    let mut ping = connector
-        .connect_stream(interactive_pair.client_addr())
-        .await
-        .unwrap();
-    ping.write_all(&[CMD_PING]).await.unwrap();
-    let mut download = connector
-        .connect_stream(interactive_pair.client_addr())
-        .await
-        .unwrap();
-    let mut download_tasks: tokio::task::JoinSet<(usize, f64)> = tokio::task::JoinSet::new();
-    download_tasks.spawn(async move {
-        let started = std::time::Instant::now();
-        download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut total = 0usize;
-        loop {
-            match download.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => total += n,
-            }
-        }
-        (total, started.elapsed().as_secs_f64())
-    });
-    let arm = tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
         .run(async {
+            let (interactive_server, bulk_server) = spawn_cmd_server_via(&task_tx).await.unwrap();
+            let interactive_pair =
+                NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
+            let connector = connector_via(&task_tx, bulk_pair.client_addr());
+            let mut ping = connector
+                .connect_stream(interactive_pair.client_addr())
+                .await
+                .unwrap();
+            ping.write_all(&[CMD_PING]).await.unwrap();
+            let mut download = connector
+                .connect_stream(interactive_pair.client_addr())
+                .await
+                .unwrap();
+            let mut download_tasks: tokio::task::JoinSet<(usize, f64)> = tokio::task::JoinSet::new();
+            download_tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut total = 0usize;
+                loop {
+                    match download.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => total += n,
+                    }
+                }
+                (total, started.elapsed().as_secs_f64())
+            });
             let mut rtts = Vec::new();
             let mut seq = 0u64;
             let mut buf = [0u8; PING_LEN];
@@ -305,6 +308,8 @@ async fn run_response_arm() -> ResponseArm {
             let (downloaded, download_secs) =
                 download.expect("download task never completed").unwrap();
             let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
+            interactive_pair.stop();
+            bulk_pair.stop();
             ResponseArm {
                 ping_rtts_ms: rtts,
                 downloaded,
@@ -312,45 +317,43 @@ async fn run_response_arm() -> ResponseArm {
                 bulk_lane_wire_pkts,
             }
         })
-        .await;
-    interactive_pair.stop();
-    bulk_pair.stop();
-    arm
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp_mux dual-lane scenario over NetemPair; slow end-to-end; run with --ignored --nocapture --test-threads=1"]
 async fn rtp_mux_survives_independent_impaired_lanes() {
     let mut tasks = support::TestScope::new();
-    let (interactive_server, bulk_server, _accepted_lanes) =
-        spawn_echo_server(&mut tasks).await.unwrap();
-    let interactive_impairment = NetemConfig {
-        latency: Duration::from_millis(15),
-        jitter: Duration::from_millis(3),
-        loss: u32::MAX / 100,
-        seed: 801,
-        ..NetemConfig::default()
-    };
-    let bulk_impairment = NetemConfig {
-        latency: Duration::from_millis(35),
-        jitter: Duration::from_millis(8),
-        loss: u32::MAX / 50,
-        seed: 802,
-        ..NetemConfig::default()
-    };
-    let interactive_pair = NetemPair::spawn(
-        interactive_server,
-        interactive_impairment.clone(),
-        interactive_impairment,
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn(bulk_server, bulk_impairment.clone(), bulk_impairment).unwrap();
-    let connector = connector(&mut tasks, bulk_pair.client_addr());
-    let interactive_payload = payload(16 * 1024);
-    let bulk_payload = payload(256 * 1024);
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (interactive_server, bulk_server, _accepted_lanes) =
+                spawn_echo_server_via(&task_tx).await.unwrap();
+            let interactive_impairment = NetemConfig {
+                latency: Duration::from_millis(15),
+                jitter: Duration::from_millis(3),
+                loss: u32::MAX / 100,
+                seed: 801,
+                ..NetemConfig::default()
+            };
+            let bulk_impairment = NetemConfig {
+                latency: Duration::from_millis(35),
+                jitter: Duration::from_millis(8),
+                loss: u32::MAX / 50,
+                seed: 802,
+                ..NetemConfig::default()
+            };
+            let interactive_pair = NetemPair::spawn(
+                interactive_server,
+                interactive_impairment.clone(),
+                interactive_impairment,
+            )
+            .unwrap();
+            let bulk_pair =
+                NetemPair::spawn(bulk_server, bulk_impairment.clone(), bulk_impairment).unwrap();
+            let connector = connector_via(&task_tx, bulk_pair.client_addr());
+            let interactive_payload = payload(16 * 1024);
+            let bulk_payload = payload(256 * 1024);
             let (interactive_echo, bulk_echo) = with_timeout(
                 Duration::from_secs(90),
                 "rtp_mux independently impaired lanes",
@@ -376,10 +379,10 @@ async fn rtp_mux_survives_independent_impaired_lanes() {
             assert_eq!(bulk_echo, bulk_payload);
             assert!(combined_stats(&interactive_pair).forwarded > 0);
             assert!(combined_stats(&bulk_pair).forwarded > 0);
+            interactive_pair.stop();
+            bulk_pair.stop();
         })
         .await;
-    interactive_pair.stop();
-    bulk_pair.stop();
 }
 
 const CMD_UPLOAD: u8 = b'U';
@@ -436,56 +439,57 @@ struct BidirArm {
 
 async fn run_bidir_arm() -> BidirArm {
     let mut tasks = support::TestScope::new();
-    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
-    let interactive_pair =
-        NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
-    let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
-    let connector = connector(&mut tasks, bulk_pair.client_addr());
-    let mut ping = connector
-        .connect_stream(interactive_pair.client_addr())
-        .await
-        .unwrap();
-    ping.write_all(&[CMD_PING]).await.unwrap();
-    let mut download = connector
-        .connect_stream(interactive_pair.client_addr())
-        .await
-        .unwrap();
-    let mut download_tasks: tokio::task::JoinSet<usize> = tokio::task::JoinSet::new();
-    download_tasks.spawn(async move {
-        download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut total = 0usize;
-        loop {
-            match download.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => total += n,
-            }
-        }
-        total
-    });
-    let mut upload = connector
-        .connect_stream(interactive_pair.client_addr())
-        .await
-        .unwrap();
-    let mut upload_tasks: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
-    upload_tasks.spawn(async move {
-        upload.write_all(&[CMD_UPLOAD]).await.unwrap();
-        let chunk = vec![0xC5u8; 64 * 1024];
-        let mut sent = 0usize;
-        while sent < UPLOAD_LEN {
-            if upload.write_all(&chunk).await.is_err() {
-                return false;
-            }
-            sent += chunk.len();
-        }
-        if upload.flush().await.is_err() {
-            return false;
-        }
-        let mut ack = [0u8; 1];
-        upload.read_exact(&mut ack).await.is_ok() && ack[0] == 1
-    });
-    let arm = tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
         .run(async {
+            let (interactive_server, bulk_server) = spawn_cmd_server_via(&task_tx).await.unwrap();
+            let interactive_pair =
+                NetemPair::spawn(interactive_server, contended_lane(), contended_lane()).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_server, contended_lane(), contended_lane()).unwrap();
+            let connector = connector_via(&task_tx, bulk_pair.client_addr());
+            let mut ping = connector
+                .connect_stream(interactive_pair.client_addr())
+                .await
+                .unwrap();
+            ping.write_all(&[CMD_PING]).await.unwrap();
+            let mut download = connector
+                .connect_stream(interactive_pair.client_addr())
+                .await
+                .unwrap();
+            let mut download_tasks: tokio::task::JoinSet<usize> = tokio::task::JoinSet::new();
+            download_tasks.spawn(async move {
+                download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut total = 0usize;
+                loop {
+                    match download.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => total += n,
+                    }
+                }
+                total
+            });
+            let mut upload = connector
+                .connect_stream(interactive_pair.client_addr())
+                .await
+                .unwrap();
+            let mut upload_tasks: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
+            upload_tasks.spawn(async move {
+                upload.write_all(&[CMD_UPLOAD]).await.unwrap();
+                let chunk = vec![0xC5u8; 64 * 1024];
+                let mut sent = 0usize;
+                while sent < UPLOAD_LEN {
+                    if upload.write_all(&chunk).await.is_err() {
+                        return false;
+                    }
+                    sent += chunk.len();
+                }
+                if upload.flush().await.is_err() {
+                    return false;
+                }
+                let mut ack = [0u8; 1];
+                upload.read_exact(&mut ack).await.is_ok() && ack[0] == 1
+            });
             let mut rtts = Vec::new();
             let mut seq = 0u64;
             let mut buf = [0u8; PING_LEN];
@@ -509,6 +513,8 @@ async fn run_bidir_arm() -> BidirArm {
             let downloaded = download.expect("download task never completed").unwrap();
             let uploaded_ok = upload.expect("upload task never completed").unwrap();
             let bulk_lane_wire_pkts = combined_stats(&bulk_pair).forwarded;
+            interactive_pair.stop();
+            bulk_pair.stop();
             BidirArm {
                 ping_rtts_ms: rtts,
                 downloaded,
@@ -516,10 +522,7 @@ async fn run_bidir_arm() -> BidirArm {
                 bulk_lane_wire_pkts,
             }
         })
-        .await;
-    interactive_pair.stop();
-    bulk_pair.stop();
-    arm
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -574,42 +577,45 @@ struct RecycleArm {
 
 async fn run_recycle_arm() -> RecycleArm {
     let mut tasks = support::TestScope::new();
-    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
-    let interactive_fan =
-        PerFlowNetem::spawn(interactive_server, || (contended_lane(), contended_lane())).unwrap();
-    let bulk_fan =
-        PerFlowNetem::spawn(bulk_server, || (contended_lane(), contended_lane())).unwrap();
-    let connector = connector(&mut tasks, bulk_fan.client_addr());
-    let addr = interactive_fan.client_addr();
-    let mut ping = connector.connect_stream(addr).await.unwrap();
-    ping.write_all(&[CMD_PING]).await.unwrap();
-    let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut download = connector.connect_stream(addr).await.unwrap();
-    let mut download_tasks: tokio::task::JoinSet<(usize, bool, f64)> = tokio::task::JoinSet::new();
-    download_tasks.spawn({
-        let gauge = Arc::clone(&downloaded_gauge);
-        async move {
-            let started = std::time::Instant::now();
-            download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut total = 0usize;
-            let mut clean = true;
-            loop {
-                match download.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        clean &= buf[..n].iter().all(|b| *b == 0xCD);
-                        total += n;
-                        gauge.store(total, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-            (total, clean, started.elapsed().as_secs_f64())
-        }
-    });
-    let old_probe = connector.probe_session(addr).expect("session must exist");
-    let arm = tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
         .run(async {
+            let (interactive_server, bulk_server) = spawn_cmd_server_via(&task_tx).await.unwrap();
+            let interactive_fan =
+                PerFlowNetem::spawn(interactive_server, || (contended_lane(), contended_lane()))
+                    .unwrap();
+            let bulk_fan =
+                PerFlowNetem::spawn(bulk_server, || (contended_lane(), contended_lane())).unwrap();
+            let connector = connector_via(&task_tx, bulk_fan.client_addr());
+            let addr = interactive_fan.client_addr();
+            let mut ping = connector.connect_stream(addr).await.unwrap();
+            ping.write_all(&[CMD_PING]).await.unwrap();
+            let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut download = connector.connect_stream(addr).await.unwrap();
+            let mut download_tasks: tokio::task::JoinSet<(usize, bool, f64)> =
+                tokio::task::JoinSet::new();
+            download_tasks.spawn({
+                let gauge = Arc::clone(&downloaded_gauge);
+                async move {
+                    let started = std::time::Instant::now();
+                    download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut total = 0usize;
+                    let mut clean = true;
+                    loop {
+                        match download.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                clean &= buf[..n].iter().all(|b| *b == 0xCD);
+                                total += n;
+                                gauge.store(total, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    (total, clean, started.elapsed().as_secs_f64())
+                }
+            });
+            let old_probe = connector.probe_session(addr).expect("session must exist");
             let mut rtts = Vec::new();
             let mut seq = 0u64;
             let mut buf = [0u8; PING_LEN];
@@ -646,6 +652,8 @@ async fn run_recycle_arm() -> RecycleArm {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            interactive_fan.stop();
+            bulk_fan.stop();
             RecycleArm {
                 ping_rtts_ms: rtts,
                 downloaded,
@@ -655,10 +663,7 @@ async fn run_recycle_arm() -> RecycleArm {
                 session_replaced,
             }
         })
-        .await;
-    interactive_fan.stop();
-    bulk_fan.stop();
-    arm
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -739,76 +744,78 @@ struct ExplorerArm {
 
 async fn run_explorer_arm() -> ExplorerArm {
     let mut tasks = support::TestScope::new();
-    let (interactive_server, bulk_server) = spawn_cmd_server(&mut tasks).await.unwrap();
-    let interactive_flows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let interactive_fan = PerFlowNetem::spawn(interactive_server, {
-        let flows = Arc::clone(&interactive_flows);
-        move || {
-            let index = flows.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let seed = 900 + index as u64;
-            if index == 1 {
-                (explorer_fast_lane(seed), explorer_fast_lane(seed))
-            } else {
-                (explorer_slow_lane(seed), explorer_slow_lane(seed))
-            }
-        }
-    })
-    .unwrap();
-    let bulk_fan = PerFlowNetem::spawn(bulk_server, || {
-        (explorer_slow_lane(950), explorer_slow_lane(951))
-    })
-    .unwrap();
-    let bind: BindSelector = Arc::new(|addr| match addr {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-        SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-    });
-    let bulk_proxy_addr = bulk_fan.client_addr();
-    let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
-    let connector = {
-        let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
-            bind,
-            bulk_addr,
-            fec: false,
-            explorer: ExplorerConfig {
-                enabled: true,
-                probe_mean_interval: Duration::from_millis(250),
-                rotation_period: Duration::from_secs(60),
-                ..ExplorerConfig::default()
-            },
-        });
-        tasks.spawn_required("rtp_mux connector driver", driver);
-        connector
-    };
-    let addr = interactive_fan.client_addr();
-    let mut ping = connector.connect_stream(addr).await.unwrap();
-    ping.write_all(&[CMD_PING]).await.unwrap();
-    let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut download = connector.connect_stream(addr).await.unwrap();
-    let mut download_tasks: tokio::task::JoinSet<(usize, bool, f64)> = tokio::task::JoinSet::new();
-    download_tasks.spawn({
-        let gauge = Arc::clone(&downloaded_gauge);
-        async move {
-            let started = std::time::Instant::now();
-            download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut total = 0usize;
-            let mut clean = true;
-            loop {
-                match download.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        clean &= buf[..n].iter().all(|b| *b == 0xCD);
-                        total += n;
-                        gauge.store(total, std::sync::atomic::Ordering::Relaxed);
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
+        .run(async {
+            let (interactive_server, bulk_server) = spawn_cmd_server_via(&task_tx).await.unwrap();
+            let interactive_flows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let interactive_fan = PerFlowNetem::spawn(interactive_server, {
+                let flows = Arc::clone(&interactive_flows);
+                move || {
+                    let index = flows.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let seed = 900 + index as u64;
+                    if index == 1 {
+                        (explorer_fast_lane(seed), explorer_fast_lane(seed))
+                    } else {
+                        (explorer_slow_lane(seed), explorer_slow_lane(seed))
                     }
                 }
-            }
-            (total, clean, started.elapsed().as_secs_f64())
-        }
-    });
-    let old_probe = connector.probe_session(addr).expect("session must exist");
-    let arm = tasks
-        .run(async {
+            })
+            .unwrap();
+            let bulk_fan = PerFlowNetem::spawn(bulk_server, || {
+                (explorer_slow_lane(950), explorer_slow_lane(951))
+            })
+            .unwrap();
+            let bind: BindSelector = Arc::new(|addr| match addr {
+                SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+                SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+            });
+            let bulk_proxy_addr = bulk_fan.client_addr();
+            let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
+            let connector = {
+                let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
+                    bind,
+                    bulk_addr,
+                    fec: false,
+                    explorer: ExplorerConfig {
+                        enabled: true,
+                        probe_mean_interval: Duration::from_millis(250),
+                        rotation_period: Duration::from_secs(60),
+                        ..ExplorerConfig::default()
+                    },
+                });
+                support::submit_test_task_required(&task_tx, "rtp_mux connector driver", driver);
+                connector
+            };
+            let addr = interactive_fan.client_addr();
+            let mut ping = connector.connect_stream(addr).await.unwrap();
+            ping.write_all(&[CMD_PING]).await.unwrap();
+            let downloaded_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut download = connector.connect_stream(addr).await.unwrap();
+            let mut download_tasks: tokio::task::JoinSet<(usize, bool, f64)> =
+                tokio::task::JoinSet::new();
+            download_tasks.spawn({
+                let gauge = Arc::clone(&downloaded_gauge);
+                async move {
+                    let started = std::time::Instant::now();
+                    download.write_all(&[CMD_DOWNLOAD]).await.unwrap();
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut total = 0usize;
+                    let mut clean = true;
+                    loop {
+                        match download.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                clean &= buf[..n].iter().all(|b| *b == 0xCD);
+                                total += n;
+                                gauge.store(total, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    (total, clean, started.elapsed().as_secs_f64())
+                }
+            });
+            let old_probe = connector.probe_session(addr).expect("session must exist");
             let mut pre_rtts = Vec::new();
             let mut post_rtts = Vec::new();
             let mut seq = 0u64;
@@ -864,6 +871,8 @@ async fn run_explorer_arm() -> ExplorerArm {
             let noop_survived = connector
                 .probe_session(addr)
                 .is_some_and(|probe| probe.id() == migrated_probe.id());
+            interactive_fan.stop();
+            bulk_fan.stop();
             ExplorerArm {
                 pre_rtts_ms: pre_rtts,
                 post_rtts_ms: post_rtts,
@@ -876,10 +885,7 @@ async fn run_explorer_arm() -> ExplorerArm {
                 noop_survived,
             }
         })
-        .await;
-    interactive_fan.stop();
-    bulk_fan.stop();
-    arm
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]

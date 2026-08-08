@@ -12,11 +12,17 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
-use support::mux::{mux_client_connect, send_timestamped_messages, spawn_mux_msg_latency_sink};
+use support::mux::{
+    mux_client_connect_via, send_timestamped_messages, spawn_mux_msg_latency_sink_via,
+};
 use support::payload::{cyclic_payload, with_timeout};
 use support::presets::{burst_loss_link, random_loss_link};
-use support::rtp::{spawn_rtp_bulk_upload_with_mss, spawn_rtp_byte_sink_server_with_mss};
+use support::rtp::{
+    rtp_connect_with_mss_via, spawn_rtp_bulk_upload_with_mss_via,
+    spawn_rtp_byte_sink_server_with_mss_via,
+};
 use support::stats::{percentile, print_perf};
+use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -182,34 +188,37 @@ async fn run_rtp_sink_upload(
     window: Duration,
 ) -> (NetemPair, u64) {
     let mut tasks = support::TestScope::new();
-    let (server_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(&mut tasks, false, MSS)
-        .await
-        .unwrap();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let mut writer = spawn_rtp_bulk_upload_with_mss(&mut tasks, pair.client_addr(), false, MSS)
-        .await
-        .unwrap();
-
-    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-    let mut pump_tasks = tokio::task::JoinSet::new();
-    pump_tasks.spawn(async move {
-        let mut offset = 0usize;
-        let start = Instant::now();
-        while start.elapsed() < window {
-            tokio::select! {
-                _ = stop_rx.changed() => break,
-                result = writer.write(&data[offset..]) => match result {
-                    Ok(0) => break,
-                    Ok(n) => offset = (offset + n) % data.len(),
-                    Err(_) => break,
-                },
-            }
-        }
-    });
-
-    let d = tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
         .run(async {
-            tokio::select! {
+            let (server_addr, delivered) =
+                spawn_rtp_byte_sink_server_with_mss_via(&task_tx, false, MSS)
+                    .await
+                    .unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+            let mut writer =
+                spawn_rtp_bulk_upload_with_mss_via(&task_tx, pair.client_addr(), false, MSS)
+                    .await
+                    .unwrap();
+
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let mut pump_tasks = tokio::task::JoinSet::new();
+            pump_tasks.spawn(async move {
+                let mut offset = 0usize;
+                let start = Instant::now();
+                while start.elapsed() < window {
+                    tokio::select! {
+                        _ = stop_rx.changed() => break,
+                        result = writer.write(&data[offset..]) => match result {
+                            Ok(0) => break,
+                            Ok(n) => offset = (offset + n) % data.len(),
+                            Err(_) => break,
+                        },
+                    }
+                }
+            });
+
+            let d = tokio::select! {
                 joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
                     // The pump ended before the measurement window completed:
                     // fail the test instead of measuring against a dead upload.
@@ -225,10 +234,10 @@ async fn run_rtp_sink_upload(
                     }
                     d
                 }
-            }
+            };
+            (pair, d)
         })
-        .await;
-    (pair, d)
+        .await
 }
 
 /// Sparse timestamped messages through a burst-loss link must deliver most
@@ -248,54 +257,37 @@ async fn run_rtp_sink_upload(
 async fn rtp_sparse_message_tail_latency_under_burst_loss() {
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (server_addr, mut latencies) = spawn_mux_msg_latency_sink(&mut tasks, false, base)
-        .await
-        .unwrap();
-    let pair = NetemPair::spawn(
-        server_addr,
-        burst_loss_link(5.0, 3.0, OWD, 11),
-        burst_loss_link(5.0, 3.0, OWD, 22),
-    )
-    .unwrap();
-
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &pair.client_addr().to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            mss: rtp::udp::MssConfig::Custom(MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let opener = mux_client_connect(
-        &mut tasks,
-        connected.read.into_async_read(),
-        connected.write.into_async_write(),
-    );
-    // The supervisor owns the session drivers; the connection must survive
-    // the whole body, so poll it from a required scope task.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
-    let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
-
-    // Keep the stream read half alive for the duration of the test so the mux
-    // connection is not closed while we are only sending pings. Parked until
-    // the connection closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match stream_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     let (sent, mut samples) = tasks
         .run(async {
+            let (server_addr, mut latencies) = spawn_mux_msg_latency_sink_via(&task_tx, false, base)
+                .await
+                .unwrap();
+            let pair = NetemPair::spawn(
+                server_addr,
+                burst_loss_link(5.0, 3.0, OWD, 11),
+                burst_loss_link(5.0, 3.0, OWD, 22),
+            )
+            .unwrap();
+
+            let (connected_read, connected_write) =
+                rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, MSS).await;
+            let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+            let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+
+            // Keep the stream read half alive for the duration of the test so the mux
+            // connection is not closed while we are only sending pings. Parked until
+            // the connection closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                loop {
+                    match stream_read.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }));
+
             let sent = with_timeout(
                 Duration::from_secs(80),
                 "send sparse timestamped messages",
@@ -316,10 +308,10 @@ async fn rtp_sparse_message_tail_latency_under_burst_loss() {
             while let Ok(latency_ms) = latencies.try_recv() {
                 samples.push(latency_ms);
             }
+            pair.stop();
             (sent, samples)
         })
         .await;
-    pair.stop();
 
     let received = samples.len() as u64;
     let delivery_pct = received as f64 / sent.max(1) as f64;

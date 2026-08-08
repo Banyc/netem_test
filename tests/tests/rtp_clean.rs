@@ -15,7 +15,7 @@ use std::time::Duration;
 use netem_test::NetemPair;
 use support::payload::{payload, with_timeout};
 use support::presets::{clean, latency};
-use support::rtp::{rtp_connect, rtp_echo_payload, spawn_rtp_echo_server};
+use support::rtp::{rtp_connect_via, rtp_echo_payload, spawn_rtp_echo_server_via};
 use support::stats::combined_stats;
 
 mod support;
@@ -25,14 +25,15 @@ mod support;
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_data() {
     let mut tasks = support::TestScope::new();
-    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
-
-    let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-
-    let payload = b"netem-rtp-integration";
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let server_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
+
+            let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+
+            let payload = b"netem-rtp-integration";
             let got = with_timeout(
                 Duration::from_secs(10),
                 "rtp clean small echo",
@@ -40,11 +41,11 @@ async fn rtp_over_netem_clean_link_delivers_data() {
             )
             .await;
             assert_eq!(got, payload);
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert_eq!(stats.dropped, 0, "clean link should not drop");
     assert!(stats.forwarded > 0, "proxy should forward packets");
 }
@@ -55,14 +56,15 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_400kib() {
     let mut tasks = support::TestScope::new();
-    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
-
-    let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-
-    let payload = payload(400 * 1024);
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let server_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
+
+            let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+
+            let payload = payload(400 * 1024);
             let got = with_timeout(
                 Duration::from_secs(30),
                 "rtp clean 400KiB echo",
@@ -70,11 +72,11 @@ async fn rtp_over_netem_clean_link_delivers_400kib() {
             )
             .await;
             assert_eq!(got, payload, "clean 400KiB delivery must be byte-exact");
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     assert_eq!(
         stats.dropped, 0,
         "clean link should not drop, got {stats:?}"
@@ -89,14 +91,15 @@ async fn rtp_over_netem_clean_link_delivers_400kib() {
 #[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_latency_is_observable() {
     let mut tasks = support::TestScope::new();
-    let server_addr = spawn_rtp_echo_server(&mut tasks, false).await.unwrap();
-
-    let latency_ms = 60;
-    let pair = NetemPair::spawn(server_addr, latency(latency_ms), latency(latency_ms)).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let server_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
+
+            let latency_ms = 60;
+            let pair = NetemPair::spawn(server_addr, latency(latency_ms), latency(latency_ms)).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+
             let start = std::time::Instant::now();
             let got = with_timeout(
                 Duration::from_secs(10),
@@ -111,8 +114,7 @@ async fn rtp_over_netem_latency_is_observable() {
                 "round trip {elapsed:?} should be >= one-way latency {}ms",
                 latency_ms,
             );
+            pair.stop();
         })
         .await;
-
-    pair.stop();
 }

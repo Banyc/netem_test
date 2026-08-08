@@ -16,9 +16,11 @@ use netem_test::{NetemConfig, NetemPair};
 use support::mux::send_timestamped_messages;
 use support::payload::{cyclic_payload, with_timeout};
 use support::rtp::{
-    spawn_rtp_bulk_upload_with_mss, spawn_rtp_byte_sink_server_with_mss, spawn_rtp_msg_latency_sink,
+    rtp_connect_with_mss_via, spawn_rtp_bulk_upload_with_mss_via,
+    spawn_rtp_byte_sink_server_with_mss_via, spawn_rtp_msg_latency_sink_via,
 };
 use support::stats::{combined_stats, percentile, print_perf};
+use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -62,73 +64,65 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
 
     let base = Instant::now();
     let mut server_tasks = support::TestScope::new();
-    let (sink_addr, delivered) = spawn_rtp_byte_sink_server_with_mss(&mut server_tasks, false, MSS)
-        .await
-        .unwrap();
-    let (latency_addr, mut latencies) = spawn_rtp_msg_latency_sink(&mut server_tasks, false, base)
-        .await
-        .unwrap();
-
-    let pair = NetemPair::spawn(sink_addr, bufferbloat_link(4), bufferbloat_link(5)).unwrap();
-
-    // Bulk upload sender. Write a repeating deterministic stream large enough
-    // that the measurement window is receive-limited, not send-limited.
-    let mut writer =
-        spawn_rtp_bulk_upload_with_mss(&mut server_tasks, pair.client_addr(), false, MSS)
-            .await
-            .unwrap();
-    let bulk_start = Instant::now();
-    let data = cyclic_payload(64 * 1024 * 1024);
-    let (pump_stop_tx, mut pump_stop_rx) = tokio::sync::watch::channel(false);
-    let mut pump_tasks = tokio::task::JoinSet::new();
-    pump_tasks.spawn(async move {
-        let mut offset = 0usize;
-        loop {
-            tokio::select! {
-                _ = pump_stop_rx.changed() => break,
-                result = writer.write(&data[offset..]) => match result {
-                    Ok(0) => break,
-                    Ok(n) => offset = (offset + n) % data.len(),
-                    Err(_) => break,
-                },
-            }
-        }
-    });
-
-    // Sparse latency sender on a separate connection through the same pair.
-    let latency_pair =
-        NetemPair::spawn(latency_addr, bufferbloat_link(4), bufferbloat_link(5)).unwrap();
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &latency_pair.client_addr().to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            mss: rtp::udp::MssConfig::Custom(MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let mut write = connected.write.into_async_write();
-    let mut read = connected.read.into_async_read();
-    // The supervisor owns the session drivers; the connection must survive
-    // the whole body, so poll it from a required scope task.
-    server_tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
-    // Keep the read half alive so ACKs keep moving; parked until the
-    // connection closes, so the owning JoinSet aborts it at scope end.
-    server_tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
+    let task_tx = server_tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
 
     server_tasks
         .run(async {
+            let (sink_addr, delivered) =
+                spawn_rtp_byte_sink_server_with_mss_via(&task_tx, false, MSS)
+                    .await
+                    .unwrap();
+            let (latency_addr, mut latencies) =
+                spawn_rtp_msg_latency_sink_via(&task_tx, false, base).await.unwrap();
+
+            let pair =
+                NetemPair::spawn(sink_addr, bufferbloat_link(4), bufferbloat_link(5)).unwrap();
+
+            // Bulk upload sender. Write a repeating deterministic stream large enough
+            // that the measurement window is receive-limited, not send-limited.
+            let mut writer =
+                spawn_rtp_bulk_upload_with_mss_via(&task_tx, pair.client_addr(), false, MSS)
+                    .await
+                    .unwrap();
+            let bulk_start = Instant::now();
+            let data = cyclic_payload(64 * 1024 * 1024);
+            let (pump_stop_tx, mut pump_stop_rx) = tokio::sync::watch::channel(false);
+            let mut pump_tasks = tokio::task::JoinSet::new();
+            pump_tasks.spawn(async move {
+                let mut offset = 0usize;
+                loop {
+                    tokio::select! {
+                        _ = pump_stop_rx.changed() => break,
+                        result = writer.write(&data[offset..]) => match result {
+                            Ok(0) => break,
+                            Ok(n) => offset = (offset + n) % data.len(),
+                            Err(_) => break,
+                        },
+                    }
+                }
+            });
+
+            // Sparse latency sender on a separate connection through the same pair.
+            let latency_pair =
+                NetemPair::spawn(latency_addr, bufferbloat_link(4), bufferbloat_link(5)).unwrap();
+            let (mut read, mut write) = rtp_connect_with_mss_via(
+                &task_tx,
+                latency_pair.client_addr(),
+                false,
+                MSS,
+            )
+            .await;
+            // Keep the read half alive so ACKs keep moving; parked until the
+            // connection closes, so the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
             // Race the bulk pump against the measurement (sparse pings plus
             // queue sampling): a premature pump completion fails the test
             // instead of measuring against a dead upload. The pump runs
@@ -192,7 +186,8 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
                 "max c2s queue {max_queue} > {MAX_QUEUE_FLOOR}"
             );
 
-            let goodput_mib_s = delivered_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+            let goodput_mib_s =
+                delivered_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
             assert!(
                 goodput_mib_s >= floor_mib_s,
                 "goodput {goodput_mib_s:.3} MiB/s < floor {floor_mib_s:.3} MiB/s"

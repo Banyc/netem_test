@@ -23,16 +23,19 @@ use mux::{DeliveryMode, DualMessageSender, LaneClass, MigratingStreamWriter};
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::contested::{DynTrafficResult, dyn_run_secs, summarize};
 use support::dual::{
-    dual_mux_client_connect, spawn_dual_msg_channel_server,
-    spawn_dual_mux_gaming_latency_bulk_server, spawn_dual_mux_latency_bulk_server,
-    spawn_dual_mux_migrating_latency_bulk_server,
+    dual_mux_client_connect_via, spawn_dual_msg_channel_server_via,
+    spawn_dual_mux_gaming_latency_bulk_server_via, spawn_dual_mux_latency_bulk_server_via,
+    spawn_dual_mux_migrating_latency_bulk_server_via,
 };
 use support::mux::{
-    mux_client_connect, spawn_mux_gaming_latency_bulk_server, spawn_mux_latency_bulk_server,
+    mux_client_connect_via, spawn_mux_gaming_latency_bulk_server_via,
+    spawn_mux_latency_bulk_server_via,
 };
 use support::payload::{cyclic_payload, with_timeout};
 use support::prng::SplitMix64;
+use support::rtp::rtp_connect_with_mss_via;
 use support::stats::percentile;
+use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -164,84 +167,77 @@ async fn dyn_single_mux_rep(seed_base: u64, run_secs: u64) -> DynTrafficResult {
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_mux_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &pair.client_addr().to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            fec: false,
-            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let opener = mux_client_connect(
-        &mut tasks,
-        connected.read.into_async_read(),
-        connected.write.into_async_write(),
-    );
-    // Hold the rtp session owner for the connection's lifetime; the session
-    // must survive the whole body, so poll it from a required scope task.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
-
-    let (mut _lat_read, mut lat_write) = opener.open().await.unwrap();
-    let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
-
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = _lat_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let _ = bulk_write.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = bulk_write.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = bulk_write.shutdown();
-        });
-    }
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = bulk_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_mux_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+
+            let (connected_read, connected_write) = rtp_connect_with_mss_via(
+                &task_tx,
+                pair.client_addr(),
+                false,
+                rtp::udp::NO_FEC_MSS,
+            )
+            .await;
+            let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+
+            let (mut _lat_read, mut lat_write) = opener.open().await.unwrap();
+            let (mut bulk_read, mut bulk_write) = opener.open().await.unwrap();
+
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = _lat_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let _ = bulk_write.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = bulk_write.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = bulk_write.shutdown();
+                });
+            }
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = bulk_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
             let body = async {
                 let (small, burst, sent) =
                     run_latency_flow(base, seed_base, run_for, &mut lat_write, &mut lat_rx, false)
@@ -305,60 +301,67 @@ async fn dyn_dual_auto_small_first_rep(seed_base: u64, run_secs: u64) -> DynTraf
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let _ = w.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = w.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = w.shutdown();
-        });
-    }
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_dual_mux_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let _ = w.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = w.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
             let body = async {
                 tokio::time::sleep(BULK_RAMP).await;
 
@@ -432,60 +435,67 @@ async fn dyn_dual_auto_big_first_rep(seed_base: u64, run_secs: u64) -> DynTraffi
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let _ = w.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = w.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = w.shutdown();
-        });
-    }
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_dual_mux_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let _ = w.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = w.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
             let body = async {
                 tokio::time::sleep(BULK_RAMP).await;
 
@@ -590,62 +600,69 @@ async fn dyn_dual_auto_per_message_rep(seed_base: u64, run_secs: u64) -> DynTraf
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let _ = w.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = w.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = w.shutdown();
-        });
-    }
-
-    tokio::time::sleep(BULK_RAMP).await;
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_dual_mux_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let _ = w.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = w.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
+            tokio::time::sleep(BULK_RAMP).await;
+
             let body = async {
                 let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
                 let mut small_latencies = Vec::new();
@@ -743,62 +760,69 @@ async fn dyn_dual_hint_static_rep(seed_base: u64, run_secs: u64) -> DynTrafficRe
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let _ = w.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = w.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = w.shutdown();
-        });
-    }
-
-    tokio::time::sleep(BULK_RAMP).await;
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_dual_mux_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let _ = w.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = w.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
+            tokio::time::sleep(BULK_RAMP).await;
+
             let body = async {
                 let (int_reader, mut int_writer) = opener
                     .open(LaneClass::Interactive)
@@ -914,61 +938,68 @@ async fn dyn_dual_msg_channel_rep(
     let (c2s, s2c) = bottleneck_config(100 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_msg_channel_server(&mut tasks, false, base, mode)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = w.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = w.shutdown();
-        });
-    }
-
-    tokio::time::sleep(BULK_RAMP).await;
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_dual_msg_channel_server_via(&task_tx, false, base, mode)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = w.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
+            tokio::time::sleep(BULK_RAMP).await;
+
             let body = async {
                 let sender = DualMessageSender::new(opener, mode);
                 let mut msg_rng = SplitMix64::new(MSG_SEED_BASE + seed_base);
@@ -1314,33 +1345,42 @@ async fn dyn_game_sync_sticky_rep(seed_base: u64, run_secs: u64) -> GamingResult
     let (c2s, s2c) = bottleneck_config(200 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (server_addr, lat_rx, bulk_counter) =
-        spawn_dual_mux_gaming_latency_bulk_server(&mut tasks, false, base)
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let (mut result, bulk_counter) = tasks
+        .run(async {
+            let (server_addr, lat_rx, bulk_counter) =
+                spawn_dual_mux_gaming_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
             .await
             .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-    let mut result = tasks
-        .run(async {
-            run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false).await
+            let result = run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, false)
+                .await;
+            (result, bulk_counter)
         })
         .await;
     result.bulk_bytes = bulk_counter.load(Ordering::Relaxed);
@@ -1369,32 +1409,43 @@ async fn dyn_game_sync_migrating_rep(seed_base: u64, run_secs: u64) -> GamingRes
     let (c2s, s2c) = bottleneck_config(300 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (server_addr, lat_rx, bulk_counter) =
-        spawn_dual_mux_gaming_latency_bulk_server(&mut tasks, false, base)
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let (mut result, bulk_counter) = tasks
+        .run(async {
+            let (server_addr, lat_rx, bulk_counter) =
+                spawn_dual_mux_gaming_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
             .await
             .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-    let mut result = tasks
-        .run(async { run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, true).await })
+            let result =
+                run_game_sync_client(seed_base, run_secs, &opener, lat_rx, base, true).await;
+            (result, bulk_counter)
+        })
         .await;
     result.bulk_bytes = bulk_counter.load(Ordering::Relaxed);
     result
@@ -1423,92 +1474,85 @@ async fn dyn_game_sync_single_mux_rep(seed_base: u64, run_secs: u64) -> GamingRe
     let (c2s, s2c) = bottleneck_config(400 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_mux_gaming_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &pair.client_addr().to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            fec: false,
-            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let opener = mux_client_connect(
-        &mut tasks,
-        connected.read.into_async_read(),
-        connected.write.into_async_write(),
-    );
-    // Hold the rtp session owner for the connection's lifetime; the session
-    // must survive the whole body, so poll it from a required scope task.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let (_, mut bulk_write) = opener.open().await.unwrap();
-    let (mut bulk_read, _) = opener.open().await.unwrap();
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = bulk_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let _ = bulk_write.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = bulk_write.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = bulk_write.shutdown();
-        });
-    }
-
-    let (mut _game_read, mut game_write) = opener.open().await.unwrap();
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = _game_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-
-    let mut sync_buf = Vec::with_capacity(GAMING_TAG.len() + GAMING_SYNC_BYTES);
-    sync_buf.extend_from_slice(GAMING_TAG);
-    sync_buf.extend_from_slice(&payload[..GAMING_SYNC_BYTES]);
-
-    let mut transition_latencies = Vec::new();
-    let mut steady_latencies = Vec::new();
-    let mut sent = 0u64;
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_mux_gaming_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+
+            let (connected_read, connected_write) = rtp_connect_with_mss_via(
+                &task_tx,
+                pair.client_addr(),
+                false,
+                rtp::udp::NO_FEC_MSS,
+            )
+            .await;
+            let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let (_, mut bulk_write) = opener.open().await.unwrap();
+            let (mut bulk_read, _) = opener.open().await.unwrap();
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = bulk_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let _ = bulk_write.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = bulk_write.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = bulk_write.shutdown();
+                });
+            }
+
+            let (mut _game_read, mut game_write) = opener.open().await.unwrap();
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = _game_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
+            let mut sync_buf = Vec::with_capacity(GAMING_TAG.len() + GAMING_SYNC_BYTES);
+            sync_buf.extend_from_slice(GAMING_TAG);
+            sync_buf.extend_from_slice(&payload[..GAMING_SYNC_BYTES]);
+
+            let mut transition_latencies = Vec::new();
+            let mut steady_latencies = Vec::new();
+            let mut sent = 0u64;
+
             let body = async move {
                 if game_write.write_all(&sync_buf).await.is_err() {
                     let _ = game_write.shutdown();
@@ -1649,62 +1693,69 @@ async fn dyn_dual_auto_small_first_migrating_rep(
     let (c2s, s2c) = bottleneck_config(500 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_migrating_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let _ = w.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = w.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = w.shutdown();
-        });
-    }
-
-    tokio::time::sleep(BULK_RAMP).await;
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_dual_mux_migrating_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let _ = w.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = w.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
+            tokio::time::sleep(BULK_RAMP).await;
+
             let body = async {
                 let logical_id = 1000 + seed_base;
                 let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);
@@ -1772,62 +1823,69 @@ async fn dyn_dual_auto_big_first_migrating_rep(seed_base: u64, run_secs: u64) ->
     let (c2s, s2c) = bottleneck_config(600 + seed_base, RATE_BPS);
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-
-    let (server_addr, mut lat_rx, bulk_counter) =
-        spawn_dual_mux_migrating_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
-    let int_pair = NetemPair::spawn_shared(
-        server_addr,
-        c2s.clone(),
-        s2c.clone(),
-        Some(c2s_shaper.clone()),
-        Some(s2c_shaper.clone()),
-    )
-    .unwrap();
-    let bulk_pair =
-        NetemPair::spawn_shared(server_addr, c2s, s2c, Some(c2s_shaper), Some(s2c_shaper)).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let _ = w.write_all(BULK_TAG).await;
-            let mut offset = 0usize;
-            loop {
-                tokio::select! {
-                    _ = bulk_stop_rx.changed() => break,
-                    result = w.write(&payload[offset..]) => match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => offset = (offset + n) % payload.len(),
-                    },
-                }
-            }
-            let _ = w.shutdown();
-        });
-    }
-
-    tokio::time::sleep(BULK_RAMP).await;
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+
+            let (server_addr, mut lat_rx, bulk_counter) =
+                spawn_dual_mux_migrating_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let c2s_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let s2c_shaper = BottleneckShaper::new(RATE_BPS, 0);
+            let int_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s.clone(),
+                s2c.clone(),
+                Some(c2s_shaper.clone()),
+                Some(s2c_shaper.clone()),
+            )
+            .unwrap();
+            let bulk_pair = NetemPair::spawn_shared(
+                server_addr,
+                c2s,
+                s2c,
+                Some(c2s_shaper),
+                Some(s2c_shaper),
+            )
+            .unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let _ = w.write_all(BULK_TAG).await;
+                    let mut offset = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = bulk_stop_rx.changed() => break,
+                            result = w.write(&payload[offset..]) => match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => offset = (offset + n) % payload.len(),
+                            },
+                        }
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
+            tokio::time::sleep(BULK_RAMP).await;
+
             let body = async {
                 let logical_id = 2000 + seed_base;
                 let mut game_writer = opener.open_migrating(logical_id, LaneClass::Interactive);

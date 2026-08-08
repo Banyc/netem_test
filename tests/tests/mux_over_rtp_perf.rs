@@ -14,13 +14,13 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::mux::{
-    mux_client_connect, mux_send_payload, mux_send_repeated, mux_timed_echo_round_trip,
-    spawn_mux_over_rtp_counting_sink_server, spawn_mux_over_rtp_echo_server,
-    spawn_mux_over_rtp_sink_server,
+    mux_client_connect_via, mux_send_payload, mux_send_repeated, mux_timed_echo_round_trip,
+    spawn_mux_over_rtp_counting_sink_server_via, spawn_mux_over_rtp_echo_server_via,
+    spawn_mux_over_rtp_sink_server_via,
 };
 use support::payload::{cyclic_payload, payload, with_timeout};
 use support::presets::{hostile_fat_pipe, lossy_400kib_per_sec};
-use support::rtp::rtp_connect;
+use support::rtp::rtp_connect_via;
 use support::stats::{combined_stats, print_perf};
 
 mod support;
@@ -34,19 +34,20 @@ mod support;
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_lossy_perf_smoke() {
     let mut tasks = support::TestScope::new();
-    let server_addr = spawn_mux_over_rtp_echo_server(&mut tasks, false)
-        .await
-        .unwrap();
-
-    let c2s = lossy_400kib_per_sec();
-    let s2c = lossy_400kib_per_sec();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-    let opener = mux_client_connect(&mut tasks, read, write);
-
-    let payload = payload(1024);
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let server_addr = spawn_mux_over_rtp_echo_server_via(&task_tx, false)
+                .await
+                .unwrap();
+
+            let c2s = lossy_400kib_per_sec();
+            let s2c = lossy_400kib_per_sec();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+            let opener = mux_client_connect_via(&task_tx, read, write);
+
+            let payload = payload(1024);
             let (got, elapsed) = with_timeout(
                 Duration::from_secs(30),
                 "mux-over-rtp 1KiB lossy perf smoke",
@@ -56,11 +57,11 @@ async fn mux_over_rtp_lossy_perf_smoke() {
 
             assert_eq!(got, payload, "mux stream must deliver all 1KiB intact");
             print_perf("mux-over-rtp 1KiB lossy perf smoke", payload.len(), elapsed);
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     eprintln!("[perf] mux-over-rtp 1KiB lossy perf smoke stats: {stats:?}");
     assert!(
         stats.forwarded > 0,
@@ -80,19 +81,20 @@ async fn mux_over_rtp_lossy_perf_smoke() {
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_400kib_lossy_contended_perf() {
     let mut tasks = support::TestScope::new();
-    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
-        .await
-        .unwrap();
-
-    let c2s = lossy_400kib_per_sec();
-    let s2c = lossy_400kib_per_sec();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-    let opener = mux_client_connect(&mut tasks, read, write);
-
-    let payload = payload(400 * 1024);
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let (server_addr, mut received) = spawn_mux_over_rtp_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+
+            let c2s = lossy_400kib_per_sec();
+            let s2c = lossy_400kib_per_sec();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+            let opener = mux_client_connect_via(&task_tx, read, write);
+
+            let payload = payload(400 * 1024);
             let elapsed = with_timeout(
                 Duration::from_secs(120),
                 "mux-over-rtp 400KiB lossy perf",
@@ -113,11 +115,11 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
                 payload.len(),
                 elapsed,
             );
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     eprintln!("[perf] mux-over-rtp 400KiB lossy/contended stats: {stats:?}");
     assert!(
         stats.dropped > 0,
@@ -138,38 +140,39 @@ async fn mux_over_rtp_400kib_lossy_contended_perf() {
 #[ignore = "perf scenario over a contended, lossy link; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_small_stream_while_bulk_perf() {
     let mut tasks = support::TestScope::new();
-    let (server_addr, mut received) = spawn_mux_over_rtp_sink_server(&mut tasks, false)
-        .await
-        .unwrap();
-
-    // A mildly contended link: latency + small loss, no harsh rate limit so
-    // the bulk and small streams can both make progress.
-    let impaired = NetemConfig {
-        latency: Duration::from_millis(10),
-        jitter: Duration::from_millis(3),
-        loss: u32::MAX / 200, // ~0.5%
-        rate: 400 * 1024 * 8,
-        seed: 17,
-        ..NetemConfig::default()
-    };
-    let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-    let opener = mux_client_connect(&mut tasks, read, write);
-
-    // Send the bulk 400 KiB payload on one stream, then after a short delay
-    // send the small interactive payload on a second stream. The opener's
-    // `open` takes `&self`, so a cloned opener can share the connection.
-    let bulk = payload(400 * 1024);
-    let small = b"small-interactive-stream".to_vec();
-
-    let start = Instant::now();
-    let bulk_opener = opener.clone();
-    let bulk_for_compare = bulk.clone();
-    let mut bulk_tasks: tokio::task::JoinSet<Duration> = tokio::task::JoinSet::new();
-    bulk_tasks.spawn(async move { mux_send_payload(&bulk_opener, &bulk).await });
-
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let (server_addr, mut received) = spawn_mux_over_rtp_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+
+            // A mildly contended link: latency + small loss, no harsh rate limit so
+            // the bulk and small streams can both make progress.
+            let impaired = NetemConfig {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(3),
+                loss: u32::MAX / 200, // ~0.5%
+                rate: 400 * 1024 * 8,
+                seed: 17,
+                ..NetemConfig::default()
+            };
+            let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+            let opener = mux_client_connect_via(&task_tx, read, write);
+
+            // Send the bulk 400 KiB payload on one stream, then after a short delay
+            // send the small interactive payload on a second stream. The opener's
+            // `open` takes `&self`, so a cloned opener can share the connection.
+            let bulk = payload(400 * 1024);
+            let small = b"small-interactive-stream".to_vec();
+
+            let start = Instant::now();
+            let bulk_opener = opener.clone();
+            let bulk_for_compare = bulk.clone();
+            let mut bulk_tasks: tokio::task::JoinSet<Duration> = tokio::task::JoinSet::new();
+            bulk_tasks.spawn(async move { mux_send_payload(&bulk_opener, &bulk).await });
+
             tokio::time::sleep(Duration::from_millis(25)).await;
             let small_elapsed = mux_send_payload(&opener, &small).await;
 
@@ -222,11 +225,11 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
                 bulk_for_compare.len(),
                 bulk_elapsed,
             );
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-
-    pair.stop();
-    let stats = combined_stats(&pair);
     eprintln!("[perf] mux-over-rtp small-while-bulk stats: {stats:?}");
     assert!(stats.forwarded > 0, "proxy should forward packets");
 }
@@ -257,19 +260,20 @@ async fn mux_over_rtp_400mib_hostile_perf() {
     const TARGET_BYTES: usize = 400 * 1024 * 1024;
     const BUDGET: Duration = Duration::from_secs(335);
     let mut tasks = support::TestScope::new();
-    let (server_addr, progress) =
-        spawn_mux_over_rtp_counting_sink_server(&mut tasks, false, rtp::udp::NO_FEC_MSS)
-            .await
-            .unwrap();
-    let impaired = hostile_fat_pipe();
-    let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
-    let (read, write) = rtp_connect(&mut tasks, pair.client_addr(), false).await;
-    let opener = mux_client_connect(&mut tasks, read, write);
-    let chunk = cyclic_payload(1024 * 1024);
-    let repeat = TARGET_BYTES.div_ceil(chunk.len());
-    let sent = chunk.len() * repeat;
-    tasks
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let stats = tasks
         .run(async {
+            let (server_addr, progress) =
+                spawn_mux_over_rtp_counting_sink_server_via(&task_tx, false, rtp::udp::NO_FEC_MSS)
+                    .await
+                    .unwrap();
+            let impaired = hostile_fat_pipe();
+            let pair = NetemPair::spawn(server_addr, impaired.clone(), impaired).unwrap();
+            let (read, write) = rtp_connect_via(&task_tx, pair.client_addr(), false).await;
+            let opener = mux_client_connect_via(&task_tx, read, write);
+            let chunk = cyclic_payload(1024 * 1024);
+            let repeat = TARGET_BYTES.div_ceil(chunk.len());
+            let sent = chunk.len() * repeat;
             let elapsed = with_timeout(
                 BUDGET,
                 "mux-over-rtp 400MiB hostile perf",
@@ -286,10 +290,11 @@ async fn mux_over_rtp_400mib_hostile_perf() {
                 "mux stream must deliver every byte sent"
             );
             print_perf("mux-over-rtp 400MiB hostile", sent, elapsed);
+
+            pair.stop();
+            combined_stats(&pair)
         })
         .await;
-    pair.stop();
-    let stats = combined_stats(&pair);
     eprintln!("[perf] mux-over-rtp 400MiB hostile stats: {stats:?}");
     assert!(
         stats.dropped > 0,

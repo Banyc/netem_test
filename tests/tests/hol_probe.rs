@@ -48,18 +48,20 @@ use std::time::{Duration, Instant};
 
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::dual::{
-    dual_mux_client_connect_with_lane_modes, spawn_dual_mux_latency_bulk_server_two_listeners,
+    dual_mux_client_connect_with_lane_modes_via,
+    spawn_dual_mux_latency_bulk_server_two_listeners_via,
 };
-use support::frame::rtp_frame_delivery_connect;
+use support::frame::rtp_frame_delivery_connect_via;
 use support::mux::{
-    mux_client_connect, send_timestamped_messages, spawn_mux_frame_delivery_latency_bulk_server,
-    spawn_mux_latency_bulk_server,
+    mux_client_connect_via, send_timestamped_messages, spawn_mux_frame_delivery_latency_bulk_server_via,
+    spawn_mux_latency_bulk_server_via,
 };
 use support::payload::{cyclic_payload, with_timeout};
 use support::presets::gilbert_elliott_loss;
-use support::rtp::{spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server};
-use support::rtp_mux::{rtp_mux_connector, spawn_rtp_mux_latency_bulk_server};
+use support::rtp::{rtp_connect_with_mss_via, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server_via};
+use support::rtp_mux::{rtp_mux_connector_via, spawn_rtp_mux_latency_bulk_server_via};
 use support::stats::{HolSummary, combined_stats, summarize};
+use support::{submit_test_task, submit_test_task_required};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod support;
@@ -177,126 +179,117 @@ async fn run_hol_probe(
     } = config;
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (server_addr, mut latencies, mux_bulk_counter) =
-        spawn_mux_latency_bulk_server(&mut tasks, fec, base)
-            .await
-            .unwrap();
-
-    // Set up the interactive NetemPair and, for split modes, a bulk pair.
-    let (interactive_pair, bulk_pair_opt, bulk_counter) = match &bulk {
-        BulkMode::None | BulkMode::Shared => {
-            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-            (pair, None, Arc::clone(&mux_bulk_counter))
-        }
-        BulkMode::Split(box_config) => {
-            let (c2s_bulk, s2c_bulk) = box_config.as_ref();
-            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-            let (sink_addr, counter) = spawn_rtp_byte_sink_server(&mut tasks, fec).await.unwrap();
-            let bulk_pair =
-                NetemPair::spawn(sink_addr, c2s_bulk.clone(), s2c_bulk.clone()).unwrap();
-            (pair, Some(bulk_pair), counter)
-        }
-        BulkMode::SplitSharedBneck(shaper_c2s, shaper_s2c) => {
-            let c2s_bulk = c2s.clone();
-            let s2c_bulk = s2c.clone();
-            let pair = NetemPair::spawn_shared(
-                server_addr,
-                c2s,
-                s2c,
-                Some(shaper_c2s.clone()),
-                Some(shaper_s2c.clone()),
-            )
-            .unwrap();
-            let (sink_addr, counter) = spawn_rtp_byte_sink_server(&mut tasks, fec).await.unwrap();
-            let bulk_pair = NetemPair::spawn_shared(
-                sink_addr,
-                c2s_bulk,
-                s2c_bulk,
-                Some(shaper_c2s.clone()),
-                Some(shaper_s2c.clone()),
-            )
-            .unwrap();
-            (pair, Some(bulk_pair), counter)
-        }
-    };
-
-    // Connect the interactive mux client.
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &interactive_pair.client_addr().to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            fec,
-            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let opener = mux_client_connect(
-        &mut tasks,
-        connected.read.into_async_read(),
-        connected.write.into_async_write(),
-    );
-    // The supervisor owns the session drivers; the connection must survive
-    // the whole body, so poll it from a required scope task.
-    tasks.spawn_required("rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
-
-    // Open the interactive `b'L'` stream and keep its read half alive.
-    let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = rr_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-
-    // For Shared mode, open a second mux stream for the bulk flow.
-    let mut shared_bulk_write = None;
-    if matches!(bulk, BulkMode::Shared) {
-        let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
-        // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-        tasks.spawn(async move {
-            let mut buf = vec![0u8; 8 * 1024];
-            while let Ok(n) = bulk_read.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-        shared_bulk_write = Some(bulk_write);
-    }
-
-    let active_for = run_for - BULK_RAMP;
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-
-    // Run the interactive sender and the bulk sender concurrently.
-    // For split modes, spawn the bulk flow on its own pair BEFORE the
-    // join so it runs concurrently with the interactive sender.
-    let mut split_bulk_tasks: tokio::task::JoinSet<u64> = match &bulk {
-        BulkMode::Split(_) | BulkMode::SplitSharedBneck(_, _) => {
-            let mut set = tokio::task::JoinSet::new();
-            let client_addr = bulk_pair_opt.as_ref().unwrap().client_addr();
-            set.spawn(run_rtp_bulk_flow(
-                client_addr,
-                fec,
-                Arc::clone(&payload),
-                BULK_RAMP,
-                active_for,
-                bulk_load,
-            ));
-            set
-        }
-        _ => tokio::task::JoinSet::new(),
-    };
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            // The whole scenario — server startup, pairs, connection setup,
+            // measurement, teardown — runs inside the actively-reaped body.
+            let (server_addr, mut latencies, mux_bulk_counter) =
+                spawn_mux_latency_bulk_server_via(&task_tx, fec, base)
+                    .await
+                    .unwrap();
+
+            // Set up the interactive NetemPair and, for split modes, a bulk pair.
+            let (interactive_pair, bulk_pair_opt, bulk_counter) = match &bulk {
+                BulkMode::None | BulkMode::Shared => {
+                    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+                    (pair, None, Arc::clone(&mux_bulk_counter))
+                }
+                BulkMode::Split(box_config) => {
+                    let (c2s_bulk, s2c_bulk) = box_config.as_ref();
+                    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+                    let (sink_addr, counter) =
+                        spawn_rtp_byte_sink_server_via(&task_tx, fec).await.unwrap();
+                    let bulk_pair =
+                        NetemPair::spawn(sink_addr, c2s_bulk.clone(), s2c_bulk.clone()).unwrap();
+                    (pair, Some(bulk_pair), counter)
+                }
+                BulkMode::SplitSharedBneck(shaper_c2s, shaper_s2c) => {
+                    let c2s_bulk = c2s.clone();
+                    let s2c_bulk = s2c.clone();
+                    let pair = NetemPair::spawn_shared(
+                        server_addr,
+                        c2s,
+                        s2c,
+                        Some(shaper_c2s.clone()),
+                        Some(shaper_s2c.clone()),
+                    )
+                    .unwrap();
+                    let (sink_addr, counter) =
+                        spawn_rtp_byte_sink_server_via(&task_tx, fec).await.unwrap();
+                    let bulk_pair = NetemPair::spawn_shared(
+                        sink_addr,
+                        c2s_bulk,
+                        s2c_bulk,
+                        Some(shaper_c2s.clone()),
+                        Some(shaper_s2c.clone()),
+                    )
+                    .unwrap();
+                    (pair, Some(bulk_pair), counter)
+                }
+            };
+
+            // Connect the interactive mux client.
+            let (connected_read, connected_write) = rtp_connect_with_mss_via(
+                &task_tx,
+                interactive_pair.client_addr(),
+                fec,
+                rtp::udp::NO_FEC_MSS,
+            )
+            .await;
+            let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+
+            // Open the interactive `b'L'` stream and keep its read half alive.
+            let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = rr_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
+            // For Shared mode, open a second mux stream for the bulk flow.
+            let mut shared_bulk_write = None;
+            if matches!(bulk, BulkMode::Shared) {
+                let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
+                // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+                submit_test_task(&task_tx, Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = bulk_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }));
+                shared_bulk_write = Some(bulk_write);
+            }
+
+            let active_for = run_for - BULK_RAMP;
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+
+            // Run the interactive sender and the bulk sender concurrently.
+            // For split modes, spawn the bulk flow on its own pair BEFORE the
+            // join so it runs concurrently with the interactive sender.
+            let mut split_bulk_tasks: tokio::task::JoinSet<u64> = match &bulk {
+                BulkMode::Split(_) | BulkMode::SplitSharedBneck(_, _) => {
+                    let mut set = tokio::task::JoinSet::new();
+                    let client_addr = bulk_pair_opt.as_ref().unwrap().client_addr();
+                    set.spawn(run_rtp_bulk_flow(
+                        client_addr,
+                        fec,
+                        Arc::clone(&payload),
+                        BULK_RAMP,
+                        active_for,
+                        bulk_load,
+                    ));
+                    set
+                }
+                _ => tokio::task::JoinSet::new(),
+            };
+
             let rr_fut =
                 run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
             let bulk_fut = async {
@@ -1343,53 +1336,56 @@ async fn run_hol_probe_frame_delivery_shared(
     } = traffic;
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (server_addr, mut latencies, mux_bulk_counter) =
-        spawn_mux_frame_delivery_latency_bulk_server(&mut tasks, fec, base)
-            .await
-            .unwrap();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (reader, writer) = rtp_frame_delivery_connect(&mut tasks, pair.client_addr(), fec).await;
-    let config = mux::MuxConfig {
-        initiation: mux::Initiation::Client,
-        heartbeat_interval: Duration::from_secs(5),
-        frame_reassembly: true,
-    };
-    let mut spawner = tokio::task::JoinSet::new();
-    let (opener, _accepter) = mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
-    // The mux supervision is drained by a required scope task: the session
-    // must survive the whole body, a panicked supervision task surfaces
-    // immediately, and the session ending before the body completes is a
-    // panic.
-    tasks.spawn_required("mux client session", async move {
-        if let Some(result) = spawner.join_next().await {
-            let err = result.unwrap();
-            panic!("mux client session ended before the test body: {err:?}");
-        }
-    });
-    let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = rr_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-    let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = bulk_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-    let active_for = run_for - BULK_RAMP;
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (server_addr, mut latencies, mux_bulk_counter) =
+                spawn_mux_frame_delivery_latency_bulk_server_via(&task_tx, fec, base)
+                    .await
+                    .unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+            let (reader, writer) =
+                rtp_frame_delivery_connect_via(&task_tx, pair.client_addr(), fec).await;
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Client,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: true,
+            };
+            let mut spawner = tokio::task::JoinSet::new();
+            let (opener, _accepter) =
+                mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+            // The mux supervision is drained by a required task submitted
+            // through the handle: the session must survive the whole body, a
+            // panicked supervision task surfaces immediately, and the
+            // session ending before the body completes is a panic.
+            submit_test_task_required(&task_tx, "mux client session", async move {
+                if let Some(result) = spawner.join_next().await {
+                    let err = result.unwrap();
+                    panic!("mux client session ended before the test body: {err:?}");
+                }
+            });
+            let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = rr_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+            let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = bulk_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+            let active_for = run_for - BULK_RAMP;
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let rr_fut =
                 run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for);
             let bulk_fut = async {
@@ -1434,54 +1430,55 @@ async fn run_hol_probe_rtp_mux(
     } = traffic;
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
-        spawn_rtp_mux_latency_bulk_server(&mut tasks, false, base)
-            .await
-            .unwrap();
-    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
-    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
-    let connector = Arc::new(rtp_mux_connector(
-        &mut tasks,
-        bulk_pair.client_addr(),
-        false,
-    ));
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let active_for = run_for - BULK_RAMP;
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-    {
-        let connector = Arc::clone(&connector);
-        let payload = Arc::clone(&payload);
-        let int_proxy_addr = int_pair.client_addr();
-        bulk_tasks.spawn(async move {
-            let mut stream = match connector
-                .connect_stream_with_lane(int_proxy_addr, mux::LaneClass::Bulk)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(_) => return,
-            };
-            // The pump runs until the watch signals shutdown at the end of
-            // the interactive measurement (or a write failure ends it).
-            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
-            // window is only a backstop so the pump never ends on its own
-            // while the measurement is still running.
-            tokio::select! {
-                _ = bulk_stop_rx.changed() => {}
-                _ = run_delayed_mux_bulk_stream(
-                    &mut stream,
-                    payload,
-                    BULK_RAMP,
-                    Duration::from_secs(3600),
-                    &BULK_NO_STOP,
-                    BulkLoad::Saturating,
-                ) => {}
-            }
-            let _ = stream.shutdown().await;
-        });
-    }
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
+                spawn_rtp_mux_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+            let connector = Arc::new(rtp_mux_connector_via(
+                &task_tx,
+                bulk_pair.client_addr(),
+                false,
+            ));
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let active_for = run_for - BULK_RAMP;
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+            {
+                let connector = Arc::clone(&connector);
+                let payload = Arc::clone(&payload);
+                let int_proxy_addr = int_pair.client_addr();
+                bulk_tasks.spawn(async move {
+                    let mut stream = match connector
+                        .connect_stream_with_lane(int_proxy_addr, mux::LaneClass::Bulk)
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    };
+                    // The pump runs until the watch signals shutdown at the end of
+                    // the interactive measurement (or a write failure ends it).
+                    // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+                    // window is only a backstop so the pump never ends on its own
+                    // while the measurement is still running.
+                    tokio::select! {
+                        _ = bulk_stop_rx.changed() => {}
+                        _ = run_delayed_mux_bulk_stream(
+                            &mut stream,
+                            payload,
+                            BULK_RAMP,
+                            Duration::from_secs(3600),
+                            &BULK_NO_STOP,
+                            BulkLoad::Saturating,
+                        ) => {}
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
             let body = async {
                 let mut stream = connector
                     .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
@@ -1567,71 +1564,73 @@ async fn run_hol_probe_dual_lane(
     } = traffic;
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
-        spawn_dual_mux_latency_bulk_server_two_listeners(
-            &mut tasks,
-            false,
-            base,
-            interactive_frame,
-            bulk_frame,
-        )
-        .await
-        .unwrap();
-    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
-    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
-    let (opener, _accepter) = dual_mux_client_connect_with_lane_modes(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-        interactive_frame,
-        bulk_frame,
-    )
-    .await
-    .unwrap();
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let active_for = run_for - BULK_RAMP;
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            // The pump runs until the watch signals shutdown at the end of
-            // the interactive measurement (or a write failure ends it).
-            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
-            // window is only a backstop so the pump never ends on its own
-            // while the measurement is still running.
-            tokio::select! {
-                _ = bulk_stop_rx.changed() => {}
-                _ = run_delayed_mux_bulk_stream(
-                    &mut w,
-                    payload,
-                    BULK_RAMP,
-                    Duration::from_secs(3600),
-                    &BULK_NO_STOP,
-                    BulkLoad::Saturating,
-                ) => {}
-            }
-            let _ = w.shutdown();
-        });
-    }
-    let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = rr_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
+                spawn_dual_mux_latency_bulk_server_two_listeners_via(
+                    &task_tx,
+                    false,
+                    base,
+                    interactive_frame,
+                    bulk_frame,
+                )
+                .await
+                .unwrap();
+            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+            let (opener, _accepter) = dual_mux_client_connect_with_lane_modes_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+                interactive_frame,
+                bulk_frame,
+            )
+            .await
+            .unwrap();
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let active_for = run_for - BULK_RAMP;
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    // The pump runs until the watch signals shutdown at the end of
+                    // the interactive measurement (or a write failure ends it).
+                    // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+                    // window is only a backstop so the pump never ends on its own
+                    // while the measurement is still running.
+                    tokio::select! {
+                        _ = bulk_stop_rx.changed() => {}
+                        _ = run_delayed_mux_bulk_stream(
+                            &mut w,
+                            payload,
+                            BULK_RAMP,
+                            Duration::from_secs(3600),
+                            &BULK_NO_STOP,
+                            BulkLoad::Saturating,
+                        ) => {}
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+            let (mut rr_read, mut rr_write) =
+                opener.open(mux::LaneClass::Interactive).await.unwrap();
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = rr_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
             let body = async {
                 let sent =
                     run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)
@@ -1703,85 +1702,86 @@ async fn run_hol_probe_dual_lane_two_interactive(
     } = config;
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (int_addr, bulk_addr, mut latencies_all, bulk_counter, _sink_streams) =
-        spawn_dual_mux_latency_bulk_server_two_listeners(
-            &mut tasks,
-            false,
-            base,
-            interactive_frame,
-            bulk_frame,
-        )
-        .await
-        .unwrap();
-
-    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
-    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
-
-    let (opener, _accepter) = dual_mux_client_connect_with_lane_modes(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-        interactive_frame,
-        bulk_frame,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let active_for = run_for - BULK_RAMP;
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            // The pump runs until the watch signals shutdown at the end of
-            // the interactive measurement (or a write failure ends it).
-            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
-            // window is only a backstop so the pump never ends on its own
-            // while the measurement is still running.
-            tokio::select! {
-                _ = bulk_stop_rx.changed() => {}
-                _ = run_delayed_mux_bulk_stream(
-                    &mut w,
-                    payload,
-                    BULK_RAMP,
-                    Duration::from_secs(3600),
-                    &BULK_NO_STOP,
-                    BulkLoad::Saturating,
-                ) => {}
-            }
-            let _ = w.shutdown();
-        });
-    }
-
-    let (mut read_a, mut write_a) = opener.open_auto();
-    let (mut read_b, mut write_b) = opener.open_auto();
-    // Parked until the streams close; the owning JoinSet aborts them at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = read_a.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = read_b.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (int_addr, bulk_addr, mut latencies_all, bulk_counter, _sink_streams) =
+                spawn_dual_mux_latency_bulk_server_two_listeners_via(
+                    &task_tx,
+                    false,
+                    base,
+                    interactive_frame,
+                    bulk_frame,
+                )
+                .await
+                .unwrap();
+
+            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+
+            let (opener, _accepter) = dual_mux_client_connect_with_lane_modes_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+                interactive_frame,
+                bulk_frame,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let active_for = run_for - BULK_RAMP;
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    // The pump runs until the watch signals shutdown at the end of
+                    // the interactive measurement (or a write failure ends it).
+                    // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+                    // window is only a backstop so the pump never ends on its own
+                    // while the measurement is still running.
+                    tokio::select! {
+                        _ = bulk_stop_rx.changed() => {}
+                        _ = run_delayed_mux_bulk_stream(
+                            &mut w,
+                            payload,
+                            BULK_RAMP,
+                            Duration::from_secs(3600),
+                            &BULK_NO_STOP,
+                            BulkLoad::Saturating,
+                        ) => {}
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
+            let (mut read_a, mut write_a) = opener.open_auto();
+            let (mut read_b, mut write_b) = opener.open_auto();
+            // Parked until the streams close; the owning JoinSet aborts them at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = read_a.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = read_b.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+
             let body = async {
                 if write_a.write_all(b"A").await.is_err() {
                     let _ = write_a.shutdown();
@@ -1905,50 +1905,53 @@ async fn run_frame_delivery_two_interactive(
     } = config;
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (server_addr, mut latencies, _bulk_counter) =
-        spawn_mux_frame_delivery_latency_bulk_server(&mut tasks, fec, base)
-            .await
-            .unwrap();
-    let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-    let (reader, writer) = rtp_frame_delivery_connect(&mut tasks, pair.client_addr(), fec).await;
-    let config = mux::MuxConfig {
-        initiation: mux::Initiation::Client,
-        heartbeat_interval: Duration::from_secs(5),
-        frame_reassembly: true,
-    };
-    let mut spawner = tokio::task::JoinSet::new();
-    let (opener, _accepter) = mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
-    // The mux supervision is drained by a required scope task: the session
-    // must survive the whole body, a panicked supervision task surfaces
-    // immediately, and the session ending before the body completes is a
-    // panic.
-    tasks.spawn_required("mux client session", async move {
-        if let Some(result) = spawner.join_next().await {
-            let err = result.unwrap();
-            panic!("mux client session ended before the test body: {err:?}");
-        }
-    });
-    let (mut read_a, mut write_a) = opener.open().await.unwrap();
-    let (mut read_b, mut write_b) = opener.open().await.unwrap();
-    // Parked until the streams close; the owning JoinSet aborts them at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = read_a.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = read_b.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (server_addr, mut latencies, _bulk_counter) =
+                spawn_mux_frame_delivery_latency_bulk_server_via(&task_tx, fec, base)
+                    .await
+                    .unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+            let (reader, writer) =
+                rtp_frame_delivery_connect_via(&task_tx, pair.client_addr(), fec).await;
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Client,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: true,
+            };
+            let mut spawner = tokio::task::JoinSet::new();
+            let (opener, _accepter) =
+                mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+            // The mux supervision is drained by a required task submitted
+            // through the handle: the session must survive the whole body, a
+            // panicked supervision task surfaces immediately, and the
+            // session ending before the body completes is a panic.
+            submit_test_task_required(&task_tx, "mux client session", async move {
+                if let Some(result) = spawner.join_next().await {
+                    let err = result.unwrap();
+                    panic!("mux client session ended before the test body: {err:?}");
+                }
+            });
+            let (mut read_a, mut write_a) = opener.open().await.unwrap();
+            let (mut read_b, mut write_b) = opener.open().await.unwrap();
+            // Parked until the streams close; the owning JoinSet aborts them at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = read_a.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = read_b.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
             let _ = write_a.write_all(b"A").await;
             let _ = write_b.write_all(b"L").await;
             let fut_a = send_timestamped_messages(&mut write_a, base, msg_bytes, cadence, run_for);
@@ -2398,75 +2401,77 @@ async fn run_hol_probe_dual_lane_separate_listeners(
     } = config;
     let base = Instant::now();
     let mut tasks = support::TestScope::new();
-    let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
-        spawn_dual_mux_latency_bulk_server_two_listeners(
-            &mut tasks,
-            false,
-            base,
-            interactive_frame,
-            bulk_frame,
-        )
-        .await
-        .unwrap();
-
-    let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
-    let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
-
-    let (opener, _accepter) = dual_mux_client_connect_with_lane_modes(
-        &mut tasks,
-        int_pair.client_addr(),
-        bulk_pair.client_addr(),
-        false,
-        interactive_frame,
-        bulk_frame,
-    )
-    .await
-    .unwrap();
-
-    let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
-    let active_for = run_for - BULK_RAMP;
-    let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-    let bulk_opener = opener.clone();
-    let mut bulk_tasks = tokio::task::JoinSet::new();
-    {
-        let payload = Arc::clone(&payload);
-        bulk_tasks.spawn(async move {
-            let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            // The pump runs until the watch signals shutdown at the end of
-            // the interactive measurement (or a write failure ends it).
-            // `BULK_NO_STOP` keeps the internal stop flag inert and the long
-            // window is only a backstop so the pump never ends on its own
-            // while the measurement is still running.
-            tokio::select! {
-                _ = bulk_stop_rx.changed() => {}
-                _ = run_delayed_mux_bulk_stream(
-                    &mut w,
-                    payload,
-                    BULK_RAMP,
-                    Duration::from_secs(3600),
-                    &BULK_NO_STOP,
-                    BulkLoad::Saturating,
-                ) => {}
-            }
-            let _ = w.shutdown();
-        });
-    }
-
-    let (mut rr_read, mut rr_write) = opener.open(mux::LaneClass::Interactive).await.unwrap();
-    // Parked until the stream closes; the owning JoinSet aborts it at scope end.
-    tasks.spawn(async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        while let Ok(n) = rr_read.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-    });
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
+                spawn_dual_mux_latency_bulk_server_two_listeners_via(
+                    &task_tx,
+                    false,
+                    base,
+                    interactive_frame,
+                    bulk_frame,
+                )
+                .await
+                .unwrap();
+
+            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+
+            let (opener, _accepter) = dual_mux_client_connect_with_lane_modes_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                false,
+                interactive_frame,
+                bulk_frame,
+            )
+            .await
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let active_for = run_for - BULK_RAMP;
+            let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            let bulk_opener = opener.clone();
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+            {
+                let payload = Arc::clone(&payload);
+                bulk_tasks.spawn(async move {
+                    let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    // The pump runs until the watch signals shutdown at the end of
+                    // the interactive measurement (or a write failure ends it).
+                    // `BULK_NO_STOP` keeps the internal stop flag inert and the long
+                    // window is only a backstop so the pump never ends on its own
+                    // while the measurement is still running.
+                    tokio::select! {
+                        _ = bulk_stop_rx.changed() => {}
+                        _ = run_delayed_mux_bulk_stream(
+                            &mut w,
+                            payload,
+                            BULK_RAMP,
+                            Duration::from_secs(3600),
+                            &BULK_NO_STOP,
+                            BulkLoad::Saturating,
+                        ) => {}
+                    }
+                    let _ = w.shutdown();
+                });
+            }
+
+            let (mut rr_read, mut rr_write) =
+                opener.open(mux::LaneClass::Interactive).await.unwrap();
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            submit_test_task(&task_tx, Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = rr_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }));
             let body = async {
                 let sent =
                     run_mux_interactive_stream(&mut rr_write, base, msg_bytes, cadence, run_for)
