@@ -35,7 +35,7 @@ mod support;
 /// supervision task still fails the test; a `MuxError` session-end is the
 /// expected teardown here, not a failure.
 fn mux_client_connect_transient<R, W>(
-    tasks: &mut support::TestScope,
+    task_tx: &tokio::sync::mpsc::Sender<support::TestTask>,
     read: R,
     write: W,
 ) -> mux::StreamOpener
@@ -51,12 +51,18 @@ where
     let mut spawner = tokio::task::JoinSet::new();
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
     // Transient drain (see doc comment): unwrap JoinErrors so panics
-    // surface; a `MuxError` session-end ends the drain normally.
-    tasks.spawn(async move {
-        if let Some(result) = spawner.join_next().await {
-            result.unwrap();
-        }
-    });
+    // surface; a `MuxError` session-end ends the drain normally. Submitted
+    // through the already-active bounded outer submitter instead of an
+    // unpolled body-local scope, so a panicked supervision task fails the
+    // test immediately rather than disappearing when the scope is dropped.
+    support::submit_test_task(
+        task_tx,
+        Box::pin(async move {
+            if let Some(result) = spawner.join_next().await {
+                result.unwrap();
+            }
+        }),
+    );
     opener
 }
 
@@ -66,7 +72,7 @@ where
 /// spawn, ending when the connection closes) rather than `spawn_required`
 /// (which would panic when the session ends before the body completes).
 async fn rtp_connect_transient(
-    tasks: &mut support::TestScope,
+    task_tx: &tokio::sync::mpsc::Sender<support::TestTask>,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
@@ -88,11 +94,17 @@ async fn rtp_connect_transient(
     .unwrap();
     let read = connected.read.into_async_read();
     let write = connected.write.into_async_write();
-    // The supervisor owns the session drivers; an ordinary spawn keeps it
+    // The supervisor owns the session drivers; an ordinary submit keeps it
     // alive only until the session ends (the expected teardown here).
-    tasks.spawn(async move {
-        let _ = connected.supervisor.await;
-    });
+    // Routing it through the already-active bounded outer submitter means a
+    // panicked supervisor fails the test immediately instead of being
+    // stored in an unpolled body-local scope until it is dropped.
+    support::submit_test_task(
+        task_tx,
+        Box::pin(async move {
+            let _ = connected.supervisor.await;
+        }),
+    );
     (read, write)
 }
 
@@ -131,15 +143,10 @@ async fn probe_rtp_echo_4mib_direct() {
             let server_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
             let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
 
-            // One-shot probes connect and tear down per iteration, so the
-            // transient supervisors go into a body-local scope: the
-            // run-racing scope is consumed by `run`, and these sessions end
-            // mid-body by design.
-            let mut transient = support::TestScope::new();
             let mut samples = Vec::with_capacity(PROBE_ITERS);
             for _ in 0..PROBE_ITERS {
                 let (read, write) = rtp_connect_transient(
-                    &mut transient,
+                    &task_tx,
                     pair.client_addr(),
                     false,
                     rtp::udp::NO_FEC_MSS,
@@ -185,16 +192,10 @@ async fn probe_rtp_echo_4mib_mss8k() {
                 .unwrap();
             let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
 
-            // One-shot probes connect and tear down per iteration, so the
-            // transient supervisors go into a body-local scope: the
-            // run-racing scope is consumed by `run`, and these sessions end
-            // mid-body by design.
-            let mut transient = support::TestScope::new();
             let mut samples = Vec::with_capacity(PROBE_ITERS);
             for _ in 0..PROBE_ITERS {
                 let (read, write) =
-                    rtp_connect_transient(&mut transient, pair.client_addr(), false, LOOPBACK_MSS)
-                        .await;
+                    rtp_connect_transient(&task_tx, pair.client_addr(), false, LOOPBACK_MSS).await;
                 let start = Instant::now();
                 let got = with_timeout(
                     Duration::from_secs(60),
@@ -246,16 +247,11 @@ async fn probe_mux_sink_4mib_direct() {
                 servers.push((server_addr, received));
             }
 
-            // One-shot probes connect and tear down per iteration, so the
-            // transient supervisors go into a body-local scope: the
-            // run-racing scope is consumed by `run`, and these sessions end
-            // mid-body by design.
-            let mut transient = support::TestScope::new();
             let mut samples = Vec::with_capacity(PROBE_ITERS);
             for (server_addr, mut received) in servers {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write) = rtp_connect_transient(
-                    &mut transient,
+                    &task_tx,
                     pair.client_addr(),
                     false,
                     rtp::udp::NO_FEC_MSS,
@@ -336,17 +332,11 @@ async fn probe_mux_sink_4mib_mss8k() {
                 servers.push((server_addr, received));
             }
 
-            // One-shot probes connect and tear down per iteration, so the
-            // transient supervisors go into a body-local scope: the
-            // run-racing scope is consumed by `run`, and these sessions end
-            // mid-body by design.
-            let mut transient = support::TestScope::new();
             let mut samples = Vec::with_capacity(PROBE_ITERS);
             for (server_addr, mut received) in servers {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write) =
-                    rtp_connect_transient(&mut transient, pair.client_addr(), false, LOOPBACK_MSS)
-                        .await;
+                    rtp_connect_transient(&task_tx, pair.client_addr(), false, LOOPBACK_MSS).await;
                 let config = mux::MuxConfig {
                     initiation: mux::Initiation::Client,
                     heartbeat_interval: Duration::from_secs(5),
@@ -426,16 +416,11 @@ async fn probe_mux_echo_1mib_direct() {
                 servers.push(server_addr);
             }
 
-            // One-shot probes connect and tear down per iteration, so the
-            // transient supervisors go into a body-local scope: the
-            // run-racing scope is consumed by `run`, and these sessions end
-            // mid-body by design.
-            let mut transient = support::TestScope::new();
             let mut samples = Vec::with_capacity(PROBE_ITERS);
             for server_addr in servers {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write) = rtp_connect_transient(
-                    &mut transient,
+                    &task_tx,
                     pair.client_addr(),
                     false,
                     rtp::udp::NO_FEC_MSS,
@@ -513,17 +498,11 @@ async fn probe_mux_echo_1mib_mss8k() {
                 servers.push(server_addr);
             }
 
-            // One-shot probes connect and tear down per iteration, so the
-            // transient supervisors go into a body-local scope: the
-            // run-racing scope is consumed by `run`, and these sessions end
-            // mid-body by design.
-            let mut transient = support::TestScope::new();
             let mut samples = Vec::with_capacity(PROBE_ITERS);
             for server_addr in servers {
                 let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write) =
-                    rtp_connect_transient(&mut transient, pair.client_addr(), false, LOOPBACK_MSS)
-                        .await;
+                    rtp_connect_transient(&task_tx, pair.client_addr(), false, LOOPBACK_MSS).await;
                 let config = mux::MuxConfig {
                     initiation: mux::Initiation::Client,
                     heartbeat_interval: Duration::from_secs(5),
@@ -602,15 +581,9 @@ async fn probe_hostile_goodput_30s() {
             )
             .unwrap();
             let pair_ref = &pair;
-            // One-shot probes connect and tear down per iteration, so the
-            // transient supervisors go into a body-local scope: the
-            // run-racing scope is consumed by `run`, and these sessions end
-            // mid-body by design.
-            let mut transient = support::TestScope::new();
             let (read, write) =
-                rtp_connect_transient(&mut transient, pair.client_addr(), false, LOOPBACK_MSS)
-                    .await;
-            let opener = mux_client_connect_transient(&mut transient, read, write);
+                rtp_connect_transient(&task_tx, pair.client_addr(), false, LOOPBACK_MSS).await;
+            let opener = mux_client_connect_transient(&task_tx, read, write);
 
             // Open the stream under a generous timeout before we start the clock.
             let (stream_read, mut stream_write) = with_timeout(

@@ -59,7 +59,7 @@ use support::mux::{
 use support::payload::{cyclic_payload, with_timeout};
 use support::presets::gilbert_elliott_loss;
 use support::rtp::{
-    rtp_connect_with_mss_via, spawn_rtp_bulk_upload, spawn_rtp_byte_sink_server_via,
+    rtp_connect_with_mss_via, spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via,
 };
 use support::rtp_mux::{rtp_mux_connector_via, spawn_rtp_mux_latency_bulk_server_via};
 use support::stats::{HolSummary, combined_stats, summarize};
@@ -286,6 +286,7 @@ async fn run_hol_probe(
                     let mut set = tokio::task::JoinSet::new();
                     let client_addr = bulk_pair_opt.as_ref().unwrap().client_addr();
                     set.spawn(run_rtp_bulk_flow(
+                        task_tx.clone(),
                         client_addr,
                         fec,
                         Arc::clone(&payload),
@@ -492,6 +493,7 @@ async fn run_delayed_mux_bulk_stream(
 /// Pump a plain-RTP bulk flow through a separate NetemPair, saturating or
 /// paced per `load` (see [`BULK_PACE_BYTES_PER_SEC`]).
 async fn run_rtp_bulk_flow(
+    task_tx: tokio::sync::mpsc::Sender<support::TestTask>,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     payload: Arc<Vec<u8>>,
@@ -499,27 +501,25 @@ async fn run_rtp_bulk_flow(
     active_for: Duration,
     load: BulkLoad,
 ) -> u64 {
-    // Races the ramp/write future against the keepalives scope so a panic
-    // in the upload's supervisor driver cascades into the caller; dropping
-    // the scope when `run` returns aborts any still-running keepalive.
-    let mut keepalives = support::TestScope::new();
-    let Ok(mut writer) = spawn_rtp_bulk_upload(&mut keepalives, proxy_client_addr, fec).await
-    else {
+    // The upload's read-keepalive is submitted through the already-active
+    // bounded outer submitter (this helper runs inside the run-racing scope
+    // that owns it), so a panic in the upload's supervisor driver cascades
+    // into the caller immediately instead of being stored until a nested
+    // scope is dropped. Connection setup therefore happens inside the
+    // caller's actively-reaped body — never before supervision starts. The
+    // keepalive exits when the session closes (normal teardown) and is
+    // drained silently; dropping the write half at return closes the
+    // session, and the outer scope aborts anything still running at teardown.
+    let Ok(mut writer) = spawn_rtp_bulk_upload_via(&task_tx, proxy_client_addr, fec).await else {
         return 0;
     };
-    keepalives
-        .run(async {
-            tokio::time::sleep(ramp).await;
-            match load {
-                BulkLoad::Saturating => {
-                    saturating_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await
-                }
-                BulkLoad::Paced => {
-                    paced_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await
-                }
-            }
-        })
-        .await
+    tokio::time::sleep(ramp).await;
+    match load {
+        BulkLoad::Saturating => {
+            saturating_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await
+        }
+        BulkLoad::Paced => paced_bulk_write(&mut writer, &payload, active_for, &BULK_NO_STOP).await,
+    }
 }
 
 fn print_hol_summary(label: &str, s: &HolSummary) {
