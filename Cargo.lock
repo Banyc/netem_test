@@ -456,18 +456,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mux"
-version = "0.1.0"
-source = "git+https://github.com/Banyc/mux.git?tag=v0.0.26#1316e6d193db3b9381377d7d5fe4a2fdfe2a9440"
-dependencies = [
- "getrandom 0.4.3",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "netem-test"
 version = "0.1.0"
 dependencies = [
@@ -771,38 +759,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtp"
-version = "0.1.0"
-source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.83#025460f2ad2b65259e42fee65b474db3927d37bc"
-dependencies = [
- "async-trait",
- "async_async_io",
- "byteorder",
- "csv",
- "dre",
- "fec",
- "mpudp",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
- "rand 0.10.2",
- "self_assign",
- "serde",
- "tap",
- "thiserror",
- "tokio",
- "tokio-util",
- "tokio_udp",
- "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.16)",
-]
-
-[[package]]
 name = "rtp_mux"
 version = "0.1.0"
 dependencies = [
  "futures",
  "metrics",
- "mux 0.1.0 (git+https://github.com/Banyc/mux.git?tag=v0.0.26)",
+ "mux",
  "rand 0.10.2",
- "rtp 0.1.0 (git+https://github.com/Banyc/rtp.git?tag=v0.0.83)",
+ "rtp",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -944,9 +908,9 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 name = "tests"
 version = "0.1.0"
 dependencies = [
- "mux 0.1.0",
+ "mux",
  "netem-test",
- "rtp 0.1.0",
+ "rtp",
  "rtp_mux",
  "tokio",
 ]
@@ -1015,7 +979,6 @@ dependencies = [
 [[package]]
 name = "tokio_udp"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/tokio_udp.git?tag=v0.0.3#b8f36184f041930551f6ea87bcb2156da91b2b68"
 dependencies = [
  "bytes",
  "socket2",
@@ -1072,18 +1035,6 @@ dependencies = [
  "bytes",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.55)",
  "tokio",
-]
-
-[[package]]
-name = "udp_listener"
-version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.16#070e63c2d05ae0bf9a8cb2130ae1e87551988e49"
-dependencies = [
- "bytes",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
- "tokio",
- "tokio_udp",
- "tracing",
 ]
 
 [[package]]
