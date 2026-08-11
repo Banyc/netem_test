@@ -144,6 +144,7 @@ fn rtp_mux_connector_core(
             bind,
             bulk_addr,
             fec,
+            handshake: true,
             explorer: rtp_mux::ExplorerConfig {
                 enabled: false,
                 ..rtp_mux::ExplorerConfig::default()

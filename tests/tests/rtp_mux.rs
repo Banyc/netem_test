@@ -76,6 +76,7 @@ fn connector_via(
         bind,
         bulk_addr,
         fec: false,
+        handshake: true,
         explorer: ExplorerConfig {
             enabled: false,
             ..ExplorerConfig::default()
@@ -780,6 +781,7 @@ async fn run_explorer_arm() -> ExplorerArm {
                     bind,
                     bulk_addr,
                     fec: false,
+                    handshake: true,
                     explorer: ExplorerConfig {
                         enabled: true,
                         probe_mean_interval: Duration::from_millis(250),
