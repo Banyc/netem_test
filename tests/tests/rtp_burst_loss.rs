@@ -205,8 +205,7 @@ async fn run_rtp_sink_upload(
             let mut pump_tasks = tokio::task::JoinSet::new();
             pump_tasks.spawn(async move {
                 let mut offset = 0usize;
-                let start = Instant::now();
-                while start.elapsed() < window {
+                loop {
                     tokio::select! {
                         _ = stop_rx.changed() => break,
                         result = writer.write(&data[offset..]) => match result {
