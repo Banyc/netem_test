@@ -156,7 +156,7 @@ def svg_histogram(samples, buckets=48):
         height = count / maximum * plot_height
         x = PAD_LEFT + index * bar_width
         y = PAD_TOP + plot_height - height
-        parts.append(f"<rect x=\"{x:.1f}\" y=\"{y:.1f}\" width=\"{max(bar_width - 1, 0):.1f}\" height=\"{height:.1f}\" fill=\"#2563eb\"/>")
+        parts.append(f"<rect x=\"{x:.1f}\" y=\"{y:.1f}\" width=\"{max(bar_width - 1, 0.5):.1f}\" height=\"{height:.1f}\" fill=\"#2563eb\"/>")
     for tick in range(6):
         value = low + (high - low) * tick / 5
         x = PAD_LEFT + plot_width * tick / 5

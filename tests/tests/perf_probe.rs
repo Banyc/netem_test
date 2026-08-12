@@ -14,11 +14,13 @@ use std::time::{Duration, Instant};
 
 use netem_test::NetemPair;
 use support::mux::{
-    mux_send_payload, mux_timed_echo_round_trip, spawn_mux_over_rtp_counting_sink_server_via,
-    spawn_mux_over_rtp_echo_server_via, spawn_mux_over_rtp_echo_server_with_mss_via,
-    spawn_mux_over_rtp_sink_server_via, spawn_mux_over_rtp_sink_server_with_mss_via,
+    mux_send_payload, mux_timed_echo_round_trip,
+    spawn_mux_over_rtp_counting_sink_server_observed_via, spawn_mux_over_rtp_echo_server_via,
+    spawn_mux_over_rtp_echo_server_with_mss_via, spawn_mux_over_rtp_sink_server_via,
+    spawn_mux_over_rtp_sink_server_with_mss_via,
 };
 use support::payload::{cyclic_payload, payload, with_timeout};
+use support::perf_trace::PerfTrace;
 use support::presets::clean;
 use support::rtp::{
     rtp_echo_payload, spawn_rtp_echo_server_via, spawn_rtp_echo_server_with_mss_via,
@@ -80,11 +82,28 @@ async fn rtp_connect_transient(
     impl tokio::io::AsyncRead + Unpin + Send + use<>,
     impl tokio::io::AsyncWrite + Unpin + Send + use<>,
 ) {
+    rtp_connect_transient_observed(task_tx, proxy_client_addr, fec, mss, None).await
+}
+
+/// [`rtp_connect_transient`] with an optional typed transport observer; the
+/// tracing harness passes its RTP observer through here so the capture covers
+/// the client endpoint as well.
+async fn rtp_connect_transient_observed(
+    task_tx: &tokio::sync::mpsc::Sender<support::TestTask>,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
+) -> (
+    impl tokio::io::AsyncRead + Unpin + Send + use<>,
+    impl tokio::io::AsyncWrite + Unpin + Send + use<>,
+) {
     let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
         &proxy_client_addr.to_string(),
         rtp::udp::ConnectConfig {
             handshake: false,
+            metrics_observer,
             fec,
             mss: rtp::udp::MssConfig::Custom(mss),
             ..rtp::udp::ConnectConfig::default()
@@ -556,10 +575,11 @@ async fn probe_mux_echo_1mib_mss8k() {
 
 /// Time-boxed `mux`-over-`rtp` goodput probe across the hostile link profile.
 ///
-/// A 128 MiB payload is far more than the link can deliver in the 30 s window,
-/// so the measured goodput is receive-limited, not send-limited. The counting
-/// sink verifies every byte in-flight and is snapshotted while the transfer is
-/// still mid-flight, so a reversed measurement order cannot inflate goodput.
+/// A cyclic payload is written repeatedly for the whole 30 s window, so the
+/// measured goodput is receive-limited, not capped by a finite sender-payload.
+/// The counting sink verifies every byte in-flight and is snapshotted while the
+/// transfer is still mid-flight, so a reversed measurement order cannot inflate
+/// goodput.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_hostile_goodput_30s() {
@@ -569,19 +589,36 @@ async fn probe_hostile_goodput_30s() {
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let (server_addr, progress) =
-                spawn_mux_over_rtp_counting_sink_server_via(&task_tx, false, LOOPBACK_MSS)
-                    .await
-                    .unwrap();
-            let pair = NetemPair::spawn(
-                server_addr,
-                support::presets::hostile_real_link(),
-                support::presets::hostile_real_link(),
+            let mut trace = PerfTrace::from_env();
+            let c2s_seed = std::env::var("NETEM_PERF_SEED")
+                .map(|value| value.parse::<u64>().expect("NETEM_PERF_SEED must be a u64"))
+                .unwrap_or(4);
+            let s2c_seed = c2s_seed.wrapping_add(1);
+            let mut c2s = support::presets::hostile_real_link();
+            c2s.seed = c2s_seed;
+            let mut s2c = support::presets::hostile_real_link();
+            s2c.seed = s2c_seed;
+            let c2s_description = format!("{c2s:?}");
+            let s2c_description = format!("{s2c:?}");
+
+            let (server_addr, progress) = spawn_mux_over_rtp_counting_sink_server_observed_via(
+                &task_tx,
+                false,
+                LOOPBACK_MSS,
+                trace.as_ref().and_then(PerfTrace::rtp_peer_observer),
             )
+            .await
             .unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
             let pair_ref = &pair;
-            let (read, write) =
-                rtp_connect_transient(&task_tx, pair.client_addr(), false, LOOPBACK_MSS).await;
+            let (read, write) = rtp_connect_transient_observed(
+                &task_tx,
+                pair.client_addr(),
+                false,
+                LOOPBACK_MSS,
+                trace.as_ref().and_then(PerfTrace::rtp_observer),
+            )
+            .await;
             let opener = mux_client_connect_transient(&task_tx, read, write);
 
             // Open the stream under a generous timeout before we start the clock.
@@ -593,42 +630,93 @@ async fn probe_hostile_goodput_30s() {
             .await;
 
             // A cyclic payload never exhausts: the pump keeps writing until the
-            // measurement owner signals it to stop, so the fixed window is never
-            // sender-limited and an early pump exit remains observable.
+            // measurement owner signals it to stop.
             let data = cyclic_payload(1024 * 1024);
             let start = Instant::now();
+            let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
+            netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             let (pump_stop_tx, mut pump_stop_rx) = tokio::sync::watch::channel(false);
             let mut pump_tasks = tokio::task::JoinSet::new();
             pump_tasks.spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = pump_stop_rx.changed() => break,
+                        _ = pump_stop_rx.changed() => return Ok::<(), std::io::Error>(()),
                         result = stream_write.write_all(&data) => {
-                            result.unwrap();
+                            result?;
                         }
                     }
                 }
             });
 
-            let (delivered, elapsed) = tokio::select! {
-                joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
-                    // The bulk pump ended before the measurement window
-                    // completed: fail the test.
-                    joined.expect("bulk pump exists").unwrap();
-                    panic!("bulk pump ended before the measurement window completed");
-                }
-                _ = tokio::time::sleep(Duration::from_secs_f64(WINDOW)) => {
-                    let delivered = progress.delivered_bytes();
-                    let elapsed = start.elapsed();
-                    pump_stop_tx.send(true).unwrap();
-                    // Epilog: join the pump so any panic surfaces.
-                    while let Some(result) = pump_tasks.join_next().await {
-                        result.unwrap();
+            let window = tokio::time::sleep(Duration::from_secs_f64(WINDOW));
+            tokio::pin!(window);
+            let mut pump_error = None;
+            loop {
+                tokio::select! {
+                    joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
+                        let result = joined.expect("bulk pump exists").unwrap();
+                        pump_error = Some(match result {
+                            Ok(()) => "bulk pump ended before the measurement window".to_owned(),
+                            Err(error) => format!("bulk pump failed: {error:?}: {error}"),
+                        });
+                        break;
                     }
-                    (delivered, elapsed)
+                    _ = netem_tick.tick(), if trace.is_some() => {
+                        trace.as_mut().unwrap().record_netem(
+                            start.elapsed(),
+                            pair_ref.snapshot_c2s(),
+                            pair_ref.snapshot_s2c(),
+                            progress.delivered_bytes(),
+                        );
+                    }
+                    _ = &mut window => break,
                 }
-            };
+            }
+
+            let delivered = progress.delivered_bytes();
+            let elapsed = start.elapsed();
+            let _ = pump_stop_tx.send(true);
+            while let Some(result) = pump_tasks.join_next().await {
+                let result = result.unwrap();
+                if let Err(error) = result {
+                    pump_error.get_or_insert_with(|| {
+                        format!("bulk pump failed during epilog: {error:?}: {error}")
+                    });
+                }
+            }
+
+            if let Some(trace) = trace {
+                let revision = std::env::var("NETEM_PERF_REVISION")
+                    .unwrap_or_else(|_| "unspecified".to_owned());
+                let output_dir = trace
+                    .finish(&[
+                        ("scenario", "mux_over_rtp_hostile_goodput_30s".to_owned()),
+                        ("revision", revision),
+                        ("window_seconds", WINDOW.to_string()),
+                        ("mss_bytes", LOOPBACK_MSS.to_string()),
+                        ("fec", "false".to_owned()),
+                        ("rtp_handshake", "false".to_owned()),
+                        ("netem_sample_interval_micros", "50000".to_owned()),
+                        ("delivered_bytes", delivered.to_string()),
+                        ("elapsed_seconds", elapsed.as_secs_f64().to_string()),
+                        (
+                            "goodput_mib_per_second",
+                            (delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64())
+                                .to_string(),
+                        ),
+                        ("netem_c2s_seed", c2s_seed.to_string()),
+                        ("netem_s2c_seed", s2c_seed.to_string()),
+                        (
+                            "probe_outcome",
+                            pump_error.as_deref().unwrap_or("completed").to_owned(),
+                        ),
+                        ("netem_c2s", c2s_description),
+                        ("netem_s2c", s2c_description),
+                    ])
+                    .expect("write perf trace");
+                eprintln!("[trace] {}", output_dir.display());
+            }
 
             pair_ref.stop();
             let stats = combined_stats(pair_ref);
@@ -637,13 +725,13 @@ async fn probe_hostile_goodput_30s() {
                 "hostile link should drop and delay packets, got {stats:?}"
             );
 
-            // The sink verifies every accepted byte but a corrupt byte only
-            // freezes the counter, so the freeze must be asserted explicitly
-            // rather than left to the goodput floor.
             assert!(
                 !progress.is_corrupt(),
                 "sink saw bytes diverging from the payload pattern"
             );
+            if let Some(error) = pump_error {
+                panic!("{error}; failed after {:.3} s", elapsed.as_secs_f64());
+            }
 
             let goodput_mib_s = delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
             assert!(

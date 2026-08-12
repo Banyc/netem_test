@@ -6,3 +6,6 @@ members = ["netem-test", "tests"]
 edition = "2024"
 version = "0.1.0"
 license = "GPL-2.0-only"
+
+[profile.release]
+debug = true

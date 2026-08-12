@@ -13,6 +13,7 @@ pub(crate) mod fan;
 pub(crate) mod frame;
 pub(crate) mod mux;
 pub(crate) mod payload;
+pub(crate) mod perf_trace;
 pub(crate) mod presets;
 pub(crate) mod prng;
 pub(crate) mod rtp;

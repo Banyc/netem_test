@@ -155,7 +155,7 @@ impl PerfTrace {
 
     fn write_manifest(&self, metadata: &[(&str, String)]) -> io::Result<()> {
         let mut out = csv_writer(self.output_dir.join("manifest.csv"))?;
-        writeln!(out, "key, value")?;
+        writeln!(out, "key,value")?;
         write_csv_row(
             &mut out,
             &["trace_schema_version", &TRACE_SCHEMA_VERSION.to_string()],
@@ -203,7 +203,7 @@ impl PerfTrace {
         let mut out = csv_writer(self.output_dir.join(filename))?;
         writeln!(
             out,
-            "schema_version, event_index, elapsed_us, event, raw_rtt_us, pacer_tokens_packets, send_rate_packets_per_second, loss_ratio, in_flight_packets, packets_in_pipe, retransmitted_packets, next_send_sequence, minimum_rtt_us, smoothed_rtt_us, congestion_window_packets, received_packets, next_receive_sequence, delivery_rate_packets_per_second, delivery_sample_app_limited, pending_send_bytes, send_stage_capacity_bytes, accepts_new_packet, slow_start, gentle_mode, gentle_draining, queue_building, drain_floor_binding, outage_recovery, no_response_for_us, no_progress_for_us, stall_reason, congestion_loss_ratio, congestion_action"
+            "schema_version,event_index,elapsed_us,event,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action"
         )?;
         for observation in observations {
             let mut fields = vec![
@@ -264,7 +264,7 @@ impl PerfTrace {
         let mut out = csv_writer(self.output_dir.join("netem.csv"))?;
         writeln!(
             out,
-            "elapsed_us, direction, delayed, dropped, duplicated, reordered, rate_limited, forwarded, received, overflow_dropped, queue_len"
+            "elapsed_us,direction,delayed,dropped,duplicated,reordered,rate_limited,forwarded,received,overflow_dropped,queue_len"
         )?;
         for observation in &self.netem {
             write_netem_row(&mut out, observation.elapsed, "c2s", observation.c2s)?;
@@ -275,11 +275,11 @@ impl PerfTrace {
 
     fn write_progress(&self) -> io::Result<()> {
         let mut out = csv_writer(self.output_dir.join("progress.csv"))?;
-        writeln!(out, "elapsed_us, delivered_bytes")?;
+        writeln!(out, "elapsed_us,delivered_bytes")?;
         for observation in &self.netem {
             writeln!(
                 out,
-                "{}, {}",
+                "{},{}",
                 observation.elapsed.as_micros(),
                 observation.delivered_bytes,
             )?;
@@ -301,7 +301,7 @@ fn write_netem_row(
     let stats = snapshot.stats;
     writeln!(
         out,
-        "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
+        "{},{},{},{},{},{},{},{},{},{},{}",
         elapsed.as_micros(),
         direction,
         stats.delayed,
@@ -401,7 +401,10 @@ mod tests {
         );
         capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
         assert_eq!(
-            capture.interest(MetricsEvent::SendDataPacketAttempt, Duration::from_millis(1)),
+            capture.interest(
+                MetricsEvent::SendDataPacketAttempt,
+                Duration::from_millis(1)
+            ),
             MetricsInterest::Skip
         );
         assert_eq!(

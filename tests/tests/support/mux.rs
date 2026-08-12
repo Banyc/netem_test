@@ -24,6 +24,7 @@ async fn spawn_mux_over_rtp_server_core<F, Fut>(
     spawn: impl FnOnce(TestTask),
     fec: bool,
     mss: usize,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
     handle_stream: F,
 ) -> std::io::Result<std::net::SocketAddr>
 where
@@ -43,6 +44,7 @@ where
                 .accept_without_handshake_with(rtp::udp::AcceptConfig {
                     fec,
                     mss: rtp::udp::MssConfig::Custom(mss),
+                    metrics_observer,
                     ..rtp::udp::AcceptConfig::default()
                 })
                 .await
@@ -63,6 +65,8 @@ where
                             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                                 fec,
                                 mss: rtp::udp::MssConfig::Custom(mss),
+                                // The drainer rejects extra logical sessions;
+                                // only the first accepted peer is observed.
                                 ..rtp::udp::AcceptConfig::default()
                             })
                             .await
@@ -166,7 +170,7 @@ where
     F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    spawn_mux_over_rtp_server_core(|fut| tasks.spawn(fut), fec, mss, handle_stream).await
+    spawn_mux_over_rtp_server_core(|fut| tasks.spawn(fut), fec, mss, None, handle_stream).await
 }
 
 /// [`spawn_mux_over_rtp_server_with_mss`] through the bounded
@@ -182,7 +186,14 @@ where
     F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    spawn_mux_over_rtp_server_core(|fut| submit_test_task(tx, fut), fec, mss, handle_stream).await
+    spawn_mux_over_rtp_server_core(
+        |fut| submit_test_task(tx, fut),
+        fec,
+        mss,
+        None,
+        handle_stream,
+    )
+    .await
 }
 
 /// Shared core for [`spawn_mux_over_rtp_echo_server_with_mss`] and its `_via`
@@ -197,6 +208,7 @@ async fn spawn_mux_over_rtp_echo_server_core(
         spawn,
         fec,
         mss,
+        None,
         |mut stream_read, mut stream_write| async move {
             let mut buf = vec![0u8; 8 * 1024];
             loop {
@@ -269,6 +281,7 @@ async fn spawn_mux_over_rtp_sink_server_core(
         spawn,
         fec,
         mss,
+        None,
         move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             async move {
@@ -375,6 +388,7 @@ async fn spawn_mux_msg_latency_sink_core(
         spawn,
         fec,
         mss,
+        None,
         move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
             async move {
@@ -668,9 +682,10 @@ async fn spawn_mux_over_rtp_counting_sink_server_core(
     spawn: impl FnOnce(TestTask),
     fec: bool,
     mss: usize,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
     let progress = Arc::new(SinkProgress::new());
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, metrics_observer, {
         let progress = Arc::clone(&progress);
         move |mut stream_read, mut stream_write| {
             let progress = Arc::clone(&progress);
@@ -725,7 +740,7 @@ pub async fn spawn_mux_over_rtp_counting_sink_server(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
-    spawn_mux_over_rtp_counting_sink_server_core(|fut| tasks.spawn(fut), fec, mss).await
+    spawn_mux_over_rtp_counting_sink_server_core(|fut| tasks.spawn(fut), fec, mss, None).await
 }
 
 /// [`spawn_mux_over_rtp_counting_sink_server`] through the bounded
@@ -736,7 +751,26 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_via(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
-    spawn_mux_over_rtp_counting_sink_server_core(|fut| submit_test_task(tx, fut), fec, mss).await
+    spawn_mux_over_rtp_counting_sink_server_core(|fut| submit_test_task(tx, fut), fec, mss, None)
+        .await
+}
+
+/// [`spawn_mux_over_rtp_counting_sink_server_via`] with an optional typed RTP
+/// transport observer: the observed counting sink is the only core caller
+/// that passes a non-`None` observer.
+pub async fn spawn_mux_over_rtp_counting_sink_server_observed_via(
+    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    fec: bool,
+    mss: usize,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
+) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
+    spawn_mux_over_rtp_counting_sink_server_core(
+        |fut| submit_test_task(tx, fut),
+        fec,
+        mss,
+        metrics_observer,
+    )
+    .await
 }
 
 /// Convenience wrapper using the default RTP MSS.
@@ -771,7 +805,7 @@ async fn spawn_mux_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -919,7 +953,7 @@ async fn spawn_mux_sized_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, None, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -1054,7 +1088,7 @@ async fn spawn_mux_gaming_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {

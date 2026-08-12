@@ -36,7 +36,7 @@ class TraceReportTest(unittest.TestCase):
                     ],
                     [3, 0, 0, "rtt_sample", 100000, 0, 128, 0.01, 2, 2, 0, 3, 100000, 100000, 10, 1, 2, 64, False, True, False, False, False, False, False, 1000, 2000, ""],
                     [3, 2, 100000, "rtt_sample", 200000, 0, 256, 0.02, 3, 3, 1, 4, 100000, 112500, 11, 2, 3, 128, False, False, True, True, True, False, True, 2000, 3000, "no_progress"],
-                    [4, 1, 50000, "rtt_sample", 300000, 0, 384, 0.03, 4, 4, 2, 5, 300000, 300000, 12, 3, 4, 192, False, False, False, False, False, False, False, 3000, 4000, ""],
+                    [4, 1, 50000, "rtt_sample", 300000, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
                 ],
             )
             self.write_csv(
