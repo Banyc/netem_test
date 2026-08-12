@@ -18,7 +18,7 @@ use support::mux::{
     spawn_mux_over_rtp_echo_server_via, spawn_mux_over_rtp_echo_server_with_mss_via,
     spawn_mux_over_rtp_sink_server_via, spawn_mux_over_rtp_sink_server_with_mss_via,
 };
-use support::payload::{payload, with_timeout};
+use support::payload::{cyclic_payload, payload, with_timeout};
 use support::presets::clean;
 use support::rtp::{
     rtp_echo_payload, spawn_rtp_echo_server_via, spawn_rtp_echo_server_with_mss_via,
@@ -564,7 +564,6 @@ async fn probe_mux_echo_1mib_mss8k() {
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_hostile_goodput_30s() {
     const WINDOW: f64 = 30.0;
-    const HOSTILE_BULK: usize = 128 * 1024 * 1024;
 
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
@@ -593,21 +592,21 @@ async fn probe_hostile_goodput_30s() {
             )
             .await;
 
-            let data = payload(HOSTILE_BULK);
+            // A cyclic payload never exhausts: the pump keeps writing until the
+            // measurement owner signals it to stop, so the fixed window is never
+            // sender-limited and an early pump exit remains observable.
+            let data = cyclic_payload(1024 * 1024);
             let start = Instant::now();
 
-            // Keep the write half busy and the read half open for the full window.
-            // The pump is raced against the window below, so an early completion
-            // (write failure) fails the test instead of measuring a dead upload.
             let (pump_stop_tx, mut pump_stop_rx) = tokio::sync::watch::channel(false);
             let mut pump_tasks = tokio::task::JoinSet::new();
             pump_tasks.spawn(async move {
-                tokio::select! {
-                    _ = pump_stop_rx.changed() => {}
-                    result = stream_write.write_all(&data) => {
-                        // The write finished before the window ended: surface the
-                        // outcome (a write failure panics the pump).
-                        result.unwrap();
+                loop {
+                    tokio::select! {
+                        _ = pump_stop_rx.changed() => break,
+                        result = stream_write.write_all(&data) => {
+                            result.unwrap();
+                        }
                     }
                 }
             });
@@ -644,10 +643,6 @@ async fn probe_hostile_goodput_30s() {
             assert!(
                 !progress.is_corrupt(),
                 "sink saw bytes diverging from the payload pattern"
-            );
-            assert!(
-                delivered <= HOSTILE_BULK as u64,
-                "sink counted more bytes than were sent: {delivered}"
             );
 
             let goodput_mib_s = delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
