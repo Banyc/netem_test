@@ -77,6 +77,19 @@ def safe_build_dir(requested, workspace, profile):
     return resolved
 
 
+def safe_temp_dir(role, seed):
+    """A unique per-probe temporary directory beneath $TMPDIR."""
+    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    safe_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    requested = safe_root / f"net-perf-tmp-{stamp}-{os.getpid()}-{role}-{seed}"
+    resolved = requested.expanduser().resolve()
+    if not resolved.is_relative_to(safe_root):
+        raise ValueError(f"probe temporary directory must remain beneath {safe_root}")
+    resolved.mkdir(parents=True, exist_ok=False)
+    return resolved
+
+
 def validate_workspace(path, role):
     workspace = path.expanduser().resolve()
     if not (workspace / "Cargo.toml").is_file() or not (workspace / "tests" / "Cargo.toml").is_file():
@@ -135,10 +148,9 @@ def run_probe(
     """Run one role/seed probe beneath the safe roots; returns a manifest row."""
     workspace = validate_workspace(workspace, role)
     trace_dir = output_root / f"trace-{role}-{seed}"
-    temp_dir = output_root / f"tmp-{role}-{seed}"
+    temp_dir = safe_temp_dir(role, seed)
     log_path = output_root / f"{role}-{seed}.log"
     trace_dir.mkdir(parents=True, exist_ok=False)
-    temp_dir.mkdir(parents=True, exist_ok=False)
     profile = "release" if release else "debug"
     build_root = safe_build_dir(target_dir, workspace.parent, profile)
 
