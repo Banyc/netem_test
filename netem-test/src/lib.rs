@@ -38,6 +38,14 @@ pub use loss::{FourStateLoss, LossModel};
 pub use rng::RndState;
 pub use shaper::BottleneckShaper;
 
+/// Default receive poll used when nothing is queued, and the upper bound for
+/// how long the runner sleeps before it must re-check the queue for a packet
+/// whose deadline is about to arrive.
+const RUNNER_IDLE_POLL: Duration = Duration::from_millis(5);
+/// Hard per-direction cap on recycled packet payload buffers; drained buffers
+/// beyond this bound are dropped so a fast flow cannot grow the cache forever.
+const MAX_REUSED_PACKET_BUFFERS: usize = 64;
+
 // ──────────────────────────── UDP transport ────────────────────────────
 
 /// Abstract UDP datagram transport.
@@ -116,7 +124,7 @@ impl StdUdpTransport {
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
         let sock = std::net::UdpSocket::bind(addr)?;
         sock.set_nonblocking(false)?;
-        sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+        sock.set_read_timeout(Some(RUNNER_IDLE_POLL))?;
         Ok(Self { sock })
     }
 }
@@ -133,7 +141,7 @@ impl UdpTransport for StdUdpTransport {
     ) -> io::Result<(usize, SocketAddr)> {
         self.sock.set_read_timeout(Some(timeout))?;
         let res = self.sock.recv_from(buf);
-        self.sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+        self.sock.set_read_timeout(Some(RUNNER_IDLE_POLL))?;
         res
     }
 
@@ -474,6 +482,11 @@ impl Drop for NetemLink {
 /// learned client address, with an optional shared-bottleneck shaper).
 struct NetemState {
     config: NetemConfig,
+    /// True when the config has no shared shaper and no stochastic or
+    /// scheduling impairment, so packets can be forwarded without touching
+    /// the heap at all. `max_datagram_size` is a deterministic filter and does
+    /// not disqualify the direct path.
+    direct_forward: bool,
     stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
@@ -494,6 +507,8 @@ struct NetemState {
     /// drive emulated time deterministically instead of sleeping.
     clock: Option<Clock>,
     queue: BinaryHeap<Reverse<Queued>>,
+    /// Recycled drained payload buffers, bounded at MAX_REUSED_PACKET_BUFFERS.
+    reused_packet_buffers: Vec<Vec<u8>>,
     reorder_counter: u32,
     seq: u64,
 }
@@ -508,6 +523,16 @@ impl NetemState {
         shared: Option<BottleneckShaper>,
         clock: Option<Clock>,
     ) -> Self {
+        let direct_forward = shared.is_none()
+            && config.latency.is_zero()
+            && config.jitter.is_zero()
+            && config.loss == 0
+            && matches!(config.loss_model, LossModel::Random)
+            && config.duplicate == 0
+            && config.reorder == 0
+            && config.reorder_gap_pkts == 0
+            && config.rate == 0
+            && config.queue_limit_pkts == 0;
         let rng = RndState::seed(config.seed);
         let link_free_at = match &clock {
             Some(c) => c.now(),
@@ -520,6 +545,7 @@ impl NetemState {
             reorder_cor: CorRng::new(config.reorder_corr),
             link_free_at,
             config,
+            direct_forward,
             stats,
             queue_len,
             blackout,
@@ -529,6 +555,7 @@ impl NetemState {
             state: FourStateState::default(),
             clock,
             queue: BinaryHeap::new(),
+            reused_packet_buffers: Vec::new(),
             reorder_counter: 0,
             seq: 0,
         }
@@ -545,6 +572,36 @@ impl NetemState {
 
     fn should_stop(&self) -> bool {
         *self.stop.lock().unwrap()
+    }
+
+    /// Forward `data` to `dst` without touching the heap when the config is
+    /// clean. Returns `true` when the packet was handled (forwarded, dropped
+    /// by the deterministic size filter, or gated by blackout); `false` when
+    /// the caller must fall through to the queued impairment path.
+    fn try_direct_forward(
+        &self,
+        data: &[u8],
+        dst: Option<SocketAddr>,
+        send: &dyn UdpTransport,
+    ) -> bool {
+        if !self.direct_forward {
+            return false;
+        }
+        self.stats.inc(|s| &s.received);
+        if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
+            self.stats.inc(|s| &s.dropped);
+            return true;
+        }
+        if self.blackout.load(Ordering::Relaxed) {
+            self.stats.inc(|s| &s.dropped);
+            return true;
+        }
+        if let Some(dst) = dst
+            && send.send_to(data, dst).is_ok()
+        {
+            self.stats.inc(|s| &s.forwarded);
+        }
+        true
     }
 
     fn handle_datagram(&mut self, data: &[u8], now: Instant, dst: Option<SocketAddr>) {
@@ -682,10 +739,15 @@ impl NetemState {
             return;
         };
 
+        // Reuse a recycled drained payload buffer instead of allocating a
+        // fresh one; `extend_from_slice` keeps the pooled allocation when its
+        // capacity is sufficient.
+        let mut packet = self.reused_packet_buffers.pop().unwrap_or_default();
+        packet.extend_from_slice(data);
         let item = Queued {
             time_to_send,
             seq: self.seq,
-            data: data.to_vec(),
+            data: packet,
             dst,
         };
         self.seq = self.seq.wrapping_add(1);
@@ -704,13 +766,29 @@ impl NetemState {
             if !ready {
                 break;
             }
-            let Reverse(Queued { data, dst, .. }) = self.queue.pop().unwrap();
+            let Reverse(Queued { mut data, dst, .. }) = self.queue.pop().unwrap();
             self.queue_len
                 .store(self.queue.len() as u64, Ordering::Relaxed);
             if send.send_to(&data, dst).is_ok() {
                 self.stats.inc(|s| &s.forwarded);
             }
+            data.clear();
+            if self.reused_packet_buffers.len() < MAX_REUSED_PACKET_BUFFERS {
+                self.reused_packet_buffers.push(data);
+            }
         }
+    }
+
+    /// How long the runner may sleep before it must wake up again: until the
+    /// next queued packet's deadline, capped at [`RUNNER_IDLE_POLL`] (and at
+    /// the idle poll when the queue is empty). A zero wait means a packet is
+    /// due right now and the caller should re-drain instead of polling.
+    fn next_receive_wait(&self, now: Instant) -> Duration {
+        self.queue
+            .peek()
+            .map(|queued| queued.0.time_to_send.saturating_duration_since(now))
+            .unwrap_or(RUNNER_IDLE_POLL)
+            .min(RUNNER_IDLE_POLL)
     }
 }
 
@@ -773,19 +851,29 @@ impl LinkRunner {
             self.pipeline
                 .drain_ready(self.pipeline.now(), &*self.transport);
 
+            // Sleep only until the next queued deadline (capped at the idle
+            // poll) so a packet that becomes ready is drained on the next
+            // iteration instead of waiting out a fixed 5 ms poll.
+            let receive_wait = self.pipeline.next_receive_wait(self.pipeline.now());
+            if receive_wait.is_zero() {
+                continue;
+            }
+
             // Block briefly on recv so we don't spin. Use the explicit
             // timeout API so the receive deadline is decoupled from the
             // transport's default read timeout and can be asserted by tests.
-            match self
-                .transport
-                .recv_from_timeout(&mut buf, Duration::from_millis(5))
-            {
+            match self.transport.recv_from_timeout(&mut buf, receive_wait) {
                 Ok((n, _from)) => {
-                    self.pipeline.handle_datagram(
-                        &buf[..n],
-                        self.pipeline.now(),
-                        Some(self.server_addr),
-                    );
+                    let dst = Some(self.server_addr);
+                    // Clean configs skip the heap entirely; only packets that
+                    // need impairment reach the queued path.
+                    if !self
+                        .pipeline
+                        .try_direct_forward(&buf[..n], dst, &*self.transport)
+                    {
+                        self.pipeline
+                            .handle_datagram(&buf[..n], self.pipeline.now(), dst);
+                    }
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -1184,12 +1272,17 @@ impl SharedLinkRunner {
             }
             self.pipeline.drain_ready(self.pipeline.now(), &*self.send);
 
+            // Sleep only until the next queued deadline (capped at the idle
+            // poll); a zero wait means a packet is due now, so re-drain on the
+            // next iteration instead of polling.
+            let receive_wait = self.pipeline.next_receive_wait(self.pipeline.now());
+            if receive_wait.is_zero() {
+                continue;
+            }
+
             // Use the explicit timeout API so the receive deadline is
             // decoupled from the transport's default read timeout.
-            match self
-                .recv
-                .recv_from_timeout(&mut buf, Duration::from_millis(5))
-            {
+            match self.recv.recv_from_timeout(&mut buf, receive_wait) {
                 Ok((n, from)) => {
                     // For c2s, learn the client address so the s2c runner can
                     // send replies back to it.
@@ -1197,8 +1290,15 @@ impl SharedLinkRunner {
                         *self.learned_dst.lock().unwrap() = Some(from);
                     }
                     let dst = self.fixed_dst.or_else(|| *self.learned_dst.lock().unwrap());
-                    self.pipeline
-                        .handle_datagram(&buf[..n], self.pipeline.now(), dst);
+                    // Clean configs skip the heap entirely; only packets that
+                    // need impairment reach the queued path.
+                    if !self
+                        .pipeline
+                        .try_direct_forward(&buf[..n], dst, &*self.send)
+                    {
+                        self.pipeline
+                            .handle_datagram(&buf[..n], self.pipeline.now(), dst);
+                    }
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -2176,5 +2276,264 @@ mod tests {
             stats.overflow_dropped, 1,
             "the overflowed 40 B packet must increment overflow_dropped"
         );
+    }
+
+    #[test]
+    fn clean_config_forwards_directly_and_honors_blackout() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let (runner, sent) = mock_runner(NetemConfig::default());
+        assert!(
+            runner.direct_forward,
+            "a default config must be direct-forward eligible"
+        );
+        // The direct path forwards without touching the heap.
+        let dst = Some(server_addr);
+        assert!(runner.try_direct_forward(b"hello", dst, &*sent));
+        assert_eq!(runner.queue.len(), 0);
+        let s = runner.stats.snapshot();
+        assert_eq!(s.received, 1);
+        assert_eq!(s.forwarded, 1);
+        assert_eq!(sent.sent.lock().unwrap().len(), 1);
+        // Blackout gates on the direct path: counted received, dropped,
+        // nothing forwarded.
+        runner.blackout.store(true, Ordering::Relaxed);
+        assert!(runner.try_direct_forward(b"gated", dst, &*sent));
+        let s = runner.stats.snapshot();
+        assert_eq!(s.received, 2);
+        assert_eq!(s.dropped, 1);
+        assert_eq!(s.forwarded, 1);
+        assert_eq!(runner.queue.len(), 0);
+        drop(sent);
+    }
+
+    #[test]
+    fn impaired_config_stays_on_the_queue_path() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        assert!(!runner.direct_forward);
+        let dst = Some(server_addr);
+        assert!(
+            !runner.try_direct_forward(b"impaired", dst, &*sent),
+            "an impaired config must refuse the direct path"
+        );
+        assert_eq!(runner.stats.snapshot().received, 0);
+        // The queued path still handles the datagram.
+        runner.handle_datagram(b"impaired", server_addr, sent.clock().now());
+        assert_eq!(runner.queue.len(), 1);
+        assert_eq!(runner.stats.snapshot().received, 1);
+        drop(sent);
+    }
+
+    #[test]
+    fn datagram_size_filter_stays_on_the_direct_path() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            max_datagram_size: 512,
+            ..Default::default()
+        };
+        let (runner, sent) = mock_runner(config);
+        assert!(
+            runner.direct_forward,
+            "max_datagram_size is a deterministic filter and must not disqualify the direct path"
+        );
+        assert!(runner.try_direct_forward(&[0u8; 600], Some(server_addr), &*sent));
+        let s = runner.stats.snapshot();
+        assert_eq!(s.received, 1);
+        assert_eq!(s.dropped, 1);
+        assert_eq!(
+            runner.queue.len(),
+            0,
+            "the oversized datagram must be dropped without entering the heap"
+        );
+        drop(sent);
+    }
+
+    #[test]
+    fn queued_payload_storage_is_reused_and_bounded() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        let clock = sent.clock();
+        let payload = vec![0xABu8; 4096];
+
+        // Enqueue a large payload and drain it: the drained buffer is recycled.
+        runner.handle_datagram(&payload, server_addr, clock.now());
+        let queued_ptr = runner.queue.peek().unwrap().0.data.as_ptr();
+        clock.advance(Duration::from_millis(20));
+        runner.drain_ready(clock.now());
+        assert_eq!(runner.reused_packet_buffers.len(), 1);
+
+        // The next enqueue pops the recycled buffer: the queued payload must
+        // reuse the same allocation (pointer reuse).
+        runner.handle_datagram(&payload, server_addr, clock.now());
+        let reused_ptr = runner.queue.peek().unwrap().0.data.as_ptr();
+        assert_eq!(
+            reused_ptr, queued_ptr,
+            "drained payload buffer must be recycled, not reallocated"
+        );
+        assert_eq!(runner.queue.len(), 1);
+        assert_eq!(runner.reused_packet_buffers.len(), 0);
+
+        // Drain a burst larger than the cap: the pool is bounded at exactly
+        // MAX_REUSED_PACKET_BUFFERS.
+        for _ in 0..(MAX_REUSED_PACKET_BUFFERS + 16) {
+            runner.handle_datagram(&payload, server_addr, clock.now());
+        }
+        clock.advance(Duration::from_millis(20));
+        while runner.queue.len() > 0 {
+            runner.drain_ready(clock.now());
+        }
+        assert_eq!(
+            runner.reused_packet_buffers.len(),
+            MAX_REUSED_PACKET_BUFFERS,
+            "the recycled pool must hold exactly MAX_REUSED_PACKET_BUFFERS"
+        );
+        drop(sent);
+    }
+
+    #[test]
+    fn receive_wait_tracks_the_next_queued_deadline() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(2),
+            ..Default::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        let clock = sent.clock();
+        let t0 = clock.now();
+        runner.handle_datagram(b"a", server_addr, t0);
+        // The next deadline is 2 ms out, below the 5 ms idle poll, so the wait
+        // tracks the queued deadline exactly.
+        assert_eq!(runner.next_receive_wait(t0), Duration::from_millis(2));
+        // One ms later the remaining wait is 1 ms.
+        assert_eq!(
+            runner.next_receive_wait(t0 + Duration::from_millis(1)),
+            Duration::from_millis(1)
+        );
+        // Once drained there is nothing queued: the wait falls back to the
+        // idle poll.
+        clock.advance(Duration::from_millis(10));
+        runner.drain_ready(clock.now());
+        assert_eq!(runner.queue.len(), 0);
+        assert_eq!(runner.next_receive_wait(clock.now()), RUNNER_IDLE_POLL);
+        drop(sent);
+    }
+
+    #[test]
+    fn receive_wait_caps_long_deadlines_at_the_idle_poll() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        runner.handle_datagram(b"a", server_addr, sent.clock().now());
+        assert_eq!(
+            runner.next_receive_wait(sent.clock().now()),
+            RUNNER_IDLE_POLL,
+            "long queued deadlines must be capped at the idle poll"
+        );
+        drop(sent);
+    }
+
+    /// Wall-clock throughput probe helper for [`clean_forwarding_perf_probe`]:
+    /// runs `op` SAMPLES times and returns millions of operations per second.
+    fn probe_mpps(mut op: impl FnMut()) -> f64 {
+        const SAMPLES: u32 = 200_000;
+        let start = std::time::Instant::now();
+        for _ in 0..SAMPLES {
+            op();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        SAMPLES as f64 / elapsed / 1e6
+    }
+
+    #[test]
+    #[ignore = "release perf probe"]
+    fn clean_forwarding_perf_probe() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let payload = vec![0x42u8; 1200];
+
+        // Direct path: a clean config forwards without touching the heap.
+        let (runner, sent) = mock_runner(NetemConfig::default());
+        let direct = || {
+            let _ = runner.try_direct_forward(&payload, Some(server_addr), &*sent);
+        };
+        let direct_mpps = probe_mpps(direct);
+
+        // Filter path: the same clean config but every datagram trips the
+        // deterministic max_datagram_size filter on the direct path.
+        let config = NetemConfig {
+            max_datagram_size: 512,
+            ..Default::default()
+        };
+        let (runner_f, sent_f) = mock_runner(config);
+        let filter = || {
+            let _ = runner_f.try_direct_forward(&payload, Some(server_addr), &*sent_f);
+        };
+        let filter_mpps = probe_mpps(filter);
+
+        // Queued path: an impaired config goes through enqueue + drain.
+        let config = NetemConfig {
+            latency: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let (mut runner_q, sent_q) = mock_runner(config);
+        let clock = sent_q.clock();
+        let queued = || {
+            runner_q.handle_datagram(&payload, server_addr, clock.now());
+            clock.advance(Duration::from_millis(2));
+            runner_q.drain_ready(clock.now());
+        };
+        let queued_mpps = probe_mpps(queued);
+
+        eprintln!(
+            "clean_forwarding_perf_probe: direct={direct_mpps:.3} Mpps filter={filter_mpps:.3} Mpps queued={queued_mpps:.3} Mpps direct/filter speedup={:.2}x direct/queued speedup={:.2}x",
+            direct_mpps / filter_mpps.max(1e-9),
+            direct_mpps / queued_mpps.max(1e-9),
+        );
+        drop(sent);
+        drop(sent_f);
+        drop(sent_q);
+    }
+
+    #[test]
+    #[ignore = "release perf probe"]
+    fn short_deadline_latency_perf_probe() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_micros(500),
+            ..Default::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        let clock = sent.clock();
+        const SAMPLES: usize = 1000;
+        let mut latencies = Vec::with_capacity(SAMPLES);
+        // Sequential 500 us deadlines: each packet must be drained soon after
+        // its deadline, without waiting out the full idle poll.
+        for _ in 0..SAMPLES {
+            let start = std::time::Instant::now();
+            runner.handle_datagram(b"x", server_addr, clock.now());
+            clock.advance(Duration::from_micros(600));
+            runner.drain_ready(clock.now());
+            latencies.push(start.elapsed());
+        }
+        latencies.sort();
+        let median = latencies[SAMPLES / 2];
+        eprintln!(
+            "short_deadline_latency_perf_probe: median={median:?} (RUNNER_IDLE_POLL={RUNNER_IDLE_POLL:?})"
+        );
+        assert!(
+            median < RUNNER_IDLE_POLL,
+            "median {median:?} must stay below the idle poll {RUNNER_IDLE_POLL:?}"
+        );
+        drop(sent);
     }
 }
