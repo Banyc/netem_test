@@ -674,6 +674,9 @@ async fn probe_hostile_goodput_30s() {
             // measurement owner signals it to stop.
             let data = cyclic_payload(1024 * 1024);
             let start = Instant::now();
+            // Anchor the measurement boundary on the shared trace clock so
+            // netem/progress samples line up with the RTP endpoint rows.
+            trace.as_mut().map(|trace| trace.mark_measurement_start(start));
             let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
             netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

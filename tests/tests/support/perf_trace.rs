@@ -1,43 +1,89 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use netem_test::CountersSnapshot;
 use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
 
-const TRACE_SCHEMA_VERSION: u16 = rtp::metrics::SCHEMA_VERSION;
+/// Trace schema 9: RTP rows carry `trace_elapsed_us` so endpoint, netem, and
+/// progress samples share one clock (`PerfTrace::trace_start`).
+const TRACE_SCHEMA_VERSION: u16 = 9;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
-const RTP_TRACE_COLUMNS: usize = 36;
-const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action";
+const RTP_TRACE_COLUMNS: usize = 37;
+const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
 
+/// One captured RTP observation plus its position on the shared trace clock.
+#[derive(Debug, Clone, Copy)]
+struct CapturedRtpObservation {
+    observation: MetricsObservation,
+    trace_elapsed: Duration,
+}
+
+/// One netem/progress sample: the scenario-relative `elapsed` and its shared
+/// trace-clock position.
 #[derive(Debug, Clone, Copy)]
 struct NetemObservation {
     elapsed: Duration,
+    trace_elapsed: Duration,
     c2s: CountersSnapshot,
     s2c: CountersSnapshot,
     delivered_bytes: u64,
 }
 
+/// A bounded, sealable capture of RTP observations for one endpoint. State
+/// samples are throttled to [`STATE_SAMPLE_INTERVAL`] while every raw RTT
+/// sample and termination row is retained; callbacks are synchronous and the
+/// storage is bounded at `capacity`.
 #[derive(Debug)]
 struct RtpCapture {
-    observations: Mutex<Vec<MetricsObservation>>,
+    trace_start: Instant,
+    observations: Mutex<Vec<CapturedRtpObservation>>,
     last_state_sample_micros: AtomicU64,
     dropped_capacity: AtomicU64,
+    sealed: AtomicBool,
     capacity: usize,
 }
 
 impl RtpCapture {
+    fn new(trace_start: Instant, capacity: usize) -> Self {
+        Self {
+            trace_start,
+            observations: Mutex::new(Vec::with_capacity(capacity)),
+            last_state_sample_micros: AtomicU64::new(u64::MAX),
+            dropped_capacity: AtomicU64::new(0),
+            sealed: AtomicBool::new(false),
+            capacity,
+        }
+    }
+
     fn record(&self, observation: MetricsObservation) {
+        if self.sealed.load(Ordering::Acquire) {
+            return;
+        }
+        let captured = CapturedRtpObservation {
+            observation,
+            trace_elapsed: self.trace_start.elapsed(),
+        };
         let mut observations = self.observations.lock().unwrap();
+        if self.sealed.load(Ordering::Acquire) {
+            return;
+        }
         if observations.len() >= self.capacity {
             self.dropped_capacity.fetch_add(1, Ordering::Relaxed);
         } else {
-            observations.push(observation);
+            observations.push(captured);
         }
+    }
+
+    /// Stop accepting callbacks. Runs before any output file is written so a
+    /// callback that raced past the finish boundary cannot corrupt the rows.
+    fn seal(&self) {
+        self.sealed.store(true, Ordering::Release);
+        drop(self.observations.lock().unwrap());
     }
 
     fn claim_state_sample_at(&self, elapsed: Duration) -> bool {
@@ -85,31 +131,43 @@ impl RtpCapture {
 pub(crate) struct PerfTrace {
     output_dir: PathBuf,
     capture_rtp: bool,
+    trace_start: Instant,
+    measurement_start_trace_elapsed: Option<Duration>,
     rtp: Arc<RtpCapture>,
     rtp_peer: Arc<RtpCapture>,
     netem: Vec<NetemObservation>,
 }
 
 impl PerfTrace {
-    fn new_rtp_capture() -> Arc<RtpCapture> {
-        Arc::new(RtpCapture {
-            observations: Mutex::new(Vec::with_capacity(DEFAULT_CAPACITY)),
-            last_state_sample_micros: AtomicU64::new(u64::MAX),
-            dropped_capacity: AtomicU64::new(0),
-            capacity: DEFAULT_CAPACITY,
-        })
+    fn new(output_dir: PathBuf, capture_rtp: bool) -> Self {
+        let trace_start = Instant::now();
+        Self {
+            output_dir,
+            capture_rtp,
+            trace_start,
+            measurement_start_trace_elapsed: None,
+            rtp: Self::new_rtp_capture(trace_start),
+            rtp_peer: Self::new_rtp_capture(trace_start),
+            netem: Vec::new(),
+        }
+    }
+
+    fn new_rtp_capture(trace_start: Instant) -> Arc<RtpCapture> {
+        Arc::new(RtpCapture::new(trace_start, DEFAULT_CAPACITY))
     }
 
     pub(crate) fn from_env() -> Option<Self> {
         let output_dir = std::env::var_os("NETEM_PERF_TRACE_DIR").map(PathBuf::from)?;
         let capture_rtp = std::env::var_os("NETEM_PERF_TRACE_RTP").is_none_or(|value| value != "0");
-        Some(Self {
-            output_dir,
-            capture_rtp,
-            rtp: Self::new_rtp_capture(),
-            rtp_peer: Self::new_rtp_capture(),
-            netem: Vec::new(),
-        })
+        Some(Self::new(output_dir, capture_rtp))
+    }
+
+    /// Anchor the measurement boundary on the shared trace clock. Netem and
+    /// progress samples recorded after this call carry
+    /// `measurement_start_trace_elapsed + scenario_elapsed`.
+    pub(crate) fn mark_measurement_start(&mut self, start: Instant) {
+        self.measurement_start_trace_elapsed =
+            Some(start.saturating_duration_since(self.trace_start));
     }
 
     pub(crate) fn rtp_observer(&self) -> Option<MetricsObserver> {
@@ -139,8 +197,13 @@ impl PerfTrace {
         s2c: CountersSnapshot,
         delivered_bytes: u64,
     ) {
+        let trace_elapsed = self
+            .measurement_start_trace_elapsed
+            .map(|start| start + elapsed)
+            .unwrap_or_else(|| self.trace_start.elapsed());
         self.netem.push(NetemObservation {
             elapsed,
+            trace_elapsed,
             c2s,
             s2c,
             delivered_bytes,
@@ -148,6 +211,8 @@ impl PerfTrace {
     }
 
     pub(crate) fn finish(self, metadata: &[(&str, String)]) -> io::Result<PathBuf> {
+        self.rtp.seal();
+        self.rtp_peer.seal();
         std::fs::create_dir_all(&self.output_dir)?;
         self.write_manifest(metadata)?;
         self.write_rtp(&self.rtp, "rtp.csv")?;
@@ -164,6 +229,30 @@ impl PerfTrace {
             &mut out,
             &["trace_schema_version", &TRACE_SCHEMA_VERSION.to_string()],
         )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "rtp_metrics_schema_version",
+                &rtp::metrics::SCHEMA_VERSION.to_string(),
+            ],
+        )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "trace_finish_elapsed_us",
+                &self.trace_start.elapsed().as_micros().to_string(),
+            ],
+        )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "measurement_start_trace_elapsed_us",
+                &self
+                    .measurement_start_trace_elapsed
+                    .map(|elapsed| elapsed.as_micros().to_string())
+                    .unwrap_or_default(),
+            ],
+        )?;
         write_csv_row(&mut out, &["rtp_observer", &self.capture_rtp.to_string()])?;
         write_csv_row(
             &mut out,
@@ -173,27 +262,12 @@ impl PerfTrace {
             ],
         )?;
         write_csv_row(&mut out, &["rtp_capacity", &self.rtp.capacity.to_string()])?;
+        write_capture_health(&mut out, "rtp", &self.rtp)?;
+        write_capture_health(&mut out, "rtp_peer", &self.rtp_peer)?;
+        write_csv_row(&mut out, &["netem_samples", &self.netem.len().to_string()])?;
         write_csv_row(
             &mut out,
-            &[
-                "rtp_dropped_capacity",
-                &self
-                    .rtp
-                    .dropped_capacity
-                    .load(Ordering::Relaxed)
-                    .to_string(),
-            ],
-        )?;
-        write_csv_row(
-            &mut out,
-            &[
-                "rtp_peer_dropped_capacity",
-                &self
-                    .rtp_peer
-                    .dropped_capacity
-                    .load(Ordering::Relaxed)
-                    .to_string(),
-            ],
+            &["progress_samples", &self.netem.len().to_string()],
         )?;
         for (key, value) in metadata {
             write_csv_row(&mut out, &[key, value])?;
@@ -203,11 +277,15 @@ impl PerfTrace {
 
     fn write_rtp(&self, capture: &RtpCapture, filename: &str) -> io::Result<()> {
         let mut observations = capture.observations.lock().unwrap().clone();
-        observations.sort_unstable_by_key(|observation| observation.event_index);
+        observations.sort_unstable_by_key(|captured| captured.observation.event_index);
         let mut out = csv_writer(self.output_dir.join(filename))?;
         writeln!(out, "{RTP_TRACE_HEADER}")?;
-        for observation in observations {
-            writeln!(out, "{}", rtp_fields(observation).join(","))?;
+        for captured in observations {
+            writeln!(
+                out,
+                "{}",
+                rtp_fields(captured.observation, captured.trace_elapsed).join(",")
+            )?;
         }
         Ok(())
     }
@@ -216,23 +294,36 @@ impl PerfTrace {
         let mut out = csv_writer(self.output_dir.join("netem.csv"))?;
         writeln!(
             out,
-            "elapsed_us,direction,delayed,dropped,duplicated,reordered,rate_limited,forwarded,received,overflow_dropped,queue_len"
+            "elapsed_us,trace_elapsed_us,direction,delayed,dropped,duplicated,reordered,rate_limited,forwarded,received,overflow_dropped,queue_len"
         )?;
         for observation in &self.netem {
-            write_netem_row(&mut out, observation.elapsed, "c2s", observation.c2s)?;
-            write_netem_row(&mut out, observation.elapsed, "s2c", observation.s2c)?;
+            write_netem_row(
+                &mut out,
+                observation.elapsed,
+                observation.trace_elapsed,
+                "c2s",
+                observation.c2s,
+            )?;
+            write_netem_row(
+                &mut out,
+                observation.elapsed,
+                observation.trace_elapsed,
+                "s2c",
+                observation.s2c,
+            )?;
         }
         Ok(())
     }
 
     fn write_progress(&self) -> io::Result<()> {
         let mut out = csv_writer(self.output_dir.join("progress.csv"))?;
-        writeln!(out, "elapsed_us,delivered_bytes")?;
+        writeln!(out, "elapsed_us,trace_elapsed_us,delivered_bytes")?;
         for observation in &self.netem {
             writeln!(
                 out,
-                "{},{}",
+                "{},{},{}",
                 observation.elapsed.as_micros(),
+                observation.trace_elapsed.as_micros(),
                 observation.delivered_bytes,
             )?;
         }
@@ -240,11 +331,32 @@ impl PerfTrace {
     }
 }
 
+fn write_capture_health(
+    out: &mut impl Write,
+    prefix: &str,
+    capture: &RtpCapture,
+) -> io::Result<()> {
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_captured"),
+            &capture.observations.lock().unwrap().len().to_string(),
+        ],
+    )?;
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_dropped_capacity"),
+            &capture.dropped_capacity.load(Ordering::Relaxed).to_string(),
+        ],
+    )
+}
+
 fn csv_writer(path: impl AsRef<Path>) -> io::Result<BufWriter<File>> {
     Ok(BufWriter::new(File::create(path)?))
 }
 
-fn rtp_fields(observation: MetricsObservation) -> Vec<String> {
+fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<String> {
     let termination = match observation.event {
         MetricsEvent::SessionTermination(termination) => Some(termination),
         _ => None,
@@ -306,8 +418,9 @@ fn rtp_fields(observation: MetricsObservation) -> Vec<String> {
                 .to_owned(),
         ]);
     } else {
-        fields.resize(RTP_TRACE_COLUMNS, String::new());
+        fields.resize(RTP_TRACE_COLUMNS - 1, String::new());
     }
+    fields.push(trace_elapsed.as_micros().to_string());
     debug_assert_eq!(fields.len(), RTP_TRACE_COLUMNS);
     fields
 }
@@ -315,14 +428,16 @@ fn rtp_fields(observation: MetricsObservation) -> Vec<String> {
 fn write_netem_row(
     out: &mut impl Write,
     elapsed: Duration,
+    trace_elapsed: Duration,
     direction: &str,
     snapshot: CountersSnapshot,
 ) -> io::Result<()> {
     let stats = snapshot.stats;
     writeln!(
         out,
-        "{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{}",
         elapsed.as_micros(),
+        trace_elapsed.as_micros(),
         direction,
         stats.delayed,
         stats.dropped,
@@ -409,14 +524,13 @@ mod tests {
         }
     }
 
+    fn capture(trace_start: Instant, capacity: usize) -> RtpCapture {
+        RtpCapture::new(trace_start, capacity)
+    }
+
     #[test]
     fn state_is_throttled_but_all_raw_rtt_samples_are_kept() {
-        let capture = RtpCapture {
-            observations: Mutex::new(Vec::new()),
-            last_state_sample_micros: AtomicU64::new(u64::MAX),
-            dropped_capacity: AtomicU64::new(0),
-            capacity: 8,
-        };
+        let capture = capture(Instant::now(), 8);
         assert_eq!(
             capture.interest(MetricsEvent::SendDataPacketAttempt, Duration::ZERO),
             MetricsInterest::Snapshot
@@ -459,10 +573,14 @@ mod tests {
 
         let observations = capture.observations.lock().unwrap();
         assert_eq!(observations.len(), 4);
-        assert_eq!(observations[0].event_index, 0);
-        assert_eq!(observations[1].event_index, 2);
-        assert_eq!(observations[2].event_index, 3);
-        assert_eq!(observations[3].event_index, 4);
+        assert_eq!(observations[0].observation.event_index, 0);
+        assert_eq!(observations[1].observation.event_index, 2);
+        assert_eq!(observations[2].observation.event_index, 3);
+        assert_eq!(observations[3].observation.event_index, 4);
+        // Every captured row carries its shared trace-clock position.
+        for captured in observations.iter() {
+            assert!(!captured.trace_elapsed.is_zero());
+        }
     }
 
     #[test]
@@ -471,32 +589,38 @@ mod tests {
         let snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
         let mut event_only = observation(1, 1, MetricsEvent::RttSample);
         event_only.snapshot = None;
-        assert_eq!(rtp_fields(snapshot).len(), RTP_TRACE_COLUMNS);
-        let event_only_fields = rtp_fields(event_only);
+        let trace_elapsed = Duration::from_micros(123);
+        assert_eq!(rtp_fields(snapshot, trace_elapsed).len(), RTP_TRACE_COLUMNS);
+        let event_only_fields = rtp_fields(event_only, trace_elapsed);
         assert_eq!(event_only_fields.len(), RTP_TRACE_COLUMNS);
         assert_eq!(event_only_fields[7], "20000");
-        assert!(event_only_fields[8..].iter().all(String::is_empty));
+        assert!(
+            event_only_fields[8..RTP_TRACE_COLUMNS - 1]
+                .iter()
+                .all(String::is_empty)
+        );
+        assert_eq!(event_only_fields[RTP_TRACE_COLUMNS - 1], "123");
+    }
+
+    #[test]
+    fn sealed_capture_rejects_callbacks_after_finish_starts() {
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 2);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        capture.seal();
+        // A callback that raced past the finish boundary must be rejected:
+        // the captured set is frozen and the count does not grow.
+        capture.record(observation(1, 1, MetricsEvent::SendDataPacketAttempt));
+        capture.record(observation(2, 2, MetricsEvent::RttSample));
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].observation.event_index, 0);
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn observer_free_capture_has_no_rtp_callback() {
-        let trace = PerfTrace {
-            output_dir: PathBuf::from("unused"),
-            capture_rtp: false,
-            rtp: Arc::new(RtpCapture {
-                observations: Mutex::new(Vec::new()),
-                last_state_sample_micros: AtomicU64::new(u64::MAX),
-                dropped_capacity: AtomicU64::new(0),
-                capacity: 1,
-            }),
-            rtp_peer: Arc::new(RtpCapture {
-                observations: Mutex::new(Vec::new()),
-                last_state_sample_micros: AtomicU64::new(u64::MAX),
-                dropped_capacity: AtomicU64::new(0),
-                capacity: 1,
-            }),
-            netem: Vec::new(),
-        };
+        let trace = PerfTrace::new(PathBuf::from("unused"), false);
         assert!(trace.rtp_observer().is_none());
         assert!(trace.rtp_peer_observer().is_none());
     }
