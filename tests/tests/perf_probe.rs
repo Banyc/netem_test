@@ -35,12 +35,16 @@ mod support;
 /// after measuring, so the supervision drain must be transient rather
 /// than `spawn_required`. JoinErrors are unwrapped so a panicked
 /// supervision task still fails the test; a `MuxError` session-end is the
-/// expected teardown here, not a failure.
+/// expected teardown here, not a failure. The first terminal mux error is
+/// latched into the returned [`support::stats::MuxSessionProgress`].
 fn mux_client_connect_transient<R, W>(
     task_tx: &tokio::sync::mpsc::Sender<support::TestTask>,
     read: R,
     write: W,
-) -> mux::StreamOpener
+) -> (
+    mux::StreamOpener,
+    std::sync::Arc<support::stats::MuxSessionProgress>,
+)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -52,6 +56,7 @@ where
     };
     let mut spawner = tokio::task::JoinSet::new();
     let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+    let progress = std::sync::Arc::new(support::stats::MuxSessionProgress::new());
     // Transient drain (see doc comment): unwrap JoinErrors so panics
     // surface; a `MuxError` session-end ends the drain normally. Submitted
     // through the already-active bounded outer submitter instead of an
@@ -59,13 +64,17 @@ where
     // test immediately rather than disappearing when the scope is dropped.
     support::submit_test_task(
         task_tx,
-        Box::pin(async move {
-            if let Some(result) = spawner.join_next().await {
-                result.unwrap();
+        Box::pin({
+            let progress = std::sync::Arc::clone(&progress);
+            async move {
+                if let Some(result) = spawner.join_next().await {
+                    let error = result.unwrap();
+                    progress.record_error(&error);
+                }
             }
         }),
     );
-    opener
+    (opener, progress)
 }
 
 /// Connect an `rtp` client whose session is intentionally torn down
@@ -583,13 +592,20 @@ async fn probe_mux_echo_1mib_mss8k() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_hostile_goodput_30s() {
-    const WINDOW: f64 = 30.0;
-
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
             let mut trace = PerfTrace::from_env();
+            let window_seconds = std::env::var("NETEM_PERF_WINDOW_SECONDS")
+                .map(|value| {
+                    let seconds = value
+                        .parse::<f64>()
+                        .expect("NETEM_PERF_WINDOW_SECONDS must be a number");
+                    assert!(seconds.is_finite() && seconds > 0.0);
+                    seconds
+                })
+                .unwrap_or(30.0);
             let c2s_seed = std::env::var("NETEM_PERF_SEED")
                 .map(|value| value.parse::<u64>().expect("NETEM_PERF_SEED must be a u64"))
                 .unwrap_or(4);
@@ -609,6 +625,7 @@ async fn probe_hostile_goodput_30s() {
             )
             .await
             .unwrap();
+            let server_mux = progress.mux_session();
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
             let pair_ref = &pair;
             let (read, write) = rtp_connect_transient_observed(
@@ -619,7 +636,7 @@ async fn probe_hostile_goodput_30s() {
                 trace.as_ref().and_then(PerfTrace::rtp_observer),
             )
             .await;
-            let opener = mux_client_connect_transient(&task_tx, read, write);
+            let (opener, client_mux) = mux_client_connect_transient(&task_tx, read, write);
 
             // Open the stream under a generous timeout before we start the clock.
             let (stream_read, mut stream_write) = with_timeout(
@@ -649,7 +666,7 @@ async fn probe_hostile_goodput_30s() {
                 }
             });
 
-            let window = tokio::time::sleep(Duration::from_secs_f64(WINDOW));
+            let window = tokio::time::sleep(Duration::from_secs_f64(window_seconds));
             tokio::pin!(window);
             let mut pump_error = None;
             loop {
@@ -685,6 +702,15 @@ async fn probe_hostile_goodput_30s() {
                     });
                 }
             }
+            if pump_error.is_some() {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(1), progress.wait_for_read_outcome())
+                        .await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), client_mux.wait_for_outcome())
+                    .await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), server_mux.wait_for_outcome())
+                    .await;
+            }
 
             if let Some(trace) = trace {
                 let revision = std::env::var("NETEM_PERF_REVISION")
@@ -693,7 +719,7 @@ async fn probe_hostile_goodput_30s() {
                     .finish(&[
                         ("scenario", "mux_over_rtp_hostile_goodput_30s".to_owned()),
                         ("revision", revision),
-                        ("window_seconds", WINDOW.to_string()),
+                        ("window_seconds", window_seconds.to_string()),
                         ("mss_bytes", LOOPBACK_MSS.to_string()),
                         ("fec", "false".to_owned()),
                         ("rtp_handshake", "false".to_owned()),
@@ -711,6 +737,9 @@ async fn probe_hostile_goodput_30s() {
                             "probe_outcome",
                             pump_error.as_deref().unwrap_or("completed").to_owned(),
                         ),
+                        ("sink_read_outcome", progress.read_outcome().as_label()),
+                        ("client_mux_outcome", client_mux.outcome().as_label()),
+                        ("server_mux_outcome", server_mux.outcome().as_label()),
                         ("netem_c2s", c2s_description),
                         ("netem_s2c", s2c_description),
                     ])

@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 use rtp::FecTuning;
 use rtp::FrameMode;
 
-use super::stats::SinkProgress;
+use super::stats::{MuxSessionProgress, SinkProgress, SinkReadOutcome};
 use crate::support::{
     LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, submit_test_task, submit_test_task_required,
     try_send_observation,
@@ -25,6 +25,7 @@ async fn spawn_mux_over_rtp_server_core<F, Fut>(
     fec: bool,
     mss: usize,
     metrics_observer: Option<rtp::metrics::MetricsObserver>,
+    mux_session: Option<Arc<MuxSessionProgress>>,
     handle_stream: F,
 ) -> std::io::Result<std::net::SocketAddr>
 where
@@ -124,8 +125,12 @@ where
                     }
                     Some(joined) = spawner.join_next() => {
                         // The mux session ended: unwrap (re-raising a panic)
-                        // and stop accepting.
-                        joined.unwrap();
+                        // and stop accepting; record the terminal error for
+                        // the diagnostic latch when one is attached.
+                        let error = joined.unwrap();
+                        if let Some(progress) = &mux_session {
+                            progress.record_error(&error);
+                        }
                         break;
                     }
                 }
@@ -170,7 +175,8 @@ where
     F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    spawn_mux_over_rtp_server_core(|fut| tasks.spawn(fut), fec, mss, None, handle_stream).await
+    spawn_mux_over_rtp_server_core(|fut| tasks.spawn(fut), fec, mss, None, None, handle_stream)
+        .await
 }
 
 /// [`spawn_mux_over_rtp_server_with_mss`] through the bounded
@@ -191,6 +197,7 @@ where
         fec,
         mss,
         None,
+        None,
         handle_stream,
     )
     .await
@@ -208,6 +215,7 @@ async fn spawn_mux_over_rtp_echo_server_core(
         spawn,
         fec,
         mss,
+        None,
         None,
         |mut stream_read, mut stream_write| async move {
             let mut buf = vec![0u8; 8 * 1024];
@@ -281,6 +289,7 @@ async fn spawn_mux_over_rtp_sink_server_core(
         spawn,
         fec,
         mss,
+        None,
         None,
         move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
@@ -388,6 +397,7 @@ async fn spawn_mux_msg_latency_sink_core(
         spawn,
         fec,
         mss,
+        None,
         None,
         move |mut stream_read, mut stream_write| {
             let tx = tx.clone();
@@ -685,42 +695,50 @@ async fn spawn_mux_over_rtp_counting_sink_server_core(
     metrics_observer: Option<rtp::metrics::MetricsObserver>,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
     let progress = Arc::new(SinkProgress::new());
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, metrics_observer, {
-        let progress = Arc::clone(&progress);
-        move |mut stream_read, mut stream_write| {
+    let addr = spawn_mux_over_rtp_server_core(
+        spawn,
+        fec,
+        mss,
+        metrics_observer,
+        Some(progress.mux_session()),
+        {
             let progress = Arc::clone(&progress);
-            async move {
-                let mut buf = vec![0u8; 64 * 1024];
-                let mut offset: u64 = 0;
-                loop {
-                    match stream_read.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if progress.is_corrupt() {
-                                continue;
-                            }
-                            let mut corrupt = false;
-                            for (j, &actual) in buf[..n].iter().enumerate() {
-                                let expected = ((offset + j as u64) % 251) as u8;
-                                if actual != expected {
-                                    corrupt = true;
-                                    break;
+            move |mut stream_read, mut stream_write| {
+                let progress = Arc::clone(&progress);
+                async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut offset: u64 = 0;
+                    let outcome = loop {
+                        match stream_read.read(&mut buf).await {
+                            Ok(0) => break SinkReadOutcome::CleanEof,
+                            Ok(n) => {
+                                if progress.is_corrupt() {
+                                    continue;
+                                }
+                                let mut corrupt = false;
+                                for (j, &actual) in buf[..n].iter().enumerate() {
+                                    let expected = ((offset + j as u64) % 251) as u8;
+                                    if actual != expected {
+                                        corrupt = true;
+                                        break;
+                                    }
+                                }
+                                if corrupt {
+                                    progress.corrupt.store(true, Ordering::Relaxed);
+                                } else {
+                                    offset += n as u64;
+                                    progress.delivered.fetch_add(n as u64, Ordering::Relaxed);
                                 }
                             }
-                            if corrupt {
-                                progress.corrupt.store(true, Ordering::Relaxed);
-                            } else {
-                                offset += n as u64;
-                                progress.delivered.fetch_add(n as u64, Ordering::Relaxed);
-                            }
+                            Err(error) => break SinkReadOutcome::ReadError(error.kind()),
                         }
-                        Err(_) => break,
-                    }
+                    };
+                    progress.record_read_outcome(outcome);
+                    let _ = stream_write.shutdown();
                 }
-                let _ = stream_write.shutdown();
             }
-        }
-    })
+        },
+    )
     .await?;
     Ok((addr, progress))
 }
@@ -805,7 +823,7 @@ async fn spawn_mux_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, None, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -953,7 +971,7 @@ async fn spawn_mux_sized_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, None, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, None, None, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -1088,7 +1106,7 @@ async fn spawn_mux_gaming_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, None, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
