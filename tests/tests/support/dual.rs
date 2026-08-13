@@ -19,7 +19,7 @@ use super::rtp::{rtp_connect, rtp_connect_via};
 use super::rtp_mux::spawn_tagged_stream_sink;
 use crate::support::{
     LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestScope, TestTask,
-    spawn_test_task_reaper, submit_test_task_required, try_send_observation,
+    submit_test_task_required, try_send_observation,
 };
 
 /// Server that accepts two RTP connections (lane‑hello paired) and handles
@@ -1906,7 +1906,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     // through a bounded channel feeding one test-owned reaper (spawned into
     // `tasks`), which selects between submissions and join_next() completions
     // and unwraps every completion so panics surface immediately.
-    let task_tx = spawn_test_task_reaper(tasks, TEST_TASK_QUEUE_BOUND);
+    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
         |name, fut| tasks.spawn_required(name, fut),
         task_tx.clone(),

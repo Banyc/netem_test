@@ -91,8 +91,7 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     Arc<AtomicU64>,
     mpsc::Sender<TestTask>,
 )> {
-    let task_tx =
-        crate::support::spawn_test_task_reaper(tasks, crate::support::TEST_TASK_QUEUE_BOUND);
+    let task_tx = tasks.submitter(crate::support::TEST_TASK_QUEUE_BOUND);
     spawn_rtp_mux_latency_bulk_server_core(
         |name, fut| tasks.spawn_required(name, fut),
         task_tx.clone(),

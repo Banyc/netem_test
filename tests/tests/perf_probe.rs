@@ -803,8 +803,7 @@ async fn probe_hostile_goodput_30s() {
                 .unwrap_or(false);
             if diagnostic_mode && goodput_mib_s < HOSTILE_GOODPUT_FLOOR_MIB_S {
                 eprintln!(
-                    "[diagnostic] goodput {goodput_mib_s:.3} MiB/s below floor "
-                    "{HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s bypassed by NETEM_PERF_DIAGNOSTIC_MODE=1"
+                    "[diagnostic] goodput {goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s bypassed by NETEM_PERF_DIAGNOSTIC_MODE=1"
                 );
             } else {
                 assert!(

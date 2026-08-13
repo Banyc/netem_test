@@ -34,37 +34,66 @@ pub(crate) const LANE_EVENT_CAPACITY: usize = 64;
 pub(crate) const TEST_TASK_QUEUE_BOUND: usize = 256;
 
 /// A boxed test-owned task future: session supervisors, per-stream sinks,
-/// and rtp_mux drivers all submit through [`spawn_test_task_reaper`].
+/// and rtp_mux drivers all submit through [`spawn_test_task_reaper_with_shutdown`].
 pub(crate) type TestTask =
     std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 /// A bounded submission channel feeding one test-owned reaper task. The
-/// reaper (spawned into `tasks`) selects between new submissions and
-/// `join_next()` completions, unwrapping every completion, so panics surface
-/// immediately instead of being observed only at scope destruction.
+/// reaper (spawned into the scope's `reapers` set) selects between new
+/// submissions and `join_next()` completions, unwrapping every completion,
+/// so panics surface immediately instead of being observed only at scope
+/// destruction. On shutdown it closes admission, adopts any future still
+/// queued, and reaps the owned set.
 ///
 /// Returns the submission sender; clone it into every scope that spawns
 /// owned tasks and keep one alive for the channel to stay open.
-pub(crate) fn spawn_test_task_reaper(
-    tasks: &mut tokio::task::JoinSet<()>,
+pub(crate) fn spawn_test_task_reaper_with_shutdown(
+    reapers: &mut tokio::task::JoinSet<()>,
     bound: usize,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::sync::mpsc::Sender<TestTask> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TestTask>(bound);
-    tasks.spawn(async move {
+    reapers.spawn(async move {
         let mut owned = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 Some(fut) = rx.recv() => {
                     owned.spawn(fut);
                 }
                 Some(joined) = owned.join_next() => {
                     joined.unwrap();
                 }
+                _ = shutdown_rx.changed() => break,
                 else => break,
             }
         }
+        // The scope is shutting down: close admission, adopt every future
+        // still queued (a submitted future is never silently dropped), and
+        // reap the owned set so a completed panic still surfaces.
+        rx.close();
+        while let Ok(fut) = rx.try_recv() {
+            owned.spawn(fut);
+        }
+        abort_and_reap_test_tasks(&mut owned).await;
     });
     tx
+}
+
+/// Abort and reap every child of `tasks`: owner-requested cancellation is
+/// expected (cancelled joins are skipped), but a child that already
+/// completed — including a panic — is unwrapped and re-raised.
+pub(super) async fn abort_and_reap_test_tasks(tasks: &mut tokio::task::JoinSet<()>) {
+    tasks.abort_all();
+    while let Some(joined) = tasks.join_next().await {
+        if joined
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+        {
+            continue;
+        }
+        joined.unwrap();
+    }
 }
 
 /// Submit a test-owned task future; panics if the bounded submission
@@ -146,5 +175,28 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "test task submission channel is full; the reaper is not draining")]
+    fn submit_test_task_panics_when_channel_is_full() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<TestTask>(1);
+        let parked = Box::pin(std::future::pending::<()>());
+        submit_test_task(&tx, parked);
+        let second = Box::pin(std::future::pending::<()>());
+        // The receiver is never polled, so the single slot stays occupied and
+        // the second submission must panic instead of being dropped silently.
+        submit_test_task(&tx, second);
+    }
+
+    #[test]
+    #[should_panic(expected = "test task reaper stopped unexpectedly")]
+    fn submit_test_task_panics_when_channel_is_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TestTask>(1);
+        drop(rx);
+        let fut = Box::pin(std::future::pending::<()>());
+        // The reaper stopped (the receiver is gone); submitting must panic
+        // rather than silently dropping the future.
+        submit_test_task(&tx, fut);
     }
 }
