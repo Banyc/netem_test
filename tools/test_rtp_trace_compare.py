@@ -46,7 +46,7 @@ class TraceCompareTest(unittest.TestCase):
             self.assertIn("Peer liveness waits", document)
             self.assertIn("rtp_peer.csv", document)
             self.assertIn("terminations", document)
-            self.assertIn("<td>1</td>", document)
+            self.assertIn("proactive_stall/broken_pipe", document)
             self.assertIn("1 / 0.000", document)
             self.assertIn("censored_outage_sample", document)
             self.assertIn("bandwidth_probe", document)

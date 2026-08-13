@@ -104,6 +104,25 @@ def event_count(trace_dir, rtp_filename, event):
     )
 
 
+def termination_summary(trace_dir, rtp_filename):
+    summary = {}
+    for row in REPORT.read_csv(trace_dir / rtp_filename):
+        event = REPORT.field(row, "event")
+        if event == "proactive_termination":
+            key = "proactive_stall/broken_pipe"
+        elif event == "session_termination":
+            cause = REPORT.field(row, "termination_cause") or "unknown"
+            error = REPORT.field(row, "termination_error_kind") or "unknown"
+            key = f"{cause}/{error}"
+            errno = REPORT.field(row, "termination_raw_os_error")
+            if errno:
+                key += f"(errno={errno})"
+        else:
+            continue
+        summary[key] = summary.get(key, 0) + 1
+    return summary
+
+
 def active_episodes(rows, key):
     episodes = []
     start = None
@@ -153,9 +172,7 @@ def render_comparison(specs, output):
                 "actions": actions,
                 "rolling": rolling_goodput(trace_dir),
                 "rtt_cdf": raw_rtt_cdf(trace_dir, rtp_filename),
-                "terminations": event_count(
-                    trace_dir, rtp_filename, "proactive_termination"
-                ),
+                "terminations": termination_summary(trace_dir, rtp_filename),
             }
         )
 
@@ -208,7 +225,7 @@ def render_comparison(specs, output):
             f"<td>{len(outage_episodes)} / {max_outage_span:.3f}</td>"
             f"<td>{100.0 * censored / count if count else math.nan:.1f}%</td>"
             f"<td>{max_no_response:.3f}/{max_no_progress:.3f}</td>"
-            f"<td>{run['terminations']}</td>"
+            f"<td>{html.escape(str(run['terminations']))}</td>"
             f"<td>{count:,}</td>"
             "</tr>"
         )
@@ -272,8 +289,8 @@ table {{ border-collapse: collapse; width: 100%; }} th, td {{ text-align: left; 
 .note {{ background: #f5f7fb; border-left: 4px solid #64748b; padding: .75rem 1rem; }}
 </style></head><body>
 <h1>RTP trace comparison</h1>
-<p class="note">Compare identical seed pairs before drawing a causal conclusion. "At ≤128 pps" identifies time pinned at the controller's initial send-rate floor; action percentages are state-snapshot occupancy, not event counts. "App-limited delivery samples" describes the packet behind the latest delivery-rate sample, not the sender's current staging state.</p>
-<section><h2>Run summary</h2><table><thead><tr><th>run</th><th>revision</th><th>c2s/s2c seed</th><th>goodput MiB/s</th><th>at ≤128 pps</th><th>app-limited delivery samples</th><th>empty send stage</th><th>accepts new packet</th><th>outage recovery</th><th>outage episodes / max span s</th><th>censored sample</th><th>max no-response/progress s</th><th>terminations</th><th>state rows</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></section>
+<p class="note">Compare identical seed pairs before drawing a causal conclusion. "At/below 128 pps" identifies time at or below the outage restart rate; loss control may intentionally reduce the rate as far as 1 pps. Action percentages are state-snapshot occupancy, not event counts. "App-limited delivery samples" describes the packet behind the latest delivery-rate sample, not the sender's current staging state.</p>
+<section><h2>Run summary</h2><table><thead><tr><th>run</th><th>revision</th><th>c2s/s2c seed</th><th>goodput MiB/s</th><th>at/below 128 pps</th><th>app-limited delivery samples</th><th>empty send stage</th><th>accepts new packet</th><th>outage recovery</th><th>outage episodes / max span s</th><th>censored sample</th><th>max no-response/progress s</th><th>terminations</th><th>state rows</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></section>
 {REPORT.svg_line_chart("Rolling application goodput", "elapsed time (s)", "MiB/s over ~1 s", rolling_series)}
 {REPORT.svg_line_chart("Congestion-control send rate", "elapsed time (s)", "packets/s", rate_series)}
 {REPORT.svg_line_chart("Raw RTT empirical CDF", "raw RTT (ms)", "samples ≤ x (%)", cdf_series, (0.0, 100.0))}

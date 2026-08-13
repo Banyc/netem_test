@@ -8,9 +8,11 @@ use std::time::Duration;
 use netem_test::CountersSnapshot;
 use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
 
-const TRACE_SCHEMA_VERSION: u16 = 7;
+const TRACE_SCHEMA_VERSION: u16 = rtp::metrics::SCHEMA_VERSION;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+const RTP_TRACE_COLUMNS: usize = 36;
+const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action";
 
 #[derive(Debug, Clone, Copy)]
 struct NetemObservation {
@@ -59,7 +61,9 @@ impl RtpCapture {
     }
 
     fn interest(&self, event: MetricsEvent, elapsed: Duration) -> MetricsInterest {
-        if event == MetricsEvent::ProactiveTermination || self.claim_state_sample_at(elapsed) {
+        if matches!(event, MetricsEvent::SessionTermination(_))
+            || self.claim_state_sample_at(elapsed)
+        {
             MetricsInterest::Snapshot
         } else if event == MetricsEvent::RttSample {
             MetricsInterest::EventOnly
@@ -201,61 +205,9 @@ impl PerfTrace {
         let mut observations = capture.observations.lock().unwrap().clone();
         observations.sort_unstable_by_key(|observation| observation.event_index);
         let mut out = csv_writer(self.output_dir.join(filename))?;
-        writeln!(
-            out,
-            "schema_version,event_index,elapsed_us,event,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action"
-        )?;
+        writeln!(out, "{RTP_TRACE_HEADER}")?;
         for observation in observations {
-            let mut fields = vec![
-                observation.schema_version.to_string(),
-                observation.event_index.to_string(),
-                observation.elapsed.as_micros().to_string(),
-                observation.event.as_str().to_owned(),
-                optional_u128(observation.raw_rtt_sample.map(|value| value.as_micros())),
-            ];
-            if let Some(snapshot) = observation.snapshot {
-                fields.extend([
-                    snapshot.pacer_tokens_packets.to_string(),
-                    snapshot.send_rate_packets_per_second.to_string(),
-                    optional_f64(snapshot.loss_ratio),
-                    snapshot.in_flight_packets.to_string(),
-                    snapshot.packets_in_pipe.to_string(),
-                    snapshot.retransmitted_packets.to_string(),
-                    snapshot.next_send_sequence.to_string(),
-                    optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
-                    snapshot.smoothed_rtt.as_micros().to_string(),
-                    snapshot.congestion_window_packets.to_string(),
-                    snapshot.received_packets.to_string(),
-                    optional_u64(snapshot.next_receive_sequence),
-                    optional_f64(snapshot.delivery_rate_packets_per_second),
-                    optional_bool(snapshot.delivery_sample_app_limited),
-                    snapshot.pending_send_bytes.to_string(),
-                    snapshot.send_stage_capacity_bytes.to_string(),
-                    snapshot.accepts_new_packet.to_string(),
-                    snapshot.slow_start.to_string(),
-                    snapshot.gentle_mode.to_string(),
-                    snapshot.gentle_draining.to_string(),
-                    snapshot.queue_building.to_string(),
-                    snapshot.drain_floor_binding.to_string(),
-                    snapshot.outage_recovery.to_string(),
-                    optional_u128(snapshot.no_response_for.map(|value| value.as_micros())),
-                    optional_u128(snapshot.no_progress_for.map(|value| value.as_micros())),
-                    snapshot
-                        .stall_reason
-                        .map(|reason| reason.as_str())
-                        .unwrap_or_default()
-                        .to_owned(),
-                    optional_f64(snapshot.congestion_loss_ratio),
-                    snapshot
-                        .congestion_action
-                        .map(|action| action.as_str())
-                        .unwrap_or_default()
-                        .to_owned(),
-                ]);
-            } else {
-                fields.resize(30, String::new());
-            }
-            writeln!(out, "{}", fields.join(","))?;
+            writeln!(out, "{}", rtp_fields(observation).join(","))?;
         }
         Ok(())
     }
@@ -290,6 +242,74 @@ impl PerfTrace {
 
 fn csv_writer(path: impl AsRef<Path>) -> io::Result<BufWriter<File>> {
     Ok(BufWriter::new(File::create(path)?))
+}
+
+fn rtp_fields(observation: MetricsObservation) -> Vec<String> {
+    let termination = match observation.event {
+        MetricsEvent::SessionTermination(termination) => Some(termination),
+        _ => None,
+    };
+    let mut fields = vec![
+        observation.schema_version.to_string(),
+        observation.event_index.to_string(),
+        observation.elapsed.as_micros().to_string(),
+        observation.event.as_str().to_owned(),
+        termination
+            .map(|termination| termination.cause.as_str().to_owned())
+            .unwrap_or_default(),
+        termination
+            .map(|termination| termination.error_kind_str().to_owned())
+            .unwrap_or_default(),
+        termination
+            .and_then(|termination| termination.raw_os_error)
+            .map(|error| error.to_string())
+            .unwrap_or_default(),
+        optional_u128(observation.raw_rtt_sample.map(|value| value.as_micros())),
+    ];
+    if let Some(snapshot) = observation.snapshot {
+        fields.extend([
+            snapshot.pacer_tokens_packets.to_string(),
+            snapshot.send_rate_packets_per_second.to_string(),
+            optional_f64(snapshot.loss_ratio),
+            snapshot.in_flight_packets.to_string(),
+            snapshot.packets_in_pipe.to_string(),
+            snapshot.retransmitted_packets.to_string(),
+            snapshot.next_send_sequence.to_string(),
+            optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
+            snapshot.smoothed_rtt.as_micros().to_string(),
+            snapshot.congestion_window_packets.to_string(),
+            snapshot.received_packets.to_string(),
+            optional_u64(snapshot.next_receive_sequence),
+            optional_f64(snapshot.delivery_rate_packets_per_second),
+            optional_bool(snapshot.delivery_sample_app_limited),
+            snapshot.pending_send_bytes.to_string(),
+            snapshot.send_stage_capacity_bytes.to_string(),
+            snapshot.accepts_new_packet.to_string(),
+            snapshot.slow_start.to_string(),
+            snapshot.gentle_mode.to_string(),
+            snapshot.gentle_draining.to_string(),
+            snapshot.queue_building.to_string(),
+            snapshot.drain_floor_binding.to_string(),
+            snapshot.outage_recovery.to_string(),
+            optional_u128(snapshot.no_response_for.map(|value| value.as_micros())),
+            optional_u128(snapshot.no_progress_for.map(|value| value.as_micros())),
+            snapshot
+                .stall_reason
+                .map(|reason| reason.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            optional_f64(snapshot.congestion_loss_ratio),
+            snapshot
+                .congestion_action
+                .map(|action| action.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        ]);
+    } else {
+        fields.resize(RTP_TRACE_COLUMNS, String::new());
+    }
+    debug_assert_eq!(fields.len(), RTP_TRACE_COLUMNS);
+    fields
 }
 
 fn write_netem_row(
@@ -345,7 +365,9 @@ fn optional_bool(value: Option<bool>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtp::metrics::{MetricsSnapshot, SCHEMA_VERSION};
+    use rtp::metrics::{
+        MetricsSnapshot, MetricsTermination, MetricsTerminationCause, SCHEMA_VERSION,
+    };
 
     fn observation(event_index: u64, elapsed_ms: u64, event: MetricsEvent) -> MetricsObservation {
         MetricsObservation {
@@ -424,7 +446,11 @@ mod tests {
         capture.record(observation(4, 50, MetricsEvent::ReceiveAckPacket));
         assert_eq!(
             capture.interest(
-                MetricsEvent::ProactiveTermination,
+                MetricsEvent::SessionTermination(MetricsTermination {
+                    cause: MetricsTerminationCause::ProactiveStall,
+                    error_kind: std::io::ErrorKind::BrokenPipe,
+                    raw_os_error: None,
+                }),
                 Duration::from_millis(51)
             ),
             MetricsInterest::Snapshot,
@@ -437,6 +463,19 @@ mod tests {
         assert_eq!(observations[1].event_index, 2);
         assert_eq!(observations[2].event_index, 3);
         assert_eq!(observations[3].event_index, 4);
+    }
+
+    #[test]
+    fn event_only_and_snapshot_rows_match_the_schema_width() {
+        assert_eq!(RTP_TRACE_HEADER.split(',').count(), RTP_TRACE_COLUMNS);
+        let snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
+        let mut event_only = observation(1, 1, MetricsEvent::RttSample);
+        event_only.snapshot = None;
+        assert_eq!(rtp_fields(snapshot).len(), RTP_TRACE_COLUMNS);
+        let event_only_fields = rtp_fields(event_only);
+        assert_eq!(event_only_fields.len(), RTP_TRACE_COLUMNS);
+        assert_eq!(event_only_fields[7], "20000");
+        assert!(event_only_fields[8..].iter().all(String::is_empty));
     }
 
     #[test]
