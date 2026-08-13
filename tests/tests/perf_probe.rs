@@ -606,13 +606,37 @@ async fn probe_hostile_goodput_30s() {
                     seconds
                 })
                 .unwrap_or(30.0);
+            let link_profile = std::env::var("NETEM_PERF_LINK_PROFILE")
+                .unwrap_or_else(|_| "hostile".to_owned());
+            assert!(
+                link_profile == "hostile" || link_profile == "clean",
+                "NETEM_PERF_LINK_PROFILE must be exactly 'hostile' or 'clean', got {link_profile:?}"
+            );
+            let mss_bytes = std::env::var("NETEM_PERF_MSS_BYTES")
+                .map(|value| {
+                    let mss = value
+                        .parse::<usize>()
+                        .expect("NETEM_PERF_MSS_BYTES must be a positive usize");
+                    assert!(mss > 0, "NETEM_PERF_MSS_BYTES must be positive");
+                    mss
+                })
+                .unwrap_or(LOOPBACK_MSS);
+            let expects_impairment = link_profile == "hostile";
             let c2s_seed = std::env::var("NETEM_PERF_SEED")
                 .map(|value| value.parse::<u64>().expect("NETEM_PERF_SEED must be a u64"))
                 .unwrap_or(4);
             let s2c_seed = c2s_seed.wrapping_add(1);
-            let mut c2s = support::presets::hostile_real_link();
+            let mut c2s = if expects_impairment {
+                support::presets::hostile_real_link()
+            } else {
+                support::presets::clean()
+            };
             c2s.seed = c2s_seed;
-            let mut s2c = support::presets::hostile_real_link();
+            let mut s2c = if expects_impairment {
+                support::presets::hostile_real_link()
+            } else {
+                support::presets::clean()
+            };
             s2c.seed = s2c_seed;
             let c2s_description = format!("{c2s:?}");
             let s2c_description = format!("{s2c:?}");
@@ -620,7 +644,7 @@ async fn probe_hostile_goodput_30s() {
             let (server_addr, progress) = spawn_mux_over_rtp_counting_sink_server_observed_via(
                 &task_tx,
                 false,
-                LOOPBACK_MSS,
+                mss_bytes,
                 trace.as_ref().and_then(PerfTrace::rtp_peer_observer),
             )
             .await
@@ -632,7 +656,7 @@ async fn probe_hostile_goodput_30s() {
                 &task_tx,
                 pair.client_addr(),
                 false,
-                LOOPBACK_MSS,
+                mss_bytes,
                 trace.as_ref().and_then(PerfTrace::rtp_observer),
             )
             .await;
@@ -717,10 +741,14 @@ async fn probe_hostile_goodput_30s() {
                     .unwrap_or_else(|_| "unspecified".to_owned());
                 let output_dir = trace
                     .finish(&[
-                        ("scenario", "mux_over_rtp_hostile_goodput_30s".to_owned()),
+                        (
+                            "scenario",
+                            format!("mux_over_rtp_{link_profile}_goodput_window"),
+                        ),
+                        ("link_profile", link_profile.clone()),
                         ("revision", revision),
                         ("window_seconds", window_seconds.to_string()),
-                        ("mss_bytes", LOOPBACK_MSS.to_string()),
+                        ("mss_bytes", mss_bytes.to_string()),
                         ("fec", "false".to_owned()),
                         ("rtp_handshake", "false".to_owned()),
                         ("netem_sample_interval_micros", "50000".to_owned()),
@@ -749,10 +777,17 @@ async fn probe_hostile_goodput_30s() {
 
             pair_ref.stop();
             let stats = combined_stats(pair_ref);
-            assert!(
-                stats.dropped > 0 && stats.delayed > 0,
-                "hostile link should drop and delay packets, got {stats:?}"
-            );
+            if expects_impairment {
+                assert!(
+                    stats.dropped > 0 && stats.delayed > 0,
+                    "hostile link should drop and delay packets, got {stats:?}"
+                );
+            } else {
+                assert!(
+                    stats.forwarded > 0 && stats.dropped == 0,
+                    "clean link should forward packets without drops, got {stats:?}"
+                );
+            }
 
             assert!(
                 !progress.is_corrupt(),
@@ -763,10 +798,20 @@ async fn probe_hostile_goodput_30s() {
             }
 
             let goodput_mib_s = delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
-            assert!(
-                goodput_mib_s >= HOSTILE_GOODPUT_FLOOR_MIB_S,
-                "goodput {goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s"
-            );
+            let diagnostic_mode = std::env::var("NETEM_PERF_DIAGNOSTIC_MODE")
+                .map(|value| value == "1")
+                .unwrap_or(false);
+            if diagnostic_mode && goodput_mib_s < HOSTILE_GOODPUT_FLOOR_MIB_S {
+                eprintln!(
+                    "[diagnostic] goodput {goodput_mib_s:.3} MiB/s below floor "
+                    "{HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s bypassed by NETEM_PERF_DIAGNOSTIC_MODE=1"
+                );
+            } else {
+                assert!(
+                    goodput_mib_s >= HOSTILE_GOODPUT_FLOOR_MIB_S,
+                    "goodput {goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s"
+                );
+            }
 
             print_perf(
                 "mux-over-rtp hostile 30s goodput window",

@@ -48,6 +48,19 @@ def boolean(value):
     return str(value).lower() in ("1", "true", "yes")
 
 
+def timeline_seconds(row, manifest):
+    """Shared timeline for a row: prefer trace_elapsed_us, otherwise align
+    legacy elapsed_us with the manifest measurement-start offset."""
+    trace_elapsed = row.get("trace_elapsed_us", "")
+    if trace_elapsed not in (None, ""):
+        return float(trace_elapsed) / 1_000_000.0
+    elapsed = float(row.get("elapsed_us", 0))
+    start = manifest.get("measurement_start_trace_elapsed_us")
+    if start not in (None, ""):
+        return (float(start) + elapsed) / 1_000_000.0
+    return elapsed / 1_000_000.0
+
+
 def quantile(sorted_values, fraction):
     if not sorted_values:
         return math.nan
@@ -189,7 +202,7 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
             continue
         rtp.append(
             {
-                "time": float(row["elapsed_us"]) / 1_000_000.0,
+                "time": timeline_seconds(row, manifest),
                 "raw_rtt": optional_float(row["raw_rtt_us"]),
                 "min_rtt": optional_float(row["minimum_rtt_us"]),
                 "srtt": float(row["smoothed_rtt_us"]),
@@ -230,7 +243,7 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
             }
         )
     raw_rtt_points = [
-        (float(row["elapsed_us"]) / 1_000_000.0, float(row["raw_rtt_us"]) / 1000.0)
+        (timeline_seconds(row, manifest), float(row["raw_rtt_us"]) / 1000.0)
         for row in rtp_rows if field(row, "raw_rtt_us") != ""
     ]
     raw_rtt_ms = sorted(value for _, value in raw_rtt_points)
@@ -295,19 +308,19 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
     queue_series = []
     for direction in ("c2s", "s2c"):
         queue_series.append(
-            (direction, [(float(row["elapsed_us"]) / 1_000_000.0, float(row["queue_len"])) for row in netem_rows if row["direction"] == direction])
+            (direction, [(timeline_seconds(row, manifest), float(row["queue_len"])) for row in netem_rows if row["direction"] == direction])
         )
     decisions_series = []
     for direction in ("c2s", "s2c"):
         rows = [row for row in netem_rows if row["direction"] == direction]
         decisions_series.extend(
             [
-                (f"{direction} dropped", [(float(row["elapsed_us"]) / 1_000_000.0, float(row["dropped"])) for row in rows]),
-                (f"{direction} forwarded", [(float(row["elapsed_us"]) / 1_000_000.0, float(row["forwarded"])) for row in rows]),
+                (f"{direction} dropped", [(timeline_seconds(row, manifest), float(row["dropped"])) for row in rows]),
+                (f"{direction} forwarded", [(timeline_seconds(row, manifest), float(row["forwarded"])) for row in rows]),
             ]
         )
     progress = [
-        (float(row["elapsed_us"]) / 1_000_000.0, float(row["delivered_bytes"]))
+        (timeline_seconds(row, manifest), float(row["delivered_bytes"]))
         for row in progress_rows
     ]
     delivered_series = [
