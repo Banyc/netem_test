@@ -226,6 +226,7 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
                     "gentle_probe": 5.0,
                     "delay_drain": 6.0,
                     "loss_backoff": 7.0,
+                    "huge_loss_backoff": 8.0,
                 }.get(field(row, "congestion_action"), 0.0),
                 "rtx": float(row["retransmitted_packets"]),
                 "pipe": float(row["packets_in_pipe"]),
@@ -240,6 +241,24 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
                 "no_response": optional_float(field(row, "no_response_for_us")),
                 "no_progress": optional_float(field(row, "no_progress_for_us")),
                 "stall": {"": 0.0, "no_response": 1.0, "no_progress": 2.0}.get(field(row, "stall_reason"), 0.0),
+                "rto": optional_float(field(row, "retransmission_timeout_us")),
+                "oldest_pipe_age": optional_float(field(row, "oldest_pipe_packet_age_us")),
+                "max_rto_overdue": optional_float(field(row, "maximum_packet_rto_overdue_us")),
+                "rto_postponements": optional_float(field(row, "rto_deadline_postponements")),
+                "rtx_active": optional_float(field(row, "retransmission_active_packets")),
+                "rtx_ready": optional_float(field(row, "retransmission_ready_packets")),
+                "cc_control_rtt": optional_float(field(row, "congestion_control_rtt_us")),
+                "cc_rtt_floor": optional_float(field(row, "congestion_rtt_floor_us")),
+                "cc_queue_tolerance": optional_float(field(row, "congestion_queue_tolerance_us")),
+                "cc_delivery_peak": optional_float(field(row, "congestion_delivery_peak_packets_per_second")),
+                "cc_drain_floor": optional_float(field(row, "congestion_drain_floor_packets_per_second")),
+                "cc_drain_target": optional_float(field(row, "congestion_drain_target_packets_per_second")),
+                "cc_rate_samples": optional_float(field(row, "congestion_rate_samples")),
+                "cc_probe_decisions": optional_float(field(row, "congestion_bandwidth_probe_decisions")),
+                "cc_probe_increases": optional_float(field(row, "congestion_bandwidth_probe_increases")),
+                "cc_probe_before_feedback": optional_float(field(row, "congestion_bandwidth_probe_before_feedback")),
+                "cc_last_probe_interval": optional_float(field(row, "congestion_last_bandwidth_probe_interval_us")),
+                "cc_delay_drains": optional_float(field(row, "congestion_delay_drains")),
             }
         )
     raw_rtt_points = [
@@ -251,15 +270,26 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
         ("raw RTT", raw_rtt_points),
         ("smoothed RTT", [(row["time"], row["srtt"] / 1000.0) for row in rtp]),
         ("minimum RTT", [(row["time"], row["min_rtt"] / 1000.0) for row in rtp if row["min_rtt"] is not None]),
+        ("current RTO", [(row["time"], row["rto"] / 1000.0) for row in rtp if row["rto"] is not None]),
+        ("oldest pipe age", [(row["time"], row["oldest_pipe_age"] / 1000.0) for row in rtp if row["oldest_pipe_age"] is not None]),
+        ("maximum stored-RTO overdue", [(row["time"], row["max_rto_overdue"] / 1000.0) for row in rtp if row["max_rto_overdue"] is not None]),
+        ("controller RTT floor", [(row["time"], row["cc_rtt_floor"] / 1000.0) for row in rtp if row["cc_rtt_floor"] is not None]),
+        ("controller queue gate", [(row["time"], row["cc_queue_tolerance"] / 1000.0) for row in rtp if row["cc_queue_tolerance"] is not None]),
     ]
     rate_series = [
         ("send rate", [(row["time"], row["send_rate"]) for row in rtp]),
         ("delivery rate", [(row["time"], row["delivery_rate"]) for row in rtp if row["delivery_rate"] is not None]),
+        ("controller delivery peak", [(row["time"], row["cc_delivery_peak"]) for row in rtp if row["cc_delivery_peak"] is not None]),
+        ("controller drain floor", [(row["time"], row["cc_drain_floor"]) for row in rtp if row["cc_drain_floor"] is not None]),
+        ("controller drain target", [(row["time"], row["cc_drain_target"]) for row in rtp if row["cc_drain_target"] is not None]),
     ]
     congestion_series = [
         ("cwnd", [(row["time"], row["cwnd"]) for row in rtp]),
         ("pipe", [(row["time"], row["pipe"]) for row in rtp]),
         ("retransmitted", [(row["time"], row["rtx"]) for row in rtp]),
+        ("retransmission active", [(row["time"], row["rtx_active"]) for row in rtp if row["rtx_active"] is not None]),
+        ("retransmission ready", [(row["time"], row["rtx_ready"]) for row in rtp if row["rtx_ready"] is not None]),
+        ("RTO deadline postponements", [(row["time"], row["rto_postponements"]) for row in rtp if row["rto_postponements"] is not None]),
     ]
     mode_series = [
         ("slow start", [(row["time"], float(row["slow_start"])) for row in rtp]),
@@ -298,6 +328,19 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
     ]
     action_series = [
         ("Last CC action", [(row["time"], row["cc_action"]) for row in rtp]),
+    ]
+    controller_rtt_series = [
+        ("controller RTT", [(row["time"], row["cc_control_rtt"] / 1000.0) for row in rtp if row["cc_control_rtt"] is not None]),
+        ("controller RTT floor", [(row["time"], row["cc_rtt_floor"] / 1000.0) for row in rtp if row["cc_rtt_floor"] is not None]),
+        ("controller queue gate", [(row["time"], row["cc_queue_tolerance"] / 1000.0) for row in rtp if row["cc_queue_tolerance"] is not None]),
+        ("probe interval", [(row["time"], row["cc_last_probe_interval"] / 1000.0) for row in rtp if row["cc_last_probe_interval"] is not None]),
+    ]
+    decision_count_series = [
+        ("rate samples", [(row["time"], row["cc_rate_samples"]) for row in rtp if row["cc_rate_samples"] is not None]),
+        ("probe decisions", [(row["time"], row["cc_probe_decisions"]) for row in rtp if row["cc_probe_decisions"] is not None]),
+        ("probe increases", [(row["time"], row["cc_probe_increases"]) for row in rtp if row["cc_probe_increases"] is not None]),
+        ("probe before feedback", [(row["time"], row["cc_probe_before_feedback"]) for row in rtp if row["cc_probe_before_feedback"] is not None]),
+        ("delay drains", [(row["time"], row["cc_delay_drains"]) for row in rtp if row["cc_delay_drains"] is not None]),
     ]
     first_send_seq = rtp[0]["send_seq"] if rtp else 0
     first_recv_seq = next((row["recv_seq"] for row in rtp if row["recv_seq"] is not None), None)
@@ -365,12 +408,14 @@ table {{ border-collapse: collapse; width: 100%; }} th, td {{ text-align: left; 
 {svg_line_chart("RTT over time", "elapsed time (s)", "RTT (ms)", rtt_series)}
 {svg_histogram(raw_rtt_ms)}
 {svg_cdf(raw_rtt_ms)}
+{svg_line_chart("Controller RTT and probe timing", "elapsed time (s)", "RTT (ms)", controller_rtt_series)}
+{svg_line_chart("Controller decision counts", "elapsed time (s)", "cumulative decisions", decision_count_series)}
 {svg_line_chart("Congestion-control rates", "elapsed time (s)", "packets/s", rate_series)}
 {svg_line_chart("Application delivery", "elapsed time (s)", "delivered MiB", delivered_series)}
 {svg_line_chart("Rolling application goodput", "elapsed time (s)", "MiB/s over ~1 s", [("goodput", rolling_goodput)])}
 {svg_line_chart("Congestion state", "elapsed time (s)", "packets", congestion_series)}
 {svg_line_chart("Controller modes", "elapsed time (s)", "active lane (0 = inactive)", mode_series, (0.0, 7.0))}
-{svg_line_chart("Congestion-control action", "elapsed time (s)", "action lane (1 reset, 2 censored, 3 slow start, 4 probe, 5 gentle, 6 drain, 7 loss)", action_series, (0.0, 7.0))}
+{svg_line_chart("Congestion-control action", "elapsed time (s)", "action lane (1 reset, 2 censored, 3 slow start, 4 probe, 5 gentle, 6 drain, 7 loss, 8 huge loss)", action_series, (0.0, 8.0))}
 {svg_line_chart("Peer liveness waits", "elapsed time (s)", "seconds", liveness_series)}
 {svg_line_chart("RTP send staging", "elapsed time (s)", "bytes", send_stage_series)}
 {svg_line_chart("Estimated packet loss", "elapsed time (s)", "loss (%)", loss_series)}

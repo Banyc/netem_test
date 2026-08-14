@@ -79,6 +79,14 @@ def state_rows(rows, manifest):
                 "no_response": optional_float(REPORT.field(row, "no_response_for_us")),
                 "no_progress": optional_float(REPORT.field(row, "no_progress_for_us")),
                 "retransmitted": metric_number(REPORT.field(row, "retransmitted_packets"), 0.0),
+                "retransmission_active": metric_number(REPORT.field(row, "retransmission_active_packets"), 0.0),
+                "retransmission_ready": metric_number(REPORT.field(row, "retransmission_ready_packets"), 0.0),
+                "rto_postponements": metric_number(REPORT.field(row, "rto_deadline_postponements"), 0.0),
+                "cc_rate_samples": metric_number(REPORT.field(row, "congestion_rate_samples"), 0.0),
+                "cc_probe_decisions": metric_number(REPORT.field(row, "congestion_bandwidth_probe_decisions"), 0.0),
+                "cc_probe_increases": metric_number(REPORT.field(row, "congestion_bandwidth_probe_increases"), 0.0),
+                "cc_probe_before_feedback": metric_number(REPORT.field(row, "congestion_bandwidth_probe_before_feedback"), 0.0),
+                "cc_delay_drains": metric_number(REPORT.field(row, "congestion_delay_drains"), 0.0),
                 "loss": metric_number(REPORT.field(row, "loss_ratio")),
                 "cc_loss": metric_number(REPORT.field(row, "congestion_loss_ratio")),
                 "event": REPORT.field(row, "event"),
@@ -206,7 +214,9 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
 
     schema = manifest.get("trace_schema_version", "")
     row_schema = REPORT.field(rtp[0], "schema_version") if rtp else ""
-    checks["schema_compatible"] = schema in ("9",) or row_schema in ("9", "1", "8")
+    checks["schema_compatible"] = schema in ("15", "14", "10", "9", "8", "1") or row_schema in (
+        "15", "14", "10", "9", "8", "1"
+    )
 
     observer = manifest.get("rtp_observer", "")
     checks["observer_present"] = boolean(observer) if observer != "" else False
@@ -317,6 +327,9 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
     empty_stage = sum(value == 0.0 for value in staged)
     accepts = [row["accepts_new_packet"] for row in state if row["accepts_new_packet"] is not None]
     retransmitted = [row["retransmitted"] for row in state if row["retransmitted"] > 0]
+    active_depths = [row["retransmission_active"] for row in state]
+    ready_depths = [row["retransmission_ready"] for row in state]
+    postponements = [row["rto_postponements"] for row in state]
     loss = [row["loss"] for row in state if row["loss"] is not None]
     cc_loss = [row["cc_loss"] for row in state if row["cc_loss"] is not None]
     controller_state = {
@@ -351,6 +364,16 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         ),
         "retransmission_samples": len(retransmitted),
         "max_retransmitted": max(retransmitted, default=0.0),
+        "max_retransmission_active": max(active_depths, default=0.0),
+        "max_retransmission_ready": max(ready_depths, default=0.0),
+        "final_rto_deadline_postponements": postponements[-1] if postponements else 0.0,
+        "final_congestion_counters": {
+            "rate_samples": state[-1]["cc_rate_samples"] if state else 0.0,
+            "probe_decisions": state[-1]["cc_probe_decisions"] if state else 0.0,
+            "probe_increases": state[-1]["cc_probe_increases"] if state else 0.0,
+            "probe_before_feedback": state[-1]["cc_probe_before_feedback"] if state else 0.0,
+            "delay_drains": state[-1]["cc_delay_drains"] if state else 0.0,
+        },
         "loss_samples": len(loss),
         "mean_loss_ratio": statistics.fmean(loss) if loss else math.nan,
         "cc_loss_samples": len(cc_loss),
@@ -419,6 +442,18 @@ def delta_percent(candidate, baseline):
 METRICS = ("goodput_mib_per_second", "rtt_p50_ms", "low_send_rate_occupancy")
 
 
+def probe_before_feedback_percent(summary):
+    """Percent of applied probe increases that ran before the previous one
+    got feedback. This is a timing classification, not proof that a probe
+    caused queue growth; it is None when no increase was ever applied so the
+    denominator is zero."""
+    counters = summary["final_congestion_counters"]
+    increases = counters["probe_increases"]
+    if not increases:
+        return None
+    return 100.0 * counters["probe_before_feedback"] / increases
+
+
 def pair_metrics(pair):
     baseline = pair["baseline"]
     candidate = pair["candidate"]
@@ -437,6 +472,13 @@ def pair_metrics(pair):
             "candidate": cand,
             "delta_percent": value,
         }
+    baseline_pbf = probe_before_feedback_percent(baseline["summary"])
+    candidate_pbf = probe_before_feedback_percent(candidate["summary"])
+    out["congestion_bandwidth_probe_before_feedback_percent"] = {
+        "baseline": baseline_pbf,
+        "candidate": candidate_pbf,
+        "delta_percent": delta_percent(candidate_pbf, baseline_pbf),
+    }
     return out
 
 
@@ -478,7 +520,9 @@ def guidance_hints(pairs, verdict):
             )
     changes.sort(key=lambda item: abs(item["delta_percent"]), reverse=True)
     for change in changes[:5]:
-        if change["metric"] == "rtt_p50_ms":
+        if change["metric"] in ("rtt_p50_ms", "congestion_bandwidth_probe_before_feedback_percent"):
+            # Lower is better for latency and for probe discipline: applying
+            # fewer increases before feedback is the improvement.
             direction = "worse" if change["delta_percent"] > 0 else "better"
         else:
             direction = "worse" if change["delta_percent"] < 0 else "better"

@@ -43,6 +43,49 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
 - `<role>-<seed>.log` — streamed probe log.
 - `comparison.json` / `comparison.html` — schema-2 comparison and report.
 
+## RTP trace schema 15 evidence
+
+The 55-column RTP trace carries the complete congestion-controller and
+retransmission-scheduler snapshot on every state row; event-only raw RTT
+rows leave all snapshot columns empty. The controller evidence:
+
+- `congestion_control_rtt_us` — the control RTT last used by the controller;
+  it paces probe spacing and the queue gate.
+- `congestion_rtt_floor_us` / `congestion_queue_tolerance_us` — the
+  controller's RTT floor and queue-gate tolerance: smoothed RTT above
+  floor + tolerance is what marks `queue_building`.
+- `congestion_delivery_peak_packets_per_second` /
+  `congestion_drain_floor_packets_per_second` /
+  `congestion_drain_target_packets_per_second` — the delivery peak feeding
+  the drain floor, the floor itself, and the drain target the controller
+  applies during gentle draining.
+- `congestion_rate_samples`, `congestion_bandwidth_probe_decisions`,
+  `congestion_bandwidth_probe_increases`, `congestion_delay_drains` —
+  cumulative controller decision counters.
+- `congestion_bandwidth_probe_before_feedback` — increases applied before
+  the previous increase received feedback. This is a timing classification,
+  not proof that a probe caused queue growth; the paired report only emits
+  `congestion_bandwidth_probe_before_feedback_percent` when
+  `congestion_bandwidth_probe_increases` is nonzero, and treats it as
+  lower-is-better (fewer un-feedbacked increases = more conservative probe
+  discipline).
+- `congestion_last_bandwidth_probe_interval_us` — spacing between the last
+  two applied probe increases.
+
+Retransmission-scheduler evidence:
+
+- `retransmission_timeout_us` — the live RTO estimate; on snapshot rows the
+  report overlays it on the RTT plot so a growing RTO tracks the estimator.
+- `oldest_pipe_packet_age_us` / `maximum_packet_rto_overdue_us` — live pipe
+  timing: how old the oldest in-pipe packet is and how far past its RTO
+  deadline the most overdue packet has run.
+- `rto_deadline_postponements` — RTO deadlines postponed by the lazy
+  live-estimator floor.
+- `retransmission_active_packets` / `retransmission_ready_packets` — the
+  retransmission scheduler's active set and how many of those packets are
+  currently due or evidence-armed; the paired report exposes their maximum
+  depths and the final postponement count.
+
 ## Verdicts and exit codes
 
 - `0` — the paired run completed and the comparison is valid.

@@ -8,13 +8,17 @@ use std::time::{Duration, Instant};
 use netem_test::CountersSnapshot;
 use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
 
-/// Trace schema 9: RTP rows carry `trace_elapsed_us` so endpoint, netem, and
-/// progress samples share one clock (`PerfTrace::trace_start`).
-const TRACE_SCHEMA_VERSION: u16 = 9;
+/// Trace schema 15: RTP rows carry the complete congestion-controller and
+/// retransmission-scheduler snapshot (55 columns) plus `trace_elapsed_us` so
+/// endpoint, netem, and progress samples share one clock
+/// (`PerfTrace::trace_start`). Event-only rows leave every snapshot column
+/// empty; the retransmission-active/ready, RTO timing, and controller
+/// decision evidence is present only on snapshot rows.
+const TRACE_SCHEMA_VERSION: u16 = 15;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
-const RTP_TRACE_COLUMNS: usize = 37;
-const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
+const RTP_TRACE_COLUMNS: usize = 55;
+const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
 
 /// One captured RTP observation plus its position on the shared trace clock.
 #[derive(Debug, Clone, Copy)]
@@ -385,15 +389,55 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
             optional_f64(snapshot.loss_ratio),
             snapshot.in_flight_packets.to_string(),
             snapshot.packets_in_pipe.to_string(),
+            snapshot.retransmission_active_packets.to_string(),
+            snapshot.retransmission_ready_packets.to_string(),
             snapshot.retransmitted_packets.to_string(),
             snapshot.next_send_sequence.to_string(),
             optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
             snapshot.smoothed_rtt.as_micros().to_string(),
+            snapshot.retransmission_timeout.as_micros().to_string(),
+            optional_u128(
+                snapshot
+                    .oldest_pipe_packet_age
+                    .map(|value| value.as_micros()),
+            ),
+            optional_u128(
+                snapshot
+                    .maximum_packet_rto_overdue
+                    .map(|value| value.as_micros()),
+            ),
+            snapshot.rto_deadline_postponements.to_string(),
             snapshot.congestion_window_packets.to_string(),
             snapshot.received_packets.to_string(),
             optional_u64(snapshot.next_receive_sequence),
             optional_f64(snapshot.delivery_rate_packets_per_second),
             optional_bool(snapshot.delivery_sample_app_limited),
+            optional_u128(
+                snapshot
+                    .congestion_control_rtt
+                    .map(|value| value.as_micros()),
+            ),
+            optional_u128(snapshot.congestion_rtt_floor.map(|value| value.as_micros())),
+            optional_u128(
+                snapshot
+                    .congestion_queue_tolerance
+                    .map(|value| value.as_micros()),
+            ),
+            optional_f64(snapshot.congestion_delivery_peak_packets_per_second),
+            optional_f64(snapshot.congestion_drain_floor_packets_per_second),
+            optional_f64(snapshot.congestion_drain_target_packets_per_second),
+            snapshot.congestion_rate_samples.to_string(),
+            snapshot.congestion_bandwidth_probe_decisions.to_string(),
+            snapshot.congestion_bandwidth_probe_increases.to_string(),
+            snapshot
+                .congestion_bandwidth_probe_before_feedback
+                .to_string(),
+            optional_u128(
+                snapshot
+                    .congestion_last_bandwidth_probe_interval
+                    .map(|value| value.as_micros()),
+            ),
+            snapshot.congestion_delay_drains.to_string(),
             snapshot.pending_send_bytes.to_string(),
             snapshot.send_stage_capacity_bytes.to_string(),
             snapshot.accepts_new_packet.to_string(),
@@ -603,14 +647,14 @@ mod tests {
 
     #[test]
     fn event_only_and_snapshot_rows_match_the_schema_width() {
-        assert_eq!(RTP_TRACE_HEADER.split(',').count(), RTP_TRACE_COLUMNS);
+        assert_eq!(RTP_TRACE_HEADER.split(',').count(), 55);
         let snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
         let mut event_only = observation(1, 1, MetricsEvent::RttSample);
         event_only.snapshot = None;
         let trace_elapsed = Duration::from_micros(123);
-        assert_eq!(rtp_fields(snapshot, trace_elapsed).len(), RTP_TRACE_COLUMNS);
+        assert_eq!(rtp_fields(snapshot, trace_elapsed).len(), 55);
         let event_only_fields = rtp_fields(event_only, trace_elapsed);
-        assert_eq!(event_only_fields.len(), RTP_TRACE_COLUMNS);
+        assert_eq!(event_only_fields.len(), 55);
         assert_eq!(event_only_fields[7], "20000");
         assert!(
             event_only_fields[8..RTP_TRACE_COLUMNS - 1]
