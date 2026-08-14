@@ -179,17 +179,33 @@ def run_probe(
         completed = subprocess_runner(
             command, cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT
         )
+    components = suite_revisions(workspace)
+    append_trace_manifest(
+        trace_dir,
+        [
+            ["perf_loop_runner_exit_code", completed.returncode],
+            ["perf_loop_role", role],
+            ["perf_loop_profile", profile],
+            ["perf_loop_components_json", json.dumps(components, sort_keys=True)],
+        ],
+    )
     row = {
         "runner_exit": int(completed.returncode),
         "role": role,
         "cargo_profile": profile,
-        "components": json.dumps(suite_revisions(workspace), sort_keys=True),
+        "components": json.dumps(components, sort_keys=True),
         "seed": str(seed),
         "link_profile": link_profile,
         "mss_bytes": str(mss_bytes),
         "trace_dir": str(trace_dir),
     }
     return row
+
+
+def append_trace_manifest(trace_dir, rows):
+    manifest = trace_dir / "manifest.csv"
+    with manifest.open("a", newline="", encoding="utf-8") as output:
+        csv.writer(output).writerows(rows)
 
 
 def write_manifest(output_root, rows):

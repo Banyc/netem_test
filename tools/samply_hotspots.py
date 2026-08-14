@@ -30,10 +30,11 @@ def _symbol_tables(profile, symbols):
         code_id = table.get("code_id")
         if code_id:
             by_identity[(name, code_id.upper())] = table
-            by_name.setdefault(name, []).append(table)
+        by_name.setdefault(name, []).append(table)
     resolved = {}
-    for index, library in enumerate(profile.get("Libs", [])):
+    for index, library in enumerate(profile.get("libs", [])):
         names = [library.get("debugName"), library.get("name")]
+        table = None
         code_id = library.get("codeId")
         if code_id:
             for name in names:
@@ -97,7 +98,7 @@ def summarize(profile, symbols, contains=(), limit=None):
                 name = thread_strings[functions["name"][function_index]]
                 resource_index = functions["resource"][function_index]
                 if resource_index is not None:
-                    library_index = resources["Lib"][resource_index]
+                    library_index = resources["lib"][resource_index]
                     table = symbol_tables.get(library_index)
                     if table is not None:
                         name = _resolved_name(
@@ -146,8 +147,10 @@ def _load_json(path):
         return json.load(handle)
 
 
-def _default_sidecar_path(profile_path):
-    return str(profile_path) + ".syms.json"
+def default_symbols_path(profile_path):
+    if profile_path.suffix == ".gz":
+        return Path(str(profile_path)[:-3] + ".syms.json")
+    return Path(str(profile_path) + ".syms.json")
 
 
 def _print_table(result):
@@ -168,10 +171,11 @@ def main(argv=None):
             "hotspots (schema %d)." % SCHEMA_VERSION
         )
     )
-    parser.add_argument("profile", help="Samply profile JSON (.json or .json.gz)")
+    parser.add_argument("profile", type=Path)
     parser.add_argument(
         "--symbols",
         default=None,
+        type=Path,
         help="Sidecar symbols JSON (default: <profile>.syms.json)",
     )
     parser.add_argument(
@@ -190,22 +194,20 @@ def main(argv=None):
     )
     parser.add_argument(
         "--json",
-        action="store_true",
-        help="Emit JSON instead of a text table",
+        type=Path,
+        help="Write the complete structured summary",
     )
     args = parser.parse_args(argv)
 
-    profile_path = Path(args.profile)
-    symbols_path = Path(args.symbols) if args.symbols else Path(
-        _default_sidecar_path(profile_path)
-    )
-    profile = _load_json(profile_path)
+    symbols_path = args.symbols or default_symbols_path(args.profile)
+    profile = _load_json(args.profile)
     symbols = _load_json(symbols_path)
-    result = summarize(
-        profile, symbols, contains=args.contains, limit=args.limit
-    )
+    result = summarize(profile, symbols, contains=args.contains, limit=args.limit)
     if args.json:
-        print(json.dumps(result, indent=2))
+        args.json.write_text(
+            json.dumps(result, encoding="utf-8", indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     else:
         _print_table(result)
     return 0

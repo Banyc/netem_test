@@ -31,8 +31,9 @@ RTP_HEADER = [
 ]
 
 NETEM_HEADER = [
-    "elapsed_us", "direction", "received", "forwarded", "delayed", "dropped",
-    "duplicated", "reordered", "rate_limited", "overflow_dropped", "queue_len",
+    "elapsed_us", "trace_elapsed_us", "direction", "delayed", "dropped",
+    "duplicated", "reordered", "rate_limited", "forwarded", "received",
+    "overflow_dropped", "queue_len",
 ]
 
 
@@ -98,6 +99,8 @@ class TraceCompareTest(unittest.TestCase):
             ["link_profile", "hostile"],
             ["netem_c2s_seed", c2s_seed],
             ["netem_s2c_seed", s2c_seed],
+            ["netem_samples", "1"],
+            ["progress_samples", "2"],
             ["goodput_mib_per_second", goodput],
             ["probe_outcome", probe_outcome],
             ["sink_read_outcome", "completed"],
@@ -129,16 +132,16 @@ class TraceCompareTest(unittest.TestCase):
             trace_dir / "netem.csv",
             [
                 NETEM_HEADER,
-                [0, "c2s", 100, 90, 50, 8, 0, 1, 0, 2, 1],
-                [0, "s2c", 100, 95, 60, 3, 0, 0, 0, 1, 1],
+                [0, 1000000, "c2s", 50, 8, 0, 1, 0, 90, 100, 2, 1],
+                [0, 1000000, "s2c", 60, 3, 0, 0, 0, 95, 100, 1, 1],
             ],
         )
         self.write_csv(
             trace_dir / "progress.csv",
             [
-                ["elapsed_us", "delivered_bytes"],
-                [1000000, 0],
-                [31000000, int(float(goodput) * 1024 * 1024 * 30)],
+                ["elapsed_us", "trace_elapsed_us", "delivered_bytes"],
+                [1000000, 1000000, 0],
+                [31000000, 31000000, int(float(goodput) * 1024 * 1024 * 30)],
             ],
         )
         if broken:

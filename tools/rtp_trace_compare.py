@@ -189,12 +189,19 @@ def read_run(spec):
         "peer_state": peer_state,
         "peer_rtt": peer_rtt,
         "rolling": rolling_goodput(progress),
-        "health": trace_health(trace_dir, manifest, rtp, peer),
+        "health": trace_health(
+            trace_dir,
+            manifest,
+            rtp,
+            peer,
+            netem,
+            progress_raw,
+        ),
         "summary": summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, rtp, peer),
     }
 
 
-def trace_health(trace_dir, manifest, rtp, peer):
+def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     checks = {}
 
     schema = manifest.get("trace_schema_version", "")
@@ -219,8 +226,55 @@ def trace_health(trace_dir, manifest, rtp, peer):
         if outcome and "corrupt" in outcome.lower():
             checks["endpoint_integrity"] = False
 
+    runner_exit = metric_number(manifest.get("perf_loop_runner_exit_code"))
+    checks["runner_succeeded"] = runner_exit in (None, 0)
+
     checks["rtp_readable"] = len(rtp) > 0
     checks["peer_readable"] = len(peer) > 0
+
+    expected_rtp = metric_number(manifest.get("rtp_captured"))
+    expected_peer = metric_number(manifest.get("rtp_peer_captured"))
+    checks["capture_counts_match"] = (
+        expected_rtp in (None, len(rtp))
+        and expected_peer in (None, len(peer))
+    )
+
+    expected_netem = metric_number(manifest.get("netem_samples"))
+    expected_progress = metric_number(manifest.get("progress_samples"))
+    checks["netem_complete"] = (
+        len(netem) > 0
+        and len(netem) % 2 == 0
+        and expected_netem in (None, len(netem) // 2)
+    )
+    checks["progress_complete"] = (
+        len(progress) > 0
+        and expected_progress in (None, len(progress))
+    )
+
+    window_seconds = metric_number(manifest.get("window_seconds"))
+    state_times = [
+        REPORT.timeline_seconds(row, manifest)
+        for row in rtp
+        if REPORT.field(row, "smoothed_rtt_us") != ""
+    ]
+    checks["measurement_state_present"] = (
+        not boolean(manifest.get("rtp_observer", ""))
+        or any(
+            time is not None
+            and (window_seconds is None or time <= window_seconds)
+            for time in state_times
+        )
+    )
+
+    sources = (rtp, peer, netem, progress)
+    checks["shared_clock"] = (
+        manifest.get("measurement_start_trace_elapsed_us", "")
+        and all(
+            REPORT.field(row, "trace_elapsed_us") != ""
+            for rows in sources
+            for row in rows
+        )
+    )
 
     failures = [key for key, ok in checks.items() if not ok]
     invalid_keys = {
@@ -229,6 +283,12 @@ def trace_health(trace_dir, manifest, rtp, peer):
         "schema_compatible",
         "task_completed",
         "endpoint_integrity",
+        "capture_not_dropped",
+        "runner_succeeded",
+        "capture_counts_match",
+        "netem_complete",
+        "progress_complete",
+        "measurement_state_present",
     }
     if any(key in invalid_keys for key in failures):
         quality = "invalid"
@@ -319,6 +379,9 @@ CONFIG_KEYS = (
     "mss_bytes",
     "fec",
     "rtp_handshake",
+    "perf_loop_profile",
+    "netem_c2s",
+    "netem_s2c",
     "link_profile",
     "scenario",
 )
@@ -491,8 +554,6 @@ def build_comparison(baseline_specs, candidate_specs):
             quality = (baseline if role == "baseline" else candidate)["health"]["evidence_quality"]
             if quality == "invalid":
                 reasons.append(f"{role} trace invalid")
-            elif quality == "degraded":
-                reasons.append(f"{role} evidence degraded")
         pair["metrics"] = pair_metrics(pair)
         pair["excluded_reasons"] = reasons
         pair["valid"] = not reasons

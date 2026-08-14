@@ -56,7 +56,7 @@ def sample_profile(frame_lists, frame_to_func, funcs, libs, strings):
                     "address": [f[1] for f in funcs],
                     "resource": [f[2] for f in funcs],
                 },
-                "resourceTable": {"Lib": [f[2] for f in funcs]},
+                "resourceTable": {"lib": [f[2] for f in funcs]},
                 "stringArray": strings,
             }
         ],
@@ -161,8 +161,14 @@ class SamplyHotspotsTest(unittest.TestCase):
         self.assertEqual(by_name["second"]["leaf_samples"], 1)
 
     def test_default_sidecar_keeps_json_in_the_name(self):
-        path = HOTSPOTS._default_sidecar_path(Path("profile.json"))
-        self.assertEqual(path, "profile.json.syms.json")
+        self.assertEqual(
+            HOTSPOTS.default_symbols_path(Path("profile.json")),
+            Path("profile.json.syms.json"),
+        )
+        self.assertEqual(
+            HOTSPOTS.default_symbols_path(Path("profile.json.gz")),
+            Path("profile.json.syms.json"),
+        )
 
 
 if __name__ == "__main__":
