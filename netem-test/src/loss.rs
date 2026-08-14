@@ -44,6 +44,7 @@ impl LossModel {
     /// Decide whether a packet is lost. Faithfully reproduces
     /// `loss_4state` and the `CLG_RANDOM` branch of `loss_event` in
     /// `sch_netem.c`.
+    #[inline(always)]
     pub(crate) fn loss(
         &self,
         state: &mut FourStateState,
