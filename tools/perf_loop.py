@@ -15,6 +15,7 @@ import csv
 import hashlib
 import json
 import os
+import statistics
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from pathlib import Path
 SAFE_TEMP_ROOT = Path.home() / "code" / "tmp"
 DEFAULT_SEEDS = (11, 21)
 PERF_TEST = "probe_hostile_goodput_30s"
+LINK_PROFILES = ("hostile", "clean", "direct")
 COMPONENTS = ("netem_test", "rtp", "mux", "rtp_mux", "tokio_udp", "udp_listener")
 
 
@@ -57,6 +59,8 @@ def safe_output_dir(requested=None):
     if requested is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         requested = safe_root / f"net-perf-loop-{stamp}-{os.getpid()}"
+    else:
+        requested = Path(requested)
     resolved = requested.expanduser().resolve()
     if not resolved.is_relative_to(safe_root):
         raise ValueError(f"performance output must remain beneath {safe_root}")
@@ -129,12 +133,105 @@ def suite_revisions(workspace):
     return dict(sorted(revisions.items()))
 
 
+def paired_execution_specs(suite_specs, pair_index):
+    """Yield the counterbalanced ``(role, spec)`` execution order for one
+    seed-major pair.
+
+    Even pair indexes run baseline before candidate; odd pair indexes run
+    candidate before baseline, so execution order cannot bias the roles.
+    The stored rows keep their baseline/candidate role labels either way.
+    """
+    spec = suite_specs[pair_index]
+    roles = (
+        ("baseline", "candidate")
+        if pair_index % 2 == 0
+        else ("candidate", "baseline")
+    )
+    for role in roles:
+        yield role, spec
+
+
+def cargo_test_executable(build_log):
+    """Extract the perf_probe test executable from a cargo JSON build log.
+
+    Accepts only compiler-artifact records whose target name is
+    ``perf_probe`` and whose kind contains ``test``; returns the executable
+    filename of the last matching artifact, or None when absent.
+    """
+    found = None
+    with build_log.open("r", encoding="utf-8", errors="replace") as source:
+        for line in source:
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("reason") != "compiler-artifact":
+                continue
+            target = message.get("target") or {}
+            if target.get("name") != "perf_probe":
+                continue
+            kinds = target.get("kind") or []
+            if not any("test" in kind for kind in kinds):
+                continue
+            filenames = message.get("filenames") or []
+            if filenames:
+                found = filenames[0]
+    return found
+
+
+def stream_build_command(role, workspace, build_root, build_log, *, release=True):
+    """Run the frozen ``cargo test --no-run`` build once for one role,
+    streaming JSON diagnostics into ``build-ROLE.log``."""
+    env = dict(os.environ)
+    env["CARGO_TARGET_DIR"] = str(build_root)
+    command = ["cargo", "test"]
+    if release:
+        command.append("--release")
+    command += [
+        "-p", "tests", "--test", "perf_probe", "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]
+    with build_log.open("wb") as log:
+        completed = subprocess.run(
+            command, cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT
+        )
+    return completed
+
+
+def build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+    """Build one role's frozen perf_probe executable once, before any timed
+    run.  Errors when the build fails or the executable is absent or
+    nonexistent."""
+    workspace = validate_workspace(workspace, role)
+    profile = "release" if release else "debug"
+    build_root = safe_build_dir(target_dir, workspace.parent, profile)
+    build_log = output_root / f"build-{role}.log"
+    completed = stream_build_command(
+        role, workspace, build_root, build_log, release=release
+    )
+    executable = cargo_test_executable(build_log)
+    if (
+        completed.returncode != 0
+        or executable is None
+        or not Path(executable).is_file()
+    ):
+        raise ValueError(
+            f"failed to build the frozen {role} perf_probe executable "
+            f"(cargo exit {completed.returncode}); see {build_log}"
+        )
+    return str(Path(executable).resolve())
+
+
 def run_probe(
     workspace,
     seed,
     role,
     output_root,
     *,
+    executable,
     release=True,
     capture_rtp=True,
     target_dir=None,
@@ -145,8 +242,10 @@ def run_probe(
     diagnostic_mode="1",
     subprocess_runner=subprocess.run,
 ):
-    """Run one role/seed probe beneath the safe roots; returns a manifest row."""
+    """Run one role/seed probe directly from its frozen executable;
+    returns a manifest row."""
     workspace = validate_workspace(workspace, role)
+    executable = Path(executable).expanduser().resolve()
     trace_dir = output_root / f"trace-{role}-{seed}"
     temp_dir = safe_temp_dir(role, seed)
     log_path = output_root / f"{role}-{seed}.log"
@@ -168,13 +267,7 @@ def run_probe(
     env["NETEM_PERF_REVISION"] = revision
     env["NETEM_PERF_DIAGNOSTIC_MODE"] = diagnostic_mode
 
-    command = ["cargo", "test"]
-    if release:
-        command.append("--release")
-    command += [
-        "-p", "tests", "--test", "perf_probe", PERF_TEST,
-        "--", "--ignored", "--nocapture", "--test-threads=1",
-    ]
+    command = [str(executable), PERF_TEST, "--ignored", "--nocapture", "--test-threads=1"]
     with open(log_path, "wb") as log:
         completed = subprocess_runner(
             command, cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT
@@ -197,6 +290,7 @@ def run_probe(
         "seed": str(seed),
         "link_profile": link_profile,
         "mss_bytes": str(mss_bytes),
+        "executable": str(executable),
         "trace_dir": str(trace_dir),
     }
     return row
@@ -214,7 +308,7 @@ def write_manifest(output_root, rows):
             handle,
             fieldnames=[
                 "runner_exit", "role", "cargo_profile", "components",
-                "seed", "link_profile", "mss_bytes", "trace_dir",
+                "seed", "link_profile", "mss_bytes", "executable", "trace_dir",
             ],
         )
         writer.writeheader()
@@ -232,12 +326,43 @@ def call_compare(baseline_dirs, candidate_dirs, output_root):
     return result
 
 
+def control_calibration(comparison):
+    """Classify same-binary control stability from valid paired goodput
+    deltas.  Stable only when every absolute valid paired goodput delta is
+    below 10%; records the median/maximum absolute delta and how many pairs
+    crossed the material-change threshold (false material changes on an
+    identical binary)."""
+    deltas = [
+        pair["metrics"]["goodput_mib_per_second"]["delta_percent"]
+        for pair in comparison.get("pairs", [])
+        if pair.get("valid")
+    ]
+    absolute = [abs(value) for value in deltas if value is not None]
+    stable = len(absolute) > 0 and all(value < 10.0 for value in absolute)
+    return {
+        "classification": "stable" if stable else "unstable",
+        "valid_pairs": len(absolute),
+        "median_absolute_delta_percent": (
+            statistics.median(absolute) if absolute else None
+        ),
+        "max_absolute_delta_percent": max(absolute) if absolute else None,
+        "false_material_change_count": sum(
+            1 for value in absolute if value >= 10.0
+        ),
+    }
+
+
 def command_run(args):
     if args.mss_bytes <= 0:
         raise argparse.ArgumentTypeError("--mss-bytes must be positive")
     baseline = validate_workspace(Path(args.baseline), "baseline")
     candidate = validate_workspace(Path(args.candidate), "candidate")
-    if baseline == candidate:
+    if args.same_binary_control:
+        if baseline != candidate:
+            raise SystemExit(
+                "--same-binary-control requires identical resolved workspaces"
+            )
+    elif baseline == candidate:
         raise SystemExit("refusing to compare a workspace with itself")
     if args.label and args.label in (".", ".."):
         raise SystemExit("label must name a run")
@@ -247,15 +372,37 @@ def command_run(args):
         "candidate": jj_revision(candidate),
     }
 
+    # Prebuild both frozen executables once, before any timed run.
+    executables = {}
+    for role, workspace in (("baseline", baseline), ("candidate", candidate)):
+        executables[role] = build_probe(
+            workspace,
+            role,
+            output_root,
+            release=args.release,
+            target_dir=args.target_dir,
+        )
+    if (
+        args.same_binary_control
+        and executables["baseline"] != executables["candidate"]
+    ):
+        raise SystemExit(
+            "--same-binary-control requires identical executable paths for both roles"
+        )
+
     rows = []
     runs = []
-    for seed in args.seeds:
-        for role, workspace in (("baseline", baseline), ("candidate", candidate)):
+    suite_specs = [{"seed": seed} for seed in args.seeds]
+    for pair_index in range(len(suite_specs)):
+        for role, spec in paired_execution_specs(suite_specs, pair_index):
+            seed = spec["seed"]
+            workspace = baseline if role == "baseline" else candidate
             row = run_probe(
                 workspace,
                 seed,
                 role,
                 output_root,
+                executable=executables[role],
                 release=args.release,
                 capture_rtp=True,
                 target_dir=args.target_dir,
@@ -270,6 +417,7 @@ def command_run(args):
                     "role": role,
                     "seed": seed,
                     "runner_exit": row["runner_exit"],
+                    "executable": row["executable"],
                     "trace_dir": row["trace_dir"],
                     "log": str(output_root / f"{role}-{seed}.log"),
                 }
@@ -291,8 +439,10 @@ def command_run(args):
     if (output_root / "comparison.json").exists():
         comparison = json.loads((output_root / "comparison.json").read_text(encoding="utf-8"))
     verdict = comparison.get("verdict", "insufficient_evidence")
+    calibration = control_calibration(comparison) if args.same_binary_control else None
 
     run_json = {
+        "pair_execution_order": "alternating",
         "link_profile": args.link_profile,
         "mss_bytes": args.mss_bytes,
         "baseline": str(baseline),
@@ -301,6 +451,18 @@ def command_run(args):
         "seeds": list(args.seeds),
         "window_seconds": args.window_seconds,
         "release": args.release,
+        "same_binary_control": bool(args.same_binary_control),
+        "control_calibration": calibration,
+        "builds": {
+            "baseline": {
+                "executable": executables["baseline"],
+                "log": str(output_root / "build-baseline.log"),
+            },
+            "candidate": {
+                "executable": executables["candidate"],
+                "log": str(output_root / "build-candidate.log"),
+            },
+        },
         "target_dirs": {
             "baseline": str(safe_build_dir(args.target_dir, baseline.parent, "release" if args.release else "debug")),
             "candidate": str(safe_build_dir(args.target_dir, candidate.parent, "release" if args.release else "debug")),
@@ -326,6 +488,12 @@ def command_run(args):
         return 2
     if args.fail_on_regression and verdict == "likely_regression":
         return 3
+    if (
+        args.fail_on_control_instability
+        and calibration is not None
+        and calibration["classification"] == "unstable"
+    ):
+        return 4
     return 0
 
 
@@ -364,19 +532,21 @@ def build_parser():
         help="comma-separated u64 seeds (default: %(default)s)",
     )
     run.add_argument("--window-seconds", type=int, default=30, help="measurement window in seconds (must be positive)")
-    run.add_argument("--link-profile", choices=("hostile", "clean"), default="hostile")
+    run.add_argument("--link-profile", choices=LINK_PROFILES, default="hostile")
     run.add_argument("--mss-bytes", type=int, default=8192)
     run.add_argument("--release", action="store_true", default=True, help=argparse.SUPPRESS)
     run.add_argument("--no-release", dest="release", action="store_false")
     run.add_argument("--target-dir", default=None, help="shared Cargo target directory")
     run.add_argument("--output", default=None, help="output directory beneath $TMPDIR")
     run.add_argument("--fail-on-regression", action="store_true")
+    run.add_argument("--same-binary-control", action="store_true", help="compare a workspace with itself to calibrate run-to-run variance")
+    run.add_argument("--fail-on-control-instability", action="store_true", help="exit 4 when same-binary control calibration is unstable")
     run.set_defaults(handler=command_run)
 
     compare = subparsers.add_parser("compare", help="compare existing trace directories")
     compare.add_argument("--baseline", action="append", nargs=2, metavar=("SEED", "TRACE_DIR"), required=True)
     compare.add_argument("--candidate", action="append", nargs=2, metavar=("SEED", "TRACE_DIR"), required=True)
-    compare.add_argument("--link-profile", choices=("hostile", "clean"), default="hostile")
+    compare.add_argument("--link-profile", choices=LINK_PROFILES, default="hostile")
     compare.add_argument("--mss-bytes", type=int, default=8192)
     compare.add_argument("--output", default=None)
     compare.add_argument("--fail-on-regression", action="store_true")

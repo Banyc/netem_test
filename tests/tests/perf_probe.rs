@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use netem_test::NetemPair;
+use netem_test::{CountersSnapshot, NetemPair};
 use support::mux::{
     mux_send_payload, mux_timed_echo_round_trip,
     spawn_mux_over_rtp_counting_sink_server_observed_via, spawn_mux_over_rtp_echo_server_via,
@@ -589,6 +589,10 @@ async fn probe_mux_echo_1mib_mss8k() {
 /// The counting sink verifies every byte in-flight and is snapshotted while the
 /// transfer is still mid-flight, so a reversed measurement order cannot inflate
 /// goodput.
+///
+/// `NETEM_PERF_LINK_PROFILE=direct` bypasses NetemPair entirely: the client
+/// connects straight to the server and the trace records zero-valued netem
+/// placeholders so artifacts stay schema-compatible.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_hostile_goodput_30s() {
@@ -609,9 +613,10 @@ async fn probe_hostile_goodput_30s() {
             let link_profile = std::env::var("NETEM_PERF_LINK_PROFILE")
                 .unwrap_or_else(|_| "hostile".to_owned());
             assert!(
-                link_profile == "hostile" || link_profile == "clean",
-                "NETEM_PERF_LINK_PROFILE must be exactly 'hostile' or 'clean', got {link_profile:?}"
+                link_profile == "hostile" || link_profile == "clean" || link_profile == "direct",
+                "NETEM_PERF_LINK_PROFILE must be exactly 'hostile', 'clean', or 'direct', got {link_profile:?}"
             );
+            let direct = link_profile == "direct";
             let mss_bytes = std::env::var("NETEM_PERF_MSS_BYTES")
                 .map(|value| {
                     let mss = value
@@ -650,11 +655,19 @@ async fn probe_hostile_goodput_30s() {
             .await
             .unwrap();
             let server_mux = progress.mux_session();
-            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-            let pair_ref = &pair;
+            // Direct mode bypasses NetemPair entirely: the client connects
+            // straight to the server and the trace records zero-valued netem
+            // placeholders so artifacts stay schema-compatible.
+            let pair = if direct {
+                None
+            } else {
+                Some(NetemPair::spawn(server_addr, c2s, s2c).unwrap())
+            };
+            let pair_ref = pair.as_ref();
+            let connect_addr = pair_ref.map_or(server_addr, |pair| pair.client_addr());
             let (read, write) = rtp_connect_transient_observed(
                 &task_tx,
-                pair.client_addr(),
+                connect_addr,
                 false,
                 mss_bytes,
                 trace.as_ref().and_then(PerfTrace::rtp_observer),
@@ -709,8 +722,8 @@ async fn probe_hostile_goodput_30s() {
                     _ = netem_tick.tick(), if trace.is_some() => {
                         trace.as_mut().unwrap().record_netem(
                             start.elapsed(),
-                            pair_ref.snapshot_c2s(),
-                            pair_ref.snapshot_s2c(),
+                            pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_c2s()),
+                            pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_s2c()),
                             progress.delivered_bytes(),
                         );
                     }
@@ -720,6 +733,10 @@ async fn probe_hostile_goodput_30s() {
 
             let delivered = progress.delivered_bytes();
             let elapsed = start.elapsed();
+            assert!(
+                delivered > 0,
+                "probe must deliver payload bytes, got {delivered}"
+            );
             let _ = pump_stop_tx.send(true);
             while let Some(result) = pump_tasks.join_next().await {
                 let result = result.unwrap();
@@ -771,25 +788,34 @@ async fn probe_hostile_goodput_30s() {
                         ("sink_read_outcome", progress.read_outcome().as_label()),
                         ("client_mux_outcome", client_mux.outcome().as_label()),
                         ("server_mux_outcome", server_mux.outcome().as_label()),
-                        ("netem_c2s", c2s_description),
-                        ("netem_s2c", s2c_description),
+                        (
+                            "netem_c2s",
+                            if direct { "direct".to_owned() } else { c2s_description },
+                        ),
+                        (
+                            "netem_s2c",
+                            if direct { "direct".to_owned() } else { s2c_description },
+                        ),
                     ])
                     .expect("write perf trace");
                 eprintln!("[trace] {}", output_dir.display());
             }
 
-            pair_ref.stop();
-            let stats = combined_stats(pair_ref);
-            if expects_impairment {
-                assert!(
-                    stats.dropped > 0 && stats.delayed > 0,
-                    "hostile link should drop and delay packets, got {stats:?}"
-                );
-            } else {
-                assert!(
-                    stats.forwarded > 0 && stats.dropped == 0,
-                    "clean link should forward packets without drops, got {stats:?}"
-                );
+            if let Some(pair) = pair_ref {
+                pair.stop();
+                let stats = combined_stats(pair);
+                eprintln!("[stats] {stats:?}");
+                if expects_impairment {
+                    assert!(
+                        stats.dropped > 0 && stats.delayed > 0,
+                        "hostile link should drop and delay packets, got {stats:?}"
+                    );
+                } else {
+                    assert!(
+                        stats.forwarded > 0 && stats.dropped == 0,
+                        "clean link should forward packets without drops, got {stats:?}"
+                    );
+                }
             }
 
             assert!(
@@ -820,7 +846,6 @@ async fn probe_hostile_goodput_30s() {
                 delivered as usize,
                 elapsed,
             );
-            eprintln!("[stats] {stats:?}");
 
             // Keep the stream read half alive until after the delivered
             // snapshot.

@@ -26,17 +26,50 @@ The historical/default scenario is hostile with MSS 8192
 recorded in every manifest (`run.json`, both trace manifests, and the
 paired `manifest.csv`), while the defaults remain hostile/8192.
 
+## Direct lane
+
+`--link-profile direct` bypasses NetemPair entirely: the client connects
+straight to the probe server and the trace records zero-valued netem
+placeholders, so artifacts stay schema-compatible while the measurement
+isolates endpoint and host throughput from proxy overhead.
+
+## Frozen executables and counterbalanced order
+
+Both roles are prebuilt once (`cargo test --release -p tests --test
+perf_probe --no-run --message-format=json-render-diagnostics` per role,
+streamed to `build-ROLE.log`) before any timed run; every seed invokes the
+recorded `perf_probe` executable directly, so no timed run compiles.  Pair
+execution order alternates per seed-major pair (baseline/candidate then
+candidate/baseline) so scheduling order cannot bias the roles; stored rows
+keep their baseline/candidate labels, and `run.json` records
+`pair_execution_order="alternating"`, the `builds`, and the per-run
+`executable`.
+
+## Same-binary control
+
+`--same-binary-control` compares a workspace with itself (the only mode
+that permits identical resolved workspaces; the resolved executable paths
+must also match) to calibrate run-to-run variance.  `run.json` then records
+`control_calibration`, classified `stable` only when every absolute valid
+paired goodput delta is below 10% — with the median/maximum absolute delta
+and the number of pairs that crossed the material-change threshold (false
+material changes on an identical binary).  With
+`--fail-on-control-instability`, an unstable calibration exits 4.
+
 ## Artifacts
 
 Every output, temporary, trace, log, and Cargo target resolves beneath
 `$TMPDIR`:
 
-- `run.json` — top-level run record: `link_profile`, `mss_bytes`,
-  workspaces, seeds, window, target directories, per-role/seed runs and
-  their artifact paths, and the comparison verdict.
+- `run.json` — top-level run record: `pair_execution_order` (`alternating`),
+  `link_profile`, `mss_bytes`, workspaces, seeds, window, target
+  directories, same-binary control flag, `control_calibration`,
+  per-role `builds` (frozen executable + build log), per-role/seed runs
+  (with the recorded `executable`) and their artifact paths, and the
+  comparison verdict.
 - `manifest.csv` — one row per role/seed probe: runner exit, role, Cargo
-  profile, sorted component-revision JSON, seed, link profile, MSS, trace
-  dir.
+  profile, sorted component-revision JSON, seed, link profile, MSS,
+  resolved executable, trace dir.
 - `trace-<role>-<seed>/` — the probe's trace directory (manifest/rtp/rtp_
   peer/netem/progress) with the link profile and MSS recorded in its
   manifest.
@@ -92,6 +125,8 @@ Retransmission-scheduler evidence:
 - `2` — probe/evidence failure: any probe exited non-zero, the comparison
   evidence is invalid, or the comparison tool itself failed.
 - `3` — only with `--fail-on-regression` and a `likely_regression` verdict.
+- `4` — only with `--fail-on-control-instability` and an unstable
+  same-binary `control_calibration`.
 
 The verdict is a consistency label over valid seed-paired evidence only; it
 is not statistical confidence or causality. Every agent hint carries a
@@ -108,9 +143,11 @@ invalid evidence.
 
 ## Safe paths and workspace topology
 
-- Baseline and candidate must be distinct resolved workspaces; a mutable
-  workspace must not be used as both roles, and debug/release evidence must
-  not be mixed.
+- Baseline and candidate must be distinct resolved workspaces outside
+  same-binary control mode; `--same-binary-control` is the only mode that
+  permits identical workspaces, and it additionally requires the resolved
+  executable paths to match.  A mutable workspace must not be used as both
+  roles, and debug/release evidence must not be mixed.
 - A frozen workspace has a `netem_test/` checkout with sibling `rtp`,
   `mux`, `rtp_mux`, `tokio_udp`, and `udp_listener` repositories; each
   component's jj revision is recorded in the manifest.
