@@ -90,7 +90,15 @@ Summarize the profile into deterministic owning-symbol hotspots:
 python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json
 python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json \
     --contains tokio --limit 20 --json
+python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json \
+    --contains tokio --thread tokio-runtime-worker --limit 20 --json
 ```
+
+When the profile also samples unrelated runtime threads, filter to the
+workload-owning thread with the exact-name `--thread` option (repeatable;
+all threads with any requested name are selected and a requested name that
+matches nothing is an error).  The workload-owning thread is required when
+it avoids unrelated runtime samples.
 
 When comparing workloads that differ, compare samples per forwarded packet
 rather than raw sample counts.

@@ -19,7 +19,7 @@ import json
 import sys
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _symbol_tables(profile, symbols):
@@ -64,22 +64,33 @@ def _resolved_name(address, table, starts, strings, fallback):
     return strings[entry["symbol"]]
 
 
-def summarize(profile, symbols, contains=(), limit=None):
+def summarize(profile, symbols, contains=(), limit=None, thread_names=()):
     """Reduce a profile+sidecar to owning-symbol hotspots.
 
-    Each nonempty sample in every thread walks its thread-local
+    Each nonempty sample in the selected threads walks its thread-local
     stackTable/frameTable/funcTable/resourceTable and resolves each frame's
     owning symbol through the sidecar symbol tables.  The leaf (first) frame
     is counted per sample; each name is counted at most once per sample for
     the inclusive total.  Percentages use the total nonempty sample count,
-    and `contains` is a disjunctive substring filter over hotspot names.
+    `contains` is a disjunctive substring filter over hotspot names, and
+    `thread_names` is an exact-name thread filter that selects every thread
+    with any requested name (zero matches is an error).
     """
     strings = symbols["string_table"]
     symbol_tables = _symbol_tables(profile, symbols)
     inclusive = Counter()
     leaf = Counter()
     total = 0
-    for thread in profile.get("threads", []):
+    selected_threads = [
+        thread
+        for thread in profile.get("threads", [])
+        if not thread_names or thread.get("name") in thread_names
+    ]
+    if thread_names and not selected_threads:
+        raise ValueError(
+            "no profile threads matched: " + ", ".join(sorted(thread_names))
+        )
+    for thread in selected_threads:
         samples = thread["samples"]
         stacks = thread["stackTable"]
         frames = thread["frameTable"]
@@ -135,6 +146,8 @@ def summarize(profile, symbols, contains=(), limit=None):
         "schema_version": SCHEMA_VERSION,
         "total_samples": total,
         "contains": list(contains),
+        "thread_names": list(thread_names),
+        "selected_thread_count": len(selected_threads),
         "hotspots": hotspots,
     }
 
@@ -186,6 +199,13 @@ def main(argv=None):
         help="Keep hotspot names containing TEXT (repeatable; any match wins)",
     )
     parser.add_argument(
+        "--thread",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Retain threads with this exact name; may be repeated",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -202,7 +222,16 @@ def main(argv=None):
     symbols_path = args.symbols or default_symbols_path(args.profile)
     profile = _load_json(args.profile)
     symbols = _load_json(symbols_path)
-    result = summarize(profile, symbols, contains=args.contains, limit=args.limit)
+    try:
+        result = summarize(
+            profile,
+            symbols,
+            contains=args.contains,
+            limit=args.limit,
+            thread_names=args.thread,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if args.json:
         args.json.write_text(
             json.dumps(result, encoding="utf-8", indent=2, sort_keys=True) + "\n",

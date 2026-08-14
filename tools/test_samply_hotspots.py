@@ -132,6 +132,72 @@ class SamplyHotspotsTest(unittest.TestCase):
         # The unfiltered denominator is the total nonempty sample count.
         self.assertEqual(filtered["total_samples"], 3)
 
+    def test_thread_filter_selects_all_threads_with_an_exact_name(self):
+        # Threads sharing the exact requested name all contribute samples;
+        # every other thread is excluded from the summary.
+        def thread_with(name, frame_lists):
+            profile = sample_profile(
+                frame_lists,
+                frame_to_func=[0],
+                funcs=[(0, 0x1000, 0)],
+                libs=[
+                    {
+                        "debugName": "lib.dylib",
+                        "codeId": "1",
+                        "symbol_table": [
+                            {"rva": 0x1000, "size": 0x100, "symbol": 0},
+                        ],
+                    }
+                ],
+                strings=["worker"],
+            )
+            thread = profile["threads"][0]
+            thread["name"] = name
+            return thread, profile["Libs"]
+
+        worker_a, libs = thread_with("tokio-runtime-worker", [[0], [0]])
+        worker_b, _ = thread_with("tokio-runtime-worker", [[0]])
+        other, _ = thread_with("main-thread", [[0]])
+        profile = {"libs": libs, "threads": [worker_a, worker_b, other]}
+        result = HOTSPOTS.summarize(
+            profile,
+            sidecar([], ["worker"]),
+            thread_names=["tokio-runtime-worker"],
+        )
+        self.assertEqual(result["thread_names"], ["tokio-runtime-worker"])
+        self.assertEqual(result["selected_thread_count"], 2)
+        # Three worker samples, none from the excluded thread.
+        self.assertEqual(result["total_samples"], 3)
+        by_name = {h["name"]: h for h in result["hotspots"]}
+        self.assertEqual(by_name["worker"]["inclusive_samples"], 3)
+        self.assertEqual(by_name["worker"]["inclusive_percent"], 100.0)
+
+    def test_thread_filter_rejects_a_name_absent_from_the_profile(self):
+        profile = sample_profile(
+            [[0]],
+            frame_to_func=[0],
+            funcs=[(0, 0x1000, 0)],
+            libs=[
+                {
+                    "debugName": "lib.dylib",
+                    "codeId": "1",
+                    "symbol_table": [
+                        {"rva": 0x1000, "size": 0x100, "symbol": 0},
+                    ],
+                }
+            ],
+            strings=["worker"],
+        )
+        profile["threads"][0]["name"] = "main-thread"
+        with self.assertRaisesRegex(
+            ValueError, "no profile threads matched: tokio-runtime-worker"
+        ):
+            HOTSPOTS.summarize(
+                profile,
+                sidecar([], ["worker"]),
+                thread_names=["tokio-runtime-worker"],
+            )
+
     def test_duplicate_library_names_match_code_id(self):
         # Two libraries share debugName but differ by codeId; the owning
         # table must be chosen by (name, code_id) identity.
