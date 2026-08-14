@@ -400,6 +400,17 @@ impl AtomicCounters {
         f(self).fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment a counter owned by exactly one writer (the direction's runner
+    /// thread): a relaxed load + store instead of a fetch_add round-trip.
+    #[inline]
+    fn inc_single_writer(&self, f: impl Fn(&AtomicCounters) -> &AtomicU64) {
+        let counter = f(self);
+        counter.store(
+            counter.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+
     fn snapshot(&self) -> Counters {
         Counters {
             delayed: self.delayed.load(Ordering::Relaxed),
@@ -625,7 +636,7 @@ impl NetemState {
             && config.queue_limit_pkts == 0;
         let has_stochastic_work = config.duplicate != 0
             || config.loss != 0
-            || matches!(config.loss_model, LossModel::Random);
+            || !matches!(config.loss_model, LossModel::Random);
         let direct_stochastic = no_scheduling && has_stochastic_work;
         let direct_forward = no_scheduling && !has_stochastic_work;
         let rng = RndState::seed(config.seed);
@@ -695,19 +706,19 @@ impl NetemState {
         dst: Option<SocketAddr>,
         send: &dyn UdpTransport,
     ) -> bool {
-        self.stats.inc(|s| &s.received);
+        self.stats.inc_single_writer(|s| &s.received);
         if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
-            self.stats.inc(|s| &s.dropped);
+            self.stats.inc_single_writer(|s| &s.dropped);
             return true;
         }
         if self.blackout.load(Ordering::Relaxed) {
-            self.stats.inc(|s| &s.dropped);
+            self.stats.inc_single_writer(|s| &s.dropped);
             return true;
         }
         if let Some(dst) = dst
             && send.send_to(data, dst).is_ok()
         {
-            self.stats.inc(|s| &s.forwarded);
+            self.stats.inc_single_writer(|s| &s.forwarded);
         }
         true
     }
@@ -749,13 +760,13 @@ impl NetemState {
         dst: Option<SocketAddr>,
         send: &dyn UdpTransport,
     ) -> bool {
-        self.stats.inc(|s| &s.received);
+        self.stats.inc_single_writer(|s| &s.received);
         if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
-            self.stats.inc(|s| &s.dropped);
+            self.stats.inc_single_writer(|s| &s.dropped);
             return true;
         }
         if self.blackout.load(Ordering::Relaxed) {
-            self.stats.inc(|s| &s.dropped);
+            self.stats.inc_single_writer(|s| &s.dropped);
             return true;
         }
         let count = self.surviving_copies();
@@ -763,7 +774,7 @@ impl NetemState {
             if let Some(dst) = dst
                 && send.send_to(data, dst).is_ok()
             {
-                self.stats.inc(|s| &s.forwarded);
+                self.stats.inc_single_writer(|s| &s.forwarded);
             }
         }
         true
@@ -2992,12 +3003,9 @@ mod tests {
     #[test]
     fn clean_config_forwards_directly_and_honors_blackout() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
-        // An explicitly no-stochastic config (four-state model with all-zero
-        // probabilities) must be clean: no scheduling, no stochastic work.
-        let config = NetemConfig {
-            loss_model: LossModel::FourState(FourStateLoss::default()),
-            ..NetemConfig::default()
-        };
+        // A default config (random loss model, zero loss, no scheduling) must
+        // be clean: no scheduling, no stochastic work.
+        let config = NetemConfig::default();
         let (runner, sent) = mock_runner(config);
         assert!(
             runner.direct_forward,
@@ -3054,7 +3062,6 @@ mod tests {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
         let config = NetemConfig {
             max_datagram_size: 512,
-            loss_model: LossModel::FourState(FourStateLoss::default()),
             ..Default::default()
         };
         let (runner, sent) = mock_runner(config);

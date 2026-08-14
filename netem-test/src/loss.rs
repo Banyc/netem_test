@@ -53,40 +53,47 @@ impl LossModel {
     ) -> bool {
         match self {
             LossModel::Random => loss != 0 && loss >= loss_cor.next(rng),
-            LossModel::FourState(p) => {
-                let rnd = rng.next_u32();
-                match state {
-                    FourStateState::TxInGap => {
-                        if rnd < p.p14 {
-                            *state = FourStateState::LostInGap;
-                            return true;
-                        } else if rnd < p.p13.saturating_add(p.p14) {
-                            *state = FourStateState::LostInBurst;
-                            return true;
-                        }
-                    }
-                    FourStateState::TxInBurst => {
-                        if rnd < p.p23 {
-                            *state = FourStateState::LostInBurst;
-                            return true;
-                        }
-                    }
-                    FourStateState::LostInBurst => {
-                        if rnd < p.p32 {
-                            *state = FourStateState::TxInBurst;
-                        } else if rnd < p.p31.saturating_add(p.p32) {
-                            *state = FourStateState::TxInGap;
-                        } else {
-                            *state = FourStateState::LostInBurst;
-                            return true;
-                        }
-                    }
-                    FourStateState::LostInGap => {
-                        *state = FourStateState::TxInGap;
-                    }
-                }
-                false
-            }
+            LossModel::FourState(p) => four_state_loss(p, state, rng),
         }
     }
+}
+
+/// Four-state Gilbert-Elliot loss decision. Extracted from the inline
+/// [`LossModel::loss`] arm so the hot path stays small; draws exactly one
+/// `u32` per packet from `rng` with transitions and return values identical
+/// to the arm it replaced.
+#[inline(never)]
+fn four_state_loss(p: &FourStateLoss, state: &mut FourStateState, rng: &mut RndState) -> bool {
+    let rnd = rng.next_u32();
+    match state {
+        FourStateState::TxInGap => {
+            if rnd < p.p14 {
+                *state = FourStateState::LostInGap;
+                return true;
+            } else if rnd < p.p13.saturating_add(p.p14) {
+                *state = FourStateState::LostInBurst;
+                return true;
+            }
+        }
+        FourStateState::TxInBurst => {
+            if rnd < p.p23 {
+                *state = FourStateState::LostInBurst;
+                return true;
+            }
+        }
+        FourStateState::LostInBurst => {
+            if rnd < p.p32 {
+                *state = FourStateState::TxInBurst;
+            } else if rnd < p.p31.saturating_add(p.p32) {
+                *state = FourStateState::TxInGap;
+            } else {
+                *state = FourStateState::LostInBurst;
+                return true;
+            }
+        }
+        FourStateState::LostInGap => {
+            *state = FourStateState::TxInGap;
+        }
+    }
+    false
 }
