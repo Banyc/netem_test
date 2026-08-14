@@ -2,7 +2,8 @@
 
 use crate::NetemConfig;
 use crate::rng::{CorRng, RndState};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) fn serialization_delay(len: usize, rate_bps: u64) -> Option<Duration> {
@@ -34,6 +35,46 @@ struct BottleneckState {
     link_free_at: Instant,
     /// Packets dropped because they exceeded `limit_bytes`.
     dropped: u64,
+    /// Length of the most recently serialized packet, for the serialization
+    /// cache.
+    last_packet_len: usize,
+    /// Serialization nanoseconds for `last_packet_len` at `rate`.
+    last_serialize_ns: u64,
+}
+
+/// Nanobits per byte: 8 bits/byte * 1e9 ns/s. Scaling the serialization and
+/// backlog arithmetic by this constant keeps every comparison in whole
+/// integers with no division.
+const NANOBITS_PER_BYTE: u128 = 8_000_000_000;
+/// Nanobits spanned by a full `u64`-second nanosecond counter wrap at the
+/// byte scale: a backlog older than this has a whole-byte size that cannot
+/// fit in `u64`, so it exceeds any byte limit.
+const U64_BACKLOG_WRAP_NANOBITS: u128 = (u64::MAX as u128 + 1) * NANOBITS_PER_BYTE;
+
+/// Whether `backlog_ns` of already-committed wire time at `rate` plus a new
+/// `len`-byte packet would exceed `limit_bytes`, decided with whole-byte
+/// backlog math but without division.
+///
+/// The whole-byte backlog is `backlog_ns * rate / NANOBITS_PER_BYTE`, so the
+/// admit condition `backlog_bytes + len <= limit_bytes` is equivalent
+/// (multiplying through by `NANOBITS_PER_BYTE`) to
+/// `backlog_ns * rate + len * NANOBITS_PER_BYTE <= limit_bytes *
+/// NANOBITS_PER_BYTE`.
+pub(crate) fn exceeds_byte_limit(
+    limit_bytes: u64,
+    backlog_ns: u128,
+    rate: u64,
+    len: usize,
+) -> bool {
+    let backlog_nanobits = backlog_ns.saturating_mul(rate as u128);
+    if backlog_nanobits > U64_BACKLOG_WRAP_NANOBITS {
+        // More than 2^64 ns of committed wire time: the whole-byte backlog is
+        // larger than any `u64` byte limit even before the new packet.
+        return true;
+    }
+    let packet_nanobits = (len as u128).saturating_mul(NANOBITS_PER_BYTE);
+    let limit_nanobits = (limit_bytes as u128).saturating_mul(NANOBITS_PER_BYTE);
+    backlog_nanobits.saturating_add(packet_nanobits) > limit_nanobits
 }
 
 impl BottleneckShaper {
@@ -49,22 +90,24 @@ impl BottleneckShaper {
             limit_bytes,
             link_free_at: Instant::now(),
             dropped: 0,
+            last_packet_len: 0,
+            last_serialize_ns: 0,
         })))
     }
 
     /// Current configured rate in bits per second.
     pub fn rate_bps(&self) -> u64 {
-        self.0.lock().unwrap().rate
+        self.0.lock().rate
     }
 
     /// Number of packets tail-dropped by the shared shaper.
     pub fn dropped(&self) -> u64 {
-        self.0.lock().unwrap().dropped
+        self.0.lock().dropped
     }
 
     /// Bytes currently sitting in the shared serialization backlog as of `now`.
     pub fn backlog_bytes(&self, now: Instant) -> u64 {
-        let state = self.0.lock().unwrap();
+        let state = self.0.lock();
         let backlog_ns = state.link_free_at.saturating_duration_since(now).as_nanos();
         (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64
     }
@@ -77,19 +120,30 @@ impl BottleneckShaper {
     /// exit time does *not* include per-flow propagation delay; the caller must
     /// add its own latency/jitter afterwards.
     pub fn schedule(&self, base: Instant, len: usize) -> Option<Instant> {
-        let mut state = self.0.lock().unwrap();
-        let backlog_ns = state
-            .link_free_at
-            .saturating_duration_since(base)
-            .as_nanos();
-        let backlog = (backlog_ns * state.rate as u128 / 1_000_000_000 / 8) as u64;
-        if state.limit_bytes != 0 && backlog.saturating_add(len as u64) > state.limit_bytes {
-            state.dropped += 1;
-            return None;
+        let mut state = self.0.lock();
+        // Bypass the backlog arithmetic entirely when the shared tail-drop
+        // buffer is unbounded.
+        if state.limit_bytes != 0 {
+            let backlog_ns = state
+                .link_free_at
+                .saturating_duration_since(base)
+                .as_nanos();
+            if exceeds_byte_limit(state.limit_bytes, backlog_ns, state.rate, len) {
+                state.dropped += 1;
+                return None;
+            }
         }
-        let packet_bits = (len as u64).saturating_mul(8);
-        let serialize_ns = (packet_bits as u128).saturating_mul(1_000_000_000) / state.rate as u128;
-        let t = base.max(state.link_free_at) + Duration::from_nanos(serialize_ns as u64);
+        // Serialization scales with packet length; consecutive packets of the
+        // same length reuse the cached serialization instead of re-multiplying.
+        let serialize_ns = if state.last_packet_len == len {
+            state.last_serialize_ns
+        } else {
+            let ns = ((len as u128) * NANOBITS_PER_BYTE / state.rate as u128) as u64;
+            state.last_packet_len = len;
+            state.last_serialize_ns = ns;
+            ns
+        };
+        let t = base.max(state.link_free_at) + Duration::from_nanos(serialize_ns);
         state.link_free_at = t;
         Some(t)
     }

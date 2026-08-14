@@ -21,7 +21,7 @@ mod rng;
 mod shaper;
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::ops::{Deref, DerefMut};
@@ -29,9 +29,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex as ParkingMutex;
+
 use loss::FourStateState;
 use queue::Queued;
 use rng::CorRng;
+#[cfg(test)]
+use shaper::exceeds_byte_limit;
 use shaper::{sample_delay, serialization_delay};
 
 pub use loss::{FourStateLoss, LossModel};
@@ -45,6 +49,42 @@ const RUNNER_IDLE_POLL: Duration = Duration::from_millis(5);
 /// Hard per-direction cap on recycled packet payload buffers; drained buffers
 /// beyond this bound are dropped so a fast flow cannot grow the cache forever.
 const MAX_REUSED_PACKET_BUFFERS: usize = 64;
+/// Total payload capacity bound for the FIFO recycle pool; a drained buffer is
+/// recycled only when both the count and the total capacity bounds remain
+/// satisfied, so a flow of large packets cannot grow the cache unboundedly.
+const MAX_FIFO_REUSED_PACKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Per-direction cap on recycled FIFO payload buffers.
+const MAX_FIFO_REUSED_PACKET_BUFFERS: usize = 4096;
+
+/// FIFO queue used by the monotonic-deadline forwarding path.
+///
+/// When jitter and reorder-gap scheduling are both zero, deadlines are
+/// monotonic in arrival order, so a `VecDeque` preserves exactly the same
+/// packet order as the delay heap while avoiding per-packet heap insertion
+/// cost. Drained payload buffers are recycled subject to both the count and
+/// the total-capacity bounds.
+#[derive(Default)]
+struct FifoQueue {
+    packets: VecDeque<Queued>,
+    reused_packet_buffers: Vec<Vec<u8>>,
+    reused_capacity_bytes: usize,
+}
+
+impl FifoQueue {
+    /// Recycle a drained payload buffer when both the count and the total
+    /// capacity bounds remain satisfied; otherwise drop it so a fast flow
+    /// cannot grow the cache forever.
+    fn recycle_packet_buffer(&mut self, mut data: Vec<u8>) {
+        if self.reused_packet_buffers.len() < MAX_FIFO_REUSED_PACKET_BUFFERS
+            && self.reused_capacity_bytes.saturating_add(data.capacity())
+                <= MAX_FIFO_REUSED_PACKET_BUFFER_BYTES
+        {
+            data.clear();
+            self.reused_capacity_bytes += data.capacity();
+            self.reused_packet_buffers.push(data);
+        }
+    }
+}
 
 // ──────────────────────────── UDP transport ────────────────────────────
 
@@ -115,9 +155,24 @@ impl<T: UdpTransport + ?Sized> UdpTransport for Arc<T> {
 }
 
 /// Standard-library `UdpSocket` backed transport.
+///
+/// Receive timeouts are serialized through a [`ParkingMutex`]-protected
+/// [`ReceiveTimeoutState`] so that repeated receives with the already-
+/// installed timeout perform no syscall, and temporary timeouts used by
+/// [`recv_from_timeout`](UdpTransport::recv_from_timeout) restore the
+/// configured default afterwards.
 #[derive(Debug)]
 pub struct StdUdpTransport {
     sock: std::net::UdpSocket,
+    receive_timeout: ParkingMutex<ReceiveTimeoutState>,
+    #[cfg(test)]
+    receive_timeout_installs: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ReceiveTimeoutState {
+    configured: Option<Duration>,
+    effective: Option<Duration>,
 }
 
 impl StdUdpTransport {
@@ -125,12 +180,41 @@ impl StdUdpTransport {
         let sock = std::net::UdpSocket::bind(addr)?;
         sock.set_nonblocking(false)?;
         sock.set_read_timeout(Some(RUNNER_IDLE_POLL))?;
-        Ok(Self { sock })
+        Ok(Self {
+            sock,
+            receive_timeout: ParkingMutex::new(ReceiveTimeoutState {
+                configured: Some(RUNNER_IDLE_POLL),
+                effective: Some(RUNNER_IDLE_POLL),
+            }),
+            #[cfg(test)]
+            receive_timeout_installs: AtomicU64::new(0),
+        })
+    }
+
+    /// Install `timeout` on the socket unless it is already effective,
+    /// tracking the effective value so repeated identical installs are no-ops.
+    fn install_receive_timeout(
+        &self,
+        state: &mut ReceiveTimeoutState,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        if state.effective == timeout {
+            return Ok(());
+        }
+        self.sock.set_read_timeout(timeout)?;
+        state.effective = timeout;
+        #[cfg(test)]
+        self.receive_timeout_installs
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
 impl UdpTransport for StdUdpTransport {
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let mut state = self.receive_timeout.lock();
+        let configured = state.configured;
+        self.install_receive_timeout(&mut state, configured)?;
         self.sock.recv_from(buf)
     }
 
@@ -139,9 +223,11 @@ impl UdpTransport for StdUdpTransport {
         buf: &mut [u8],
         timeout: Duration,
     ) -> io::Result<(usize, SocketAddr)> {
-        self.sock.set_read_timeout(Some(timeout))?;
+        let mut state = self.receive_timeout.lock();
+        self.install_receive_timeout(&mut state, Some(timeout))?;
         let res = self.sock.recv_from(buf);
-        self.sock.set_read_timeout(Some(RUNNER_IDLE_POLL))?;
+        let configured = state.configured;
+        self.install_receive_timeout(&mut state, configured)?;
         res
     }
 
@@ -155,15 +241,18 @@ impl UdpTransport for StdUdpTransport {
     }
 
     fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
-        if timeout.is_zero() {
-            self.sock.set_read_timeout(None)
+        let mut state = self.receive_timeout.lock();
+        state.configured = if timeout.is_zero() {
+            None
         } else {
-            self.sock.set_read_timeout(Some(timeout))
-        }
+            Some(timeout)
+        };
+        let configured = state.configured;
+        self.install_receive_timeout(&mut state, configured)
     }
 
     fn recv_timeout(&self) -> io::Result<Option<Duration>> {
-        self.sock.read_timeout()
+        Ok(self.receive_timeout.lock().configured)
     }
 }
 
@@ -342,7 +431,7 @@ pub struct NetemLink {
     stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
-    stop: Arc<Mutex<bool>>,
+    stop: Arc<AtomicBool>,
     /// Handle of the spawned runner thread; `None` once joined.
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -388,7 +477,7 @@ impl NetemLink {
         let stats = Arc::new(AtomicCounters::default());
         let queue_len = Arc::new(AtomicU64::new(0));
         let blackout = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(Mutex::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let link = Self {
             client_addr,
@@ -457,7 +546,7 @@ impl NetemLink {
     /// Signal the proxy thread to stop and wait for it to exit. Idempotent:
     /// once joined, subsequent calls are no-ops.
     pub fn stop(&self) {
-        *self.stop.lock().unwrap() = true;
+        self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.lock().unwrap().take() {
             thread.join().unwrap();
         }
@@ -487,10 +576,14 @@ struct NetemState {
     /// the heap at all. `max_datagram_size` is a deterministic filter and does
     /// not disqualify the direct path.
     direct_forward: bool,
+    /// True when the config has stochastic work (duplication or loss) but no
+    /// scheduling, so duplicate/loss draws can be applied directly without
+    /// enqueueing into a delay queue.
+    direct_stochastic: bool,
     stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
-    stop: Arc<Mutex<bool>>,
+    stop: Arc<AtomicBool>,
     /// Optional shared-bottleneck shaper. When set, it replaces the per-
     /// direction `config.rate` serialization clock.
     shared: Option<BottleneckShaper>,
@@ -519,20 +612,22 @@ impl NetemState {
         stats: Arc<AtomicCounters>,
         queue_len: Arc<AtomicU64>,
         blackout: Arc<AtomicBool>,
-        stop: Arc<Mutex<bool>>,
+        stop: Arc<AtomicBool>,
         shared: Option<BottleneckShaper>,
         clock: Option<Clock>,
     ) -> Self {
-        let direct_forward = shared.is_none()
+        let no_scheduling = shared.is_none()
             && config.latency.is_zero()
             && config.jitter.is_zero()
-            && config.loss == 0
-            && matches!(config.loss_model, LossModel::Random)
-            && config.duplicate == 0
             && config.reorder == 0
             && config.reorder_gap_pkts == 0
             && config.rate == 0
             && config.queue_limit_pkts == 0;
+        let has_stochastic_work = config.duplicate != 0
+            || config.loss != 0
+            || matches!(config.loss_model, LossModel::Random);
+        let direct_stochastic = no_scheduling && has_stochastic_work;
+        let direct_forward = no_scheduling && !has_stochastic_work;
         let rng = RndState::seed(config.seed);
         let link_free_at = match &clock {
             Some(c) => c.now(),
@@ -546,6 +641,7 @@ impl NetemState {
             link_free_at,
             config,
             direct_forward,
+            direct_stochastic,
             stats,
             queue_len,
             blackout,
@@ -571,7 +667,7 @@ impl NetemState {
     }
 
     fn should_stop(&self) -> bool {
-        *self.stop.lock().unwrap()
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Forward `data` to `dst` without touching the heap when the config is
@@ -587,6 +683,18 @@ impl NetemState {
         if !self.direct_forward {
             return false;
         }
+        self.forward_direct(data, dst, send)
+    }
+
+    /// Clean no-clock direct loop: count the datagram, apply the deterministic
+    /// size filter and the blackout gate, then forward immediately without
+    /// touching the heap or reading the clock.
+    fn forward_direct(
+        &self,
+        data: &[u8],
+        dst: Option<SocketAddr>,
+        send: &dyn UdpTransport,
+    ) -> bool {
         self.stats.inc(|s| &s.received);
         if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
             self.stats.inc(|s| &s.dropped);
@@ -600,6 +708,63 @@ impl NetemState {
             && send.send_to(data, dst).is_ok()
         {
             self.stats.inc(|s| &s.forwarded);
+        }
+        true
+    }
+
+    /// Apply duplication and loss to a received datagram, returning the number
+    /// of surviving copies (0 = lost, 1 = forwarded once, 2 = duplicated).
+    /// Preserves the kernel's duplicate-before-loss draw order and the
+    /// duplicated/dropped counters; shared by the heap, FIFO, and direct
+    /// stochastic paths so every path consumes PRNG draws identically.
+    fn surviving_copies(&mut self) -> u32 {
+        // ── duplication ──────────────────────────────────────────────
+        let mut count = 1u32;
+        if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
+            count += 1;
+            self.stats.inc(|s| &s.duplicated);
+        }
+
+        // ── loss ─────────────────────────────────────────────────────
+        if self.config.loss_model.loss(
+            &mut self.state,
+            &mut self.loss_cor,
+            &mut self.rng,
+            self.config.loss,
+        ) {
+            self.stats.inc(|s| &s.dropped);
+            // A lost packet still consumes a duplication slot.
+            count = count.saturating_sub(1);
+        }
+        count
+    }
+
+    /// Stochastic-only direct loop: apply duplication then loss directly with
+    /// no scheduling, forwarding every surviving copy immediately. Retains the
+    /// `max_datagram_size`/blackout checks and the duplicate-before-loss PRNG
+    /// and counter order of the queued pipeline.
+    fn forward_stochastic_direct(
+        &mut self,
+        data: &[u8],
+        dst: Option<SocketAddr>,
+        send: &dyn UdpTransport,
+    ) -> bool {
+        self.stats.inc(|s| &s.received);
+        if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
+            self.stats.inc(|s| &s.dropped);
+            return true;
+        }
+        if self.blackout.load(Ordering::Relaxed) {
+            self.stats.inc(|s| &s.dropped);
+            return true;
+        }
+        let count = self.surviving_copies();
+        for _ in 0..count {
+            if let Some(dst) = dst
+                && send.send_to(data, dst).is_ok()
+            {
+                self.stats.inc(|s| &s.forwarded);
+            }
         }
         true
     }
@@ -623,25 +788,7 @@ impl NetemState {
             return;
         }
 
-        // ── duplication ──────────────────────────────────────────────
-        let mut count = 1u32;
-        if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
-            count += 1;
-            self.stats.inc(|s| &s.duplicated);
-        }
-
-        // ── loss ─────────────────────────────────────────────────────
-        if self.config.loss_model.loss(
-            &mut self.state,
-            &mut self.loss_cor,
-            &mut self.rng,
-            self.config.loss,
-        ) {
-            self.stats.inc(|s| &s.dropped);
-            // A lost packet still consumes a duplication slot.
-            count = count.saturating_sub(1);
-        }
-
+        let count = self.surviving_copies();
         if count == 0 {
             return;
         }
@@ -790,6 +937,154 @@ impl NetemState {
             .unwrap_or(RUNNER_IDLE_POLL)
             .min(RUNNER_IDLE_POLL)
     }
+
+    // ─────────────────────── FIFO scheduling path ───────────────────────
+
+    /// True when every scheduled deadline is monotonic in arrival order, so a
+    /// FIFO queue preserves the exact packet order of the delay heap: jitter
+    /// and reorder-gap scheduling are both zero. Direct paths are dispatched
+    /// before this is consulted.
+    fn uses_fifo_scheduling(&self) -> bool {
+        !self.direct_forward
+            && !self.direct_stochastic
+            && self.config.jitter.is_zero()
+            && self.config.reorder_gap_pkts == 0
+    }
+
+    /// Same impairment pipeline as [`NetemState::handle_datagram`] but
+    /// enqueueing into a [`FifoQueue`]: duplicate-before-loss PRNG draws and
+    /// counters are identical, only the storage differs.
+    fn handle_datagram_fifo(
+        &mut self,
+        data: &[u8],
+        now: Instant,
+        dst: Option<SocketAddr>,
+        fifo: &mut FifoQueue,
+    ) {
+        self.stats.inc(|s| &s.received);
+
+        // ── max datagram size filter ──────────────────────────────────
+        if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
+            self.stats.inc(|s| &s.dropped);
+            return;
+        }
+
+        // ── blackout gate ────────────────────────────────────────────
+        if self.blackout.load(Ordering::Relaxed) {
+            self.stats.inc(|s| &s.dropped);
+            return;
+        }
+
+        let count = self.surviving_copies();
+        if count == 0 {
+            return;
+        }
+        for _ in 0..count {
+            self.enqueue_fifo(data, now, dst, fifo);
+        }
+    }
+
+    /// FIFO analogue of [`NetemState::enqueue`]. With jitter and reorder-gap
+    /// both zero, the delay is the fixed `latency` (no PRNG draw), deadlines
+    /// are monotonic, and the queue limit tail-drops before any scheduling
+    /// arithmetic.
+    fn enqueue_fifo(
+        &mut self,
+        data: &[u8],
+        now: Instant,
+        dst: Option<SocketAddr>,
+        fifo: &mut FifoQueue,
+    ) {
+        // ── queue limit (tail-drop) ──────────────────────────────────
+        if self.config.queue_limit_pkts != 0 && fifo.packets.len() >= self.config.queue_limit_pkts {
+            self.stats.inc(|s| &s.overflow_dropped);
+            return;
+        }
+
+        let delay = self.config.latency;
+        if !delay.is_zero() {
+            self.stats.inc(|s| &s.delayed);
+        }
+
+        let time_to_send = if let Some(shared) = &self.shared {
+            // ── shared bottleneck (normal branch only) ──────────────────
+            // Shape at packet arrival time, then add the fixed propagation
+            // delay; identical scheduling to the heap path.
+            match shared.schedule(now, data.len()) {
+                Some(t) => {
+                    if t != now {
+                        self.stats.inc(|s| &s.rate_limited);
+                    }
+                    t + delay
+                }
+                None => {
+                    self.stats.inc(|s| &s.overflow_dropped);
+                    return;
+                }
+            }
+        } else if let Some(serialize) = serialization_delay(data.len(), self.config.rate) {
+            // ── rate shaping (normal branch only) ───────────────────
+            let base = now + delay;
+            let earliest = base.max(self.link_free_at);
+            let t = earliest + serialize;
+            self.link_free_at = t;
+            if t != base {
+                self.stats.inc(|s| &s.rate_limited);
+            }
+            t
+        } else {
+            now + delay
+        };
+
+        let Some(dst) = dst else {
+            // No known destination yet (s2c before the first client packet).
+            return;
+        };
+
+        // Reuse a recycled drained payload buffer; `extend_from_slice` keeps
+        // the pooled allocation when its capacity is sufficient.
+        let mut packet = fifo.reused_packet_buffers.pop().unwrap_or_default();
+        packet.extend_from_slice(data);
+        let item = Queued {
+            time_to_send,
+            seq: self.seq,
+            data: packet,
+            dst,
+        };
+        self.seq = self.seq.wrapping_add(1);
+        fifo.packets.push_back(item);
+        self.queue_len
+            .store(fifo.packets.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Drain every FIFO packet whose deadline has passed, forwarding in
+    /// arrival order and recycling drained payload buffers subject to the FIFO
+    /// count and capacity bounds.
+    fn drain_ready_fifo(&mut self, fifo: &mut FifoQueue, now: Instant, send: &dyn UdpTransport) {
+        while let Some(front) = fifo.packets.front() {
+            if front.time_to_send > now {
+                break;
+            }
+            let Queued { data, dst, .. } = fifo.packets.pop_front().unwrap();
+            self.queue_len
+                .store(fifo.packets.len() as u64, Ordering::Relaxed);
+            if send.send_to(&data, dst).is_ok() {
+                self.stats.inc(|s| &s.forwarded);
+            }
+            fifo.recycle_packet_buffer(data);
+        }
+    }
+
+    /// How long the runner may sleep before it must re-check the FIFO: until
+    /// the front packet's deadline, capped at [`RUNNER_IDLE_POLL`] (and at the
+    /// idle poll when the FIFO is empty).
+    fn next_receive_wait_fifo(&self, fifo: &FifoQueue, now: Instant) -> Duration {
+        fifo.packets
+            .front()
+            .map(|queued| queued.time_to_send.saturating_duration_since(now))
+            .unwrap_or(RUNNER_IDLE_POLL)
+            .min(RUNNER_IDLE_POLL)
+    }
 }
 
 struct LinkRunner {
@@ -804,7 +1099,7 @@ struct RunnerConfig {
     stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
-    stop: Arc<Mutex<bool>>,
+    stop: Arc<AtomicBool>,
     transport: Box<dyn UdpTransport>,
     clock: Option<Clock>,
 }
@@ -843,6 +1138,139 @@ impl LinkRunner {
 
     fn run(mut self) {
         let mut buf = [0u8; 64 * 1024];
+        // Dispatch once: the config never changes, so each runner picks the
+        // cheapest loop that preserves its impairment semantics. Stochastic-
+        // only and clean configs avoid the delay heap entirely; monotonic
+        // deadlines use the FIFO queue; jitter/reorder stay on the heap.
+        if self.pipeline.direct_stochastic {
+            self.run_stochastic_direct(&mut buf);
+        } else if self.pipeline.uses_fifo_scheduling() {
+            self.run_fifo(&mut buf);
+        } else if self.pipeline.direct_forward {
+            self.run_direct(&mut buf);
+        } else {
+            self.run_heap(&mut buf);
+        }
+    }
+
+    /// Clean no-clock direct loop: receives with the transport's default
+    /// timeout and forwards every datagram without reading the clock or
+    /// touching a queue.
+    fn run_direct(&mut self, buf: &mut [u8]) {
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            match self.transport.recv_from(buf) {
+                Ok((n, _from)) => {
+                    self.pipeline.forward_direct(
+                        &buf[..n],
+                        Some(self.server_addr),
+                        &*self.transport,
+                    );
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Stochastic-only direct loop: applies duplicate then loss directly
+    /// without scheduling, again without reading the clock.
+    fn run_stochastic_direct(&mut self, buf: &mut [u8]) {
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            match self.transport.recv_from(buf) {
+                Ok((n, _from)) => {
+                    self.pipeline.forward_stochastic_direct(
+                        &buf[..n],
+                        Some(self.server_addr),
+                        &*self.transport,
+                    );
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// FIFO loop for configs with scheduling but monotonic deadlines: drains
+    /// the front packet when it is due, then sleeps only until its deadline.
+    /// An empty FIFO performs no clock read at all.
+    fn run_fifo(&mut self, buf: &mut [u8]) {
+        let mut fifo = FifoQueue::default();
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            if let Some(front) = fifo.packets.front() {
+                let now = self.pipeline.now();
+                if front.time_to_send <= now {
+                    self.pipeline
+                        .drain_ready_fifo(&mut fifo, now, &*self.transport);
+                    continue;
+                }
+                let receive_wait = self.pipeline.next_receive_wait_fifo(&fifo, now);
+                if receive_wait.is_zero() {
+                    continue;
+                }
+                match self.transport.recv_from_timeout(buf, receive_wait) {
+                    Ok((n, _from)) => {
+                        let now = self.pipeline.now();
+                        self.pipeline.handle_datagram_fifo(
+                            &buf[..n],
+                            now,
+                            Some(self.server_addr),
+                            &mut fifo,
+                        );
+                    }
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        // keep draining
+                    }
+                    Err(_) => break,
+                }
+            } else {
+                // Empty FIFO: no clock read, block on the default timeout.
+                match self.transport.recv_from(buf) {
+                    Ok((n, _from)) => {
+                        let now = self.pipeline.now();
+                        self.pipeline.handle_datagram_fifo(
+                            &buf[..n],
+                            now,
+                            Some(self.server_addr),
+                            &mut fifo,
+                        );
+                    }
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        // keep draining
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    /// Heap loop for configs whose deadlines can be non-monotonic (jitter or
+    /// reorder-gap scheduling): the existing delay-heap pipeline.
+    fn run_heap(&mut self, buf: &mut [u8]) {
         loop {
             if self.pipeline.should_stop() {
                 break;
@@ -862,7 +1290,7 @@ impl LinkRunner {
             // Block briefly on recv so we don't spin. Use the explicit
             // timeout API so the receive deadline is decoupled from the
             // transport's default read timeout and can be asserted by tests.
-            match self.transport.recv_from_timeout(&mut buf, receive_wait) {
+            match self.transport.recv_from_timeout(&mut buf[..], receive_wait) {
                 Ok((n, _from)) => {
                     let dst = Some(self.server_addr);
                     // Clean configs skip the heap entirely; only packets that
@@ -917,7 +1345,7 @@ pub struct NetemPair {
     queue_len_s2c: Arc<AtomicU64>,
     blackout_c2s: Arc<AtomicBool>,
     blackout_s2c: Arc<AtomicBool>,
-    stop: Arc<Mutex<bool>>,
+    stop: Arc<AtomicBool>,
     /// Handle of the c2s runner thread; `None` once joined.
     thread_c2s: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Handle of the s2c runner thread; `None` once joined.
@@ -941,6 +1369,32 @@ impl NetemPair {
     pub fn spawn(server_addr: SocketAddr, c2s: NetemConfig, s2c: NetemConfig) -> io::Result<Self> {
         let localhost = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
         Self::spawn_on(server_addr, c2s, s2c, localhost, localhost)
+    }
+
+    /// Spawn with custom transports (for in-memory tests). Both transports
+    /// must already be bound; the client transport's local address becomes
+    /// the client address.
+    pub fn spawn_with_transports(
+        server_addr: SocketAddr,
+        c2s: NetemConfig,
+        s2c: NetemConfig,
+        client_transport: Box<dyn UdpTransport>,
+        server_transport: Box<dyn UdpTransport>,
+    ) -> io::Result<Self> {
+        let client_addr = client_transport.local_addr()?;
+        Self::spawn_from_sockets(
+            server_addr,
+            client_transport,
+            server_transport,
+            client_addr,
+            NetemPairConfig {
+                c2s,
+                s2c,
+                c2s_shared: None,
+                s2c_shared: None,
+                clock: None,
+            },
+        )
     }
 
     /// Spawn with explicit bind addresses for the two proxy sockets.
@@ -1054,8 +1508,8 @@ impl NetemPair {
         let queue_len_s2c = Arc::new(AtomicU64::new(0));
         let blackout_c2s = Arc::new(AtomicBool::new(false));
         let blackout_s2c = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(Mutex::new(false));
-        let learned_client = Arc::new(Mutex::<Option<SocketAddr>>::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let learned_client = Arc::new(LearnedDestination::default());
 
         let pair = Self {
             client_addr,
@@ -1198,7 +1652,7 @@ impl NetemPair {
     /// Signal both proxy threads to stop and wait for them to exit.
     /// Idempotent: once joined, subsequent calls are no-ops.
     pub fn stop(&self) {
-        *self.stop.lock().unwrap() = true;
+        self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread_c2s.lock().unwrap().take() {
             thread.join().unwrap();
         }
@@ -1216,13 +1670,61 @@ impl Drop for NetemPair {
 
 // ─────────────────────── per-direction runner ────────────────────────────
 
+/// Client destination learned from the first c2s packet, published by the c2s
+/// runner and read by the s2c runner. A generation counter lets the reader
+/// skip the lock entirely until the publisher actually changes the address.
+#[derive(Default)]
+struct LearnedDestination {
+    address: Mutex<Option<SocketAddr>>,
+    generation: AtomicU64,
+}
+
+impl LearnedDestination {
+    /// Publish `address` unless it is already the current destination,
+    /// bumping the generation only on an actual change.
+    fn publish(&self, address: SocketAddr) {
+        let mut current = self.address.lock().unwrap();
+        if *current == Some(address) {
+            return;
+        }
+        *current = Some(address);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Publish `address` and update the caller's cache when it differs from
+    /// what the caller has already seen.
+    fn publish_if_changed(&self, cached: &mut Option<SocketAddr>, address: SocketAddr) {
+        if *cached == Some(address) {
+            return;
+        }
+        *self.address.lock().unwrap() = Some(address);
+        *cached = Some(address);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Refresh the caller's cached destination only when the generation
+    /// counter moved, taking the lock only on an actual change.
+    fn refresh_if_changed(
+        &self,
+        cached: &mut Option<SocketAddr>,
+        observed_generation: &mut u64,
+    ) -> Option<SocketAddr> {
+        let generation = self.generation.load(Ordering::Acquire);
+        if generation != *observed_generation {
+            *cached = *self.address.lock().unwrap();
+            *observed_generation = generation;
+        }
+        *cached
+    }
+}
+
 struct SharedLinkRunner {
     recv: Arc<dyn UdpTransport>,
     send: Arc<dyn UdpTransport>,
     /// Fixed destination (the real server for c2s). When `None`, the runner
     /// uses the learned client address (`learned_dst`).
     fixed_dst: Option<SocketAddr>,
-    learned_dst: Arc<Mutex<Option<SocketAddr>>>,
+    learned_dst: Arc<LearnedDestination>,
     pipeline: NetemState,
 }
 
@@ -1231,9 +1733,9 @@ struct DirectionRunnerConfig {
     stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
-    stop: Arc<Mutex<bool>>,
+    stop: Arc<AtomicBool>,
     fixed_dst: Option<SocketAddr>,
-    learned_dst: Arc<Mutex<Option<SocketAddr>>>,
+    learned_dst: Arc<LearnedDestination>,
     shared: Option<BottleneckShaper>,
     clock: Option<Clock>,
 }
@@ -1266,6 +1768,212 @@ impl SharedLinkRunner {
 
     fn run(mut self) {
         let mut buf = [0u8; 64 * 1024];
+        // Dispatch once to the cheapest loop that preserves the direction's
+        // semantics: stochastic-only and clean configs skip the queue
+        // entirely (with fixed- or learned-destination variants), monotonic
+        // deadlines use the FIFO queue, and jitter/reorder stay on the heap.
+        if self.pipeline.direct_stochastic {
+            if self.fixed_dst.is_some() {
+                self.run_stochastic_fixed_direct(&mut buf);
+            } else {
+                self.run_stochastic_learned_direct(&mut buf);
+            }
+        } else if self.pipeline.uses_fifo_scheduling() {
+            self.run_fifo(&mut buf);
+        } else if self.pipeline.direct_forward {
+            if self.fixed_dst.is_some() {
+                self.run_fixed_direct(&mut buf);
+            } else {
+                self.run_learned_direct(&mut buf);
+            }
+        } else {
+            self.run_heap(&mut buf);
+        }
+    }
+
+    /// Clean no-clock c2s direct loop: publish the client address, then
+    /// forward every datagram to the fixed server without reading the clock.
+    fn run_fixed_direct(&mut self, buf: &mut [u8]) {
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            match self.recv.recv_from(buf) {
+                Ok((n, from)) => {
+                    self.learned_dst.publish(from);
+                    self.pipeline
+                        .forward_direct(&buf[..n], self.fixed_dst, &*self.send);
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Clean no-clock s2c direct loop: refresh the learned client address
+    /// without locking until the publisher changes it, then forward replies.
+    fn run_learned_direct(&mut self, buf: &mut [u8]) {
+        let mut cached = None;
+        let mut observed_generation = 0;
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            match self.recv.recv_from(buf) {
+                Ok((n, _from)) => {
+                    // Read the destination at packet-processing time so a
+                    // just-published client address is never missed.
+                    let dst = self
+                        .learned_dst
+                        .refresh_if_changed(&mut cached, &mut observed_generation);
+                    self.pipeline.forward_direct(&buf[..n], dst, &*self.send);
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Stochastic-only c2s loop: publish the client address, then apply
+    /// duplicate/loss directly without scheduling or clock reads.
+    fn run_stochastic_fixed_direct(&mut self, buf: &mut [u8]) {
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            match self.recv.recv_from(buf) {
+                Ok((n, from)) => {
+                    self.learned_dst.publish(from);
+                    self.pipeline
+                        .forward_stochastic_direct(&buf[..n], self.fixed_dst, &*self.send);
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Stochastic-only s2c loop: refresh the learned destination, then apply
+    /// duplicate/loss directly; a reply is forwarded only once a destination
+    /// has been learned.
+    fn run_stochastic_learned_direct(&mut self, buf: &mut [u8]) {
+        let mut cached = None;
+        let mut observed_generation = 0;
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            match self.recv.recv_from(buf) {
+                Ok((n, _from)) => {
+                    // Read the destination at packet-processing time so a
+                    // just-published client address is never missed.
+                    let dst = self
+                        .learned_dst
+                        .refresh_if_changed(&mut cached, &mut observed_generation);
+                    self.pipeline
+                        .forward_stochastic_direct(&buf[..n], dst, &*self.send);
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // keep draining
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// FIFO loop for directions with scheduling but monotonic deadlines.
+    /// An empty FIFO performs no clock read.
+    fn run_fifo(&mut self, buf: &mut [u8]) {
+        let mut fifo = FifoQueue::default();
+        let mut cached = None;
+        let mut observed_generation = 0;
+        let mut cached_from = None;
+        loop {
+            if self.pipeline.should_stop() {
+                break;
+            }
+            if let Some(front) = fifo.packets.front() {
+                let now = self.pipeline.now();
+                if front.time_to_send <= now {
+                    self.pipeline.drain_ready_fifo(&mut fifo, now, &*self.send);
+                    continue;
+                }
+                let receive_wait = self.pipeline.next_receive_wait_fifo(&fifo, now);
+                if receive_wait.is_zero() {
+                    continue;
+                }
+                match self.recv.recv_from_timeout(buf, receive_wait) {
+                    Ok((n, from)) => {
+                        if self.fixed_dst.is_some() {
+                            self.learned_dst.publish_if_changed(&mut cached_from, from);
+                        }
+                        let dst = self.fixed_dst.or_else(|| {
+                            self.learned_dst
+                                .refresh_if_changed(&mut cached, &mut observed_generation)
+                        });
+                        let now = self.pipeline.now();
+                        self.pipeline
+                            .handle_datagram_fifo(&buf[..n], now, dst, &mut fifo);
+                    }
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        // keep draining
+                    }
+                    Err(_) => break,
+                }
+            } else {
+                // Empty FIFO: no clock read, block on the default timeout.
+                match self.recv.recv_from(buf) {
+                    Ok((n, from)) => {
+                        if self.fixed_dst.is_some() {
+                            self.learned_dst.publish_if_changed(&mut cached_from, from);
+                        }
+                        let dst = self.fixed_dst.or_else(|| {
+                            self.learned_dst
+                                .refresh_if_changed(&mut cached, &mut observed_generation)
+                        });
+                        let now = self.pipeline.now();
+                        self.pipeline
+                            .handle_datagram_fifo(&buf[..n], now, dst, &mut fifo);
+                    }
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        // keep draining
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    /// Heap loop for directions whose deadlines can be non-monotonic (jitter
+    /// or reorder-gap scheduling): the existing delay-heap pipeline.
+    fn run_heap(&mut self, buf: &mut [u8]) {
+        let mut cached = None;
+        let mut observed_generation = 0;
+        let mut cached_from = None;
         loop {
             if self.pipeline.should_stop() {
                 break;
@@ -1282,14 +1990,17 @@ impl SharedLinkRunner {
 
             // Use the explicit timeout API so the receive deadline is
             // decoupled from the transport's default read timeout.
-            match self.recv.recv_from_timeout(&mut buf, receive_wait) {
+            match self.recv.recv_from_timeout(&mut buf[..], receive_wait) {
                 Ok((n, from)) => {
                     // For c2s, learn the client address so the s2c runner can
-                    // send replies back to it.
+                    // send replies back to it; skip the lock when unchanged.
                     if self.fixed_dst.is_some() {
-                        *self.learned_dst.lock().unwrap() = Some(from);
+                        self.learned_dst.publish_if_changed(&mut cached_from, from);
                     }
-                    let dst = self.fixed_dst.or_else(|| *self.learned_dst.lock().unwrap());
+                    let dst = self.fixed_dst.or_else(|| {
+                        self.learned_dst
+                            .refresh_if_changed(&mut cached, &mut observed_generation)
+                    });
                     // Clean configs skip the heap entirely; only packets that
                     // need impairment reach the queued path.
                     if !self
@@ -1561,7 +2272,7 @@ mod tests {
             stats: Arc::new(AtomicCounters::default()),
             queue_len: Arc::new(AtomicU64::new(0)),
             blackout: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(Mutex::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
             transport: Box::new(Arc::clone(&captured) as Arc<dyn UdpTransport>),
             clock: Some(clock),
         });
@@ -2281,14 +2992,24 @@ mod tests {
     #[test]
     fn clean_config_forwards_directly_and_honors_blackout() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
-        let (runner, sent) = mock_runner(NetemConfig::default());
+        // An explicitly no-stochastic config (four-state model with all-zero
+        // probabilities) must be clean: no scheduling, no stochastic work.
+        let config = NetemConfig {
+            loss_model: LossModel::FourState(FourStateLoss::default()),
+            ..NetemConfig::default()
+        };
+        let (runner, sent) = mock_runner(config);
         assert!(
             runner.direct_forward,
-            "a default config must be direct-forward eligible"
+            "a clean config must be direct-forward eligible"
+        );
+        assert!(
+            !runner.direct_stochastic,
+            "a clean config must not need stochastic work"
         );
         // The direct path forwards without touching the heap.
         let dst = Some(server_addr);
-        assert!(runner.try_direct_forward(b"hello", dst, &*sent));
+        assert!(runner.forward_direct(b"hello", dst, &*sent));
         assert_eq!(runner.queue.len(), 0);
         let s = runner.stats.snapshot();
         assert_eq!(s.received, 1);
@@ -2297,7 +3018,7 @@ mod tests {
         // Blackout gates on the direct path: counted received, dropped,
         // nothing forwarded.
         runner.blackout.store(true, Ordering::Relaxed);
-        assert!(runner.try_direct_forward(b"gated", dst, &*sent));
+        assert!(runner.forward_direct(b"gated", dst, &*sent));
         let s = runner.stats.snapshot();
         assert_eq!(s.received, 2);
         assert_eq!(s.dropped, 1);
@@ -2333,6 +3054,7 @@ mod tests {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
         let config = NetemConfig {
             max_datagram_size: 512,
+            loss_model: LossModel::FourState(FourStateLoss::default()),
             ..Default::default()
         };
         let (runner, sent) = mock_runner(config);
@@ -2362,39 +3084,63 @@ mod tests {
         let (mut runner, sent) = mock_runner(config);
         let clock = sent.clock();
         let payload = vec![0xABu8; 4096];
+        let mut fifo = FifoQueue::default();
 
-        // Enqueue a large payload and drain it: the drained buffer is recycled.
-        runner.handle_datagram(&payload, server_addr, clock.now());
-        let queued_ptr = runner.queue.peek().unwrap().0.data.as_ptr();
+        // Enqueue a large payload into the FIFO and drain it: the drained
+        // buffer is recycled into the FIFO's own pool.
+        runner.handle_datagram_fifo(&payload, clock.now(), Some(server_addr), &mut fifo);
+        let queued_ptr = fifo.packets.front().unwrap().data.as_ptr();
         clock.advance(Duration::from_millis(20));
-        runner.drain_ready(clock.now());
-        assert_eq!(runner.reused_packet_buffers.len(), 1);
+        runner.drain_ready_fifo(&mut fifo, clock.now(), &*sent);
+        assert_eq!(fifo.reused_packet_buffers.len(), 1);
+        assert_eq!(fifo.reused_capacity_bytes, payload.capacity());
 
         // The next enqueue pops the recycled buffer: the queued payload must
         // reuse the same allocation (pointer reuse).
-        runner.handle_datagram(&payload, server_addr, clock.now());
-        let reused_ptr = runner.queue.peek().unwrap().0.data.as_ptr();
+        runner.handle_datagram_fifo(&payload, clock.now(), Some(server_addr), &mut fifo);
+        let reused_ptr = fifo.packets.front().unwrap().data.as_ptr();
         assert_eq!(
             reused_ptr, queued_ptr,
             "drained payload buffer must be recycled, not reallocated"
         );
-        assert_eq!(runner.queue.len(), 1);
-        assert_eq!(runner.reused_packet_buffers.len(), 0);
+        assert_eq!(fifo.packets.len(), 1);
+        assert_eq!(fifo.reused_packet_buffers.len(), 0);
 
-        // Drain a burst larger than the cap: the pool is bounded at exactly
-        // MAX_REUSED_PACKET_BUFFERS.
-        for _ in 0..(MAX_REUSED_PACKET_BUFFERS + 16) {
-            runner.handle_datagram(&payload, server_addr, clock.now());
+        // Drain a burst of small payloads larger than the count cap: the pool
+        // is bounded at exactly MAX_FIFO_REUSED_PACKET_BUFFERS (the byte bound
+        // never trips for 1-byte payloads).
+        let small = [0x42u8; 1];
+        for _ in 0..(MAX_FIFO_REUSED_PACKET_BUFFERS + 16) {
+            runner.handle_datagram_fifo(&small, clock.now(), Some(server_addr), &mut fifo);
         }
         clock.advance(Duration::from_millis(20));
-        while runner.queue.len() > 0 {
-            runner.drain_ready(clock.now());
+        while !fifo.packets.is_empty() {
+            runner.drain_ready_fifo(&mut fifo, clock.now(), &*sent);
         }
         assert_eq!(
-            runner.reused_packet_buffers.len(),
-            MAX_REUSED_PACKET_BUFFERS,
-            "the recycled pool must hold exactly MAX_REUSED_PACKET_BUFFERS"
+            fifo.reused_packet_buffers.len(),
+            MAX_FIFO_REUSED_PACKET_BUFFERS,
+            "the FIFO recycle pool must hold exactly MAX_FIFO_REUSED_PACKET_BUFFERS"
         );
+        assert!(fifo.reused_capacity_bytes <= MAX_FIFO_REUSED_PACKET_BUFFER_BYTES);
+
+        // The byte bound caps the pool before the count bound for large
+        // payloads: 4 MiB / 64 KiB = 64 buffers.
+        let mut big_fifo = FifoQueue::default();
+        let big = vec![0xCDu8; 64 * 1024];
+        for _ in 0..100 {
+            runner.handle_datagram_fifo(&big, clock.now(), Some(server_addr), &mut big_fifo);
+        }
+        clock.advance(Duration::from_millis(20));
+        while !big_fifo.packets.is_empty() {
+            runner.drain_ready_fifo(&mut big_fifo, clock.now(), &*sent);
+        }
+        assert_eq!(
+            big_fifo.reused_packet_buffers.len(),
+            MAX_FIFO_REUSED_PACKET_BUFFER_BYTES / (64 * 1024),
+            "the byte bound must stop recycling before the count bound"
+        );
+        assert!(big_fifo.reused_capacity_bytes <= MAX_FIFO_REUSED_PACKET_BUFFER_BYTES);
         drop(sent);
     }
 
@@ -2535,5 +3281,355 @@ mod tests {
             "median {median:?} must stay below the idle poll {RUNNER_IDLE_POLL:?}"
         );
         drop(sent);
+    }
+
+    // ────────────────── specialized-path equivalence tests ──────────────────
+
+    /// The stochastic-only direct path must consume exactly the same PRNG
+    /// draws and produce exactly the same counters as the queued pipeline for
+    /// an identical stochastic config (duplication + loss, no scheduling).
+    #[test]
+    fn stochastic_direct_path_matches_the_queued_pipeline() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            duplicate: u32::MAX / 2,
+            loss: u32::MAX / 3,
+            ..Default::default()
+        };
+        let (mut direct, direct_sent) = mock_runner(config.clone());
+        let (mut queued, queued_sent) = mock_runner(config);
+        assert!(
+            direct.direct_stochastic,
+            "stochastic-only config must take the direct stochastic path"
+        );
+        assert!(
+            !direct.direct_forward,
+            "stochastic work disqualifies the clean direct path"
+        );
+        let now = Instant::now();
+        let payload = b"stochastic-direct";
+        for _ in 0..256 {
+            // Both paths start each packet from an identical RNG state.
+            let before_direct = direct.rng;
+            let before_queued = queued.rng;
+            assert_eq!(before_direct.s1, before_queued.s1);
+            assert_eq!(before_direct.s2, before_queued.s2);
+            assert_eq!(before_direct.s3, before_queued.s3);
+            assert_eq!(before_direct.s4, before_queued.s4);
+
+            direct.forward_stochastic_direct(payload, Some(server_addr), &*direct_sent);
+            queued
+                .pipeline
+                .handle_datagram(payload, now, Some(server_addr));
+            queued.pipeline.drain_ready(now, &*queued_sent);
+
+            let ds = direct.stats.snapshot();
+            let qs = queued.stats.snapshot();
+            assert_eq!(ds.received, qs.received);
+            assert_eq!(ds.dropped, qs.dropped);
+            assert_eq!(ds.duplicated, qs.duplicated);
+            assert_eq!(ds.forwarded, qs.forwarded);
+            // Identical draw order leaves the RNG lanes bit-for-bit equal.
+            assert_eq!(direct.rng.s1, queued.rng.s1);
+            assert_eq!(direct.rng.s2, queued.rng.s2);
+            assert_eq!(direct.rng.s3, queued.rng.s3);
+            assert_eq!(direct.rng.s4, queued.rng.s4);
+        }
+        let ds = direct.stats.snapshot();
+        let qs = queued.stats.snapshot();
+        assert_eq!(ds.received, 256);
+        assert_eq!(ds.forwarded, qs.forwarded);
+        assert_eq!(
+            direct_sent.sent.lock().unwrap().len(),
+            queued_sent.sent.lock().unwrap().len()
+        );
+        drop(direct_sent);
+        drop(queued_sent);
+    }
+
+    /// The FIFO path must schedule, order, and count packets exactly like the
+    /// delay heap for an identical latency + shared-shaper config.
+    #[test]
+    fn fifo_scheduling_matches_heap_with_a_shared_shaper() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(30),
+            ..Default::default()
+        };
+        let (mut fifo_runner, fifo_sent) = mock_runner(config.clone());
+        let (mut heap_runner, heap_sent) = mock_runner(config);
+        assert!(
+            fifo_runner.uses_fifo_scheduling(),
+            "latency-only config must select the FIFO path"
+        );
+        // Two independent shapers with identical rates: both paths start from
+        // a base later than the shapers' creation instants, so the first
+        // schedule is deterministic for both.
+        let fifo_shaper = BottleneckShaper::new(8_000_000, 0);
+        let heap_shaper = BottleneckShaper::new(8_000_000, 0);
+        fifo_runner.shared = Some(fifo_shaper);
+        heap_runner.shared = Some(heap_shaper);
+        let clock = fifo_sent.clock();
+        // Advance past both shapers' creation instants so the first schedule
+        // is deterministic for both paths.
+        clock.advance(Duration::from_millis(1));
+        let now = clock.now();
+        let payloads: [&[u8]; 6] = [b"aa", b"bbbb", b"c", b"dd", b"eeeee", b"ff"];
+        let mut fifo = FifoQueue::default();
+        for p in payloads {
+            fifo_runner.handle_datagram_fifo(p, now, Some(server_addr), &mut fifo);
+            heap_runner
+                .pipeline
+                .handle_datagram(p, now, Some(server_addr));
+        }
+        // Identical deadlines per packet.
+        let fifo_times: Vec<Instant> = fifo.packets.iter().map(|q| q.time_to_send).collect();
+        let heap_times: Vec<Instant> = heap_runner.queue.iter().map(|q| q.0.time_to_send).collect();
+        assert_eq!(
+            fifo_times, heap_times,
+            "FIFO and heap must schedule identically"
+        );
+        // Draining at the last deadline forwards everything in identical order.
+        let last = *fifo_times.last().unwrap();
+        fifo_runner.drain_ready_fifo(&mut fifo, last, &*fifo_sent);
+        heap_runner.pipeline.drain_ready(last, &*heap_sent);
+        let fifo_sent_payloads: Vec<Vec<u8>> = fifo_sent
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(d, _)| d.clone())
+            .collect();
+        let heap_sent_payloads: Vec<Vec<u8>> = heap_sent
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(d, _)| d.clone())
+            .collect();
+        assert_eq!(fifo_sent_payloads, heap_sent_payloads);
+        assert_eq!(
+            fifo_runner.stats.snapshot(),
+            heap_runner.stats.snapshot(),
+            "FIFO and heap must count identically"
+        );
+        drop(fifo_sent);
+        drop(heap_sent);
+    }
+
+    /// The standard transport must skip redundant read-timeout installs and
+    /// restore the configured default after a temporary timeout receive.
+    #[test]
+    fn std_udp_transport_skips_redundant_timeout_installs_and_restores_default() {
+        let bind = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        let transport = StdUdpTransport::bind(bind).unwrap();
+        let installs = || transport.receive_timeout_installs.load(Ordering::Relaxed);
+        // Binding installs the idle poll once; the state already matches it.
+        assert_eq!(transport.recv_timeout().unwrap(), Some(RUNNER_IDLE_POLL));
+        assert_eq!(installs(), 0);
+        // Re-setting the same timeout performs no syscall.
+        transport.set_recv_timeout(RUNNER_IDLE_POLL).unwrap();
+        assert_eq!(installs(), 0);
+        // A different timeout installs exactly once.
+        transport.set_recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(installs(), 1);
+        // A temporary timeout receive installs the temporary value and then
+        // restores the configured default: two more installs.
+        let mut buf = [0u8; 16];
+        let _ = transport.recv_from_timeout(&mut buf, Duration::from_millis(1));
+        assert_eq!(installs(), 3);
+        assert_eq!(
+            transport.recv_timeout().unwrap(),
+            Some(Duration::from_secs(2))
+        );
+        // A plain receive sees the configured default already effective.
+        let _ = transport.recv_from(&mut buf);
+        assert_eq!(installs(), 3);
+        // Duration::ZERO disables the timeout (configured None).
+        transport.set_recv_timeout(Duration::ZERO).unwrap();
+        assert_eq!(installs(), 4);
+        assert_eq!(transport.recv_timeout().unwrap(), None);
+        drop(transport);
+    }
+
+    /// [`NetemPair::spawn_with_transports`] must expose the custom client
+    /// transport's address and forward c2s traffic to the fixed server.
+    #[test]
+    fn pair_custom_transports_expose_client_address_and_forward() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3500));
+        let clock = Clock::new();
+        let client_sock = Arc::new(MockTransport::with_clock(
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 4501)),
+            clock.clone(),
+        ));
+        let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
+        let pair = NetemPair::spawn_with_transports(
+            server_addr,
+            NetemConfig::default(),
+            NetemConfig::default(),
+            Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
+            Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
+        )
+        .unwrap();
+        assert_eq!(pair.client_addr(), client_sock.local_addr().unwrap());
+        assert_eq!(pair.server_addr(), server_addr);
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001));
+        client_sock.push_recv(vec![7u8], from);
+        wait_until("c2s forwarded", || {
+            server_sock.sent.lock().unwrap().len() == 1
+        });
+        let sent = server_sock.sent.lock().unwrap();
+        assert_eq!(sent[0].0, vec![7u8]);
+        assert_eq!(sent[0].1, server_addr);
+        pair.stop();
+    }
+
+    /// The impaired c2s runner must publish the learned client destination so
+    /// the clean s2c runner can forward server replies back to the client.
+    #[test]
+    fn impaired_c2s_publishes_destination_to_clean_s2c() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3600));
+        let clock = Clock::new();
+        let client_sock = Arc::new(MockTransport::with_clock(
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 4601)),
+            clock.clone(),
+        ));
+        let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
+        let client_addr = client_sock.local_addr().unwrap();
+        let pair = NetemPair::spawn_from_sockets(
+            server_addr,
+            Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
+            Box::new(Arc::clone(&server_sock) as Arc<dyn UdpTransport>),
+            client_addr,
+            NetemPairConfig {
+                c2s: NetemConfig {
+                    latency: Duration::from_millis(20),
+                    ..Default::default()
+                },
+                s2c: NetemConfig::default(),
+                c2s_shared: None,
+                s2c_shared: None,
+                clock: Some(clock.clone()),
+            },
+        )
+        .unwrap();
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001));
+        // The c2s runner (latency => FIFO path) learns and publishes the
+        // client address while the packet sits behind its 20 ms delay.
+        client_sock.push_recv(vec![1u8], from);
+        wait_until("c2s received", || pair.stats_c2s().received == 1);
+        clock.advance(Duration::from_millis(50));
+        wait_until("c2s forwarded", || pair.stats_c2s().forwarded == 1);
+        // The clean s2c runner now forwards the server reply to the learned
+        // client address.
+        server_sock.push_recv(vec![2u8], server_addr);
+        wait_until("s2c forwarded to learned client", || {
+            client_sock.sent.lock().unwrap().len() == 1
+        });
+        let sent = client_sock.sent.lock().unwrap();
+        assert_eq!(sent[0].0, vec![2u8]);
+        assert_eq!(
+            sent[0].1, from,
+            "reply must go to the learned client address"
+        );
+        pair.stop();
+    }
+
+    /// The serialization cache must produce exactly the packet-length-scaled
+    /// serialization for repeated and changing lengths.
+    #[test]
+    fn shared_shaper_serialization_cache_tracks_packet_size_changes() {
+        let shaper = BottleneckShaper::new(800_000, 0);
+        let base = Instant::now();
+        // 1000 B at 800 kbit/s serializes in exactly 10 ms; repeated lengths
+        // reuse the cached serialization and step by the same amount.
+        let t1 = shaper.schedule(base, 1000).unwrap();
+        let t2 = shaper.schedule(base, 1000).unwrap();
+        assert_eq!(t2 - t1, Duration::from_millis(10));
+        // A different length recomputes the serialization (2000 B => 20 ms).
+        let t3 = shaper.schedule(base, 2000).unwrap();
+        assert_eq!(t3 - t2, Duration::from_millis(20));
+        // Back to the cached length.
+        let t4 = shaper.schedule(base, 1000).unwrap();
+        assert_eq!(t4 - t3, Duration::from_millis(10));
+        assert_eq!(shaper.dropped(), 0);
+    }
+
+    /// The division-free backlog comparison must make exactly the same
+    /// admit/reject decisions as the whole-byte backlog math, both on a sweep
+    /// of values and through the shaper itself.
+    #[test]
+    fn shared_shaper_limit_comparison_matches_whole_byte_backlog_math() {
+        fn whole_byte_exceeds(limit_bytes: u64, backlog_ns: u128, rate: u64, len: usize) -> bool {
+            let backlog = (backlog_ns * rate as u128 / 1_000_000_000 / 8) as u64;
+            backlog.saturating_add(len as u64) > limit_bytes
+        }
+        let mut rng = RndState::seed(0x5EED_C0DE);
+        for _ in 0..10_000 {
+            let limit_bytes = 1 + (rng.next_u32() as u64 % 100_000);
+            let backlog_ns = rng.next_u32() as u128; // up to ~4.3 s of backlog
+            let rate = 1 + (rng.next_u32() as u64 % 100_000_000);
+            let len = 1 + (rng.next_u32() as usize % 10_000);
+            assert_eq!(
+                exceeds_byte_limit(limit_bytes, backlog_ns, rate, len),
+                whole_byte_exceeds(limit_bytes, backlog_ns, rate, len),
+                "limit={limit_bytes} backlog_ns={backlog_ns} rate={rate} len={len}"
+            );
+        }
+        // End-to-end: drive a bounded shaper and compare each schedule
+        // decision against the whole-byte backlog reported by `backlog_bytes`.
+        let rate = 8_000u64;
+        let limit = 120u64;
+        let shaper = BottleneckShaper::new(rate, limit);
+        let base = Instant::now();
+        let mut len = 100usize;
+        for _ in 0..12 {
+            let backlog = shaper.backlog_bytes(base);
+            let expect_reject = backlog.saturating_add(len as u64) > limit;
+            let rejected = shaper.schedule(base, len).is_none();
+            assert_eq!(
+                rejected, expect_reject,
+                "backlog={backlog} len={len} limit={limit}"
+            );
+            len = len.wrapping_mul(2) % 90 + 10;
+        }
+    }
+
+    /// Concurrent callers must serialize exactly once per packet: the shared
+    /// clock advances by one serialization per accepted schedule with no lost
+    /// or duplicated updates.
+    #[test]
+    fn shared_shaper_serializes_concurrent_callers_exactly_once() {
+        let shaper = Arc::new(BottleneckShaper::new(8_000_000, 0)); // 1 ms per 1000 B
+        let base = Instant::now();
+        const PER_THREAD: usize = 100;
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let shaper = Arc::clone(&shaper);
+                std::thread::spawn(move || {
+                    let mut last = base;
+                    for _ in 0..PER_THREAD {
+                        last = shaper.schedule(last, 1000).unwrap();
+                    }
+                    last
+                })
+            })
+            .collect();
+        let max_exit = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .max()
+            .unwrap();
+        // 4 threads * 100 packets * 1 ms: the last exit is exactly 400 ms out
+        // when every schedule advanced the shared clock exactly once.
+        let expected = base + Duration::from_millis(400);
+        assert!(
+            max_exit >= expected,
+            "lost serialization: max exit {max_exit:?} before {expected:?}"
+        );
+        assert!(
+            max_exit <= expected + Duration::from_micros(50),
+            "duplicated serialization: max exit {max_exit:?} after {expected:?}"
+        );
     }
 }
