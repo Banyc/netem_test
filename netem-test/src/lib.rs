@@ -26,7 +26,7 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as ParkingMutex;
@@ -93,6 +93,14 @@ impl FifoQueue {
 /// Implemented as a trait object (`Box<dyn UdpTransport>`) so the harness can
 /// run against either real OS sockets or an in-memory loopback in tests.
 pub trait UdpTransport: Send + Sync + 'static {
+    /// Connect the transport to a fixed peer. Once connected, receives report
+    /// that peer as the source and sends to any other address fail. The
+    /// default implementation is a no-op so multi-source transports (e.g. the
+    /// in-memory test mock) are unaffected.
+    fn connect_peer(&self, _peer: SocketAddr) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Receive a datagram into `buf`, returning `(len, from)`.
     ///
     /// If no datagram is available, the call should block until either a
@@ -130,6 +138,9 @@ pub trait UdpTransport: Send + Sync + 'static {
 }
 
 impl<T: UdpTransport + ?Sized> UdpTransport for Arc<T> {
+    fn connect_peer(&self, peer: SocketAddr) -> io::Result<()> {
+        (**self).connect_peer(peer)
+    }
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         (**self).recv_from(buf)
     }
@@ -164,6 +175,8 @@ impl<T: UdpTransport + ?Sized> UdpTransport for Arc<T> {
 #[derive(Debug)]
 pub struct StdUdpTransport {
     sock: std::net::UdpSocket,
+    connect_lock: ParkingMutex<()>,
+    connected_peer: OnceLock<SocketAddr>,
     receive_timeout: ParkingMutex<ReceiveTimeoutState>,
     #[cfg(test)]
     receive_timeout_installs: AtomicU64,
@@ -182,6 +195,8 @@ impl StdUdpTransport {
         sock.set_read_timeout(Some(RUNNER_IDLE_POLL))?;
         Ok(Self {
             sock,
+            connect_lock: ParkingMutex::new(()),
+            connected_peer: OnceLock::new(),
             receive_timeout: ParkingMutex::new(ReceiveTimeoutState {
                 configured: Some(RUNNER_IDLE_POLL),
                 effective: Some(RUNNER_IDLE_POLL),
@@ -211,11 +226,34 @@ impl StdUdpTransport {
 }
 
 impl UdpTransport for StdUdpTransport {
+    fn connect_peer(&self, peer: SocketAddr) -> io::Result<()> {
+        let _connect = self.connect_lock.lock();
+        if let Some(connected) = self.connected_peer.get() {
+            return if *connected == peer {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("UDP transport is already connected to {connected}"),
+                ))
+            };
+        }
+        self.sock.connect(peer)?;
+        self.connected_peer
+            .set(peer)
+            .expect("connect lock serializes connected-peer initialization");
+        Ok(())
+    }
+
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let mut state = self.receive_timeout.lock();
         let configured = state.configured;
         self.install_receive_timeout(&mut state, configured)?;
-        self.sock.recv_from(buf)
+        if let Some(peer) = self.connected_peer.get().copied() {
+            self.sock.recv(buf).map(|len| (len, peer))
+        } else {
+            self.sock.recv_from(buf)
+        }
     }
 
     fn recv_from_timeout(
@@ -225,14 +263,31 @@ impl UdpTransport for StdUdpTransport {
     ) -> io::Result<(usize, SocketAddr)> {
         let mut state = self.receive_timeout.lock();
         self.install_receive_timeout(&mut state, Some(timeout))?;
-        let res = self.sock.recv_from(buf);
+        let res = if let Some(peer) = self.connected_peer.get().copied() {
+            self.sock.recv(buf).map(|len| (len, peer))
+        } else {
+            self.sock.recv_from(buf)
+        };
         let configured = state.configured;
         self.install_receive_timeout(&mut state, configured)?;
         res
     }
 
     fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
-        self.sock.send_to(data, dst)?;
+        match self.connected_peer.get() {
+            Some(peer) if *peer == dst => {
+                self.sock.send(data)?;
+            }
+            Some(peer) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("UDP transport is connected to {peer}, not {dst}"),
+                ));
+            }
+            None => {
+                self.sock.send_to(data, dst)?;
+            }
+        }
         Ok(())
     }
 
@@ -1368,6 +1423,7 @@ struct NetemPairConfig {
     s2c: NetemConfig,
     c2s_shared: Option<BottleneckShaper>,
     s2c_shared: Option<BottleneckShaper>,
+    pin_client_peer: bool,
     clock: Option<Clock>,
 }
 
@@ -1403,6 +1459,7 @@ impl NetemPair {
                 s2c,
                 c2s_shared: None,
                 s2c_shared: None,
+                pin_client_peer: false,
                 clock: None,
             },
         )
@@ -1429,6 +1486,7 @@ impl NetemPair {
                 s2c,
                 c2s_shared: None,
                 s2c_shared: None,
+                pin_client_peer: true,
                 clock: None,
             },
         )
@@ -1482,6 +1540,7 @@ impl NetemPair {
                 s2c,
                 c2s_shared,
                 s2c_shared,
+                pin_client_peer: true,
                 clock: None,
             },
         )
@@ -1499,6 +1558,7 @@ impl NetemPair {
             s2c,
             c2s_shared,
             s2c_shared,
+            pin_client_peer,
             clock,
         } = config;
         if c2s_shared.is_some() {
@@ -1513,6 +1573,7 @@ impl NetemPair {
                 "double-shape: s2c has both config.rate and a BottleneckShaper"
             );
         }
+        server_sock.connect_peer(server_addr)?;
         let stats_c2s = Arc::new(AtomicCounters::default());
         let stats_s2c = Arc::new(AtomicCounters::default());
         let queue_len_c2s = Arc::new(AtomicU64::new(0));
@@ -1554,6 +1615,7 @@ impl NetemPair {
                 stop: Arc::clone(&stop),
                 fixed_dst: Some(server_addr),
                 learned_dst: Arc::clone(&learned_client),
+                connect_client_on_first_packet: pin_client_peer,
                 shared: c2s_shared,
                 clock: clock.clone(),
             },
@@ -1576,6 +1638,7 @@ impl NetemPair {
                 stop,
                 fixed_dst: None,
                 learned_dst: learned_client,
+                connect_client_on_first_packet: false,
                 shared: s2c_shared,
                 clock,
             },
@@ -1688,26 +1751,22 @@ impl Drop for NetemPair {
 struct LearnedDestination {
     address: Mutex<Option<SocketAddr>>,
     generation: AtomicU64,
+    #[cfg(test)]
+    publish_locks: AtomicU64,
+    #[cfg(test)]
+    refresh_locks: AtomicU64,
 }
 
 impl LearnedDestination {
-    /// Publish `address` unless it is already the current destination,
-    /// bumping the generation only on an actual change.
-    fn publish(&self, address: SocketAddr) {
-        let mut current = self.address.lock().unwrap();
-        if *current == Some(address) {
-            return;
-        }
-        *current = Some(address);
-        self.generation.fetch_add(1, Ordering::Release);
-    }
-
     /// Publish `address` and update the caller's cache when it differs from
-    /// what the caller has already seen.
+    /// what the caller has already seen, bumping the generation only on an
+    /// actual change.
     fn publish_if_changed(&self, cached: &mut Option<SocketAddr>, address: SocketAddr) {
         if *cached == Some(address) {
             return;
         }
+        #[cfg(test)]
+        self.publish_locks.fetch_add(1, Ordering::Relaxed);
         *self.address.lock().unwrap() = Some(address);
         *cached = Some(address);
         self.generation.fetch_add(1, Ordering::Release);
@@ -1722,6 +1781,8 @@ impl LearnedDestination {
     ) -> Option<SocketAddr> {
         let generation = self.generation.load(Ordering::Acquire);
         if generation != *observed_generation {
+            #[cfg(test)]
+            self.refresh_locks.fetch_add(1, Ordering::Relaxed);
             *cached = *self.address.lock().unwrap();
             *observed_generation = generation;
         }
@@ -1736,6 +1797,11 @@ struct SharedLinkRunner {
     /// uses the learned client address (`learned_dst`).
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<LearnedDestination>,
+    /// Pin the receive transport to the first client tuple seen (standard
+    /// pairs). When false (custom transports), the transport keeps
+    /// multi-source behaviour and the destination is still published to
+    /// `learned_dst`.
+    connect_client_on_first_packet: bool,
     pipeline: NetemState,
 }
 
@@ -1747,6 +1813,7 @@ struct DirectionRunnerConfig {
     stop: Arc<AtomicBool>,
     fixed_dst: Option<SocketAddr>,
     learned_dst: Arc<LearnedDestination>,
+    connect_client_on_first_packet: bool,
     shared: Option<BottleneckShaper>,
     clock: Option<Clock>,
 }
@@ -1765,6 +1832,7 @@ impl SharedLinkRunner {
             stop,
             fixed_dst,
             learned_dst,
+            connect_client_on_first_packet,
             shared,
             clock,
         } = config;
@@ -1773,8 +1841,21 @@ impl SharedLinkRunner {
             send,
             fixed_dst,
             learned_dst,
+            connect_client_on_first_packet,
             pipeline: NetemState::new(netem, stats, queue_len, blackout, stop, shared, clock),
         }
+    }
+
+    /// Connect the receive transport to the first client tuple seen, exactly
+    /// once, when the pair pins its client peer. Later source tuples are
+    /// rejected by the connected socket; errors are ignored because the
+    /// connection is best-effort for custom transports.
+    fn connect_client_once(&mut self, source: SocketAddr) {
+        if !self.connect_client_on_first_packet {
+            return;
+        }
+        let _ = self.recv.connect_peer(source);
+        self.connect_client_on_first_packet = false;
     }
 
     fn run(mut self) {
@@ -1805,13 +1886,16 @@ impl SharedLinkRunner {
     /// Clean no-clock c2s direct loop: publish the client address, then
     /// forward every datagram to the fixed server without reading the clock.
     fn run_fixed_direct(&mut self, buf: &mut [u8]) {
+        let mut published_source = None;
         loop {
             if self.pipeline.should_stop() {
                 break;
             }
             match self.recv.recv_from(buf) {
                 Ok((n, from)) => {
-                    self.learned_dst.publish(from);
+                    self.connect_client_once(from);
+                    self.learned_dst
+                        .publish_if_changed(&mut published_source, from);
                     self.pipeline
                         .forward_direct(&buf[..n], self.fixed_dst, &*self.send);
                 }
@@ -1858,13 +1942,16 @@ impl SharedLinkRunner {
     /// Stochastic-only c2s loop: publish the client address, then apply
     /// duplicate/loss directly without scheduling or clock reads.
     fn run_stochastic_fixed_direct(&mut self, buf: &mut [u8]) {
+        let mut published_source = None;
         loop {
             if self.pipeline.should_stop() {
                 break;
             }
             match self.recv.recv_from(buf) {
                 Ok((n, from)) => {
-                    self.learned_dst.publish(from);
+                    self.connect_client_once(from);
+                    self.learned_dst
+                        .publish_if_changed(&mut published_source, from);
                     self.pipeline
                         .forward_stochastic_direct(&buf[..n], self.fixed_dst, &*self.send);
                 }
@@ -1890,9 +1977,7 @@ impl SharedLinkRunner {
                 break;
             }
             match self.recv.recv_from(buf) {
-                Ok((n, _from)) => {
-                    // Read the destination at packet-processing time so a
-                    // just-published client address is never missed.
+                Ok((n, from)) => {
                     let dst = self
                         .learned_dst
                         .refresh_if_changed(&mut cached, &mut observed_generation);
@@ -1934,6 +2019,7 @@ impl SharedLinkRunner {
                 match self.recv.recv_from_timeout(buf, receive_wait) {
                     Ok((n, from)) => {
                         if self.fixed_dst.is_some() {
+                            self.connect_client_once(from);
                             self.learned_dst.publish_if_changed(&mut cached_from, from);
                         }
                         let dst = self.fixed_dst.or_else(|| {
@@ -1957,6 +2043,7 @@ impl SharedLinkRunner {
                 match self.recv.recv_from(buf) {
                     Ok((n, from)) => {
                         if self.fixed_dst.is_some() {
+                            self.connect_client_once(from);
                             self.learned_dst.publish_if_changed(&mut cached_from, from);
                         }
                         let dst = self.fixed_dst.or_else(|| {
@@ -2006,6 +2093,7 @@ impl SharedLinkRunner {
                     // For c2s, learn the client address so the s2c runner can
                     // send replies back to it; skip the lock when unchanged.
                     if self.fixed_dst.is_some() {
+                        self.connect_client_once(from);
                         self.learned_dst.publish_if_changed(&mut cached_from, from);
                     }
                     let dst = self.fixed_dst.or_else(|| {
@@ -2473,7 +2561,6 @@ mod tests {
             queue_limit_pkts: 2,
             ..Default::default()
         };
-
         let clock = Clock::new();
         let client_sock = Arc::new(MockTransport::with_clock(
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 4001)),
@@ -2491,20 +2578,17 @@ mod tests {
                 s2c,
                 c2s_shared: None,
                 s2c_shared: None,
+                pin_client_peer: false,
                 clock: Some(clock),
             },
         )
         .unwrap();
-
-        // Pump c2s: send 3 client packets; with queue_limit_pkts 5 they all queue.
         for i in 0..3u8 {
             client_sock.push_recv(
                 vec![i],
                 SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5000)),
             );
         }
-        // The runner ingests them at clock time 0 behind the 1 s latency; they
-        // stay queued because we never advance the clock.
         wait_until("c2s runner to receive all 3 packets", || {
             pair.stats_c2s().received == 3
         });
@@ -2524,7 +2608,6 @@ mod tests {
             latency: Duration::from_millis(2),
             ..Default::default()
         };
-
         let clock = Clock::new();
         let client_sock = Arc::new(MockTransport::with_clock(
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 4002)),
@@ -2542,12 +2625,11 @@ mod tests {
                 s2c,
                 c2s_shared: None,
                 s2c_shared: None,
+                pin_client_peer: false,
                 clock: Some(clock.clone()),
             },
         )
         .unwrap();
-
-        // First packet forwarded normally.
         client_sock.push_recv(
             vec![1],
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001)),
@@ -2555,8 +2637,6 @@ mod tests {
         wait_until("first packet received", || pair.stats_c2s().received >= 1);
         clock.advance(Duration::from_millis(5));
         wait_until("first packet forwarded", || pair.stats_c2s().forwarded >= 1);
-
-        // Enable blackout and send more packets.
         pair.set_blackout_c2s(true);
         client_sock.push_recv(
             vec![2],
@@ -2570,8 +2650,6 @@ mod tests {
         let gated = pair.stats_c2s();
         assert_eq!(gated.received, 3);
         assert_eq!(gated.dropped, 2);
-
-        // Disable blackout; subsequent packets forward again.
         pair.set_blackout_c2s(false);
         client_sock.push_recv(
             vec![4],
@@ -2679,7 +2757,7 @@ mod tests {
         ));
         let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
-        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001));
         let pair = NetemPair::spawn_from_sockets(
             server_addr,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
@@ -2690,33 +2768,25 @@ mod tests {
                 s2c,
                 c2s_shared: Some(shared),
                 s2c_shared: None,
+                pin_client_peer: false,
                 clock: Some(clock.clone()),
             },
         )
         .unwrap();
-
-        // 100 B > 80 B limit: drop.
         client_sock.push_recv(vec![0u8; 100], from);
-        // 60 B fits and serializes for 60 ms.
         client_sock.push_recv(vec![1u8; 60], from);
-        // 30 B while the 60 B packet is still draining: 60 + 30 > 80 B: drop.
         client_sock.push_recv(vec![2u8; 30], from);
-        // Wait for the runner to ingest all three at clock time 0, so the
-        // overflow decisions happen against the fresh 80 B shared buffer.
         wait_until("c2s runner to receive all 3 packets", || {
             pair.stats_c2s().received == 3
         });
-        // Advance past the 60 ms serialization so the 60 B packet drains.
         clock.advance(Duration::from_millis(150));
         wait_until("60 B packet forwarded", || pair.stats_c2s().forwarded == 1);
-        pair.stop();
-
         let stats = pair.stats_c2s();
         assert_eq!(stats.received, 3);
         assert_eq!(stats.forwarded, 1, "only the 60 B packet should exit");
         assert_eq!(
             stats.overflow_dropped, 2,
-            "shared-buffer overflow should count as overflow_dropped"
+            "the packets that do not fit the shared bottleneck queue should count as overflow_dropped"
         );
         assert_eq!(stats.dropped, 0, "overflow drops are not loss-model drops");
     }
@@ -2892,7 +2962,6 @@ mod tests {
         ));
         let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
-
         let pair = NetemPair::spawn_from_sockets(
             server_addr,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
@@ -2903,24 +2972,18 @@ mod tests {
                 s2c,
                 c2s_shared: Some(shaper.clone()),
                 s2c_shared: None,
+                pin_client_peer: false,
                 clock: Some(clock.clone()),
             },
         )
         .unwrap();
-
         let from_a = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
         let from_b = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7001));
-
-        // Push interleaved from two different source addresses.
         client_sock.push_recv(vec![0xAA, 0x01], from_a);
         client_sock.push_recv(vec![0xBB, 0x01], from_b);
         client_sock.push_recv(vec![0xAA, 0x02], from_a);
         client_sock.push_recv(vec![0xBB, 0x02], from_b);
         client_sock.push_recv(vec![0xAA, 0x03], from_a);
-
-        // Wait for the runner to ingest all five at clock time 0 so the shared
-        // bottleneck sees them in arrival order, then advance well past the
-        // ~10 µs it takes to serialize five 2-byte packets at 8 Mbps.
         wait_until("c2s runner to receive all 5 packets", || {
             pair.stats_c2s().received == 5
         });
@@ -2929,7 +2992,6 @@ mod tests {
             server_sock.sent.lock().unwrap().len() == 5
         });
         pair.stop();
-
         let sent = server_sock.sent.lock().unwrap();
         let tags: Vec<u8> = sent.iter().map(|(data, _)| data[0]).collect();
         assert_eq!(
@@ -2957,7 +3019,6 @@ mod tests {
         ));
         let server_sock = Arc::new(MockTransport::with_clock(server_addr, clock.clone()));
         let client_addr = client_sock.local_addr().unwrap();
-
         let pair = NetemPair::spawn_from_sockets(
             server_addr,
             Box::new(Arc::clone(&client_sock) as Arc<dyn UdpTransport>),
@@ -2968,27 +3029,20 @@ mod tests {
                 s2c,
                 c2s_shared: Some(shaper.clone()),
                 s2c_shared: None,
+                pin_client_peer: false,
                 clock: Some(clock.clone()),
             },
         )
         .unwrap();
-
         let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7000));
-
-        // 50 B + 40 B = 90 > 80 B limit: second packet overflows.
         client_sock.push_recv(vec![0u8; 50], from);
         client_sock.push_recv(vec![0u8; 40], from);
-
-        // Wait for the runner to ingest both at clock time 0 so the 40 B packet
-        // overflows against the fresh 80 B shared buffer; then advance past the
-        // 50 ms it takes to serialize the 50 B packet.
         wait_until("c2s runner to receive both packets", || {
             pair.stats_c2s().received == 2
         });
         clock.advance(Duration::from_millis(100));
         wait_until("50 B packet forwarded", || pair.stats_c2s().forwarded == 1);
         pair.stop();
-
         let stats = pair.stats_c2s();
         let sent = server_sock.sent.lock().unwrap();
         let fwd: Vec<usize> = sent.iter().map(|(data, _)| data.len()).collect();
@@ -2996,7 +3050,7 @@ mod tests {
         assert_eq!(stats.forwarded, 1);
         assert_eq!(
             stats.overflow_dropped, 1,
-            "the overflowed 40 B packet must increment overflow_dropped"
+            "the 40 B packet that does not fit the shared bottleneck queue should count as overflow dropped"
         );
     }
 
@@ -3459,6 +3513,153 @@ mod tests {
         drop(transport);
     }
 
+    /// A connected [`StdUdpTransport`] preserves datagram endpoints: receives
+    /// report the connected peer, idempotent connects succeed, sends to the
+    /// peer work, and connecting to a different peer fails.
+    #[test]
+    fn std_udp_transport_connected_peer_preserves_datagram_endpoints() {
+        let localhost = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        let server = std::net::UdpSocket::bind(localhost).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let transport = StdUdpTransport::bind(localhost).unwrap();
+        let transport_addr = transport.local_addr().unwrap();
+        transport.connect_peer(server_addr).unwrap();
+        transport.connect_peer(server_addr).unwrap();
+        transport.send_to(b"ping", server_addr).unwrap();
+        let mut buffer = [0; 16];
+        let (received, source) = server.recv_from(&mut buffer).unwrap();
+        assert_eq!(&buffer[..received], b"ping");
+        assert_eq!(source, transport_addr);
+        server.send_to(b"pong", source).unwrap();
+        let (received, source) = transport
+            .recv_from_timeout(&mut buffer, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(&buffer[..received], b"pong");
+        assert_eq!(source, server_addr);
+        let other_server = std::net::UdpSocket::bind(localhost).unwrap();
+        let error = transport
+            .connect_peer(other_server.local_addr().unwrap())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let error = transport
+            .send_to(b"wrong peer", other_server.local_addr().unwrap())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A standard pair pins the first client tuple: once the first client
+    /// packet is processed, the client-side socket is connected to that
+    /// source, so a later source tuple cannot replace the pinned route.
+    #[test]
+    fn standard_pair_pins_the_first_client_tuple() {
+        let localhost = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        let server = std::net::UdpSocket::bind(localhost).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let pair = NetemPair::spawn(
+            server.local_addr().unwrap(),
+            NetemConfig::default(),
+            NetemConfig::default(),
+        )
+        .unwrap();
+        let client_a = std::net::UdpSocket::bind(localhost).unwrap();
+        let client_b = std::net::UdpSocket::bind(localhost).unwrap();
+        client_a
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client_a.send_to(b"a1", pair.client_addr()).unwrap();
+        let mut payload = [0; 16];
+        let (received, proxy_server_addr) = server.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload[..received], b"a1");
+        server.send_to(b"reply", proxy_server_addr).unwrap();
+        let (received, _) = client_a.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload[..received], b"reply");
+        client_b.send_to(b"client-b", pair.client_addr()).unwrap();
+        client_a.send_to(b"a2", pair.client_addr()).unwrap();
+        let (received, _) = server.recv_from(&mut payload).unwrap();
+        assert_eq!(
+            &payload[..received],
+            b"a2",
+            "a later source tuple must not replace the pair's pinned first client tuple"
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only connected UDP peer performance probe"]
+    fn std_udp_connected_peer_perf_probe() {
+        const OPERATIONS: usize = 2_000;
+        const SAMPLES: usize = 21;
+        const PAYLOAD_LEN: usize = 64;
+        fn run_sample(connected: bool) -> Duration {
+            let localhost = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+            let server = std::net::UdpSocket::bind(localhost).unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let transport = StdUdpTransport::bind(localhost).unwrap();
+            if connected {
+                transport.connect_peer(server_addr).unwrap();
+            }
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            let server_ready = Arc::clone(&ready);
+            let echo = std::thread::spawn(move || {
+                let mut payload = [0; PAYLOAD_LEN];
+                server_ready.wait();
+                for _ in 0..OPERATIONS {
+                    let (received, source) = server.recv_from(&mut payload).unwrap();
+                    assert_eq!(received, PAYLOAD_LEN);
+                    assert_eq!(
+                        server.send_to(&payload[..received], source).unwrap(),
+                        received
+                    );
+                }
+            });
+            let mut sent = [0; PAYLOAD_LEN];
+            let mut received = [0; PAYLOAD_LEN];
+            ready.wait();
+            let started = Instant::now();
+            for sequence in 0..OPERATIONS {
+                sent[..size_of::<u64>()].copy_from_slice(&(sequence as u64).to_ne_bytes());
+                transport.send_to(&sent, server_addr).unwrap();
+                let (received_len, source) = transport
+                    .recv_from_timeout(&mut received, Duration::from_secs(1))
+                    .unwrap();
+                assert_eq!(received_len, PAYLOAD_LEN);
+                assert_eq!(source, server_addr);
+                assert_eq!(received, sent);
+            }
+            let elapsed = started.elapsed();
+            echo.join().unwrap();
+            elapsed
+        }
+        let mut connected_samples = Vec::with_capacity(SAMPLES);
+        let mut unconnected_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample % 2 == 0 {
+                connected_samples.push(run_sample(true));
+                unconnected_samples.push(run_sample(false));
+            } else {
+                unconnected_samples.push(run_sample(false));
+                connected_samples.push(run_sample(true));
+            }
+        }
+        connected_samples.sort_unstable();
+        unconnected_samples.sort_unstable();
+        let connected_median = connected_samples[SAMPLES / 2];
+        let unconnected_median = unconnected_samples[SAMPLES / 2];
+        eprintln!(
+            "[perf] connected UDP peer: connected={:.0} roundtrips/s; unconnected={:.0} roundtrips/s; speedup={:.3}x",
+            OPERATIONS as f64 / connected_median.as_secs_f64(),
+            OPERATIONS as f64 / unconnected_median.as_secs_f64(),
+            unconnected_median.as_secs_f64() / connected_median.as_secs_f64(),
+        );
+    }
+
     /// [`NetemPair::spawn_with_transports`] must expose the custom client
     /// transport's address and forward c2s traffic to the fixed server.
     #[test]
@@ -3491,6 +3692,84 @@ mod tests {
         pair.stop();
     }
 
+    /// Learned-destination publication and refresh must take the shared lock
+    /// only when the route actually changes; unchanged routes are served from
+    /// the caller's cache and the generation counter.
+    #[test]
+    fn learned_destination_locks_only_when_the_route_changes() {
+        let learned = LearnedDestination::default();
+        let client_a = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001));
+        let client_b = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5002));
+        let mut published = None;
+        let mut destination = None;
+        let mut observed_generation = 0;
+        learned.publish_if_changed(&mut published, client_a);
+        for _ in 0..16 {
+            learned.publish_if_changed(&mut published, client_a);
+        }
+        assert_eq!(
+            learned.refresh_if_changed(&mut destination, &mut observed_generation),
+            Some(client_a)
+        );
+        for _ in 0..16 {
+            assert_eq!(
+                learned.refresh_if_changed(&mut destination, &mut observed_generation),
+                Some(client_a)
+            );
+        }
+        assert_eq!(learned.publish_locks.load(Ordering::Relaxed), 1);
+        assert_eq!(learned.refresh_locks.load(Ordering::Relaxed), 1);
+        learned.publish_if_changed(&mut published, client_b);
+        assert_eq!(
+            learned.refresh_if_changed(&mut destination, &mut observed_generation),
+            Some(client_b)
+        );
+        assert_eq!(learned.publish_locks.load(Ordering::Relaxed), 2);
+        assert_eq!(learned.refresh_locks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    #[ignore = "release-only learned-destination cache performance probe"]
+    fn learned_destination_cache_perf_probe() {
+        const ITERATIONS: usize = 5_000_000;
+        let client = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001));
+        let learned = LearnedDestination::default();
+        let mut published = None;
+        let mut destination = None;
+        let mut observed_generation = 0;
+        learned.publish_if_changed(&mut published, client);
+        assert_eq!(
+            learned.refresh_if_changed(&mut destination, &mut observed_generation),
+            Some(client)
+        );
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            learned.publish_if_changed(std::hint::black_box(&mut published), client);
+            std::hint::black_box(learned.refresh_if_changed(
+                std::hint::black_box(&mut destination),
+                std::hint::black_box(&mut observed_generation),
+            ));
+        }
+        let cached = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut address = learned.address.lock().unwrap();
+            if *address != Some(client) {
+                *address = Some(client);
+            }
+            drop(address);
+            std::hint::black_box(*learned.address.lock().unwrap());
+        }
+        let locked = started.elapsed();
+        let cached_ns = cached.as_secs_f64() * 1e9 / ITERATIONS as f64;
+        let locked_ns = locked.as_secs_f64() * 1e9 / ITERATIONS as f64;
+        eprintln!(
+            "[perf] Learned destination: cached={cached_ns:.2} ns/packet; locked={locked_ns:.2} ns/packet; speedup={:.2}x",
+            locked_ns / cached_ns
+        );
+        assert!(cached < locked, "cached={cached:?}, locked={locked:?}");
+    }
+
     /// The impaired c2s runner must publish the learned client destination so
     /// the clean s2c runner can forward server replies back to the client.
     #[test]
@@ -3516,19 +3795,16 @@ mod tests {
                 s2c: NetemConfig::default(),
                 c2s_shared: None,
                 s2c_shared: None,
+                pin_client_peer: false,
                 clock: Some(clock.clone()),
             },
         )
         .unwrap();
         let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001));
-        // The c2s runner (latency => FIFO path) learns and publishes the
-        // client address while the packet sits behind its 20 ms delay.
         client_sock.push_recv(vec![1u8], from);
         wait_until("c2s received", || pair.stats_c2s().received == 1);
         clock.advance(Duration::from_millis(50));
         wait_until("c2s forwarded", || pair.stats_c2s().forwarded == 1);
-        // The clean s2c runner now forwards the server reply to the learned
-        // client address.
         server_sock.push_recv(vec![2u8], server_addr);
         wait_until("s2c forwarded to learned client", || {
             client_sock.sent.lock().unwrap().len() == 1
