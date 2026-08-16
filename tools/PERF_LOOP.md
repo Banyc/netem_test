@@ -5,26 +5,117 @@ runs the hostile/clean goodput probe against a baseline and a candidate
 frozen `netem_test` workspace (each with sibling `rtp`, `mux`, `rtp_mux`,
 `tokio_udp`, and `udp_listener` repositories), and compares the traces.
 
+Freeze the current completed suite without creating additional JJ workspaces:
+
+```sh
+./tools/perf-loop snapshot --source . --revision @- \
+--output $TMPDIR/rtp-before
+```
+
+The snapshot exports exact committed trees for all six sibling components and
+writes `suite-revisions.json`. Paired runs read this manifest so archived trees
+remain revision-identifiable even though they are deliberately not mutable JJ workspaces.
+
 ## Default hostile command
 
 ```sh
 ./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
-    --seeds 11,21 --window-seconds 30
+--link-profile hostile --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30
 ```
 
 The historical/default scenario is hostile with MSS 8192
 (`--link-profile hostile --mss-bytes 8192`).
 
-## Clean packet-processing-ceiling quick path
+## Stochastic fat-pipe recovery lane
+
+Use the existing 100 Mbit/s, 150 ms, 30 ms-jitter Gilbert-Elliott preset when
+recovery behavior is under test:
 
 ```sh
 ./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
-    --link-profile clean --mss-bytes 1400 --seeds 11,21 --window-seconds 10
+--link-profile hostile-fat-pipe --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30
+```
+
+Unlike the historical `hostile` profile, this lane does not clamp a 500 ms
+jitter distribution against a 300 ms mean delay. It remains stochastic and can
+amplify small timing differences through its stateful loss stream, so do not use
+it as the primary retention gate.
+
+## Deterministic controller-retention lane
+
+Use the fixed 100 Mbit/s, 150 ms shaped link for congestion-controller and
+queue-growth changes:
+
+```sh
+./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
+--link-profile controller-fat-pipe --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30
+```
+
+This lane retains the bandwidth-delay product and queue limit but has no
+random loss or jitter. Calibrate it with `--same-binary-control` before relying
+on a small delta, and follow retained recovery changes with the stochastic
+`hostile-fat-pipe` and adversarial `hostile` lanes.
+
+Use at least a 30-second measurement window for retention decisions. Shorter
+windows can straddle only one phase of RTP's delay-drain/recovery cycle even on
+fixed inputs; they are useful for smoke tests, not comparative conclusions.
+
+Every timed run first drives the same live session for a five-second unmeasured
+warmup (`--warmup-seconds`, set to `0` to reproduce the legacy boundary). The
+runner records the warmup duration, while the probe subtracts warmup delivery
+and clears setup/warmup RTP observations at the measurement boundary. Trace
+schema 22 also subtracts the last pre-boundary RTP snapshot from every
+connection-lifetime repair and controller counter. The baseline is sampled at
+most one 50 ms observer interval before the boundary. Its presence is recorded
+for each endpoint; a warmed schema-22 trace without both baselines is degraded.
+This reduces startup-ramp bias; it does not remove thermal, power, scheduling,
+or nonlinear time drift, so same-binary calibration remains required.
+
+Trace schema 19 defines that measurement boundary: RTP rows captured during
+setup or warmup are excluded, and paired comparison rejects runs with different
+warmup durations. A missing duration in an older artifact means zero warmup.
+
+Comparison schema 18 also interpolates `progress.csv` at the exact midpoint of
+the measurement window and reports first-half and second-half application
+goodput separately. Use the two phase rates to distinguish startup or
+controller convergence from sustained behavior before interpreting a short
+whole-window delta. The values are unavailable when progress samples do
+not bracket the midpoint within one second; the analyzer never assumes a sparse
+historical trace was stationary.
+
+Comparison schema 19 keeps the familiar baseline-relative percentage and
+metric-native difference, but ranks `largest_changes` and `agent_guidance`
+with a separate signed two-sided percentage: `difference / max(abs(baseline),
+abs(candidate))`. The ranking value is bounded to +100%, so a near-zero
+baseline cannot outrank every other signal with an arbitrarily large ratio;
+an actual appearance or disappearance still ranks as a full-scale change in
+its pair. Guidance aggregates each metric across all valid pairs and ranks the
+median bounded change. A transition isolated to one seed remains visible in
+the pair table but cannot monopolize the five-item summary; guidance also
+records pair count, changed-pair count, and directional consistency.
+
+Comparison schema 20 adds `behavior_conditioned_observations`. For each
+gentle-mode exit counter, it reports candidate-higher and candidate-lower
+pairs separately, then summarizes goodput, second-half goodput, RTT, and
+retransmission changes inside each group. This prevents event additions and
+removals from cancelling each other and keeps a one-pair observation visible
+as isolated support. Repeated, directionally consistent goodput shifts of at
+least 10% are marked for attention. These are post-selection diagnostics, not
+causal evidence; every hint retains its does_not_prove constraint.
+
+## Clean lane
+
+```sh
+./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
+--link-profile clean --mss-bytes 1400 --seeds 11,21 --window-seconds 10
 ```
 
 `--link-profile` and `--mss-bytes` are identical across each pair and are
-recorded in every manifest (`run.json`, both trace manifests, and the
-paired `manifest.csv`), while the defaults remain hostile/8192.
+recorded in every manifest (`run.json`, both trace manifests, and the paired
+`manifest.csv`), while the defaults remain hostile/8192.
 
 ## Direct lane
 
@@ -37,23 +128,51 @@ isolates endpoint and host throughput from proxy overhead.
 
 Both roles are prebuilt once (`cargo test --release -p tests --test
 perf_probe --no-run --message-format=json-render-diagnostics` per role,
-streamed to `build-ROLE.log`) before any timed run; every seed invokes the
-recorded `perf_probe` executable directly, so no timed run compiles.  Pair
-execution order alternates per seed-major pair (baseline/candidate then
-candidate/baseline) so scheduling order cannot bias the roles; stored rows
-keep their baseline/candidate labels, and `run.json` records
-`pair_execution_order="alternating"`, the `builds`, and the per-run
-`executable`.
+streamed to `build-ROLE.log`) before any timed run. Immediately after each
+build, the runner copies the artifact to a SHA-256-addressed sibling in the
+same Cargo artifact directory. This prevents a shared target directory from
+overwriting the baseline executable during the candidate build. Every seed
+invokes that preserved `perf_probe` executable directly, so no timed run
+compiles.
+
+Pair execution order alternates per seed-major pair (baseline/candidate then
+candidate/baseline) to counterbalance first/second position across adjacent
+two-pair blocks; stored rows keep their baseline/candidate labels, and
+`run.json` records `pair_execution_order: "alternating"`, the `builds`, and
+the per-run `executable` paths.
+
+It also records `execution_order_analysis`, which converts each
+candidate-minus-baseline goodput delta into a role-independent
+later-minus-earlier delta. A consistent later-faster or later-slower result
+marks the role comparison as directionally confounded and carries an explicit
+`does_not_prove` guard; it does not guess whether warm-up, thermal/power state,
+scheduling, or adjacent load caused the drift.
+
+`counterbalanced_goodput_analysis` then converts each valid candidate/baseline
+goodput ratio to log space. Within every complete adjacent AB/BA block it
+reports the geometric candidate-role effect separately from the multiplicative
+later-run position effect. Invalid, incomplete, and non-counterbalanced blocks
+are excluded explicitly. This decomposition exactly cancels only a stable
+multiplicative position effect inside the block; its `does_not_prove` guard
+states that nonlinear drift, stochastic path divergence, role/order
+interaction, and unrelated machine load remain possible. At least two complete
+blocks (four valid pairs) are required for a classification.
+
+When exact binaries are already preserved, bypass compilation with both
+`--baseline-executable <path>` and `--candidate-executable <path>`. The runner
+validates both executables and records their paths and SHA-256 digests as
+prebuilt in `run.json`. Supply both flags or neither; the caller is responsible
+for matching each binary to its workspace revisions.
 
 ## Same-binary control
 
-`--same-binary-control` compares a workspace with itself (the only mode
-that permits identical resolved workspaces; the resolved executable paths
-must also match) to calibrate run-to-run variance.  `run.json` then records
-`control_calibration`, classified `stable` only when every absolute valid
+`--same-binary-control` compares a workspace with itself (the only mode that
+permits identical resolved workspaces; the resolved executable paths must
+also match) to calibrate run-to-run variance. `run.json` then records
+`control_calibration`, classified stable only when every absolute valid
 paired goodput delta is below 10% — with the median/maximum absolute delta
 and the number of pairs that crossed the material-change threshold (false
-material changes on an identical binary).  With
+material changes on an identical binary). With
 `--fail-on-control-instability`, an unstable calibration exits 4.
 
 ## Artifacts
@@ -62,11 +181,12 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
 `$TMPDIR`:
 
 - `run.json` — top-level run record: `pair_execution_order` (`alternating`),
-  `link_profile`, `mss_bytes`, workspaces, seeds, window, target
-  directories, same-binary control flag, `control_calibration`,
-  per-role `builds` (frozen executable + build log), per-role/seed runs
-  (with the recorded `executable`) and their artifact paths, and the
-  comparison verdict.
+  role-independent `execution_order_analysis`, AB/BA
+  `counterbalanced_goodput_analysis`, `link_profile`, `mss_bytes`,
+  workspaces, seeds, window, target directories, warmup duration,
+  same-binary control flag, control calibration, per-role builds (frozen
+  executable + build log), per-role/seed runs (with the `executable`) and
+  their artifact paths, and the comparison verdict.
 - `manifest.csv` — one row per role/seed probe: runner exit, role, Cargo
   profile, sorted component-revision JSON, seed, link profile, MSS,
   resolved executable, trace dir.
@@ -74,12 +194,86 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
   peer/netem/progress) with the link profile and MSS recorded in its
   manifest.
 - `<role>-<seed>.log` — streamed probe log.
-- `comparison.json` / `comparison.html` — schema-2 comparison and report.
+- `comparison.json` / `comparison.html` — schema-15 comparison and report.
 
-## RTP trace schema 15 evidence
+Time-boxed goodput traces record `measurement_end_reason=timebox_elapsed`.
+When the probe completed and all three endpoint outcome trackers are still
+`running`, schema 16 defines that as an intentional live snapshot at the
+measurement boundary. The comparator accepts that explicit lifecycle evidence
+without requiring session-termination rows; early pump completion and missing
+lifecycle evidence remain degraded or invalid as appropriate.
 
-The 55-column RTP trace carries the complete congestion-controller and
-retransmission-scheduler snapshot on every state row; event-only raw RTT
+Netem counters are cumulative at each 50 ms sample. Comparison schema 4
+reports the final snapshot for each direction; it never sums cumulative rows.
+
+Comparison schema 5 converts raw RTP RTT observations from trace microseconds
+to the documented millisecond report unit.
+
+Trace schema 17 added the instantaneous number of application writers blocked
+on RTP staging capacity plus cumulative accepted and waiter-suppressed
+application-limited detections. Comparison schema 7 reports their final counts,
+sampled waiting-writer occupancy, application-limited occupancy, and the
+suppressed share of all classification attempts as first-class paired metrics.
+
+Trace schema 18 adds cumulative retransmission attempts, first/repeat attempt
+counts, every independent scheduler reason armed on selection, and tail probes.
+Reason counts are intentionally non-exclusive: one repair can be both RTO- and
+reorder-ready. Comparison summaries expose the final counters for each run.
+
+Comparison schema 9 additionally reports total and repeat retransmission
+attempts per GiB of application data delivered. These normalized rates are
+diagnostic-only, do not affect the goodput verdict, and are `null` when no
+application bytes were delivered.
+
+Comparison schema 10 classifies RTT, low-send-rate occupancy, un-feedbacked
+probe share, and normalized repair load as lower-is-better when producing
+human/agent guidance; controller-state occupancy remains direction-neutral.
+
+Comparison schema 11 adds a signed, metric-native difference beside every
+relative delta. Changes from a zero baseline therefore remain visible in JSON,
+HTML, and guidance instead of becoming an unranked `null` percentage; occupancy
+differences are percentage points, while other metrics retain their named unit.
+
+Comparison schema 12 promotes gentle draining, drain-floor binding, and outage
+recovery occupancy to first-class paired metrics. Gentle draining and floor
+binding remain direction-neutral diagnostics; outage recovery is lower-is-better.
+
+Comparison schema 13 adds total gentle drain-guard exits across both RTP
+endpoints. Older manifests without either typed-event counter remain `null`
+rather than being misreported as zero.
+
+Comparison schema 14 replaces that guard-only metric with four exact
+gentle-mode exit causes: loss, clean gate reopening, ineffective drain guard,
+and outage reset. Each paired metric sums both endpoints and remains `null`
+unless both endpoint counters are present.
+
+Comparison schema 15 recognizes trace schema 22 and checks that both RTP
+endpoints captured the counter baseline required to make cumulative repair and
+controller fields measurement-relative after a nonzero warmup.
+
+Comparison schema 16 adds direction-neutral persistent-queue occupancy,
+maximum continuous duration, and reset-count diagnostics from trace schema 23.
+They distinguish a gate that never arms from one repeatedly broken by jitter;
+none of the three is independently evidence of better or worse transport
+behavior.
+
+Comparison schema 17 adds `gentle_gate_open_streak_max_ms`, the longest
+observed continuous run of gentle_probe controller actions. This is a sampled
+lower bound on how long the clean-gate exit timer accumulated without reset,
+not the controller's private timer value, and remains direction-neutral.
+
+RTP metrics schema 17 adds send-driver wake-source events. The perf observer
+counts resume notifications, pacing timers, protocol timers, and kill requests
+without retaining a row for every wake. Measurement-boundary resets exclude
+setup and warmup, and each endpoint's counts are written to `manifest.csv` and
+the comparison run summaries. These counters identify what actually resumed
+the driver; they do not infer why a notification was sent or whether a timer
+was avoidable.
+
+## RTP trace evidence
+
+The 68-column RTP trace carries the complete congestion-controller and
+retransmission-scheduler snapshot on every state row; event-only raw RTP
 rows leave all snapshot columns empty. The controller evidence:
 
 - `congestion_control_rtt_us` — the control RTT last used by the controller;
@@ -87,17 +281,30 @@ rows leave all snapshot columns empty. The controller evidence:
 - `congestion_rtt_floor_us` / `congestion_queue_tolerance_us` — the
   controller's RTT floor and queue-gate tolerance: smoothed RTT above
   floor + tolerance is what marks `queue_building`.
+- `congestion_persistent_queue_for_us` — how long the wider queue-growth
+  signal has remained continuously armed at the current rate sample; an empty
+  value means it is clear. `congestion_persistent_queue_resets` counts observed
+  armed-to-clear transitions and is rebased at the measurement boundary. The
+  comparison reports occupancy, maximum continuous duration, and resets as
+  direction-neutral diagnostics.
 - `congestion_delivery_peak_packets_per_second` /
   `congestion_drain_floor_packets_per_second` /
   `congestion_drain_target_packets_per_second` — the delivery peak feeding
   the drain floor, the floor itself, and the drain target the controller
   applies during gentle draining.
-- `congestion_rate_samples`, `congestion_bandwidth_probe_decisions`,
-  `congestion_bandwidth_probe_increases`, `congestion_delay_drains` —
-  cumulative controller decision counters.
-- `congestion_bandwidth_probe_before_feedback` — increases applied before
-  the previous increase received feedback. This is a timing classification,
-  not proof that a probe caused queue growth; the paired report only emits
+- `congestion_bandwidth_probe_increases` /
+  `congestion_bandwidth_probe_decreases` / `congestion_delay_drains` —
+  cumulative controller decision counters, rebased to the measurement boundary
+  in trace schema 22.
+- `rtp_gentle_mode_exit_{loss, gate_open, drain_guard, outage_reset}` and
+  matching `rtp_peer_*` keys in `manifest.csv` — cumulative typed transitions
+  that explain exactly why each gentle-mode episode ended. The capture
+  aggregates and skips these rare events without storing another row or
+  enlarging every state snapshot. Paired comparisons sum the two endpoint
+  counters per cause, so a peer-only exit remains visible.
+- `congestion_bandwidth_probe_before_feedback` — increases applied before a
+  previous increase received feedback. This is a timing classification, not
+  proof that a probe caused queue growth; the paired report only emits
   `congestion_bandwidth_probe_before_feedback_percent` when
   `congestion_bandwidth_probe_increases` is nonzero, and treats it as
   lower-is-better (fewer un-feedbacked increases = more conservative probe
@@ -118,6 +325,15 @@ Retransmission-scheduler evidence:
   retransmission scheduler's active set and how many of those packets are
   currently due or evidence-armed; the paired report exposes their maximum
   depths and the final postponement count.
+- `retransmission_attempts`, `retransmission_first_attempts`,
+  `retransmission_repeat_attempts` — cumulative scheduler-selected repairs,
+  rebased to the measurement boundary in trace schema 22.
+- `retransmission_rto_reason`, `retransmission_reorder_reason`,
+  `retransmission_fast_loss_reason`, and `retransmission_pre_outage_reason` —
+  independent reasons armed when each repair was selected; their sum can
+  exceed `retransmission_attempts`.
+- `tail_probe_attempts` — tail-loss probes emitted outside the ordinary
+  retransmission-ready path.
 
 ## Verdicts and exit codes
 
@@ -146,38 +362,41 @@ invalid evidence.
 - Baseline and candidate must be distinct resolved workspaces outside
   same-binary control mode; `--same-binary-control` is the only mode that
   permits identical workspaces, and it additionally requires the resolved
-  executable paths to match.  A mutable workspace must not be used as both
+  executable paths to match. A mutable workspace must not be used as both
   roles, and debug/release evidence must not be mixed.
-- A frozen workspace has a `netem_test/` checkout with sibling `rtp`,
-  `mux`, `rtp_mux`, `tokio_udp`, and `udp_listener` repositories; each
-  component's jj revision is recorded in the manifest.
+- A frozen workspace has a `netem_test/` checkout with sibling `rtp`, `mux`,
+  `rtp_mux`, `tokio_udp`, and `udp_listener` repositories; each component's
+  jj revision is recorded in the manifest.
 
-## Samply sampling
+## Sampling
 
-When a workload's cost is dominated by CPU, record a Samply profile instead
-of (or alongside) the RTP traces:
+Alongside the RTP traces, `samply` can create a one-shot profile of a
+workload command and keep both the profile and its `syms.json` sidecar
+beneath the tmp dir:
 
 ```sh
-samply record --save-only --unstable --presymbolicate \
-    -- <workload command and its arguments>
+samply record --save-only --unstable-presymbolicate -- <workload command and its arguments>
 ```
-
-Keep both the profile and its `.syms.json` sidecar beneath tmp dir
 
 Summarize the profile into deterministic owning-symbol hotspots:
 
 ```sh
 python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json
-python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json \
-    --contains tokio --limit 20 --json
-python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json \
-    --contains tokio --thread tokio-runtime-worker --limit 20 --json
+python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json --contains tokio --limit 20 --json
+python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json --contains tokio --thread tokio-rt-worker --limit 20 --json
 ```
+
+Every schema-7 summary includes a whole-profile thread inventory before any
+`--thread` filter is applied. It groups equal thread names, reports nonempty and
+CPU-active sample counts, and ranks each name's share of all CPU-active samples.
+Inspect this inventory before filtering: proxy workloads use dedicated
+`netem-c2s` and `netem-s2c` workers, so a Tokio-only summary does not cover the
+packet-forwarding path.
 
 When the profile also samples unrelated runtime threads, filter to the
 workload-owning thread with the exact-name `--thread` option (repeatable;
 all threads with any requested name are selected and a requested name that
-matches nothing is an error).  The workload-owning thread is required when
+matches nothing is an error). The workload-owning thread is required when
 it avoids unrelated runtime samples.
 
 When comparing workloads that differ, compare samples per forwarded packet
