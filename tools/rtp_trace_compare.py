@@ -18,7 +18,9 @@ import math
 import statistics
 from pathlib import Path
 
-COMPARISON_SCHEMA_VERSION = 2
+COMPARISON_SCHEMA_VERSION = 20
+
+GENTLE_EXIT_CAUSES = ("loss", "gate_open", "drain_guard", "outage_reset")
 
 MODULE_PATH = Path(__file__).with_name("rtp_trace_report.py")
 SPEC = importlib.util.spec_from_file_location("rtp_trace_report", MODULE_PATH)
@@ -70,10 +72,18 @@ def state_rows(rows, manifest):
                 "delivery_sample_app_limited": boolean(
                     REPORT.field(row, "delivery_sample_app_limited", "app_limited")
                 ),
+                "application_write_waiters": optional_float(
+                    REPORT.field(row, "application_write_waiters")
+                ),
+                "application_limited_detections": optional_float(
+                    REPORT.field(row, "application_limited_detections")
+                ),
+                "application_limited_detections_suppressed_by_waiting_writer": optional_float(
+                    REPORT.field(row, "application_limited_detections_suppressed_by_waiting_writer")
+                ),
                 "pending_send_bytes": optional_float(REPORT.field(row, "pending_send_bytes")),
                 "accepts_new_packet": (
-                    None
-                    if REPORT.field(row, "accepts_new_packet") == ""
+                    None if REPORT.field(row, "accepts_new_packet") == ""
                     else boolean(REPORT.field(row, "accepts_new_packet"))
                 ),
                 "no_response": optional_float(REPORT.field(row, "no_response_for_us")),
@@ -81,11 +91,26 @@ def state_rows(rows, manifest):
                 "retransmitted": metric_number(REPORT.field(row, "retransmitted_packets"), 0.0),
                 "retransmission_active": metric_number(REPORT.field(row, "retransmission_active_packets"), 0.0),
                 "retransmission_ready": metric_number(REPORT.field(row, "retransmission_ready_packets"), 0.0),
+                "retransmission_attempts": metric_number(REPORT.field(row, "retransmission_attempts"), 0.0),
+                "retransmission_first_attempts": metric_number(REPORT.field(row, "retransmission_first_attempts"), 0.0),
+                "retransmission_repeat_attempts": metric_number(REPORT.field(row, "retransmission_repeat_attempts"), 0.0),
+                "retransmission_rto_reason": metric_number(REPORT.field(row, "retransmission_rto_reason"), 0.0),
+                "retransmission_reorder_reason": metric_number(REPORT.field(row, "retransmission_reorder_reason"), 0.0),
+                "retransmission_fast_loss_reason": metric_number(REPORT.field(row, "retransmission_fast_loss_reason"), 0.0),
+                "retransmission_pre_outage_reason": metric_number(REPORT.field(row, "retransmission_pre_outage_reason"), 0.0),
+                "tail_probe_attempts": metric_number(REPORT.field(row, "tail_probe_attempts"), 0.0),
                 "rto_postponements": metric_number(REPORT.field(row, "rto_deadline_postponements"), 0.0),
                 "cc_rate_samples": metric_number(REPORT.field(row, "congestion_rate_samples"), 0.0),
                 "cc_probe_decisions": metric_number(REPORT.field(row, "congestion_bandwidth_probe_decisions"), 0.0),
                 "cc_probe_increases": metric_number(REPORT.field(row, "congestion_bandwidth_probe_increases"), 0.0),
                 "cc_probe_before_feedback": metric_number(REPORT.field(row, "congestion_bandwidth_probe_before_feedback"), 0.0),
+                "cc_persistent_queue_available": "congestion_persistent_queue_for_us" in row,
+                "cc_persistent_queue_for": optional_float(
+                    REPORT.field(row, "congestion_persistent_queue_for_us")
+                ),
+                "cc_persistent_queue_resets": optional_float(
+                    REPORT.field(row, "congestion_persistent_queue_resets")
+                ),
                 "cc_delay_drains": metric_number(REPORT.field(row, "congestion_delay_drains"), 0.0),
                 "loss": metric_number(REPORT.field(row, "loss_ratio")),
                 "cc_loss": metric_number(REPORT.field(row, "congestion_loss_ratio")),
@@ -97,7 +122,7 @@ def state_rows(rows, manifest):
 
 def raw_rtt_ms(rows):
     return sorted(
-        value
+        value / 1000.0
         for value in (optional_float(REPORT.field(row, "raw_rtt_us")) for row in rows)
         if value is not None
     )
@@ -131,16 +156,17 @@ def has_terminal_event(rows):
 
 def final_netem_counters(netem_rows):
     counters = {}
-    for row in netem_rows:
+    for row in reversed(netem_rows):
         direction = REPORT.field(row, "direction")
-        if direction not in counters:
-            counters[direction] = {}
-        for key in (
-            "received", "forwarded", "delayed", "dropped", "duplicated",
-            "reordered", "rate_limited", "overflow_dropped",
-        ):
-            value = metric_number(REPORT.field(row, key), 0.0)
-            counters[direction][key] = counters[direction].get(key, 0.0) + value
+        if not direction or direction in counters:
+            continue
+        counters[direction] = {
+            key: metric_number(REPORT.field(row, key), 0.0)
+            for key in (
+                "received", "forwarded", "delayed", "dropped",
+                "duplicated", "reordered", "rate_limited", "overflow_dropped",
+            )
+        }
     return counters
 
 
@@ -162,6 +188,51 @@ def rolling_goodput(progress_rows):
     return points
 
 
+def split_window_goodput(progress_rows, elapsed_seconds, delivered_bytes):
+    """Return first-half and second-half application goodput in MiB/s.
+
+    The cumulative delivery counter is linearly interpolated at the exact
+    measurement midpoint. A trace must bracket that midpoint with samples no
+    more than one second apart; sparse historical traces return unavailable
+    values rather than pretending their whole-window average was stationary.
+    """
+    if (
+        elapsed_seconds is None
+        or delivered_bytes is None
+        or elapsed_seconds <= 0
+        or delivered_bytes < 0
+    ):
+        return None, None
+    midpoint = elapsed_seconds / 2.0
+    points = [
+        (elapsed, delivered)
+        for elapsed, delivered in progress_rows
+        if 0.0 <= elapsed <= elapsed_seconds
+    ]
+    if len(points) < 2:
+        return None, None
+    for previous, current in zip(points, points[1:]):
+        if current[0] < previous[0] or current[1] < previous[1]:
+            return None, None
+    left = next(
+        (point for point in reversed(points) if point[0] <= midpoint), None
+    )
+    right = next((point for point in points if point[0] >= midpoint), None)
+    if left is None or right is None or right[0] - left[0] > 1.0:
+        return None, None
+    if right[0] == left[0]:
+        midpoint_delivered = left[1]
+    else:
+        fraction = (midpoint - left[0]) / (right[0] - left[0])
+        midpoint_delivered = left[1] + fraction * (right[1] - left[1])
+    if not 0.0 <= midpoint_delivered <= delivered_bytes:
+        return None, None
+    mib = 1024 * 1024
+    first = midpoint_delivered / midpoint / mib
+    second = (delivered_bytes - midpoint_delivered) / midpoint / mib
+    return first, second
+
+
 def read_run(spec):
     if len(spec) == 2:
         label, trace_dir = spec
@@ -176,6 +247,11 @@ def read_run(spec):
     progress_raw = read_csv(trace_dir / "progress.csv")
     progress = [
         (REPORT.timeline_seconds(row, manifest), float(row["delivered_bytes"]))
+        for row in progress_raw
+        if REPORT.field(row, "delivered_bytes") != ""
+    ]
+    measurement_progress = [
+        (float(row.get("elapsed_us", 0)) / 1_000_000.0, float(row["delivered_bytes"]))
         for row in progress_raw
         if REPORT.field(row, "delivered_bytes") != ""
     ]
@@ -195,8 +271,8 @@ def read_run(spec):
         "state": state,
         "rtt": rtt,
         "peer_state": peer_state,
-        "peer_rtt": peer_rtt,
         "rolling": rolling_goodput(progress),
+        "peer_rtt": peer_rtt,
         "health": trace_health(
             trace_dir,
             manifest,
@@ -205,50 +281,87 @@ def read_run(spec):
             netem,
             progress_raw,
         ),
-        "summary": summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, rtp, peer),
+        "summary": summarize_run(
+            manifest,
+            state,
+            peer_state,
+            rtt,
+            peer_rtt,
+            netem,
+            measurement_progress,
+            rtp,
+            peer,
+        ),
     }
 
 
 def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     checks = {}
-
     schema = manifest.get("trace_schema_version", "")
     row_schema = REPORT.field(rtp[0], "schema_version") if rtp else ""
-    checks["schema_compatible"] = schema in ("15", "14", "10", "9", "8", "1") or row_schema in (
-        "15", "14", "10", "9", "8", "1"
+    supported_schemas = (
+        "23",
+        "22",
+        "21",
+        "20",
+        "19",
+        "18",
+        "17",
+        "16",
+        "15",
+        "14",
+        "10",
+        "9",
+        "8",
+        "1",
     )
-
+    checks["schema_compatible"] = (
+        schema in supported_schemas or row_schema in supported_schemas
+    )
     observer = manifest.get("rtp_observer", "")
     checks["observer_present"] = boolean(observer) if observer != "" else False
-
+    warmup_seconds = metric_number(manifest.get("warmup_seconds"), 0.0) or 0.0
+    checks["counter_baseline_present"] = (
+        schema not in ("22", "23")
+        or not checks["observer_present"]
+        or warmup_seconds == 0.0
+        or (
+            boolean(manifest.get("rtp_counter_baseline_present"))
+            and boolean(manifest.get("rtp_peer_counter_baseline_present"))
+        )
+    )
     dropped = metric_number(manifest.get("rtp_dropped_capacity"), 0) or 0
     peer_dropped = metric_number(manifest.get("rtp_peer_dropped_capacity"), 0) or 0
     checks["capture_not_dropped"] = dropped == 0 and peer_dropped == 0
-
-    checks["terminated"] = has_terminal_event(rtp) and has_terminal_event(peer)
-
     probe_outcome = manifest.get("probe_outcome", "")
     checks["task_completed"] = probe_outcome in ("", "completed")
-
+    endpoint_outcomes = [
+        manifest.get(key, "")
+        for key in ("sink_read_outcome", "client_mux_outcome", "server_mux_outcome")
+    ]
+    expected_live_timebox = (
+        manifest.get("measurement_end_reason", "") == "timebox_elapsed"
+        and probe_outcome == "completed"
+        and all(outcome == "running" for outcome in endpoint_outcomes)
+    )
+    checks["endpoint_lifecycle_accounted"] = (
+        has_terminal_event(rtp) and has_terminal_event(peer)
+    ) or expected_live_timebox
     checks["endpoint_integrity"] = True
     for key in ("sink_read_outcome", "client_mux_outcome", "server_mux_outcome"):
         outcome = manifest.get(key, "")
         if outcome and "corrupt" in outcome.lower():
             checks["endpoint_integrity"] = False
-
     runner_exit = metric_number(manifest.get("perf_loop_runner_exit_code"))
     checks["runner_succeeded"] = runner_exit in (None, 0)
-
     checks["rtp_readable"] = len(rtp) > 0
     checks["peer_readable"] = len(peer) > 0
-
     expected_rtp = metric_number(manifest.get("rtp_captured"))
     expected_peer = metric_number(manifest.get("rtp_peer_captured"))
     checks["capture_counts_match"] = (
         expected_rtp in (None, len(rtp))
         and expected_peer in (None, len(peer))
     )
-
     expected_netem = metric_number(manifest.get("netem_samples"))
     expected_progress = metric_number(manifest.get("progress_samples"))
     checks["netem_complete"] = (
@@ -260,7 +373,6 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
         len(progress) > 0
         and expected_progress in (None, len(progress))
     )
-
     window_seconds = metric_number(manifest.get("window_seconds"))
     state_times = [
         REPORT.timeline_seconds(row, manifest)
@@ -275,7 +387,6 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
             for time in state_times
         )
     )
-
     sources = (rtp, peer, netem, progress)
     checks["shared_clock"] = (
         manifest.get("measurement_start_trace_elapsed_us", "")
@@ -285,7 +396,6 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
             for row in rows
         )
     )
-
     failures = [key for key, ok in checks.items() if not ok]
     invalid_keys = {
         "rtp_readable",
@@ -313,7 +423,67 @@ def _percent(value, total):
     return 100.0 * value / total if total else math.nan
 
 
+def _per_gib(value, delivered_bytes):
+    """Normalize an event count by application bytes delivered."""
+    return value * 1024 ** 3 / delivered_bytes if delivered_bytes > 0 else None
+
+
+def action_streak_max_ms(state, action):
+    """Longest observed continuous run of one controller action.
+
+    State snapshots are sampled, so the run length is bounded below by the
+    longest interval between consecutive retained samples of the action
+    rather than a reconstructed timer value.
+    """
+    longest = 0.0
+    start = None
+    last = None
+    for row in state:
+        if row["action"] == action:
+            if start is None:
+                start = row["time"]
+                last = row["time"]
+            else:
+                last = row["time"]
+        elif start is not None:
+            longest = max(longest, last - start)
+            start = None
+            last = None
+    if start is not None:
+        longest = max(longest, last - start)
+    return longest * 1000.0
+
+
 def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, rtp, peer):
+    def send_driver_wakes(prefix):
+        return {
+            wake: metric_number(
+                manifest.get(f"{prefix}_send_driver_{wake}_wakes"), 0.0
+            )
+            for wake in (
+                "resume_signal",
+                "pacing_timer",
+                "protocol_timer",
+                "kill_requested",
+            )
+        }
+
+    def send_driver_resume_requests(prefix):
+        return {
+            source: metric_number(
+                manifest.get(f"{prefix}_send_driver_resume_{source}_requests"), 0.0
+            )
+            for source in (
+                "application_data",
+                "application_frame",
+                "application_finish",
+                "peer_ack",
+                "ack_flush",
+                "post_open_handshake",
+                "receive_opportunity",
+            )
+        }
+
     count = len(state)
     actions = {}
     for row in state:
@@ -321,17 +491,61 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
     low_rate = sum(row["send_rate"] <= 128.0001 for row in state)
     outage = sum(row["outage"] for row in state)
     app_limited = sum(row["delivery_sample_app_limited"] for row in state)
+    waiting_writers = [
+        row["application_write_waiters"]
+        for row in state
+        if row["application_write_waiters"] is not None
+    ]
     staged = [
-        row["pending_send_bytes"] for row in state if row["pending_send_bytes"] is not None
+        row["pending_send_bytes"]
+        for row in state
+        if row["pending_send_bytes"] is not None
     ]
     empty_stage = sum(value == 0.0 for value in staged)
-    accepts = [row["accepts_new_packet"] for row in state if row["accepts_new_packet"] is not None]
-    retransmitted = [row["retransmitted"] for row in state if row["retransmitted"] > 0]
+    accepts = [
+        row["accepts_new_packet"]
+        for row in state
+        if row["accepts_new_packet"] is not None
+    ]
+    retransmitted = [
+        row["retransmitted"]
+        for row in state
+        if row["retransmitted"] > 0
+    ]
     active_depths = [row["retransmission_active"] for row in state]
     ready_depths = [row["retransmission_ready"] for row in state]
-    postponements = [row["rto_postponements"] for row in state]
+    postponements = [
+        row["rto_postponements"]
+        for row in state
+        if row["rto_postponements"] is not None
+    ]
+    retransmission_attempts = state[-1]["retransmission_attempts"] if state else 0.0
+    retransmission_repeat_attempts = state[-1]["retransmission_repeat_attempts"] if state else 0.0
     loss = [row["loss"] for row in state if row["loss"] is not None]
     cc_loss = [row["cc_loss"] for row in state if row["cc_loss"] is not None]
+    # gentle_mode_exits = actions.get("gentle_probe", 0)
+    # delivered_bytes = float(manifest.get("delivered_bytes", 0) or 0)
+    persistent_queue_rows = [
+        row for row in state if row["cc_persistent_queue_available"]
+    ]
+    persistent_queue_durations = [
+        row["cc_persistent_queue_for"]
+        for row in persistent_queue_rows
+        if row["cc_persistent_queue_for"] is not None
+    ]
+    final_counter = lambda field: next(
+        (row[field] for row in reversed(state) if row[field] is not None), None
+    )
+    application_limited_detections = final_counter("application_limited_detections")
+    application_limited_suppressions = final_counter(
+        "application_limited_detections_suppressed_by_waiting_writer"
+    )
+    application_limited_classifications = (
+        application_limited_detections + application_limited_suppressions 
+        if application_limited_detections is not None
+        and application_limited_suppressions is not None
+        else None
+    )
     controller_state = {
         "slow_start": _percent(
             sum(boolean(REPORT.field(row, "slow_start")) for row in rtp), count
@@ -351,13 +565,75 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "outage_recovery": _percent(outage, count),
     }
     delivered = metric_number(manifest.get("delivered_bytes"))
+    delivered_bytes = delivered if delivered is not None else (
+        progress[-1][1] if progress else 0
+    )
+
     elapsed = metric_number(manifest.get("elapsed_seconds"))
+    first_half_goodput, second_half_goodput = split_window_goodput(
+        progress, elapsed, delivered_bytes
+    )
+
+    gentle_mode_exits = {
+        cause: metric_number(manifest.get(f"rtp_gentle_mode_exit_{cause}"))
+        for cause in GENTLE_EXIT_CAUSES
+    }
+    peer_gentle_mode_exits = {
+        cause: metric_number(manifest.get(f"rtp_peer_gentle_mode_exit_{cause}"))
+        for cause in GENTLE_EXIT_CAUSES
+    }
+    total_gentle_mode_exits = {
+        cause: (
+            gentle_mode_exits[cause] + peer_gentle_mode_exits[cause] if gentle_mode_exits[cause] is not None
+            and peer_gentle_mode_exits[cause] is not None
+            else None
+        )
+        for cause in GENTLE_EXIT_CAUSES
+    }
+
     return {
         "count": count,
         "actions": actions,
-        "low_send_rate_occupancy": _percent(low_rate, count),
         "controller_state_occupancy": controller_state,
+        "low_send_rate_occupancy": _percent(low_rate, count),
+        "gentle_mode_occupancy": controller_state["gentle_mode"],
+        "gentle_draining_occupancy": controller_state["gentle_draining"],
+        "queue_building_occupancy": controller_state["queue_building"],
+        "drain_floor_binding_occupancy": controller_state["drain_floor_binding"],
+        "outage_recovery_occupancy": controller_state["outage_recovery"],
+        "persistent_queue_occupancy": (
+            _percent(len(persistent_queue_durations), len(persistent_queue_rows))
+            if persistent_queue_rows
+            else None
+        ),
+        "persistent_queue_max_ms": (
+            max(persistent_queue_durations, default=0.0) / 1000.0
+            if persistent_queue_rows
+            else None
+        ),
+        "persistent_queue_resets": final_counter("cc_persistent_queue_resets"),
+        "gentle_gate_open_streak_max_ms": action_streak_max_ms(
+            state, "gentle_probe"
+        ),
+        **{
+            f"gentle_mode_exit_{cause}": total_gentle_mode_exits[cause]
+            for cause in GENTLE_EXIT_CAUSES
+        },
+        "gentle_mode_exits": gentle_mode_exits,
+        "peer_gentle_mode_exits": peer_gentle_mode_exits,
         "app_limited_occupancy": _percent(app_limited, count),
+        "application_write_waiter_occupancy": (
+            _percent(sum(value > 0 for value in waiting_writers), len(waiting_writers))
+            if waiting_writers
+            else math.nan
+        ),
+        "application_limited_detections": application_limited_detections,
+        "application_limited_detections_suppressed_by_waiting_writer": application_limited_suppressions,
+        "application_limited_suppression_percent": (
+            _percent(application_limited_suppressions, application_limited_classifications)
+            if application_limited_classifications
+            else None
+        ),
         "empty_send_stage_occupancy": _percent(empty_stage, len(staged)) if staged else math.nan,
         "accepts_new_packet_occupancy": (
             _percent(sum(accepts), len(accepts)) if accepts else math.nan
@@ -366,6 +642,18 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "max_retransmitted": max(retransmitted, default=0.0),
         "max_retransmission_active": max(active_depths, default=0.0),
         "max_retransmission_ready": max(ready_depths, default=0.0),
+        "final_retransmission_counters": {
+            "attempts": retransmission_attempts,
+            "first_attempts": state[-1]["retransmission_first_attempts"] if state else 0.0,
+            "repeat_attempts": retransmission_repeat_attempts,
+            "rto_reason": state[-1]["retransmission_rto_reason"] if state else 0.0,
+            "reorder_reason": state[-1]["retransmission_reorder_reason"] if state else 0.0,
+            "fast_loss_reason": state[-1]["retransmission_fast_loss_reason"] if state else 0.0,
+            "pre_outage_reason": state[-1]["retransmission_pre_outage_reason"] if state else 0.0,
+            "tail_probes": state[-1]["tail_probe_attempts"] if state else 0.0,
+        },
+        "retransmission_attempts_per_gib_delivered": _per_gib(retransmission_attempts, delivered_bytes),
+        "retransmission_repeat_attempts_per_gib_delivered": _per_gib(retransmission_repeat_attempts, delivered_bytes),
         "final_rto_deadline_postponements": postponements[-1] if postponements else 0.0,
         "final_congestion_counters": {
             "rate_samples": state[-1]["cc_rate_samples"] if state else 0.0,
@@ -373,6 +661,7 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
             "probe_increases": state[-1]["cc_probe_increases"] if state else 0.0,
             "probe_before_feedback": state[-1]["cc_probe_before_feedback"] if state else 0.0,
             "delay_drains": state[-1]["cc_delay_drains"] if state else 0.0,
+            "gentle_mode_exits": gentle_mode_exits,
         },
         "loss_samples": len(loss),
         "mean_loss_ratio": statistics.fmean(loss) if loss else math.nan,
@@ -382,30 +671,34 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "peer_rtt_p50_ms": REPORT.quantile(peer_rtt, 0.5) if peer_rtt else math.nan,
         "terminations": termination_summary(rtp),
         "peer_terminations": termination_summary(peer),
+        "send_driver_wakes": send_driver_wakes("rtp"),
+        "peer_send_driver_wakes": send_driver_wakes("rtp_peer"),
+        "send_driver_resume_requests": send_driver_resume_requests("rtp"),
+        "peer_send_driver_resume_requests": send_driver_resume_requests("rtp_peer"),
         "final_netem_counters": final_netem_counters(netem),
-        "delivered_bytes": delivered if delivered is not None else (
-            progress[-1][1] if progress else 0
-        ),
-        "elapsed_seconds": elapsed if elapsed is not None else (
-            progress[-1][0] if progress else 0
-        ),
+        "delivered_bytes": delivered_bytes,
+        "elapsed_seconds": elapsed if elapsed is not None else (progress[-1][0] if progress else 0),
         "goodput_mib_per_second": metric_number(manifest.get("goodput_mib_per_second")),
+        "goodput_first_half_mib_per_second": first_half_goodput,
+        "goodput_second_half_mib_per_second": second_half_goodput,
         "sink_read_outcome": manifest.get("sink_read_outcome", ""),
         "client_mux_outcome": manifest.get("client_mux_outcome", ""),
         "server_mux_outcome": manifest.get("server_mux_outcome", ""),
         "probe_outcome": manifest.get("probe_outcome", ""),
+        "measurement_end_reason": manifest.get("measurement_end_reason", ""),
     }
 
 
 CONFIG_KEYS = (
+    "warmup_seconds",
     "window_seconds",
     "mss_bytes",
     "fec",
     "rtp_handshake",
     "perf_loop_profile",
-    "netem_c2s",
     "netem_s2c",
     "link_profile",
+    "netem_c2s",
     "scenario",
 )
 
@@ -413,8 +706,9 @@ CONFIG_KEYS = (
 def pair_config_agrees(baseline, candidate):
     mismatches = []
     for key in CONFIG_KEYS:
-        left = baseline.get(key, "")
-        right = candidate.get(key, "")
+        default = "0" if key == "warmup_seconds" else ""
+        left = baseline.get(key, default)
+        right = candidate.get(key, default)
         if left and right and left != right:
             mismatches.append(key)
     return mismatches
@@ -433,13 +727,102 @@ def pair_runs(baseline_runs, candidate_runs):
     return pairs
 
 
-def delta_percent(candidate, baseline):
-    if baseline in (None, 0) or candidate is None:
+def metric_difference(candidate, baseline):
+    if baseline is None or candidate is None:
         return None
-    return (candidate - baseline) / abs(baseline) * 100.0
+    difference = candidate - baseline
+    return difference if math.isfinite(difference) else None
 
 
-METRICS = ("goodput_mib_per_second", "rtt_p50_ms", "low_send_rate_occupancy")
+def delta_percent(candidate, baseline):
+    difference = metric_difference(candidate, baseline)
+    if difference is None or baseline == 0:
+        return None
+    return difference / abs(baseline) * 100.0
+
+
+def ranking_delta_percent(candidate, baseline):
+    """Signed, bounded two-sided delta used only to rank guidance.
+
+    Baseline-relative percentages are useful to display, but become
+    arbitrarily large when the baseline is near zero and are undefined
+    when it is exactly zero. Scaling by the larger endpoint keeps the ranking in
+    [-100, 100] while preserving direction and treating a true
+    appearance/disappearance as a full-scale change.
+    """
+    difference = metric_difference(candidate, baseline)
+    if difference is None:
+        return None
+    scale = max(abs(candidate), abs(baseline))
+    if scale == 0:
+        return 0.0
+    return difference / scale * 100.0
+
+
+METRICS = (
+    "goodput_mib_per_second",
+    "goodput_first_half_mib_per_second",
+    "goodput_second_half_mib_per_second",
+    "rtt_p50_ms",
+    "low_send_rate_occupancy",
+    "gentle_mode_occupancy",
+    "gentle_draining_occupancy",
+    "queue_building_occupancy",
+    "drain_floor_binding_occupancy",
+    "outage_recovery_occupancy",
+    "persistent_queue_occupancy",
+    "persistent_queue_max_ms",
+    "persistent_queue_resets",
+    "gentle_gate_open_streak_max_ms",
+    "gentle_mode_exit_loss",
+    "gentle_mode_exit_gate_open",
+    "gentle_mode_exit_outage_reset",
+    "gentle_mode_exit_drain_guard",
+    "app_limited_occupancy",
+    "application_write_waiter_occupancy",
+    "application_limited_suppression_percent",
+    "retransmission_attempts_per_gib_delivered",
+    "retransmission_repeat_attempts_per_gib_delivered",
+)
+
+NEUTRAL_DIRECTION_METRICS = {
+    "app_limited_occupancy",
+    "application_write_waiter_occupancy",
+    "application_limited_suppression_percent",
+    "gentle_mode_occupancy",
+    "gentle_draining_occupancy",
+    "queue_building_occupancy",
+    "drain_floor_binding_occupancy",
+    "gentle_mode_exit_loss",
+    "gentle_mode_exit_gate_open",
+    "gentle_mode_exit_drain_guard",
+    "gentle_mode_exit_outage_reset",
+    "persistent_queue_occupancy",
+    "persistent_queue_max_ms",
+    "persistent_queue_resets",
+    "gentle_gate_open_streak_max_ms",
+}
+
+LOWER_IS_BETTER_METRICS = {
+    "rtt_p50_ms",
+    "congestion_bandwidth_probe_before_feedback_percent",
+    "low_send_rate_occupancy",
+    "outage_recovery_occupancy",
+    "retransmission_attempts_per_gib_delivered",
+    "retransmission_repeat_attempts_per_gib_delivered",
+}
+
+CONDITIONING_METRICS = tuple(
+    f"gentle_mode_exit_{cause}" for cause in GENTLE_EXIT_CAUSES
+)
+
+CONDITIONED_OUTCOME_METRICS = (
+    "goodput_mib_per_second",
+    "goodput_second_half_mib_per_second",
+    "rtt_p50_ms",
+    "retransmission_attempts_per_gib_delivered",
+    "retransmission_repeat_attempts_per_gib_delivered",
+)
 
 
 def probe_before_feedback_percent(summary):
@@ -452,6 +835,126 @@ def probe_before_feedback_percent(summary):
     if not increases:
         return None
     return 100.0 * counters["probe_before_feedback"] / increases
+
+
+def metric_direction(metric, signed_change):
+    if metric in NEUTRAL_DIRECTION_METRICS:
+        return "changed"
+    if metric in LOWER_IS_BETTER_METRICS:
+        return "worse" if signed_change > 0 else "better"
+    return "worse" if signed_change < 0 else "better"
+
+
+def _conditioned_outcome(pairs, metric):
+    samples = []
+    for pair in pairs:
+        values = pair["metrics"][metric]
+        difference = values["difference"]
+        ranking_delta = ranking_delta_percent(
+            values["candidate"], values["baseline"]
+        )
+        if difference is None or ranking_delta is None:
+            continue
+        samples.append(
+            {
+                "baseline": values["baseline"],
+                "candidate": values["candidate"],
+                "difference": difference,
+                "delta_percent": values["delta_percent"],
+                "ranking_delta_percent": ranking_delta,
+            }
+        )
+    if not samples:
+        return None
+
+    changed = [sample for sample in samples if sample["difference"] != 0]
+    positive = sum(sample["ranking_delta_percent"] > 0 for sample in changed)
+    negative = sum(sample["ranking_delta_percent"] < 0 for sample in changed)
+    raw_deltas = [
+        sample["delta_percent"]
+        for sample in samples
+        if sample["delta_percent"] is not None
+    ]
+    ranking_delta = statistics.median(
+        sample["ranking_delta_percent"] for sample in samples
+    )
+    return {
+        "metric": metric,
+        "baseline": statistics.median(sample["baseline"] for sample in samples),
+        "candidate": statistics.median(sample["candidate"] for sample in samples),
+        "difference": statistics.median(sample["difference"] for sample in samples),
+        "delta_percent": statistics.median(raw_deltas) if raw_deltas else None,
+        "ranking_delta_percent": ranking_delta,
+        "direction": (
+            metric_direction(metric, ranking_delta)
+            if ranking_delta != 0
+            else "unchanged"
+        ),
+        "pair_count": len(samples),
+        "changed_pairs": len(changed),
+        "directional_consistency_percent": (
+            100.0 * max(positive, negative) / len(changed) if changed else 0.0
+        ),
+    }
+
+
+def behavior_conditioned_observations(pairs):
+    """Summarize outcomes where a candidate behavior counter differs."""
+    observations = []
+    for conditioning_metric in CONDITIONING_METRICS:
+        for condition, predicate in (
+            ("candidate_higher", lambda difference: difference > 0),
+            ("candidate_lower", lambda difference: difference < 0),
+        ):
+            selected = [
+                pair
+                for pair in pairs
+                if pair["metrics"][conditioning_metric]["difference"] is not None
+                and predicate(pair["metrics"][conditioning_metric]["difference"])
+            ]
+            if not selected:
+                continue
+            outcomes = [
+                outcome
+                for metric in CONDITIONED_OUTCOME_METRICS
+                if (outcome := _conditioned_outcome(selected, metric)) is not None
+            ]
+            goodput = next(
+                (
+                    outcome
+                    for outcome in outcomes
+                    if outcome["metric"] == "goodput_mib_per_second"
+                ),
+                None,
+            )
+            material_consistent_goodput = (
+                len(selected) >= 2
+                and goodput is not None
+                and abs(goodput["ranking_delta_percent"]) >= 10.0
+                and goodput["directional_consistency_percent"] == 100.0
+            )
+            observations.append(
+                {
+                    "metric": conditioning_metric,
+                    "condition": condition,
+                    "pair_count": len(selected),
+                    "total_valid_pairs": len(pairs),
+                    "support": "repeated" if len(selected) >= 2 else "isolated",
+                    "attention": (
+                        "consistent_material_goodput_shift"
+                        if material_consistent_goodput
+                        else "context_only"
+                    ),
+                    "outcomes": outcomes,
+                    "does_not_prove": (
+                        "This groups pairs after observing a behavior-counter "
+                        "difference. Selection can amplify noise and does_not_prove "
+                        "that the event produced any outcome; use it to find the "
+                        "behavior-changing pairs, then inspect their timelines."
+                    ),
+                }
+            )
+    return observations
 
 
 def pair_metrics(pair):
@@ -470,6 +973,7 @@ def pair_metrics(pair):
         out[metric] = {
             "baseline": base,
             "candidate": cand,
+            "difference": metric_difference(cand, base),
             "delta_percent": value,
         }
     baseline_pbf = probe_before_feedback_percent(baseline["summary"])
@@ -477,6 +981,7 @@ def pair_metrics(pair):
     out["congestion_bandwidth_probe_before_feedback_percent"] = {
         "baseline": baseline_pbf,
         "candidate": candidate_pbf,
+        "difference": metric_difference(candidate_pbf, baseline_pbf),
         "delta_percent": delta_percent(candidate_pbf, baseline_pbf),
     }
     return out
@@ -503,38 +1008,87 @@ def classify(valid_pairs):
 
 def guidance_hints(pairs, verdict):
     hints = []
-    changes = []
-    for index, pair in enumerate(pairs):
+    by_metric = {}
+    for pair in pairs:
         for metric, values in pair["metrics"].items():
-            delta = values["delta_percent"]
-            if delta is None:
+            difference = values["difference"]
+            if difference is None:
                 continue
-            changes.append(
+            ranking_delta = ranking_delta_percent(
+                values["candidate"], values["baseline"]
+            )
+            if ranking_delta is None:
+                continue
+            by_metric.setdefault(metric, []).append(
                 {
-                    "pair": index,
-                    "metric": metric,
                     "baseline": values["baseline"],
                     "candidate": values["candidate"],
-                    "delta_percent": delta,
+                    "difference": difference,
+                    "delta_percent": values["delta_percent"],
+                    "ranking_delta_percent": ranking_delta,
                 }
             )
-    changes.sort(key=lambda item: abs(item["delta_percent"]), reverse=True)
+    changes = []
+    for metric, samples in by_metric.items():
+        changed = [sample for sample in samples if sample["difference"] != 0]
+        if not changed:
+            continue
+        ranking_delta = statistics.median(
+            sample["ranking_delta_percent"] for sample in samples
+        )
+        # A one-pair outlier in a larger paired set remains visible in the
+        # pair table, but does not become aggregate guidance by itself.
+        if ranking_delta == 0:
+            continue
+        raw_deltas = [
+            sample["delta_percent"]
+            for sample in samples
+            if sample["delta_percent"] is not None
+        ]
+        positive = sum(sample["ranking_delta_percent"] > 0 for sample in changed)
+        negative = sum(sample["ranking_delta_percent"] < 0 for sample in changed)
+        directional_consistency = 100.0 * max(positive, negative) / len(changed)
+        changes.append(
+            {
+                "metric": metric,
+                "baseline": statistics.median(
+                    sample["baseline"] for sample in samples
+                ),
+                "candidate": statistics.median(
+                    sample["candidate"] for sample in samples
+                ),
+                "difference": statistics.median(
+                    sample["difference"] for sample in samples
+                ),
+                "delta_percent": (
+                    statistics.median(raw_deltas) if raw_deltas else None
+                ),
+                "ranking_delta_percent": ranking_delta,
+                "pair_count": len(samples),
+                "changed_pairs": len(changed),
+                "directional_consistency_percent": directional_consistency,
+                "sort_magnitude": abs(ranking_delta),
+            }
+        )
+    changes.sort(key=lambda item: item["sort_magnitude"], reverse=True)
     for change in changes[:5]:
-        if change["metric"] in ("rtt_p50_ms", "congestion_bandwidth_probe_before_feedback_percent"):
-            # Lower is better for latency and for probe discipline: applying
-            # fewer increases before feedback is the improvement.
-            direction = "worse" if change["delta_percent"] > 0 else "better"
-        else:
-            direction = "worse" if change["delta_percent"] < 0 else "better"
+        direction = metric_direction(
+            change["metric"], change["ranking_delta_percent"]
+        )
         hints.append(
             {
                 "metric": change["metric"],
                 "baseline": change["baseline"],
                 "candidate": change["candidate"],
                 "direction": direction,
+                "difference": change["difference"],
                 "delta_percent": change["delta_percent"],
+                "ranking_delta_percent": change["ranking_delta_percent"],
+                "pair_count": change["pair_count"],
+                "changed_pairs": change["changed_pairs"],
+                "directional_consistency_percent": change["directional_consistency_percent"],
                 "does_not_prove": (
-                    "This is a consistency signal from the paired traces and "
+                    "This is a median consistency signal from the paired traces "
                     "does_not_prove that any specific change produced the "
                     "difference; machine noise, scheduling, or adjacent workload "
                     "interference can move the same metric."
@@ -608,6 +1162,7 @@ def build_comparison(baseline_specs, candidate_specs):
 
     verdict = classify(valid_pairs)
     hints = guidance_hints(valid_pairs, verdict)
+    conditioned = behavior_conditioned_observations(valid_pairs)
 
     run_health = [
         {
@@ -620,7 +1175,6 @@ def build_comparison(baseline_specs, candidate_specs):
         }
         for run in runs
     ]
-
     return {
         "schema_version": COMPARISON_SCHEMA_VERSION,
         "verdict": verdict,
@@ -639,6 +1193,7 @@ def build_comparison(baseline_specs, candidate_specs):
                     metric: {
                         "baseline": values["baseline"],
                         "candidate": values["candidate"],
+                        "difference": values["difference"],
                         "delta_percent": values["delta_percent"],
                     }
                     for metric, values in pair["metrics"].items()
@@ -651,12 +1206,18 @@ def build_comparison(baseline_specs, candidate_specs):
                 "metric": change["metric"],
                 "baseline": change["baseline"],
                 "candidate": change["candidate"],
+                "difference": change["difference"],
                 "delta_percent": change["delta_percent"],
+                "ranking_delta_percent": change["ranking_delta_percent"],
+                "pair_count": change["pair_count"],
+                "changed_pairs": change["changed_pairs"],
+                "directional_consistency_percent": change["directional_consistency_percent"],
                 "does_not_prove": change["does_not_prove"],
             }
             for change in hints
             if "baseline" in change
         ],
+        "behavior_conditioned_observations": conditioned,
         "agent_guidance": hints,
     }
 
@@ -677,6 +1238,22 @@ def _fmt(value, pattern):
         except (ValueError, TypeError):
             return str(value)
     return str(value)
+
+
+def _guidance_change(hint):
+    parts = []
+    if hint["delta_percent"] is not None:
+        parts.append(f"{hint['delta_percent']:+.1f}%")
+    elif hint.get("difference") is not None:
+        parts.append(f"Δ {hint['difference']:+.3f}")
+    if hint.get("ranking_delta_percent") is not None:
+        parts.append(f"median rank {hint['ranking_delta_percent']:+.1f}%")
+    if hint.get("pair_count"):
+        parts.append(f"changed {hint['changed_pairs']}/{hint['pair_count']}")
+        parts.append(
+            f"{hint['directional_consistency_percent']:.0f}% directional consistency"
+        )
+    return f", {'; '.join(parts)}" if parts else ""
 
 
 def escape(value):
@@ -713,25 +1290,39 @@ def render_html(comparison, runs):
             f"<td>{escape(run['health']['evidence_quality'])}</td>"
             f"<td>{escape(run['manifest'].get('netem_c2s_seed', ''))} / {escape(run['manifest'].get('netem_s2c_seed', ''))}</td>"
             f"<td>{escape(_fmt(summary['goodput_mib_per_second'], '{:.3f}'))}</td>"
+            f"<td>{escape(_fmt(summary['goodput_first_half_mib_per_second'], '{:.3f}'))} / "
+            f"{escape(_fmt(summary['goodput_second_half_mib_per_second'], '{:.3f}'))}</td>"
             f"<td>{escape(_fmt(summary['rtt_p50_ms'], '{:.2f}'))}</td>"
             f"<td>{escape(_fmt(summary['low_send_rate_occupancy'], '{:.1f}'))}</td>"
             f"<td>{escape(str(summary['terminations']))}</td>"
             f"<td>{escape(str(summary['peer_terminations']))}</td>"
+            f"<td>{escape(str(summary['send_driver_wakes']))}</td>"
+            f"<td>{escape(str(summary['peer_send_driver_wakes']))}</td>"
+            f"<td>{escape(str(summary['send_driver_resume_requests']))}</td>"
+            f"<td>{escape(str(summary['peer_send_driver_resume_requests']))}</td>"
             f"<td>{escape(str(summary['final_netem_counters']))}</td>"
             f"<td>{escape(str(summary['sink_read_outcome'] or summary['probe_outcome'] or ''))}</td>"
             f"<td>{escape(str(summary['client_mux_outcome']))} / {escape(str(summary['server_mux_outcome']))}</td>"
             "</tr>"
         )
-
     pair_rows = []
     for index, pair in enumerate(comparison["pairs"]):
         cells = ""
         for metric in METRICS:
             values = pair["metrics"][metric]
+            change = (
+                _fmt(values['delta_percent'], '{:+.1f}%')
+                if values["delta_percent"] is not None
+                else (
+                    f"Δ {_fmt(values['difference'], '{:+.3f}')}"
+                    if values["difference"] is not None
+                    else "n/a"
+                )
+            )
             cells += (
                 f"<td>{escape(_fmt(values['baseline'], '{:.3f}'))}"
                 f" → {escape(_fmt(values['candidate'], '{:.3f}'))}"
-                f" ({escape(_fmt(values['delta_percent'], '{:+.1f}%'))})</td>"
+                f" ({escape(change)})</td>"
             )
         pair_rows.append(
             "<tr>"
@@ -743,20 +1334,35 @@ def render_html(comparison, runs):
             f"{cells}"
             "</tr>"
         )
-
     guidance = "".join(
         f"<li><b>{escape(hint['metric'])}</b> ({escape(hint['direction'])})"
-        f"{f', {hint['delta_percent']:+.1f}%' if hint['delta_percent'] is not None else ''}: {escape(hint['does_not_prove'])}</li>"
+        f"{escape(_guidance_change(hint))}: {escape(hint['does_not_prove'])}</li>"
         for hint in comparison["agent_guidance"]
     )
-
+    conditioned_rows = []
+    for observation in comparison["behavior_conditioned_observations"]:
+        outcomes = "<br>".join(
+            f"{escape(outcome['metric'])} ({escape(outcome['direction'])})"
+            f"{escape(_guidance_change(outcome))}"
+            for outcome in observation["outcomes"]
+        )
+        conditioned_rows.append(
+            "<tr>"
+            f"<th>{escape(observation['metric'])}</th>"
+            f"<td>{escape(observation['condition'])}</td>"
+            f"<td>{escape(observation['pair_count'])} / {escape(observation['total_valid_pairs'])}</td>"
+            f"<td>{escape(observation['support'])}</td>"
+            f"<td>{escape(observation['attention'])}</td>"
+            f"<td>{outcomes}</td>"
+            f"<td>{escape(observation['does_not_prove'])}</td>"
+            "</tr>"
+        )
     controller_rows = "".join(
         "<tr>"
         f"<th>{escape(run['label'])}</th>{controller}"
         "</tr>"
         for run in runs
     )
-
     timeline_series = []
     for run in runs:
         timeline_series.append(
@@ -779,24 +1385,35 @@ def render_html(comparison, runs):
     netem_series = []
     for run in runs:
         for direction, counters in run["summary"]["final_netem_counters"].items():
-            netem_series.append((f"{run['label']} {direction} forwarded", [(0, counters.get("forwarded", 0.0))]))
+            netem_series.append(
+                (
+                    f"{run['label']} {direction} forwarded",
+                    [(0, counters.get("forwarded", 0))],
+                )
+            )
 
     content = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Netem paired comparison</title>
 <style>
 body {{ font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem auto; max-width: 1200px; padding: 0 1rem; color: #172033; }}
-h1 {{ margin-bottom: .25rem; }} section {{ margin: 2rem 0; }} svg {{ width: 100%; height: auto; border: 1px solid #d9dfeb; border-radius: 8px; }}
-text {{ font-size: 11px; fill: #43506a; }} .plot-bg {{ fill: #fbfcff; }} .grid {{ stroke: #dfe5ef; stroke-width: 1; }}
-table {{ border-collapse: collapse; width: 100%; }} th, td {{ text-align: left; border-bottom: 1px solid #e5e7eb; padding: .4rem .55rem; vertical-align: top; }}
+h1 {{ margin-bottom: .25rem; }}
+section {{ margin: 2rem 0; }}
+svg {{ width: 100%; height: auto; border: 1px solid #d9dfeb; border-radius: 8px; }}
+text {{ font-size: 11px; fill: #43506a; }}
+.plot-bg {{ fill: #fbfcff; }}
+.grid {{ stroke: #dfe5ef; stroke-width: 1; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ text-align: left; border-bottom: 1px solid #e5e7eb; padding: .4rem .55rem; vertical-align: top; }}
 .note {{ background: #f5f7fb; border-left: 4px solid #64748b; padding: .75rem 1rem; }}
 .verdict {{ font-size: 1.15rem; font-weight: 600; }}
 </style></head><body>
 <h1>Netem paired comparison</h1>
 <p class="note">The verdict is a consistency label derived from valid paired seed identities only; it is not statistical confidence and does not prove causality. Every hint below carries a does_not_prove constraint.</p>
-<p class="verdict">verdict: {escape(comparison['verdict'])} — {comparison['valid_pairs']} valid / {comparison['total_pairs']} total pairs</p>
-<section><h2>Run health</h2><table><thead><tr><th>run</th><th>role</th><th>evidence</th><th>c2s/s2c seed</th><th>goodput MiB/s</th><th>RTT p50 ms</th><th>low rate %</th><th>terminations</th><th>peer terminations</th><th>netem counters</th><th>probe/sink</th><th>mux outcomes</th></tr></thead><tbody>{''.join(health_rows)}</tbody></table></section>
+<p class="verdict">verdict: {escape(comparison['verdict'])} - {comparison['valid_pairs']} valid / {comparison['total_pairs']} total pairs</p>
+<section><h2>Run health</h2><table><thead><tr><th>run</th><th>role</th><th>evidence</th><th>c2s/s2c seed</th><th>goodput MiB/s</th><th>first / second half MiB/s</th><th>RTT p50 ms</th><th>low rate %</th><th>terminations</th><th>peer terminations</th><th>send-driver wakes</th><th>peer send-driver wakes</th><th>resume requests</th><th>peer resume requests</th><th>netem counters</th><th>probe/sink</th><th>mux outcomes</th></tr></thead><tbody>{''.join(health_rows)}</tbody></table></section>
 <section><h2>Paired outcomes</h2><table><thead><tr><th>#</th><th>baseline</th><th>candidate</th><th>valid</th><th>excluded</th>{''.join(f'<th>{escape(metric)}</th>' for metric in METRICS)}</tr></thead><tbody>{''.join(pair_rows)}</tbody></table></section>
+<section><h2>Behavior-conditioned observations</h2><table><thead><tr><th>counter</th><th>condition</th><th>pairs</th><th>support</th><th>attention</th><th>outcomes</th><th>boundary</th></tr></thead><tbody>{''.join(conditioned_rows)}</tbody></table></section>
 <section><h2>Controller-state occupancy</h2><table><thead><tr><th>run</th><th>slow start</th><th>gentle</th><th>gentle drain</th><th>queue building</th><th>drain floor</th><th>outage recovery</th></tr></thead><tbody>{controller_rows}</tbody></table></section>
 {REPORT.svg_line_chart("Rolling application goodput (shared timeline)", "trace time (s)", "MiB/s over ~1 s", timeline_series)}
 {REPORT.svg_line_chart("Raw RTT empirical CDF", "raw RTT (ms)", "samples ≤ x (%)", cdf_series, (0.0, 100.0))}
