@@ -17,6 +17,77 @@ use crate::support::{
     try_send_observation,
 };
 
+const PAYLOAD_PATTERN_PERIOD: usize = 251;
+const PAYLOAD_VERIFY_CHUNK_BYTES: usize = 64 * 1024;
+static PAYLOAD_VERIFY_WINDOW: [u8; PAYLOAD_VERIFY_CHUNK_BYTES + PAYLOAD_PATTERN_PERIOD - 1] = {
+    let mut pattern = [0; PAYLOAD_VERIFY_CHUNK_BYTES + PAYLOAD_PATTERN_PERIOD - 1];
+    let mut i = 0;
+    while i < pattern.len() {
+        pattern[i] = (i % PAYLOAD_PATTERN_PERIOD) as u8;
+        i += 1;
+    }
+    pattern
+};
+
+/// Verifies consecutive chunks of the deterministic perf payload, advancing
+/// its stream offset only after a complete chunk matches.
+#[derive(Default)]
+struct PayloadPatternVerifier {
+    phase: usize,
+}
+
+impl PayloadPatternVerifier {
+    fn verify(&mut self, actual: &[u8]) -> bool {
+        let mut compared = 0;
+        while compared < actual.len() {
+            let chunk_len = (actual.len() - compared).min(PAYLOAD_VERIFY_CHUNK_BYTES);
+            let pattern_start =
+                (self.phase + compared % PAYLOAD_PATTERN_PERIOD) % PAYLOAD_PATTERN_PERIOD;
+            if actual[compared..compared + chunk_len]
+                != PAYLOAD_VERIFY_WINDOW[pattern_start..pattern_start + chunk_len]
+            {
+                return false;
+            }
+            compared += chunk_len;
+        }
+        self.phase = (self.phase + actual.len() % PAYLOAD_PATTERN_PERIOD) % PAYLOAD_PATTERN_PERIOD;
+        true
+    }
+}
+
+#[cfg(test)]
+mod payload_pattern_tests {
+    use super::{PAYLOAD_PATTERN_PERIOD, PayloadPatternVerifier};
+
+    fn payload(phase: usize, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((phase + i) % PAYLOAD_PATTERN_PERIOD) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn verifier_handles_boundaries_and_does_not_advance_on_corruption() {
+        let mut verifier = PayloadPatternVerifier::default();
+        assert!(verifier.verify(&[]));
+
+        for len in [1, 249, 251, 252, 64 * 1024 + 257] {
+            let expected = payload(verifier.phase, len);
+            assert!(verifier.verify(&expected));
+        }
+        
+        let phase_before_corruption = verifier.phase;
+        let mut corrupt = payload(phase_before_corruption, 64 * 1024 + 1);
+        for index in [0, corrupt.len() / 2, corrupt.len() - 1] {
+            corrupt[index] ^= 1;
+            assert!(!verifier.verify(&corrupt));
+            assert_eq!(verifier.phase, phase_before_corruption);
+            corrupt[index] ^= 1;
+        }
+
+        assert!(verifier.verify(&corrupt));
+    }
+}
+
 /// Shared core for [`spawn_mux_over_rtp_server_with_mss`] and its `_via`
 /// variant: binds the listener and hands the accept-loop future to `spawn`
 /// (either a [`TestScope`] spawn or the bounded reaper submission).
@@ -685,9 +756,9 @@ pub async fn mux_send_repeated(
     start.elapsed()
 }
 
-/// Shared core for [`spawn_mux_over_rtp_counting_sink_server`] and its `_via`
+/// Shared core for [spawn_mux_over_rtp_counting_sink_server] and its _via
 /// variant: spawns the mux-over-RTP server with a counting-sink handler via
-/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+/// spawn (either a [TestScope] spawn or the bounded reaper submission).
 async fn spawn_mux_over_rtp_counting_sink_server_core(
     spawn: impl FnOnce(TestTask),
     fec: bool,
@@ -707,7 +778,7 @@ async fn spawn_mux_over_rtp_counting_sink_server_core(
                 let progress = Arc::clone(&progress);
                 async move {
                     let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset: u64 = 0;
+                    let mut verifier = PayloadPatternVerifier::default();
                     let outcome = loop {
                         match stream_read.read(&mut buf).await {
                             Ok(0) => break SinkReadOutcome::CleanEof,
@@ -715,18 +786,9 @@ async fn spawn_mux_over_rtp_counting_sink_server_core(
                                 if progress.is_corrupt() {
                                     continue;
                                 }
-                                let mut corrupt = false;
-                                for (j, &actual) in buf[..n].iter().enumerate() {
-                                    let expected = ((offset + j as u64) % 251) as u8;
-                                    if actual != expected {
-                                        corrupt = true;
-                                        break;
-                                    }
-                                }
-                                if corrupt {
+                                if !verifier.verify(&buf[..n]) {
                                     progress.corrupt.store(true, Ordering::Relaxed);
                                 } else {
-                                    offset += n as u64;
                                     progress.delivered.fetch_add(n as u64, Ordering::Relaxed);
                                 }
                             }
@@ -809,9 +871,9 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_default_via(
     spawn_mux_over_rtp_counting_sink_server_via(tx, fec, rtp::udp::NO_FEC_MSS).await
 }
 
-/// Shared core for [`spawn_mux_latency_bulk_server`] and its `_via` variant:
-/// spawns the mux-over-RTP server with a tag-classifying handler via `spawn`
-/// (either a [`TestScope`] spawn or the bounded reaper submission).
+/// Shared core for [spawn_mux_latency_bulk_server] and its _via
+/// variant: spawns the mux-over-RTP server with a tag-classifying
+/// handler via spawn (either a [TestScope] spawn or the bounded reaper submission).
 async fn spawn_mux_latency_bulk_server_core(
     spawn: impl FnOnce(TestTask),
     fec: bool,
@@ -842,9 +904,8 @@ async fn spawn_mux_latency_bulk_server_core(
                     let _ = stream_write.shutdown();
                     return;
                 }
-
+                // Timestamped latency frame parser.
                 if tag[0] == b'L' {
-                    // Timestamped latency frame parser.
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset = 0usize;
                     while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
@@ -877,7 +938,7 @@ async fn spawn_mux_latency_bulk_server_core(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            if !try_send_observation(&tx, latency_ms, "latency sample") {
+                            if !try_send_observation(&tx, latency_ms, "Latency sample") {
                                 break;
                             }
                             buf.copy_within(frame_len..offset, 0);
@@ -888,26 +949,16 @@ async fn spawn_mux_latency_bulk_server_core(
                     // Bulk byte sink: verify the deterministic pattern and
                     // count verified bytes. The tag byte itself is excluded.
                     let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset: u64 = 0;
+                    let mut verifier = PayloadPatternVerifier::default();
                     while let Ok(n) = stream_read.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
-                        let mut ok = true;
-                        for (j, &actual) in buf[..n].iter().enumerate() {
-                            let expected = ((offset + j as u64) % 251) as u8;
-                            if actual != expected {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
-                            offset += n as u64;
+                        if verifier.verify(&buf[..n]) {
                             bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
                         }
                     }
                 }
-
                 let _ = stream_write.shutdown();
             }
         }
@@ -956,9 +1007,9 @@ pub async fn spawn_mux_latency_bulk_server_via(
     spawn_mux_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base).await
 }
 
-/// Shared core for [`spawn_mux_sized_latency_bulk_server`] and its `_via`
-/// variant: spawns the mux-over-RTP server with a tag-classifying handler via
-/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+/// Shared core for [spawn_mux_sized_latency_bulk_server] and its _via
+/// variant: spawns the mux-over-RTP server with a tag-classifying
+/// handler via spawn (either a [TestScope] spawn or the bounded reaper submission).
 async fn spawn_mux_sized_latency_bulk_server_core(
     spawn: impl FnOnce(TestTask),
     fec: bool,
@@ -990,7 +1041,7 @@ async fn spawn_mux_sized_latency_bulk_server_core(
                     let _ = stream_write.shutdown();
                     return;
                 }
-
+                // Timestamped latency frame parser.
                 if tag[0] == b'L' {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut offset = 0usize;
@@ -1024,7 +1075,7 @@ async fn spawn_mux_sized_latency_bulk_server_core(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            if !try_send_observation(&tx, latency_ms, "latency sample") {
+                            if !try_send_observation(&tx, latency_ms, "Latency sample") {
                                 break;
                             }
                             buf.copy_within(frame_len..offset, 0);
@@ -1032,27 +1083,19 @@ async fn spawn_mux_sized_latency_bulk_server_core(
                         }
                     }
                 } else {
+                    // Bulk byte sink: verify the deterministic pattern and
+                    // count verified bytes. The tag byte itself is excluded.
                     let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset: u64 = 0;
+                    let mut verifier = PayloadPatternVerifier::default();
                     while let Ok(n) = stream_read.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
-                        let mut ok = true;
-                        for (j, &actual) in buf[..n].iter().enumerate() {
-                            let expected = ((offset + j as u64) % 251) as u8;
-                            if actual != expected {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
-                            offset += n as u64;
+                        if verifier.verify(&buf[..n]) {
                             bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
                         }
                     }
                 }
-
                 let _ = stream_write.shutdown();
             }
         }
@@ -1091,9 +1134,9 @@ pub async fn spawn_mux_sized_latency_bulk_server_via(
     spawn_mux_sized_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base, mss).await
 }
 
-/// Shared core for [`spawn_mux_gaming_latency_bulk_server`] and its `_via`
+/// Shared core for [spawn_mux_gaming_latency_bulk_server] and its _via
 /// variant: spawns the mux-over-RTP server with a gaming tag-classifying
-/// handler via `spawn` (either a [`TestScope`] spawn or the bounded reaper
+/// handler via spawn (either a [TestScope] spawn or the bounded reaper
 /// submission).
 async fn spawn_mux_gaming_latency_bulk_server_core(
     spawn: impl FnOnce(TestTask),
@@ -1133,8 +1176,8 @@ async fn spawn_mux_gaming_latency_bulk_server_core(
                         let to_read = remaining.min(buf.len());
                         match stream_read.read(&mut buf[..to_read]).await {
                             Ok(0) | Err(_) => break,
-                            Ok(_n) => remaining -= _n,
-                        };
+                            Ok(n) => remaining -= n,
+                        }
                     }
                     let mut offset = 0usize;
                     while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
@@ -1164,7 +1207,7 @@ async fn spawn_mux_gaming_latency_bulk_server_core(
                             ]);
                             let now_us = base.elapsed().as_micros() as u64;
                             let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            if !try_send_observation(&tx, latency_ms, "latency sample") {
+                            if !try_send_observation(&tx, latency_ms, "Latency sample") {
                                 break;
                             }
                             buf.copy_within(frame_len..offset, 0);
@@ -1172,22 +1215,15 @@ async fn spawn_mux_gaming_latency_bulk_server_core(
                         }
                     }
                 } else {
+                    // Bulk byte sink: verify the deterministic pattern and
+                    // count verified bytes. The tag byte itself is excluded.
                     let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset: u64 = 0;
+                    let mut verifier = PayloadPatternVerifier::default();
                     while let Ok(n) = stream_read.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
-                        let mut ok = true;
-                        for (j, &actual) in buf[..n].iter().enumerate() {
-                            let expected = ((offset + j as u64) % 251) as u8;
-                            if actual != expected {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
-                            offset += n as u64;
+                        if verifier.verify(&buf[..n]) {
                             bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
                         }
                     }
@@ -1230,9 +1266,9 @@ pub async fn spawn_mux_gaming_latency_bulk_server_via(
     spawn_mux_gaming_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base).await
 }
 
-/// Shared core for [`spawn_mux_frame_delivery_latency_bulk_server`] and its
-/// `_via` variant: binds the listener and hands the accept-loop future to
-/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+/// Shared core for [spawn_mux_frame_delivery_latency_bulk_server] and its _via
+/// variant: binds the listener and hands the accept-loop future to
+/// spawn (either a [TestScope] spawn or the bounded reaper submission).
 async fn spawn_mux_frame_delivery_latency_bulk_server_core(
     spawn: impl FnOnce(TestTask),
     fec: bool,
@@ -1263,9 +1299,9 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
             })
             .await
             .unwrap();
-        // The extra-accept drainer loop keeps driving `udp_listener`'s
-        // dispatcher for the server's lifetime: `accept()` both establishes
-        // new connections and dispatches packets to existing ones. Without a
+        // The extra-accept drainer loop keeps driving 'udp_listener's
+        // dispatcher for the server's lifetime: accept() both establishes
+        // new connections and dispatches packets to existing ones. With a
         // background accept-loop, the dispatcher stops after the first
         // connection and subsequent datagrams are never forwarded to it, so
         // the reliable layer stalls. The drainer is pinned and selected
@@ -1292,21 +1328,23 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
 
         let read = accepted.read.into_async_read();
         let write = accepted.write.into_async_write();
+
         // The accepted lane's rtp session supervisor owns the session
         // drivers; poll it from the select loop below so a panicked driver
         // terminates the server instead of being silently dropped.
         let supervisor = accepted.supervisor;
         tokio::pin!(supervisor);
+
         let config = mux::MuxConfig {
-            initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
+            initiation: mux::Initiation::Server,
             frame_reassembly: true,
         };
         let mut spawner = JoinSet::new();
         let (_opener, mut accepter) =
             mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
 
-        // Per-stream sink tasks owned by this accept loop's scope. The loop
+        // Per-stream sink tasks owned by this accepter. The select
         // below polls acceptance, per-stream handler completion, and mux
         // session completion together, so a panicked handler or session
         // surfaces immediately instead of only once the accept loop ends;
@@ -1328,70 +1366,65 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
                             let bulk = Arc::clone(&bulk_delivered_for_server);
                             handlers.spawn(async move {
                                 let mut tag = [0u8; 1];
-                if reader.read_exact(&mut tag).await.is_err() {
-                    let _ = writer.shutdown();
-                    return;
-                }
-                if tag[0] != b'B' {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset = 0usize;
-                    while let Ok(n) = reader.read(&mut buf[offset..]).await {
-                        if n == 0 {
-                            break;
-                        }
-                        offset += n;
-                        loop {
-                            if offset < 4 {
-                                break;
-                            }
-                            let frame_len =
-                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                            if frame_len < 12 || offset < frame_len {
-                                break;
-                            }
-                            let payload_end = frame_len - 8;
-                            let sent_us = u64::from_le_bytes([
-                                buf[payload_end],
-                                buf[payload_end + 1],
-                                buf[payload_end + 2],
-                                buf[payload_end + 3],
-                                buf[payload_end + 4],
-                                buf[payload_end + 5],
-                                buf[payload_end + 6],
-                                buf[payload_end + 7],
-                            ]);
-                            let now_us = base.elapsed().as_micros() as u64;
-                            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            if !try_send_observation(&tx, (tag[0], latency_ms), "latency sample") {
-                                break;
-                            }
-                            buf.copy_within(frame_len..offset, 0);
-                            offset -= frame_len;
-                        }
-                    }
-                } else {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset: u64 = 0;
-                    loop {
-                        match reader.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                let mut ok = true;
-                                for (j, &actual) in buf[..n].iter().enumerate() {
-                                    let expected = ((offset + j as u64) % 251) as u8;
-                                    if actual != expected {
-                                        ok = false;
-                                        break;
+                                if reader.read_exact(&mut tag).await.is_err() {
+                                    let _ = writer.shutdown();
+                                    return;
+                                }
+                                if tag[0] != b'B' {
+                                    let mut buf = vec![0u8; 64 * 1024];
+                                    let mut offset = 0usize;
+                                    while let Ok(n) = reader.read(&mut buf[offset..]).await {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        offset += n;
+                                        loop {
+                                            if offset < 4 {
+                                                break;
+                                            }
+                                            let frame_len =
+                                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                                            if frame_len < 12 {
+                                                break;
+                                            }
+                                            if offset < frame_len {
+                                                break;
+                                            }
+                                            let payload_end = frame_len - 8;
+                                            let sent_us = u64::from_le_bytes([
+                                                buf[payload_end],
+                                                buf[payload_end + 1],
+                                                buf[payload_end + 2],
+                                                buf[payload_end + 3],
+                                                buf[payload_end + 4],
+                                                buf[payload_end + 5],
+                                                buf[payload_end + 6],
+                                                buf[payload_end + 7],
+                                            ]);
+                                            let now_us = base.elapsed().as_micros() as u64;
+                                            let latency_ms =
+                                                now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                            if !try_send_observation(&tx, (tag[0], latency_ms), "Latency sample") {
+                                                break;
+                                            }
+                                            buf.copy_within(frame_len..offset, 0);
+                                            offset -= frame_len;
+                                        }
+                                    }
+                                } else {
+                                    let mut buf = vec![0u8; 64 * 1024];
+                                    let mut verifier = PayloadPatternVerifier::default();
+                                    loop {
+                                        match reader.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                if verifier.verify(&buf[..n]) {
+                                                    bulk.fetch_add(n as u64, Ordering::Relaxed);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                if ok {
-                                    offset += n as u64;
-                                    bulk.fetch_add(n as u64, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                }
                                 let _ = writer.shutdown();
                             });
                         }
@@ -1403,7 +1436,7 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
                     joined.unwrap();
                 }
                 Some(joined) = spawner.join_next() => {
-                    // The mux session ended: unwrap (re-raising a panic) and
+                    // Session ended: unwrap (re-raising a panic) and
                     // stop accepting.
                     joined.unwrap();
                     break;
