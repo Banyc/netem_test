@@ -27,6 +27,17 @@ remain revision-identifiable even though they are deliberately not mutable JJ wo
 The historical/default scenario is hostile with MSS 8192
 (`--link-profile hostile --mss-bytes 8192`).
 
+## Lossy narrow-link safety lane
+
+Use the existing 400 KiB/s lossy narrow-link preset as a safety lane when
+retention must hold under a constrained link:
+
+```sh
+./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
+--link-profile lossy-400kib --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30
+```
+
 ## Stochastic fat-pipe recovery lane
 
 Use the existing 100 Mbit/s, 150 ms, 30 ms-jitter Gilbert-Elliott preset when

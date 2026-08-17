@@ -653,6 +653,7 @@ class PerfLoopTest(unittest.TestCase):
             ]
         )
         self.assertEqual(stochastic_shaped.link_profile, "hostile-fat-pipe")
+        narrow_shaped = parser.parse_args(["run", "--baseline", "/suite/b", "--candidate", "/suite/c", "--link-profile", "lossy-400kib"]); self.assertEqual(narrow_shaped.link_profile, "lossy-400kib")
         controller_shaped = parser.parse_args(
             [
                 "run",

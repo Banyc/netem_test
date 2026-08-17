@@ -28,6 +28,7 @@ DEFAULT_WARMUP_SECONDS = 5.0
 PERF_TEST = "probe_hostile_goodput_30s"
 LINK_PROFILES = (
     "hostile",
+    "lossy-400kib",
     "hostile-fat-pipe",
     "controller-fat-pipe",
     "clean",

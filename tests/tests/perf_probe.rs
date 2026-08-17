@@ -30,6 +30,22 @@ use tokio::io::AsyncWriteExt;
 
 mod support;
 
+/// The controller-retention lane must be pure fixed shaping: a fixed
+/// 100 Mbit/s rate and 150 ms latency with no stochastic loss or jitter.
+#[test]
+fn controller_fat_pipe_has_only_fixed_shaping() {
+    let config = support::presets::controller_fat_pipe();
+    assert_eq!(config.rate, 100 * 1000 * 1000);
+    assert_eq!(config.latency, Duration::from_millis(150));
+    assert_eq!(config.queue_limit_pkts, 16 * 1024);
+    assert_eq!(config.loss, 0, "fixed shaping must not include random loss");
+    assert_eq!(config.jitter, Duration::ZERO, "fixed shaping must not include jitter");
+    assert!(
+        matches!(config.loss_model, netem_test::LossModel::Random),
+        "fixed shaping must not include a stochastic loss model"
+    );
+}
+
 /// Connect a `mux` client whose session is intentionally torn down
 /// mid-body: each one-shot probe stops its pair (cutting the link) right
 /// after measuring, so the supervision drain must be transient rather
@@ -610,11 +626,28 @@ async fn probe_hostile_goodput_30s() {
                     seconds
                 })
                 .unwrap_or(30.0);
+            let warmup_seconds = std::env::var("NETEM_PERF_WARMUP_SECONDS")
+                .map(|value| {
+                    let seconds = value
+                        .parse::<f64>()
+                        .expect("NETEM_PERF_WARMUP_SECONDS must be a number");
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                    seconds
+                })
+                .unwrap_or(5.0);
             let link_profile = std::env::var("NETEM_PERF_LINK_PROFILE")
                 .unwrap_or_else(|_| "hostile".to_owned());
             assert!(
-                link_profile == "hostile" || link_profile == "clean" || link_profile == "direct",
-                "NETEM_PERF_LINK_PROFILE must be exactly 'hostile', 'clean', or 'direct', got {link_profile:?}"
+                matches!(
+                    link_profile.as_str(),
+                    "hostile"
+                        | "lossy-400kib"
+                        | "hostile-fat-pipe"
+                        | "controller-fat-pipe"
+                        | "clean"
+                        | "direct"
+                ),
+                "NETEM_PERF_LINK_PROFILE must be exactly 'hostile', 'lossy-400kib', 'hostile-fat-pipe', 'controller-fat-pipe', 'clean', or 'direct', got {link_profile:?}"
             );
             let direct = link_profile == "direct";
             let mss_bytes = std::env::var("NETEM_PERF_MSS_BYTES")
@@ -626,22 +659,21 @@ async fn probe_hostile_goodput_30s() {
                     mss
                 })
                 .unwrap_or(LOOPBACK_MSS);
-            let expects_impairment = link_profile == "hostile";
+            let make_link = || match link_profile.as_str() {
+                "hostile" => support::presets::hostile_real_link(),
+                "lossy-400kib" => support::presets::lossy_400kib_per_sec(),
+                "hostile-fat-pipe" => support::presets::hostile_fat_pipe(),
+                "controller-fat-pipe" => support::presets::controller_fat_pipe(),
+                "clean" | "direct" => support::presets::clean(),
+                _ => unreachable!("link profile was validated above"),
+            };
             let c2s_seed = std::env::var("NETEM_PERF_SEED")
                 .map(|value| value.parse::<u64>().expect("NETEM_PERF_SEED must be a u64"))
                 .unwrap_or(4);
             let s2c_seed = c2s_seed.wrapping_add(1);
-            let mut c2s = if expects_impairment {
-                support::presets::hostile_real_link()
-            } else {
-                support::presets::clean()
-            };
+            let mut c2s = make_link();
             c2s.seed = c2s_seed;
-            let mut s2c = if expects_impairment {
-                support::presets::hostile_real_link()
-            } else {
-                support::presets::clean()
-            };
+            let mut s2c = make_link();
             s2c.seed = s2c_seed;
             let c2s_description = format!("{c2s:?}");
             let s2c_description = format!("{s2c:?}");
@@ -686,13 +718,6 @@ async fn probe_hostile_goodput_30s() {
             // A cyclic payload never exhausts: the pump keeps writing until the
             // measurement owner signals it to stop.
             let data = cyclic_payload(1024 * 1024);
-            let start = Instant::now();
-            // Anchor the measurement boundary on the shared trace clock so
-            // netem/progress samples line up with the RTP endpoint rows.
-            trace.as_mut().map(|trace| trace.mark_measurement_start(start));
-            let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
-            netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
             let (pump_stop_tx, mut pump_stop_rx) = tokio::sync::watch::channel(false);
             let mut pump_tasks = tokio::task::JoinSet::new();
             pump_tasks.spawn(async move {
@@ -706,9 +731,13 @@ async fn probe_hostile_goodput_30s() {
                 }
             });
 
-            let window = tokio::time::sleep(Duration::from_secs_f64(window_seconds));
-            tokio::pin!(window);
+            // Unmeasured warmup: let the live transfer reach steady state
+            // before the measurement boundary is anchored on the shared trace
+            // clock. Warmup delivery is excluded from every progress and
+            // final delivered value.
             let mut pump_error = None;
+            let warmup = tokio::time::sleep(Duration::from_secs_f64(warmup_seconds));
+            tokio::pin!(warmup);
             loop {
                 tokio::select! {
                     joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
@@ -719,19 +748,44 @@ async fn probe_hostile_goodput_30s() {
                         });
                         break;
                     }
-                    _ = netem_tick.tick(), if trace.is_some() => {
-                        trace.as_mut().unwrap().record_netem(
-                            start.elapsed(),
-                            pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_c2s()),
-                            pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_s2c()),
-                            progress.delivered_bytes(),
-                        );
+                    _ = &mut warmup => break,
+                }
+            }
+            let warmup_delivered = progress.delivered_bytes();
+            let start = Instant::now();
+            // Anchor the measurement boundary on the shared trace clock so
+            // netem/progress samples line up with the RTP endpoint rows.
+            trace.as_mut().map(|trace| trace.mark_measurement_start(start));
+            let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
+            netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            if pump_error.is_none() {
+                let window = tokio::time::sleep(Duration::from_secs_f64(window_seconds));
+                tokio::pin!(window);
+                loop {
+                    tokio::select! {
+                        joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
+                            let result = joined.expect("bulk pump exists").unwrap();
+                            pump_error = Some(match result {
+                                Ok(()) => "bulk pump ended before the measurement window".to_owned(),
+                                Err(error) => format!("bulk pump failed: {error:?}: {error}"),
+                            });
+                            break;
+                        }
+                        _ = netem_tick.tick(), if trace.is_some() => {
+                            trace.as_mut().unwrap().record_netem(
+                                start.elapsed(),
+                                pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_c2s()),
+                                pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_s2c()),
+                                progress.delivered_bytes() - warmup_delivered,
+                            );
+                        }
+                        _ = &mut window => break,
                     }
-                    _ = &mut window => break,
                 }
             }
 
-            let delivered = progress.delivered_bytes();
+            let delivered = progress.delivered_bytes() - warmup_delivered;
             let elapsed = start.elapsed();
             assert!(
                 delivered > 0,
@@ -768,6 +822,16 @@ async fn probe_hostile_goodput_30s() {
                         ("link_profile", link_profile.clone()),
                         ("revision", revision),
                         ("window_seconds", window_seconds.to_string()),
+                        ("warmup_seconds", warmup_seconds.to_string()),
+                        ("warmup_delivered_bytes", warmup_delivered.to_string()),
+                        (
+                            "measurement_end_reason",
+                            if pump_error.is_none() {
+                                "timebox_elapsed".to_owned()
+                            } else {
+                                "pump_ended_early".to_owned()
+                            },
+                        ),
                         ("mss_bytes", mss_bytes.to_string()),
                         ("fec", "false".to_owned()),
                         ("rtp_handshake", "false".to_owned()),
@@ -805,10 +869,18 @@ async fn probe_hostile_goodput_30s() {
                 pair.stop();
                 let stats = combined_stats(pair);
                 eprintln!("[stats] {stats:?}");
-                if expects_impairment {
+                if matches!(
+                    link_profile.as_str(),
+                    "hostile" | "lossy-400kib" | "hostile-fat-pipe"
+                ) {
                     assert!(
                         stats.dropped > 0 && stats.delayed > 0,
-                        "hostile link should drop and delay packets, got {stats:?}"
+                        "lossy link should drop and delay packets, got {stats:?}"
+                    );
+                } else if link_profile == "controller-fat-pipe" {
+                    assert!(
+                        stats.forwarded > 0 && stats.dropped == 0 && stats.delayed > 0,
+                        "fixed-shaping link should forward and delay packets without drops, got {stats:?}"
                     );
                 } else {
                     assert!(

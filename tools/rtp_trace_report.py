@@ -19,6 +19,19 @@ COLORS = (
     "#be185d",
     "#4d7c0f",
 )
+
+CONGESTION_ACTION_LANES = {
+    "": 0.0,
+    "outage_reset": 1.0,
+    "censored_outage_sample": 2.0,
+    "slow_start_ack": 3.0,
+    "bandwidth_probe": 4.0,
+    "gentle_probe": 5.0,
+    "queue_hold": 6.0,
+    "delay_drain": 7.0,
+    "loss_backoff": 8.0,
+    "huge_loss_backoff": 9.0,
+}
 WIDTH = 960
 HEIGHT = 300
 PAD_LEFT = 72
@@ -230,17 +243,9 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
                 "accepts_new_packet": boolean(field(row, "accepts_new_packet")),
                 "loss": optional_float(row["loss_ratio"]),
                 "cc_loss": optional_float(field(row, "congestion_loss_ratio")),
-                "cc_action": {
-                    "": 0.0,
-                    "outage_reset": 1.0,
-                    "censored_outage_sample": 2.0,
-                    "slow_start_ack": 3.0,
-                    "bandwidth_probe": 4.0,
-                    "gentle_probe": 5.0,
-                    "delay_drain": 6.0,
-                    "loss_backoff": 7.0,
-                    "huge_loss_backoff": 8.0,
-                }.get(field(row, "congestion_action"), 0.0),
+                "cc_action": CONGESTION_ACTION_LANES.get(
+                    field(row, "congestion_action"), 0.0
+                ),
                 "rtx": float(row["retransmitted_packets"]),
                 "pipe": float(row["packets_in_pipe"]),
                 "send_seq": int(row["next_send_sequence"]),
@@ -286,6 +291,19 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
                 "cc_drain_target": optional_float(
                     field(row, "congestion_drain_target_packets_per_second")
                 ),
+                "cc_loss_backoff_floor": optional_float(
+                    field(row, "congestion_loss_backoff_floor_packets_per_second")
+                ),
+                "cc_loss_backoff_raw": optional_float(
+                    field(row, "congestion_loss_backoff_raw_target_packets_per_second")
+                ),
+                "cc_loss_backoff_target": optional_float(
+                    field(row, "congestion_loss_backoff_target_packets_per_second")
+                ),
+                "cc_loss_backoffs": optional_float(field(row, "congestion_loss_backoffs")),
+                "cc_loss_backoff_bindings": optional_float(
+                    field(row, "congestion_loss_backoff_floor_bindings")
+                ),
                 "cc_rate_samples": optional_float(field(row, "congestion_rate_samples")),
                 "cc_probe_decisions": optional_float(field(row, "congestion_bandwidth_probe_decisions")),
                 "cc_probe_increases": optional_float(field(row, "congestion_bandwidth_probe_increases")),
@@ -318,6 +336,9 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
         ("controller delivery peak", [(row["time"], row["cc_delivery_peak"]) for row in rtp if row["cc_delivery_peak"] is not None]),
         ("controller drain floor", [(row["time"], row["cc_drain_floor"]) for row in rtp if row["cc_drain_floor"] is not None]),
         ("controller drain target", [(row["time"], row["cc_drain_target"]) for row in rtp if row["cc_drain_target"] is not None]),
+        ("loss floor", [(row["time"], row["cc_loss_backoff_floor"]) for row in rtp if row["cc_loss_backoff_floor"] is not None]),
+        ("loss raw target", [(row["time"], row["cc_loss_backoff_raw"]) for row in rtp if row["cc_loss_backoff_raw"] is not None]),
+        ("loss target", [(row["time"], row["cc_loss_backoff_target"]) for row in rtp if row["cc_loss_backoff_target"] is not None]),
     ]
     congestion_series = [
         ("cwnd", [(row["time"], row["cwnd"]) for row in rtp]),
@@ -376,6 +397,8 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
         ("probe before feedback", [(row["time"], row["cc_probe_before_feedback"]) for row in rtp if row["cc_probe_before_feedback"] is not None]),
         ("persistent queue resets", [(row["time"], row["cc_persistent_queue_resets"]) for row in rtp if row["cc_persistent_queue_resets"] is not None]),
         ("delay drains", [(row["time"], row["cc_delay_drains"]) for row in rtp if row["cc_delay_drains"] is not None]),
+        ("loss backoffs", [(row["time"], row["cc_loss_backoffs"]) for row in rtp if row["cc_loss_backoffs"] is not None]),
+        ("loss backoff floor bindings", [(row["time"], row["cc_loss_backoff_bindings"]) for row in rtp if row["cc_loss_backoff_bindings"] is not None]),
         ("application-limited detections", [(row["time"], row["application_limited_detections"]) for row in rtp if row["application_limited_detections"] is not None]),
         ("app-limit suppressions for waiting writer", [(row["time"], row["application_limited_detections_suppressed_by_waiting_writer"]) for row in rtp if row["application_limited_detections_suppressed_by_waiting_writer"] is not None]),
     ]
@@ -458,7 +481,7 @@ th {{ width: 18rem; }}
 {svg_line_chart("Congestion state", "elapsed time (s)", "packets", congestion_series)}
 {svg_line_chart("Retransmission causes", "elapsed time (s)", "cumulative transmissions", retransmission_count_series)}
 {svg_line_chart("Controller modes", "elapsed time (s)", "active lane (0 = inactive)", mode_series, (0.0, 7.0))}
-{svg_line_chart("Congestion-control action", "elapsed time (s)", "action lane (1 reset, 2 censored, 3 slow start, 4 probe, 5 gentle, 6 drain, 7 loss, 8 huge loss)", action_series, (0.0, 8.0))}
+{svg_line_chart("Congestion-control action", "elapsed time (s)", "action lane (1 reset, 2 censored, 3 slow start, 4 probe, 5 gentle, 6 hold, 7 drain, 8 loss, 9 huge loss)", action_series, (0.0, 10.0))}
 {svg_line_chart("Peer liveness waits", "elapsed time (s)", "seconds", liveness_series)}
 {svg_line_chart("RTP send staging", "elapsed time (s)", "bytes", send_stage_series)}
 {svg_line_chart("Estimated packet loss", "elapsed time (s)", "loss (%)", loss_series)}

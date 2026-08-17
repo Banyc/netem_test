@@ -3,6 +3,7 @@
 import csv
 import importlib.util
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,66 @@ SPEC.loader.exec_module(REPORT)
 
 
 class TraceReportTest(unittest.TestCase):
+    def test_queue_hold_has_a_distinct_lane_before_delay_drain(self):
+        # queue_hold must occupy lane 6 and delay_drain lane 7 so a hold is
+        # visually distinct from (and plotted before) the drain that follows.
+        self.assertEqual(REPORT.CONGESTION_ACTION_LANES["queue_hold"], 6.0)
+        self.assertEqual(REPORT.CONGESTION_ACTION_LANES["delay_drain"], 7.0)
+        safe_tmp = os.environ["TMPDIR"]
+        with tempfile.TemporaryDirectory(dir=safe_tmp) as directory:
+            trace_dir = Path(directory)
+            self.write_csv(
+                trace_dir / "manifest.csv",
+                [["key", "value"], ["scenario", "lane-fixture"]],
+            )
+            self.write_csv(
+                trace_dir / "rtp.csv",
+                [
+                    "elapsed_us", "raw_rtt_us", "minimum_rtt_us", "smoothed_rtt_us",
+                    "send_rate_packets_per_second", "retransmission_timeout_us",
+                    "congestion_window_packets", "retransmitted_packets",
+                    "packets_in_pipe", "next_send_sequence",
+                    "next_receive_sequence", "loss_ratio", "congestion_action",
+                ],
+                [0, 100000, 100000, 100000, 128, 500000, 10, 0, 2, 3, 2, 0.0, "queue_hold"],
+                [100000, 200000, 100000, 200000, 300, 600000, 31, 4, 20, 4, 2, 0.2, "delay_drain"],
+            )
+            self.write_csv(
+                trace_dir / "netem.csv",
+                ["elapsed_us", "direction", "delayed", "dropped", "duplicated", "reordered", "rate_limited", "forwarded", "received", "overflow_dropped", "queue_len"],
+                [0, "c2s", 1, 0, 0, 0, 1, 1, 1, 0, 2],
+            )
+            self.write_csv(
+                trace_dir / "progress.csv",
+                ["elapsed_us", "delivered_bytes"],
+                [0, 0],
+            )
+            output = trace_dir / "report.html"
+            REPORT.render_report(trace_dir, output)
+            document = output.read_text(encoding="utf-8")
+            section = document.split(
+                "<h2>Congestion-control action</h2>", 1
+            )[1].split("</section>", 1)[0]
+            polyline = re.search(r'<polyline points="([^"]+)"', section)
+            self.assertIsNotNone(polyline)
+            points = [
+                tuple(float(value) for value in pair.split(","))
+                for pair in polyline.group(1).split()
+            ]
+            self.assertEqual(len(points), 2)
+            # The first row (queue_hold) renders before the second
+            # (delay_drain); the two lanes map to distinct y positions with
+            # lane 6 plotted before lane 7 on the shared action axis.
+            first_lane = 10.0 - (
+                points[0][1] - REPORT.PAD_TOP
+            ) / (REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM) * 10.0
+            second_lane = 10.0 - (
+                points[1][1] - REPORT.PAD_TOP
+            ) / (REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM) * 10.0
+            self.assertAlmostEqual(first_lane, 6.0)
+            self.assertAlmostEqual(second_lane, 7.0)
+            self.assertLess(points[0][0], points[1][0])
+
     def test_render_reads_trace_and_emits_all_figures(self):
         safe_tmp = os.environ["TMPDIR"]
         with tempfile.TemporaryDirectory(dir=safe_tmp) as directory:

@@ -71,6 +71,19 @@ pub fn hostile_fat_pipe() -> NetemConfig {
     }
 }
 
+/// The fixed-shaping controller-retention lane: the same bandwidth-delay
+/// product and queue limit as [`hostile_fat_pipe`] but with no stochastic
+/// loss or jitter, so congestion-controller and queue-growth changes are
+/// measured against a deterministic link.
+pub fn controller_fat_pipe() -> NetemConfig {
+    NetemConfig {
+        rate: 100 * 1000 * 1000,
+        latency: Duration::from_millis(150),
+        queue_limit_pkts: 16 * 1024,
+        ..NetemConfig::default()
+    }
+}
+
 /// Two-state Gilbert-Elliott loss model on top of the four-state `sch_netem`
 /// representation.
 ///

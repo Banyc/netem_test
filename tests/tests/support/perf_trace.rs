@@ -6,19 +6,138 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netem_test::CountersSnapshot;
-use rtp::metrics::{MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver};
+use rtp::metrics::{
+    MetricsEvent, MetricsGentleExitCause, MetricsInterest, MetricsObservation, MetricsObserver,
+    MetricsRetransmissionCounters, MetricsSendDriverResumeSource, MetricsSendDriverWake,
+    MetricsSnapshot,
+};
 
-/// Trace schema 15: RTP rows carry the complete congestion-controller and
-/// retransmission-scheduler snapshot (55 columns) plus `trace_elapsed_us` so
+/// Trace schema 26: RTP rows carry the complete congestion-controller and
+/// retransmission-scheduler snapshot (73 columns) plus `trace_elapsed_us` so
 /// endpoint, netem, and progress samples share one clock
 /// (`PerfTrace::trace_start`). Event-only rows leave every snapshot column
 /// empty; the retransmission-active/ready, RTO timing, and controller
 /// decision evidence is present only on snapshot rows.
-const TRACE_SCHEMA_VERSION: u16 = 15;
+const TRACE_SCHEMA_VERSION: u16 = 26;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
-const RTP_TRACE_COLUMNS: usize = 55;
-const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
+const RTP_TRACE_COLUMNS: usize = 73;
+const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
+
+/// Exact per-cause gentle-mode exit counters. Rare transitions are aggregated
+/// atomically and never consume bounded state-row capacity.
+#[derive(Debug, Default)]
+struct GentleExitCounters {
+    loss: AtomicU64,
+    gate_open: AtomicU64,
+    drain_guard: AtomicU64,
+    outage_reset: AtomicU64,
+}
+
+impl GentleExitCounters {
+    fn counter(&self, cause: MetricsGentleExitCause) -> &AtomicU64 {
+        match cause {
+            MetricsGentleExitCause::Loss => &self.loss,
+            MetricsGentleExitCause::GateOpen => &self.gate_open,
+            MetricsGentleExitCause::DrainGuard => &self.drain_guard,
+            MetricsGentleExitCause::OutageReset => &self.outage_reset,
+        }
+    }
+
+    fn increment(&self, cause: MetricsGentleExitCause) {
+        self.counter(cause).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        for cause in MetricsGentleExitCause::ALL {
+            self.counter(cause).store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self, cause: MetricsGentleExitCause) -> u64 {
+        self.counter(cause).load(Ordering::Relaxed)
+    }
+}
+
+/// Connection-lifetime cumulative counters rebased at the measurement
+/// boundary so warmup delivery is excluded from the retained evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CumulativeCounters {
+    retransmission: MetricsRetransmissionCounters,
+    rto_deadline_postponements: u64,
+    application_limited_detections: u64,
+    application_limited_suppressions: u64,
+    congestion_rate_samples: u64,
+    congestion_probe_decisions: u64,
+    congestion_probe_increases: u64,
+    congestion_probe_before_feedback: u64,
+    congestion_persistent_queue_resets: u64,
+    congestion_delay_drains: u64,
+    congestion_loss_backoffs: u64,
+    congestion_loss_backoff_floor_bindings: u64,
+}
+
+impl CumulativeCounters {
+    fn from_snapshot(snapshot: MetricsSnapshot) -> Self {
+        Self {
+            retransmission: snapshot.retransmission_counters,
+            rto_deadline_postponements: snapshot.rto_deadline_postponements,
+            application_limited_detections: snapshot.application_limited_detections,
+            application_limited_suppressions: snapshot.application_limited_detections_suppressed_by_waiting_writer,
+            congestion_rate_samples: snapshot.congestion_rate_samples,
+            congestion_probe_decisions: snapshot.congestion_bandwidth_probe_decisions,
+            congestion_probe_increases: snapshot.congestion_bandwidth_probe_increases,
+            congestion_probe_before_feedback: snapshot.congestion_bandwidth_probe_before_feedback,
+            congestion_persistent_queue_resets: snapshot.congestion_persistent_queue_resets,
+            congestion_delay_drains: snapshot.congestion_delay_drains,
+            congestion_loss_backoffs: snapshot.congestion_loss_backoffs,
+            congestion_loss_backoff_floor_bindings: snapshot.congestion_loss_backoff_floor_bindings,
+        }
+    }
+
+    fn apply_to(self, snapshot: &mut MetricsSnapshot) {
+        snapshot.retransmission_counters = self.retransmission;
+        snapshot.rto_deadline_postponements = self.rto_deadline_postponements;
+        snapshot.application_limited_detections = self.application_limited_detections;
+        snapshot.application_limited_detections_suppressed_by_waiting_writer =
+            self.application_limited_suppressions;
+        snapshot.congestion_rate_samples = self.congestion_rate_samples;
+        snapshot.congestion_bandwidth_probe_decisions = self.congestion_probe_decisions;
+        snapshot.congestion_bandwidth_probe_increases = self.congestion_probe_increases;
+        snapshot.congestion_bandwidth_probe_before_feedback = self.congestion_probe_before_feedback;
+        snapshot.congestion_persistent_queue_resets = self.congestion_persistent_queue_resets;
+        snapshot.congestion_delay_drains = self.congestion_delay_drains;
+        snapshot.congestion_loss_backoffs = self.congestion_loss_backoffs;
+        snapshot.congestion_loss_backoff_floor_bindings = self.congestion_loss_backoff_floor_bindings;
+    }
+
+    fn since(self, baseline: Self) -> Self {
+        let since = |current: u64, previous: u64| current.saturating_sub(previous);
+        Self {
+            retransmission: MetricsRetransmissionCounters {
+                attempts: since(self.retransmission.attempts, baseline.retransmission.attempts),
+                first_attempts: since(self.retransmission.first_attempts, baseline.retransmission.first_attempts),
+                repeat_attempts: since(self.retransmission.repeat_attempts, baseline.retransmission.repeat_attempts),
+                rto_reason: since(self.retransmission.rto_reason, baseline.retransmission.rto_reason),
+                reorder_reason: since(self.retransmission.reorder_reason, baseline.retransmission.reorder_reason),
+                fast_loss_reason: since(self.retransmission.fast_loss_reason, baseline.retransmission.fast_loss_reason),
+                pre_outage_reason: since(self.retransmission.pre_outage_reason, baseline.retransmission.pre_outage_reason),
+                tail_probes: since(self.retransmission.tail_probes, baseline.retransmission.tail_probes),
+            },
+            rto_deadline_postponements: since(self.rto_deadline_postponements, baseline.rto_deadline_postponements),
+            application_limited_detections: since(self.application_limited_detections, baseline.application_limited_detections),
+            application_limited_suppressions: since(self.application_limited_suppressions, baseline.application_limited_suppressions),
+            congestion_rate_samples: since(self.congestion_rate_samples, baseline.congestion_rate_samples),
+            congestion_probe_decisions: since(self.congestion_probe_decisions, baseline.congestion_probe_decisions),
+            congestion_probe_increases: since(self.congestion_probe_increases, baseline.congestion_probe_increases),
+            congestion_probe_before_feedback: since(self.congestion_probe_before_feedback, baseline.congestion_probe_before_feedback),
+            congestion_persistent_queue_resets: since(self.congestion_persistent_queue_resets, baseline.congestion_persistent_queue_resets),
+            congestion_delay_drains: since(self.congestion_delay_drains, baseline.congestion_delay_drains),
+            congestion_loss_backoffs: since(self.congestion_loss_backoffs, baseline.congestion_loss_backoffs),
+            congestion_loss_backoff_floor_bindings: since(self.congestion_loss_backoff_floor_bindings, baseline.congestion_loss_backoff_floor_bindings),
+        }
+    }
+}
 
 /// One captured RTP observation plus its position on the shared trace clock.
 #[derive(Debug, Clone, Copy)]
@@ -41,13 +160,31 @@ struct NetemObservation {
 /// A bounded, sealable capture of RTP observations for one endpoint. State
 /// samples are throttled to [`STATE_SAMPLE_INTERVAL`] while every raw RTT
 /// sample and termination row is retained; callbacks are synchronous and the
-/// storage is bounded at `capacity`.
+/// storage is bounded at `capacity`. Rare scheduler/recovery events are
+/// aggregate atomics and never consume bounded state-row capacity.
 #[derive(Debug)]
 struct RtpCapture {
     trace_start: Instant,
     observations: Mutex<Vec<CapturedRtpObservation>>,
+    counter_baseline: Mutex<Option<CumulativeCounters>>,
+    measurement_start_micros: AtomicU64,
     last_state_sample_micros: AtomicU64,
     dropped_capacity: AtomicU64,
+    send_driver_resume_signal_wakes: AtomicU64,
+    send_driver_ack_schedule_signal_wakes: AtomicU64,
+    send_driver_pacing_timer_wakes: AtomicU64,
+    send_driver_protocol_timer_wakes: AtomicU64,
+    send_driver_kill_requested_wakes: AtomicU64,
+    send_driver_resume_application_data_requests: AtomicU64,
+    send_driver_resume_application_frame_requests: AtomicU64,
+    send_driver_resume_application_finish_requests: AtomicU64,
+    send_driver_resume_peer_ack_requests: AtomicU64,
+    send_driver_resume_ack_flush_requests: AtomicU64,
+    send_driver_resume_post_open_handshake_requests: AtomicU64,
+    send_driver_resume_receive_opportunity_requests: AtomicU64,
+    retransmission_armor_duplicates: AtomicU64,
+    data_send_would_blocks: AtomicU64,
+    gentle_exits: GentleExitCounters,
     sealed: AtomicBool,
     capacity: usize,
 }
@@ -57,8 +194,25 @@ impl RtpCapture {
         Self {
             trace_start,
             observations: Mutex::new(Vec::with_capacity(capacity)),
+            counter_baseline: Mutex::new(None),
+            measurement_start_micros: AtomicU64::new(0),
             last_state_sample_micros: AtomicU64::new(u64::MAX),
             dropped_capacity: AtomicU64::new(0),
+            send_driver_resume_signal_wakes: AtomicU64::new(0),
+            send_driver_ack_schedule_signal_wakes: AtomicU64::new(0),
+            send_driver_pacing_timer_wakes: AtomicU64::new(0),
+            send_driver_protocol_timer_wakes: AtomicU64::new(0),
+            send_driver_kill_requested_wakes: AtomicU64::new(0),
+            send_driver_resume_application_data_requests: AtomicU64::new(0),
+            send_driver_resume_application_frame_requests: AtomicU64::new(0),
+            send_driver_resume_application_finish_requests: AtomicU64::new(0),
+            send_driver_resume_peer_ack_requests: AtomicU64::new(0),
+            send_driver_resume_ack_flush_requests: AtomicU64::new(0),
+            send_driver_resume_post_open_handshake_requests: AtomicU64::new(0),
+            send_driver_resume_receive_opportunity_requests: AtomicU64::new(0),
+            retransmission_armor_duplicates: AtomicU64::new(0),
+            data_send_would_blocks: AtomicU64::new(0),
+            gentle_exits: GentleExitCounters::default(),
             sealed: AtomicBool::new(false),
             capacity,
         }
@@ -76,6 +230,10 @@ impl RtpCapture {
         if self.sealed.load(Ordering::Acquire) {
             return;
         }
+        let measurement_start = self.measurement_start_micros.load(Ordering::Acquire);
+        if measurement_start != 0 && captured.trace_elapsed.as_micros() < measurement_start.into() {
+            return;
+        }
         if observations.len() >= self.capacity {
             self.dropped_capacity.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -88,6 +246,47 @@ impl RtpCapture {
     fn seal(&self) {
         self.sealed.store(true, Ordering::Release);
         drop(self.observations.lock().unwrap());
+    }
+
+    /// Anchor the measurement boundary and rebase connection-lifetime
+    /// counters. Warmup rows are discarded, capacity state is reset, and one
+    /// pre-boundary baseline snapshot is captured for later `since`
+    /// subtraction while serializing sealed observations.
+    fn begin_measurement(&self, trace_elapsed: Duration) {
+        let boundary = u64::try_from(trace_elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.measurement_start_micros.store(boundary, Ordering::Release);
+        let mut observations = self.observations.lock().unwrap();
+        let counter_baseline = observations
+            .iter()
+            .filter(|captured| captured.trace_elapsed < trace_elapsed)
+            .filter_map(|captured| {
+                captured
+                    .observation
+                    .snapshot
+                    .map(|snapshot| (captured.observation.event_index, snapshot))
+            })
+            .max_by_key(|(event_index, _)| *event_index)
+            .map(|(_, snapshot)| CumulativeCounters::from_snapshot(snapshot));
+        *self.counter_baseline.lock().unwrap() = counter_baseline;
+        observations.retain(|captured| captured.trace_elapsed >= trace_elapsed);
+        drop(observations);
+        self.last_state_sample_micros.store(u64::MAX, Ordering::Relaxed);
+        self.dropped_capacity.store(0, Ordering::Relaxed);
+        self.send_driver_resume_signal_wakes.store(0, Ordering::Relaxed);
+        self.send_driver_ack_schedule_signal_wakes.store(0, Ordering::Relaxed);
+        self.send_driver_pacing_timer_wakes.store(0, Ordering::Relaxed);
+        self.send_driver_protocol_timer_wakes.store(0, Ordering::Relaxed);
+        self.send_driver_kill_requested_wakes.store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_data_requests.store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_frame_requests.store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_finish_requests.store(0, Ordering::Relaxed);
+        self.send_driver_resume_peer_ack_requests.store(0, Ordering::Relaxed);
+        self.send_driver_resume_ack_flush_requests.store(0, Ordering::Relaxed);
+        self.send_driver_resume_post_open_handshake_requests.store(0, Ordering::Relaxed);
+        self.send_driver_resume_receive_opportunity_requests.store(0, Ordering::Relaxed);
+        self.retransmission_armor_duplicates.store(0, Ordering::Relaxed);
+        self.data_send_would_blocks.store(0, Ordering::Relaxed);
+        self.gentle_exits.reset();
     }
 
     fn claim_state_sample_at(&self, elapsed: Duration) -> bool {
@@ -111,6 +310,58 @@ impl RtpCapture {
     }
 
     fn interest(&self, event: MetricsEvent, elapsed: Duration) -> MetricsInterest {
+        if self.sealed.load(Ordering::Acquire) {
+            return MetricsInterest::Skip;
+        }
+        match event {
+            MetricsEvent::SendDriverWake(wake) => {
+                let counter = match wake {
+                    MetricsSendDriverWake::ResumeSignal => &self.send_driver_resume_signal_wakes,
+                    MetricsSendDriverWake::AckScheduleSignal => &self.send_driver_ack_schedule_signal_wakes,
+                    MetricsSendDriverWake::PacingTimer => &self.send_driver_pacing_timer_wakes,
+                    MetricsSendDriverWake::ProtocolTimer => &self.send_driver_protocol_timer_wakes,
+                    MetricsSendDriverWake::KillRequested => &self.send_driver_kill_requested_wakes,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::SendDriverResumeRequest(source) => {
+                let counter = match source {
+                    MetricsSendDriverResumeSource::ApplicationData => {
+                        &self.send_driver_resume_application_data_requests
+                    }
+                    MetricsSendDriverResumeSource::ApplicationFrame => {
+                        &self.send_driver_resume_application_frame_requests
+                    }
+                    MetricsSendDriverResumeSource::ApplicationFinish => {
+                        &self.send_driver_resume_application_finish_requests
+                    }
+                    MetricsSendDriverResumeSource::PeerAck => &self.send_driver_resume_peer_ack_requests,
+                    MetricsSendDriverResumeSource::AckFlush => &self.send_driver_resume_ack_flush_requests,
+                    MetricsSendDriverResumeSource::PostOpenHandshake => {
+                        &self.send_driver_resume_post_open_handshake_requests
+                    }
+                    MetricsSendDriverResumeSource::ReceiveOpportunity => {
+                        &self.send_driver_resume_receive_opportunity_requests
+                    }
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::GentleModeExit(cause) => {
+                self.gentle_exits.increment(cause);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::RetransmissionArmorDuplicate => {
+                self.retransmission_armor_duplicates.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::DataSendWouldBlock => {
+                self.data_send_would_blocks.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            _ => {}
+        }
         if matches!(event, MetricsEvent::SessionTermination(_))
             || self.claim_state_sample_at(elapsed)
         {
@@ -168,10 +419,14 @@ impl PerfTrace {
 
     /// Anchor the measurement boundary on the shared trace clock. Netem and
     /// progress samples recorded after this call carry
-    /// `measurement_start_trace_elapsed + scenario_elapsed`.
+    /// `measurement_start_trace_elapsed + scenario_elapsed`; RTP captures
+    /// discard warmup rows and rebase their cumulative counters from the
+    /// last pre-boundary snapshot.
     pub(crate) fn mark_measurement_start(&mut self, start: Instant) {
-        self.measurement_start_trace_elapsed =
-            Some(start.saturating_duration_since(self.trace_start));
+        let trace_elapsed = start.saturating_duration_since(self.trace_start);
+        self.measurement_start_trace_elapsed = Some(trace_elapsed);
+        self.rtp.begin_measurement(trace_elapsed);
+        self.rtp_peer.begin_measurement(trace_elapsed);
     }
 
     pub(crate) fn rtp_observer(&self) -> Option<MetricsObserver> {
@@ -282,13 +537,21 @@ impl PerfTrace {
     fn write_rtp(&self, capture: &RtpCapture, filename: &str) -> io::Result<()> {
         let mut observations = capture.observations.lock().unwrap().clone();
         observations.sort_unstable_by_key(|captured| captured.observation.event_index);
+        let counter_baseline = *capture.counter_baseline.lock().unwrap();
         let mut out = csv_writer(self.output_dir.join(filename))?;
         writeln!(out, "{RTP_TRACE_HEADER}")?;
         for captured in observations {
+            let mut observation = captured.observation;
+            if let (Some(baseline), Some(mut snapshot)) = (counter_baseline, observation.snapshot) {
+                CumulativeCounters::from_snapshot(snapshot)
+                    .since(baseline)
+                    .apply_to(&mut snapshot);
+                observation.snapshot = Some(snapshot);
+            }
             writeln!(
                 out,
                 "{}",
-                rtp_fields(captured.observation, captured.trace_elapsed).join(",")
+                rtp_fields(observation, captured.trace_elapsed).join(",")
             )?;
         }
         Ok(())
@@ -353,7 +616,73 @@ fn write_capture_health(
             &format!("{prefix}_dropped_capacity"),
             &capture.dropped_capacity.load(Ordering::Relaxed).to_string(),
         ],
-    )
+    )?;
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_counter_baseline_present"),
+            &capture.counter_baseline.lock().unwrap().is_some().to_string(),
+        ],
+    )?;
+    for cause in MetricsGentleExitCause::ALL {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_gentle_mode_exit_{}", cause.as_str()),
+                &capture.gentle_exits.load(cause).to_string(),
+            ],
+        )?;
+    }
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_retransmission_armor_duplicates"),
+            &capture
+                .retransmission_armor_duplicates
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ],
+    )?;
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_data_send_would_blocks"),
+            &capture.data_send_would_blocks.load(Ordering::Relaxed).to_string(),
+        ],
+    )?;
+    for (wake, count) in [
+        ("resume_signal", capture.send_driver_resume_signal_wakes.load(Ordering::Relaxed)),
+        ("ack_schedule_signal", capture.send_driver_ack_schedule_signal_wakes.load(Ordering::Relaxed)),
+        ("pacing_timer", capture.send_driver_pacing_timer_wakes.load(Ordering::Relaxed)),
+        ("protocol_timer", capture.send_driver_protocol_timer_wakes.load(Ordering::Relaxed)),
+        ("kill_requested", capture.send_driver_kill_requested_wakes.load(Ordering::Relaxed)),
+    ] {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_send_driver_{wake}_wakes"),
+                &count.to_string(),
+            ],
+        )?;
+    }
+    for (source, count) in [
+        ("application_data", capture.send_driver_resume_application_data_requests.load(Ordering::Relaxed)),
+        ("application_frame", capture.send_driver_resume_application_frame_requests.load(Ordering::Relaxed)),
+        ("application_finish", capture.send_driver_resume_application_finish_requests.load(Ordering::Relaxed)),
+        ("peer_ack", capture.send_driver_resume_peer_ack_requests.load(Ordering::Relaxed)),
+        ("ack_flush", capture.send_driver_resume_ack_flush_requests.load(Ordering::Relaxed)),
+        ("post_open_handshake", capture.send_driver_resume_post_open_handshake_requests.load(Ordering::Relaxed)),
+        ("receive_opportunity", capture.send_driver_resume_receive_opportunity_requests.load(Ordering::Relaxed)),
+    ] {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_send_driver_resume_{source}_requests"),
+                &count.to_string(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn csv_writer(path: impl AsRef<Path>) -> io::Result<BufWriter<File>> {
@@ -392,6 +721,14 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
             snapshot.retransmission_active_packets.to_string(),
             snapshot.retransmission_ready_packets.to_string(),
             snapshot.retransmitted_packets.to_string(),
+            snapshot.retransmission_counters.attempts.to_string(),
+            snapshot.retransmission_counters.first_attempts.to_string(),
+            snapshot.retransmission_counters.repeat_attempts.to_string(),
+            snapshot.retransmission_counters.rto_reason.to_string(),
+            snapshot.retransmission_counters.reorder_reason.to_string(),
+            snapshot.retransmission_counters.fast_loss_reason.to_string(),
+            snapshot.retransmission_counters.pre_outage_reason.to_string(),
+            snapshot.retransmission_counters.tail_probes.to_string(),
             snapshot.next_send_sequence.to_string(),
             optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
             snapshot.smoothed_rtt.as_micros().to_string(),
@@ -412,6 +749,11 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
             optional_u64(snapshot.next_receive_sequence),
             optional_f64(snapshot.delivery_rate_packets_per_second),
             optional_bool(snapshot.delivery_sample_app_limited),
+            snapshot.application_write_waiters.to_string(),
+            snapshot.application_limited_detections.to_string(),
+            snapshot
+                .application_limited_detections_suppressed_by_waiting_writer
+                .to_string(),
             optional_u128(
                 snapshot
                     .congestion_control_rtt
@@ -423,9 +765,20 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
                     .congestion_queue_tolerance
                     .map(|value| value.as_micros()),
             ),
+            optional_u128(
+                snapshot
+                    .congestion_persistent_queue_for
+                    .map(|value| value.as_micros()),
+            ),
+            snapshot.congestion_persistent_queue_resets.to_string(),
             optional_f64(snapshot.congestion_delivery_peak_packets_per_second),
             optional_f64(snapshot.congestion_drain_floor_packets_per_second),
             optional_f64(snapshot.congestion_drain_target_packets_per_second),
+            optional_f64(snapshot.congestion_loss_backoff_floor_packets_per_second),
+            optional_f64(snapshot.congestion_loss_backoff_raw_target_packets_per_second),
+            optional_f64(snapshot.congestion_loss_backoff_target_packets_per_second),
+            snapshot.congestion_loss_backoffs.to_string(),
+            snapshot.congestion_loss_backoff_floor_bindings.to_string(),
             snapshot.congestion_rate_samples.to_string(),
             snapshot.congestion_bandwidth_probe_decisions.to_string(),
             snapshot.congestion_bandwidth_probe_increases.to_string(),
@@ -525,7 +878,8 @@ fn optional_bool(value: Option<bool>) -> String {
 mod tests {
     use super::*;
     use rtp::metrics::{
-        MetricsSnapshot, MetricsTermination, MetricsTerminationCause, SCHEMA_VERSION,
+        MetricsSendDriverResumeSource, MetricsSendDriverWake, MetricsSnapshot, MetricsTermination,
+        MetricsTerminationCause, SCHEMA_VERSION,
     };
 
     fn observation(event_index: u64, elapsed_ms: u64, event: MetricsEvent) -> MetricsObservation {
@@ -558,12 +912,23 @@ mod tests {
                 next_receive_sequence: None,
                 delivery_rate_packets_per_second: None,
                 delivery_sample_app_limited: None,
+                retransmission_counters: MetricsRetransmissionCounters::default(),
+                application_write_waiters: 0,
+                application_limited_detections: 0,
+                application_limited_detections_suppressed_by_waiting_writer: 0,
                 congestion_control_rtt: None,
                 congestion_rtt_floor: None,
                 congestion_queue_tolerance: None,
+                congestion_persistent_queue_for: None,
+                congestion_persistent_queue_resets: 0,
                 congestion_delivery_peak_packets_per_second: None,
                 congestion_drain_floor_packets_per_second: None,
                 congestion_drain_target_packets_per_second: None,
+                congestion_loss_backoff_floor_packets_per_second: None,
+                congestion_loss_backoff_raw_target_packets_per_second: None,
+                congestion_loss_backoff_target_packets_per_second: None,
+                congestion_loss_backoffs: 0,
+                congestion_loss_backoff_floor_bindings: 0,
                 congestion_rate_samples: 0,
                 congestion_bandwidth_probe_decisions: 0,
                 congestion_bandwidth_probe_increases: 0,
@@ -647,14 +1012,14 @@ mod tests {
 
     #[test]
     fn event_only_and_snapshot_rows_match_the_schema_width() {
-        assert_eq!(RTP_TRACE_HEADER.split(',').count(), 55);
+        assert_eq!(RTP_TRACE_HEADER.split(',').count(), 73);
         let snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
         let mut event_only = observation(1, 1, MetricsEvent::RttSample);
         event_only.snapshot = None;
         let trace_elapsed = Duration::from_micros(123);
-        assert_eq!(rtp_fields(snapshot, trace_elapsed).len(), 55);
+        assert_eq!(rtp_fields(snapshot, trace_elapsed).len(), 73);
         let event_only_fields = rtp_fields(event_only, trace_elapsed);
-        assert_eq!(event_only_fields.len(), 55);
+        assert_eq!(event_only_fields.len(), 73);
         assert_eq!(event_only_fields[7], "20000");
         assert!(
             event_only_fields[8..RTP_TRACE_COLUMNS - 1]
@@ -685,5 +1050,217 @@ mod tests {
         let trace = PerfTrace::new(PathBuf::from("unused"), false);
         assert!(trace.rtp_observer().is_none());
         assert!(trace.rtp_peer_observer().is_none());
+    }
+
+    #[test]
+    fn measurement_boundary_discards_warmup_rows_and_resets_capacity_state() {
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 2);
+        for index in 0..3 {
+            capture.record(observation(index, index, MetricsEvent::SendDataPacketAttempt));
+        }
+        // The third row overflows the bounded capacity while still warmup.
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 1);
+        std::thread::sleep(Duration::from_millis(2));
+        let boundary = trace_start.elapsed();
+        capture.begin_measurement(boundary);
+        // Warmup rows are discarded and the capacity state is reset.
+        assert_eq!(capture.observations.lock().unwrap().len(), 0);
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 0);
+        capture.record(observation(3, 3, MetricsEvent::SendDataPacketAttempt));
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].observation.event_index, 3);
+    }
+
+    #[test]
+    fn cumulative_counters_start_at_the_measurement_boundary() {
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 8);
+        let mut warmup = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
+        warmup.snapshot.as_mut().unwrap().rto_deadline_postponements = 10;
+        capture.record(warmup);
+        std::thread::sleep(Duration::from_millis(2));
+        let mut boundary_snapshot = observation(1, 1, MetricsEvent::ReceiveAckPacket);
+        boundary_snapshot.snapshot.as_mut().unwrap().rto_deadline_postponements = 17;
+        capture.record(boundary_snapshot);
+        std::thread::sleep(Duration::from_millis(2));
+        let boundary = trace_start.elapsed();
+        capture.begin_measurement(boundary);
+        // The baseline is the last pre-boundary snapshot.
+        let baseline = capture.counter_baseline.lock().unwrap().unwrap();
+        assert_eq!(baseline.rto_deadline_postponements, 17);
+        let mut after = observation(2, 2, MetricsEvent::SendDataPacketAttempt);
+        after.snapshot.as_mut().unwrap().rto_deadline_postponements = 23;
+        capture.record(after);
+        let retained = capture.observations.lock().unwrap();
+        assert_eq!(retained.len(), 1);
+        let snapshot = retained[0].observation.snapshot.unwrap();
+        drop(retained);
+        let rebased = CumulativeCounters::from_snapshot(snapshot).since(baseline);
+        assert_eq!(rebased.rto_deadline_postponements, 6);
+    }
+
+    #[test]
+    fn send_driver_wakes_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        for wake in [
+            MetricsSendDriverWake::ResumeSignal,
+            MetricsSendDriverWake::AckScheduleSignal,
+            MetricsSendDriverWake::PacingTimer,
+            MetricsSendDriverWake::ProtocolTimer,
+            MetricsSendDriverWake::KillRequested,
+        ] {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::SendDriverWake(wake),
+                    Duration::from_millis(1)
+                ),
+                MetricsInterest::Skip,
+            );
+        }
+        assert_eq!(
+            capture.send_driver_resume_signal_wakes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture.send_driver_ack_schedule_signal_wakes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture.send_driver_pacing_timer_wakes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture.send_driver_protocol_timer_wakes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture.send_driver_kill_requested_wakes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn gentle_mode_exit_causes_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        for cause in MetricsGentleExitCause::ALL {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::GentleModeExit(cause),
+                    Duration::from_millis(1)
+                ),
+                MetricsInterest::Skip,
+            );
+            assert_eq!(capture.gentle_exits.load(cause), 1);
+        }
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn retransmission_armor_duplicates_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        assert_eq!(
+            capture.interest(
+                MetricsEvent::RetransmissionArmorDuplicate,
+                Duration::from_millis(1)
+            ),
+            MetricsInterest::Skip,
+        );
+        assert_eq!(
+            capture.retransmission_armor_duplicates.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn data_send_would_blocks_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        assert_eq!(
+            capture.interest(MetricsEvent::DataSendWouldBlock, Duration::from_millis(1)),
+            MetricsInterest::Skip,
+        );
+        assert_eq!(
+            capture.data_send_would_blocks.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn send_driver_resume_requests_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        for source in [
+            MetricsSendDriverResumeSource::ApplicationData,
+            MetricsSendDriverResumeSource::ApplicationFrame,
+            MetricsSendDriverResumeSource::ApplicationFinish,
+            MetricsSendDriverResumeSource::PeerAck,
+            MetricsSendDriverResumeSource::AckFlush,
+            MetricsSendDriverResumeSource::PostOpenHandshake,
+            MetricsSendDriverResumeSource::ReceiveOpportunity,
+        ] {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::SendDriverResumeRequest(source),
+                    Duration::from_millis(1)
+                ),
+                MetricsInterest::Skip,
+            );
+        }
+        assert_eq!(
+            capture
+                .send_driver_resume_application_data_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_application_frame_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_application_finish_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_peer_ack_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_ack_flush_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_post_open_handshake_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_receive_opportunity_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
     }
 }

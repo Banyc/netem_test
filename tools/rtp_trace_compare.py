@@ -112,6 +112,21 @@ def state_rows(rows, manifest):
                     REPORT.field(row, "congestion_persistent_queue_resets")
                 ),
                 "cc_delay_drains": metric_number(REPORT.field(row, "congestion_delay_drains"), 0.0),
+                "cc_loss_backoff_floor": optional_float(
+                    REPORT.field(row, "congestion_loss_backoff_floor_packets_per_second")
+                ),
+                "cc_loss_backoff_raw": optional_float(
+                    REPORT.field(row, "congestion_loss_backoff_raw_target_packets_per_second")
+                ),
+                "cc_loss_backoff_target": optional_float(
+                    REPORT.field(row, "congestion_loss_backoff_target_packets_per_second")
+                ),
+                "cc_loss_backoffs": metric_number(
+                    REPORT.field(row, "congestion_loss_backoffs"), 0.0
+                ),
+                "cc_loss_backoff_floor_bindings": metric_number(
+                    REPORT.field(row, "congestion_loss_backoff_floor_bindings"), 0.0
+                ),
                 "loss": metric_number(REPORT.field(row, "loss_ratio")),
                 "cc_loss": metric_number(REPORT.field(row, "congestion_loss_ratio")),
                 "event": REPORT.field(row, "event"),
@@ -546,6 +561,19 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         and application_limited_suppressions is not None
         else None
     )
+    queue_hold_occupancy = _percent(actions.get("queue_hold", 0), count)
+    delay_drain_occupancy = _percent(actions.get("delay_drain", 0), count)
+    final_loss_backoffs = state[-1]["cc_loss_backoffs"] if state else 0.0
+    final_loss_backoff_bindings = (
+        state[-1]["cc_loss_backoff_floor_bindings"] if state else 0.0
+    )
+    loss_floor_lifts = [
+        row["cc_loss_backoff_floor"] - row["cc_loss_backoff_raw"]
+        for row in state
+        if row["cc_loss_backoff_floor"] is not None
+        and row["cc_loss_backoff_raw"] is not None
+        and row["cc_loss_backoff_floor"] > row["cc_loss_backoff_raw"]
+    ]
     controller_state = {
         "slow_start": _percent(
             sum(boolean(REPORT.field(row, "slow_start")) for row in rtp), count
@@ -594,6 +622,25 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
     return {
         "count": count,
         "actions": actions,
+        "queue_hold_occupancy": queue_hold_occupancy,
+        "delay_drain_occupancy": delay_drain_occupancy,
+        "congestion_loss_backoff_floor_binding_percent": (
+            100.0 * final_loss_backoff_bindings / final_loss_backoffs
+            if final_loss_backoffs > 0 and final_loss_backoff_bindings is not None
+            else None
+        ),
+        "congestion_loss_backoffs_per_gib_delivered": _per_gib(
+            final_loss_backoffs, delivered_bytes
+        ),
+        "congestion_loss_backoff_floor_bindings_per_gib_delivered": _per_gib(
+            final_loss_backoff_bindings, delivered_bytes
+        ),
+        "congestion_loss_backoff_floor_lift_p50": (
+            REPORT.quantile(loss_floor_lifts, 0.5) if loss_floor_lifts else None
+        ),
+        "congestion_loss_backoff_floor_lift_max": (
+            max(loss_floor_lifts) if loss_floor_lifts else None
+        ),
         "controller_state_occupancy": controller_state,
         "low_send_rate_occupancy": _percent(low_rate, count),
         "gentle_mode_occupancy": controller_state["gentle_mode"],
@@ -778,6 +825,13 @@ METRICS = (
     "gentle_mode_exit_gate_open",
     "gentle_mode_exit_outage_reset",
     "gentle_mode_exit_drain_guard",
+    "queue_hold_occupancy",
+    "delay_drain_occupancy",
+    "congestion_loss_backoff_floor_binding_percent",
+    "congestion_loss_backoffs_per_gib_delivered",
+    "congestion_loss_backoff_floor_bindings_per_gib_delivered",
+    "congestion_loss_backoff_floor_lift_p50",
+    "congestion_loss_backoff_floor_lift_max",
     "app_limited_occupancy",
     "application_write_waiter_occupancy",
     "application_limited_suppression_percent",
@@ -801,6 +855,11 @@ NEUTRAL_DIRECTION_METRICS = {
     "persistent_queue_max_ms",
     "persistent_queue_resets",
     "gentle_gate_open_streak_max_ms",
+    "queue_hold_occupancy",
+    "delay_drain_occupancy",
+    "congestion_loss_backoff_floor_binding_percent",
+    "congestion_loss_backoff_floor_lift_p50",
+    "congestion_loss_backoff_floor_lift_max",
 }
 
 LOWER_IS_BETTER_METRICS = {
@@ -810,6 +869,8 @@ LOWER_IS_BETTER_METRICS = {
     "outage_recovery_occupancy",
     "retransmission_attempts_per_gib_delivered",
     "retransmission_repeat_attempts_per_gib_delivered",
+    "congestion_loss_backoffs_per_gib_delivered",
+    "congestion_loss_backoff_floor_bindings_per_gib_delivered",
 }
 
 CONDITIONING_METRICS = tuple(

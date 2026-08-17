@@ -125,6 +125,8 @@ class TraceCompareTest(unittest.TestCase):
         counter_baseline_present=None,
         persistent_queue_for_us="",
         persistent_queue_resets=0,
+        first_action="none",
+        second_action="bandwidth_probe",
         revision="1",
     ):
         trace_dir.mkdir(parents=True)
@@ -186,6 +188,7 @@ class TraceCompareTest(unittest.TestCase):
             rtp_row(
                 "send_data_pkt",
                 100000,
+                action=first_action,
                 slow_start=True,
                 gentle_mode=gentle_mode,
                 gentle_draining=gentle_draining,
@@ -201,7 +204,7 @@ class TraceCompareTest(unittest.TestCase):
                 "session_termination",
                 50000,
                 200000,
-                action="bandwidth_probe",
+                action=second_action,
                 slow_start=True,
                 gentle_mode=gentle_mode,
                 gentle_draining=gentle_draining,
@@ -249,6 +252,7 @@ class TraceCompareTest(unittest.TestCase):
                 queue_building=True,
                 drain_floor_binding=True,
                 outage_recovery=True,
+                first_action="queue_hold",
                 gentle_mode_exits={
                     "loss": 2,
                     "gate_open": 1,
@@ -270,6 +274,7 @@ class TraceCompareTest(unittest.TestCase):
                 "2.0",
                 11,
                 12,
+                first_action="delay_drain",
                 gentle_mode_exits={
                     "loss": 0,
                     "gate_open": 2,
@@ -320,6 +325,32 @@ class TraceCompareTest(unittest.TestCase):
                     run["summary"]["application_limited_suppression_percent"],
                     100.0 / 3.0,
                 )
+                # The action-row occupancy metrics are exercised by the
+                # fixture: one queue_hold/delay_drain row out of two state rows.
+                self.assertEqual(
+                    run["summary"]["queue_hold_occupancy"],
+                    50.0 if run["label"] == "before-1" else 0.0,
+                )
+                self.assertEqual(
+                    run["summary"]["delay_drain_occupancy"],
+                    0.0 if run["label"] == "before-1" else 50.0,
+                )
+                # The legacy fixtures carry no loss-backoff columns, so the
+                # counters stay absent: binding percent stays unknown and the
+                # per-GiB values are zero (never normalized without bytes).
+                self.assertIsNone(
+                    run["summary"]["congestion_loss_backoff_floor_binding_percent"]
+                )
+                self.assertEqual(
+                    run["summary"]["congestion_loss_backoffs_per_gib_delivered"],
+                    0.0,
+                )
+                self.assertEqual(
+                    run["summary"]["congestion_loss_backoff_floor_bindings_per_gib_delivered"],
+                    0.0,
+                )
+                self.assertIsNone(run["summary"]["congestion_loss_backoff_floor_lift_p50"])
+                self.assertIsNone(run["summary"]["congestion_loss_backoff_floor_lift_max"])
                 self.assertEqual(
                     run["summary"]["final_retransmission_counters"],
                     {
@@ -396,6 +427,12 @@ class TraceCompareTest(unittest.TestCase):
             self.assertEqual(pair_metrics["queue_building_occupancy"]["candidate"], 0.0)
             self.assertEqual(pair_metrics["drain_floor_binding_occupancy"]["delta_percent"], -100.0)
             self.assertEqual(pair_metrics["outage_recovery_occupancy"]["delta_percent"], -100.0)
+            self.assertEqual(pair_metrics["queue_hold_occupancy"]["baseline"], 50.0)
+            self.assertEqual(pair_metrics["queue_hold_occupancy"]["candidate"], 0.0)
+            self.assertEqual(pair_metrics["queue_hold_occupancy"]["delta_percent"], -100.0)
+            self.assertEqual(pair_metrics["delay_drain_occupancy"]["baseline"], 0.0)
+            self.assertEqual(pair_metrics["delay_drain_occupancy"]["candidate"], 50.0)
+            self.assertEqual(pair_metrics["delay_drain_occupancy"]["difference"], 50.0)
             self.assertEqual(pair_metrics["persistent_queue_occupancy"]["baseline"], 100.0)
             self.assertEqual(pair_metrics["persistent_queue_occupancy"]["candidate"], 0.0)
             self.assertEqual(pair_metrics["persistent_queue_max_ms"]["baseline"], 400.0)
