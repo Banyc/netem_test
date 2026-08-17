@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _symbol_tables(profile, symbols):
@@ -85,6 +85,11 @@ def _thread_inventory(profile):
             if cpu_deltas_valid
             else None
         )
+        cpu_delta = (
+            sum(float(delta) for delta in cpu_deltas)
+            if cpu_deltas_valid
+            else None
+        )
         cpu_active_complete &= cpu_deltas_valid
         record = grouped.setdefault(
             name,
@@ -94,6 +99,7 @@ def _thread_inventory(profile):
                 "sample_count": 0,
                 "nonempty_samples": 0,
                 "cpu_active_samples": 0,
+                "cpu_delta": 0.0,
             },
         )
         record["thread_count"] += 1
@@ -103,8 +109,17 @@ def _thread_inventory(profile):
             record["cpu_active_samples"] = None
         else:
             record["cpu_active_samples"] += cpu_active_samples
+        if record["cpu_delta"] is None or cpu_delta is None:
+            record["cpu_delta"] = None
+        else:
+            record["cpu_delta"] += cpu_delta
     total_cpu_active_samples = (
         sum(record["cpu_active_samples"] for record in grouped.values())
+        if cpu_active_complete
+        else None
+    )
+    total_cpu_delta = (
+        sum(record["cpu_delta"] for record in grouped.values())
         if cpu_active_complete
         else None
     )
@@ -113,6 +128,11 @@ def _thread_inventory(profile):
         record["cpu_active_percent"] = (
             100.0 * record["cpu_active_samples"] / total_cpu_active_samples
             if total_cpu_active_samples
+            else None
+        )
+        record["cpu_delta_percent"] = (
+            100.0 * record["cpu_delta"] / total_cpu_delta
+            if total_cpu_delta
             else None
         )
     records.sort(
@@ -125,6 +145,7 @@ def _thread_inventory(profile):
     return {
         "cpu_active_complete": cpu_active_complete,
         "total_cpu_active_samples": total_cpu_active_samples,
+        "total_cpu_delta": total_cpu_delta,
         "threads": records,
     }
 
@@ -150,17 +171,23 @@ def summarize(
     with any requested name (zero matches is an error). With
     'cpu_active_only', samples whose aligned Samply threadCPUDelta is zero
     are excluded; missing, nonnumeric, negative, or misaligned CPU deltas are
-    errors rather than silently falling back to wall-clock sampling.
+    errors rather than silently falling back to wall-clock sampling. The
+    result carries both count-ranked 'hotspots' and CPU-ranked
+    'cpu_hotspots', whose inclusive and leaf ownership are weighted by the
+    sample delta, while immediate distinct caller attribution stays exact.
     """
     strings = symbols["string_table"]
     symbol_tables = _symbol_tables(profile, symbols)
     thread_inventory = _thread_inventory(profile)
     inclusive = Counter()
     leaf = Counter()
+    inclusive_cpu = Counter()
+    leaf_cpu = Counter()
     caller_edges = Counter()
     total = 0
     examined_nonempty = 0
     excluded_zero_cpu = 0
+    total_cpu_delta = 0.0
     selected_threads = [
         thread
         for thread in profile.get("threads", [])
@@ -194,6 +221,7 @@ def summarize(
             if stack_index is None:
                 continue
             examined_nonempty += 1
+            weight = 1.0
             if cpu_active_only:
                 cpu_delta = cpu_deltas[sample_index]
                 if not isinstance(cpu_delta, (int, float)) or cpu_delta < 0:
@@ -204,6 +232,8 @@ def summarize(
                 if cpu_delta == 0:
                     excluded_zero_cpu += 1
                     continue
+                weight = float(cpu_delta)
+            total_cpu_delta += weight
             stack_frames = []
             while stack_index is not None and stack_index >= 0:
                 frame_index = stacks["frame"][stack_index]
@@ -260,6 +290,9 @@ def summarize(
             leaf[stack_names[0]] += 1
             for name in set(stack_names):
                 inclusive[name] += 1
+            leaf_cpu[stack_names[0]] += weight
+            for name in set(stack_names):
+                inclusive_cpu[name] += weight
             seen_edges = set()
             for index, callee in enumerate(stack_names):
                 if not any(value in callee for value in callers_of):
@@ -303,6 +336,27 @@ def summarize(
     hotspots.sort(key=lambda h: (-h["inclusive_samples"], -h["leaf_samples"], h["name"]))
     if limit is not None:
         hotspots = hotspots[:limit]
+    cpu_hotspots = [
+        {
+            "name": name,
+            "inclusive_cpu": inclusive_cpu[name],
+            "inclusive_cpu_percent": (
+                100.0 * inclusive_cpu[name] / total_cpu_delta
+                if total_cpu_delta > 0.0
+                else 0.0
+            ),
+            "leaf_cpu": leaf_cpu[name],
+            "leaf_cpu_percent": (
+                100.0 * leaf_cpu[name] / total_cpu_delta
+                if total_cpu_delta > 0.0
+                else 0.0
+            ),
+        }
+        for name in names
+    ]
+    cpu_hotspots.sort(key=lambda h: (-h["inclusive_cpu"], h["name"]))
+    if limit is not None:
+        cpu_hotspots = cpu_hotspots[:limit]
     callers = [
         {
             "callee": callee,
@@ -331,12 +385,14 @@ def summarize(
         "total_samples": total,
         "examined_nonempty_samples": examined_nonempty,
         "excluded_zero_cpu_samples": excluded_zero_cpu,
+        "total_cpu_delta": total_cpu_delta,
         "contains": list(contains),
         "thread_names": list(thread_names),
         "callers_of": list(callers_of),
         "selected_thread_count": len(selected_threads),
         "thread_inventory": thread_inventory,
         "hotspots": hotspots,
+        "cpu_hotspots": cpu_hotspots,
         "callers": callers,
     }
 
@@ -399,6 +455,13 @@ def _print_table(result):
             f"{hotspot['inclusive_samples']:>8} {hotspot['inclusive_percent']:6.2f}% "
             f"{hotspot['leaf_samples']:>8} {hotspot['leaf_percent']:6.2f}% {hotspot['name']}"
         )
+    if result["sample_mode"] == "cpu-active-only":
+        print("CPU-weighted hotspots:")
+        for hotspot in result["cpu_hotspots"]:
+            print(
+                f"{hotspot['inclusive_cpu']:>10.0f} {hotspot['inclusive_cpu_percent']:6.2f}% "
+                f"{hotspot['leaf_cpu']:>10.0f} {hotspot['leaf_cpu_percent']:6.2f}% {hotspot['name']}"
+            )
     if result["callers"]:
         print("callers:")
         for edge in result["callers"]:
@@ -421,7 +484,6 @@ def main(argv=None):
         "--symbols",
         default=None,
         type=Path,
-        default=None,
         help=(
             "Sidecar symbols JSON (default: "
             "Samply's emitted sibling, with "

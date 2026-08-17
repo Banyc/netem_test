@@ -18,7 +18,7 @@ import math
 import statistics
 from pathlib import Path
 
-COMPARISON_SCHEMA_VERSION = 20
+COMPARISON_SCHEMA_VERSION = 28
 
 GENTLE_EXIT_CAUSES = ("loss", "gate_open", "drain_guard", "outage_reset")
 
@@ -315,6 +315,9 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     schema = manifest.get("trace_schema_version", "")
     row_schema = REPORT.field(rtp[0], "schema_version") if rtp else ""
     supported_schemas = (
+        "26",
+        "25",
+        "24",
         "23",
         "22",
         "21",
@@ -337,7 +340,7 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     checks["observer_present"] = boolean(observer) if observer != "" else False
     warmup_seconds = metric_number(manifest.get("warmup_seconds"), 0.0) or 0.0
     checks["counter_baseline_present"] = (
-        schema not in ("22", "23")
+        schema not in ("22", "23", "24", "25", "26")
         or not checks["observer_present"]
         or warmup_seconds == 0.0
         or (
@@ -439,8 +442,15 @@ def _percent(value, total):
 
 
 def _per_gib(value, delivered_bytes):
-    """Normalize an event count by application bytes delivered."""
-    return value * 1024 ** 3 / delivered_bytes if delivered_bytes > 0 else None
+    """Normalize an event count by application bytes delivered.
+
+    Rejects the normalization unless BOTH a concrete counter and positive
+    delivered bytes exist: an absent schema field stays None rather than
+    being misread as zero, while a present zero count with bytes is a real
+    zero."""
+    if value is None or delivered_bytes is None or delivered_bytes <= 0:
+        return None
+    return value * 1024 ** 3 / delivered_bytes
 
 
 def action_streak_max_ms(state, action):
@@ -477,6 +487,7 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
             )
             for wake in (
                 "resume_signal",
+                "ack_schedule_signal",
                 "pacing_timer",
                 "protocol_timer",
                 "kill_requested",
@@ -618,6 +629,18 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         )
         for cause in GENTLE_EXIT_CAUSES
     }
+    sender_wakes = send_driver_wakes("rtp")
+    peer_wakes = send_driver_wakes("rtp_peer")
+    resume_requests = send_driver_resume_requests("rtp")
+    peer_resume_requests = send_driver_resume_requests("rtp_peer")
+    sender_armor_duplicates = metric_number(
+        manifest.get("rtp_retransmission_armor_duplicates")
+    )
+    peer_armor_duplicates = metric_number(
+        manifest.get("rtp_peer_retransmission_armor_duplicates")
+    )
+    sender_would_blocks = metric_number(manifest.get("rtp_data_send_would_blocks"))
+    peer_would_blocks = metric_number(manifest.get("rtp_peer_data_send_would_blocks"))
 
     return {
         "count": count,
@@ -718,10 +741,35 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "peer_rtt_p50_ms": REPORT.quantile(peer_rtt, 0.5) if peer_rtt else math.nan,
         "terminations": termination_summary(rtp),
         "peer_terminations": termination_summary(peer),
-        "send_driver_wakes": send_driver_wakes("rtp"),
-        "peer_send_driver_wakes": send_driver_wakes("rtp_peer"),
-        "send_driver_resume_requests": send_driver_resume_requests("rtp"),
-        "peer_send_driver_resume_requests": send_driver_resume_requests("rtp_peer"),
+        "send_driver_wakes": sender_wakes,
+        "peer_send_driver_wakes": peer_wakes,
+        "send_driver_resume_requests": resume_requests,
+        "peer_send_driver_resume_requests": peer_resume_requests,
+        "sender_application_data_resume_requests_per_gib_delivered": _per_gib(
+            resume_requests["application_data"], delivered_bytes
+        ),
+        "sender_protocol_timer_wakes_per_gib_delivered": _per_gib(
+            sender_wakes["protocol_timer"], delivered_bytes
+        ),
+        "peer_protocol_timer_wakes_per_gib_delivered": _per_gib(
+            peer_wakes["protocol_timer"], delivered_bytes
+        ),
+        "sender_retransmission_armor_duplicates": sender_armor_duplicates,
+        "sender_retransmission_armor_duplicates_per_gib_delivered": _per_gib(
+            sender_armor_duplicates, delivered_bytes
+        ),
+        "peer_retransmission_armor_duplicates": peer_armor_duplicates,
+        "peer_retransmission_armor_duplicates_per_gib_delivered": _per_gib(
+            peer_armor_duplicates, delivered_bytes
+        ),
+        "sender_data_send_would_blocks": sender_would_blocks,
+        "sender_data_send_would_blocks_per_gib_delivered": _per_gib(
+            sender_would_blocks, delivered_bytes
+        ),
+        "peer_data_send_would_blocks": peer_would_blocks,
+        "peer_data_send_would_blocks_per_gib_delivered": _per_gib(
+            peer_would_blocks, delivered_bytes
+        ),
         "final_netem_counters": final_netem_counters(netem),
         "delivered_bytes": delivered_bytes,
         "elapsed_seconds": elapsed if elapsed is not None else (progress[-1][0] if progress else 0),
@@ -832,6 +880,17 @@ METRICS = (
     "congestion_loss_backoff_floor_bindings_per_gib_delivered",
     "congestion_loss_backoff_floor_lift_p50",
     "congestion_loss_backoff_floor_lift_max",
+    "sender_application_data_resume_requests_per_gib_delivered",
+    "sender_protocol_timer_wakes_per_gib_delivered",
+    "peer_protocol_timer_wakes_per_gib_delivered",
+    "sender_retransmission_armor_duplicates",
+    "sender_retransmission_armor_duplicates_per_gib_delivered",
+    "peer_retransmission_armor_duplicates",
+    "peer_retransmission_armor_duplicates_per_gib_delivered",
+    "sender_data_send_would_blocks",
+    "sender_data_send_would_blocks_per_gib_delivered",
+    "peer_data_send_would_blocks",
+    "peer_data_send_would_blocks_per_gib_delivered",
     "app_limited_occupancy",
     "application_write_waiter_occupancy",
     "application_limited_suppression_percent",
@@ -860,6 +919,10 @@ NEUTRAL_DIRECTION_METRICS = {
     "congestion_loss_backoff_floor_binding_percent",
     "congestion_loss_backoff_floor_lift_p50",
     "congestion_loss_backoff_floor_lift_max",
+    "sender_retransmission_armor_duplicates",
+    "peer_retransmission_armor_duplicates",
+    "sender_data_send_would_blocks",
+    "peer_data_send_would_blocks",
 }
 
 LOWER_IS_BETTER_METRICS = {
@@ -871,6 +934,13 @@ LOWER_IS_BETTER_METRICS = {
     "retransmission_repeat_attempts_per_gib_delivered",
     "congestion_loss_backoffs_per_gib_delivered",
     "congestion_loss_backoff_floor_bindings_per_gib_delivered",
+    "sender_application_data_resume_requests_per_gib_delivered",
+    "sender_protocol_timer_wakes_per_gib_delivered",
+    "peer_protocol_timer_wakes_per_gib_delivered",
+    "sender_retransmission_armor_duplicates_per_gib_delivered",
+    "peer_retransmission_armor_duplicates_per_gib_delivered",
+    "sender_data_send_would_blocks_per_gib_delivered",
+    "peer_data_send_would_blocks_per_gib_delivered",
 }
 
 CONDITIONING_METRICS = tuple(

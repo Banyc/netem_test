@@ -25,6 +25,7 @@ from pathlib import Path
 SAFE_TEMP_ROOT = Path.home() / "code" / "tmp"
 DEFAULT_SEEDS = (11, 21)
 DEFAULT_WARMUP_SECONDS = 5.0
+MATERIAL_PHASE_DRIFT_PERCENT = 20.0
 PERF_TEST = "probe_hostile_goodput_30s"
 LINK_PROFILES = (
     "hostile",
@@ -36,6 +37,8 @@ LINK_PROFILES = (
 )
 COMPONENTS = ("netem_test", "rtp", "mux", "rtp_mux", "tokio_udp", "udp_listener")
 SUITE_REVISION_MANIFEST = "suite-revisions.json"
+SUITE_REVISION_MANIFEST_SCHEMA = 2
+PROBE_SOURCE_MANIFEST_SCHEMA = 1
 
 
 def parse_seeds(value):
@@ -91,25 +94,20 @@ def safe_output_dir(requested=None):
 def safe_build_dir(requested, workspace, profile):
     safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
     safe_root.mkdir(parents=True, exist_ok=True)
-    if requested is None:
-        identity = hashlib.sha256(str(workspace).encode()).hexdigest()[:16]
-        requested = safe_root / "net-perf-targets" / f"{identity}-{profile}"
+    requested = requested if requested is not None else safe_root / "net-perf-targets" / f"{hashlib.sha256(str(workspace).encode()).hexdigest()[:16]}-{profile}" / "target"
     resolved = Path(requested).expanduser().resolve()
-    if not resolved.is_relative_to(safe_root):
-        raise ValueError(f"Cargo target directory must remain beneath {safe_root}")
+    (_ for _ in ()).throw(ValueError(f"Cargo target directory must remain beneath {safe_root}")) if not resolved.is_relative_to(safe_root) else None
+    (_ for _ in ()).throw(ValueError("Cargo target directory must use a final 'target' path component; managed hosts may reject generated executables from custom layouts")) if resolved.name != "target" else None
     resolved.mkdir(parents=True, exist_ok=True)
     return resolved
 
 
 def safe_temp_dir(role, seed):
-    """A unique per-probe temporary directory beneath $TMPDIR."""
     safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
     safe_root.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    requested = safe_root / f"net-perf-tmp-{stamp}-{os.getpid()}-{role}-{seed}"
-    resolved = requested.expanduser().resolve()
-    if not resolved.is_relative_to(safe_root):
-        raise ValueError(f"probe temporary directory must remain beneath {safe_root}")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    resolved = (safe_root / f"net-perf-tmp-{stamp}-{os.getpid()}-{role}-{seed}").resolve()
+    (_ for _ in ()).throw(ValueError(f"probe temporary directory must remain beneath {safe_root}")) if not resolved.is_relative_to(safe_root) else None
     resolved.mkdir(parents=True, exist_ok=False)
     return resolved
 
@@ -132,7 +130,7 @@ def frozen_suite_manifest(directory):
     except (OSError, json.JSONDecodeError):
         return None
     components = manifest.get("components")
-    if manifest.get("schema") != 1 or not isinstance(components, dict):
+    if manifest.get("schema") != SUITE_REVISION_MANIFEST_SCHEMA or not isinstance(components, dict):
         return None
     if set(components) != set(COMPONENTS):
         return None
@@ -145,27 +143,30 @@ def frozen_suite_manifest(directory):
     return manifest
 
 
-def jj_revision(directory):
-    """Current jj commit id of a workspace or sibling component repo."""
+def jj_revision(directory, revision="@"):
+    """Exact jj identity (40-char commit_id plus change_id) of a workspace
+    or sibling component repo at a resolved revision."""
     directory = Path(directory)
-    if not directory.is_dir():
-        return "unknown"
     frozen = frozen_suite_manifest(directory)
     if frozen is not None and directory.name in frozen["components"]:
-        return frozen["components"][directory.name]["commit_id"]
+        return frozen["components"][directory.name]
+    if not directory.is_dir():
+        return {"commit_id": "unknown", "change_id": "unknown"}
+    template = 'commit_id ++ "\n" ++ change_id'
     try:
         result = subprocess.run(
-            ["jj", "--no-pager", "log", "-r", "@", "--no-graph", "-T", "commit_id"],
+            ["jj", "--no-pager", "log", "-r", revision, "--no-graph", "-T", template],
             cwd=directory,
             capture_output=True,
             text=True,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
-    if result.returncode != 0:
-        return "unknown"
-    return result.stdout.strip()
+        return {"commit_id": "unknown", "change_id": "unknown"}
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or len(lines) != 2:
+        return {"commit_id": "unknown", "change_id": "unknown"}
+    return {"commit_id": lines[0], "change_id": lines[1]}
 
 
 def jj_identity(directory, revision):
@@ -236,31 +237,19 @@ def snapshot_component(source, destination, revision):
 
 
 def command_snapshot(args):
-    """Freeze a complete sibling-component suite at exact committed revisions."""
     source = validate_workspace(Path(args.source), "source")
     output_root = safe_output_dir(Path(args.output) if args.output else None)
     source_root = source.parent
-    components = {}
-    for component in COMPONENTS:
-        component_source = source_root / component
-        if not component_source.is_dir():
-            raise ValueError(f"suite component is missing: {component_source}")
-        components[component] = snapshot_component(
-            component_source,
-            output_root / component,
-            args.revision,
-        )
-    validate_workspace(output_root / "netem_test", "snapshot")
-    manifest = {
-        "schema": 1,
-        "source": str(source),
-        "requested_revision": args.revision,
-        "components": dict(sorted(components.items())),
-    }
-    (output_root / SUITE_REVISION_MANIFEST).write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    pairs = list(args.component_revision)
+    component_revisions = dict(pairs)
+    (_ for _ in ()).throw(ValueError("duplicate component revision")) if len(component_revisions) != len(pairs) else None
+    unknown = sorted(set(component_revisions) - set(COMPONENTS))
+    (_ for _ in ()).throw(ValueError(f"unknown component revision overrides: {', '.join(unknown)}")) if unknown else None
+    missing = next((source_root / component for component in COMPONENTS if not (source_root / component).is_dir()), None)
+    (_ for _ in ()).throw(ValueError(f"suite component is missing: {missing}")) if missing is not None else None
+    components = {component: snapshot_component(source_root / component, output_root / component, component_revisions.get(component, args.revision)) for component in COMPONENTS}
+    manifest = {"schema": SUITE_REVISION_MANIFEST_SCHEMA, "source": str(source), "requested_revision": args.revision, "component_revision_overrides": dict(sorted(component_revisions.items())), "components": dict(sorted(components.items()))}
+    (output_root / SUITE_REVISION_MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output_root)
     return 0
 
@@ -279,7 +268,45 @@ def suite_revisions(workspace):
 
 def component_revisions(workspace):
     """Revision of every suite component for a workspace, sorted keys."""
-    return suite_revisions(workspace)
+    components = suite_revisions(workspace)
+    if components is None:
+        return None
+    identity = {component: commit_id for component, commit_id in components.items()}
+    for component in COMPONENTS:
+        if component not in identity:
+            continue
+        for other in COMPONENTS:
+            if other == component or other not in identity:
+                continue
+            if identity[component] == identity[other] and component != other:
+                raise ValueError(
+                    f"workspace {workspace} component {component} and {other} "
+                    f"share the same commit_id {identity[component]!r}"
+                )
+    return validate_component_revisions(components, "workspace components", allow_unknown=True)
+
+
+def validate_component_revisions(components, context, *, allow_unknown=False):
+    (_ for _ in ()).throw(ValueError(f"{context} must contain exactly the suite components")) if not isinstance(components, dict) or set(components) != set(COMPONENTS) else None
+    invalid = next(((component, components[component]) for component in COMPONENTS if not isinstance(components[component], str) or not (len(components[component]) == 40 or (allow_unknown and components[component] == "unknown"))), None)
+    (_ for _ in ()).throw(ValueError(f"{context} has an invalid commit id for {invalid[0]}: {invalid[1]!r}")) if invalid else None
+    return dict(sorted(components.items()))
+
+
+def write_probe_source_manifest(path, executable, components, source):
+    path = Path(path)
+    payload = {"schema": PROBE_SOURCE_MANIFEST_SCHEMA, "executable_sha256": executable_sha256(executable), "components": validate_component_revisions(components, "probe source manifest components", allow_unknown=True), "source": source}
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def load_probe_source_manifest(path, executable, role):
+    path = Path(path).expanduser().resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    (_ for _ in ()).throw(ValueError(f"unsupported {role} probe source manifest schema: {path}")) if payload.get("schema") != PROBE_SOURCE_MANIFEST_SCHEMA else None
+    expected = executable_sha256(executable)
+    (_ for _ in ()).throw(ValueError(f"{role} probe source manifest does not match executable SHA-256: {path}")) if payload.get("executable_sha256") != expected else None
+    return validate_component_revisions(payload.get("components"), f"{role} probe source manifest")
 
 
 def paired_execution_specs(suite_specs, pair_index):
@@ -340,36 +367,15 @@ def executable_sha256(executable):
 
 
 def preserve_built_probe(executable):
-    """Copy a Cargo-built probe to an immutable content-addressed sibling.
-
-    Cargo can reuse the same artifact path when baseline and candidate builds
-    share a target directory. Preserve each artifact immediately, before the
-    next role builds, so later compilation cannot replace the bytes that a
-    timed run is supposed to execute. Keeping the copy beside Cargo's output
-    preserves the host execution policy that applies to that directory.
-    """
     executable = Path(executable).expanduser().resolve()
-    if not executable.is_file():
-        raise ValueError(f"built perf_probe is not a file: {executable}")
-    if not os.access(executable, os.X_OK):
-        raise ValueError(f"built perf_probe is not executable: {executable}")
-
+    (_ for _ in ()).throw(ValueError(f"built perf_probe is not a file: {executable}")) if not executable.is_file() else None
+    (_ for _ in ()).throw(ValueError(f"built perf_probe is not executable: {executable}")) if not os.access(executable, os.X_OK) else None
     digest = executable_sha256(executable)
-    preserved = executable.with_name(
-        f"{executable.name}.perf-loop-{digest}"
-    )
-    if preserved.exists():
-        if not preserved.is_file() or executable_sha256(preserved) != digest:
-            raise ValueError(
-                f"preserved perf_probe does not match its content address: {preserved}"
-            )
-    else:
-        shutil.copy2(executable, preserved)
-
-    if executable_sha256(preserved) != digest:
-        raise ValueError(f"failed to preserve exact perf_probe bytes: {preserved}")
-    if not os.access(preserved, os.X_OK):
-        raise ValueError(f"preserved perf_probe is not executable: {preserved}")
+    preserved = executable.with_name(f"{executable.name}.perf-loop-{digest}")
+    (_ for _ in ()).throw(ValueError(f"preserved perf_probe does not match its content address: {preserved}")) if preserved.exists() and (not preserved.is_file() or executable_sha256(preserved) != digest) else None
+    shutil.copy2(executable, preserved) if not preserved.exists() else None
+    (_ for _ in ()).throw(ValueError(f"failed to preserve exact perf_probe bytes: {preserved}")) if executable_sha256(preserved) != digest else None
+    (_ for _ in ()).throw(ValueError(f"preserved perf_probe is not executable: {preserved}")) if not os.access(preserved, os.X_OK) else None
     return str(preserved.resolve())
 
 
@@ -388,7 +394,9 @@ def stream_build_command(role, workspace, build_root, build_log, *, release=True
     streaming JSON diagnostics into ``build-ROLE.log``."""
     env = dict(os.environ)
     env["CARGO_TARGET_DIR"] = str(build_root)
-    command = ["cargo", "test"]
+    env["RUST_WRAPPER"] = ""
+    env["RUSTC_WORKSPACE_WRAPPER"] = ""
+    command = ["cargo", "test", "-j1"]
     if release:
         command.append("--release")
     command += [
@@ -541,30 +549,17 @@ def call_compare(baseline_dirs, candidate_dirs, output_root):
     return result
 
 
+def within_run_phase_analysis(comparison):
+    observations = [{"label": run.get("label"), "role": run.get("role"), "first_half_mib_per_second": first, "second_half_mib_per_second": second, "second_minus_first_percent": shift, "material_phase_drift": abs(shift) >= MATERIAL_PHASE_DRIFT_PERCENT} for run in comparison.get("runs", []) for summary in (run.get("summary", {}),) if isinstance(summary.get("goodput_first_half_mib_per_second"), (int, float)) and isinstance(summary.get("goodput_second_half_mib_per_second"), (int, float)) for first in (float(summary["goodput_first_half_mib_per_second"]),) for second in (float(summary["goodput_second_half_mib_per_second"]),) if math.isfinite(first) and math.isfinite(second) and first > 0.0 for shift in ((second / first - 1.0) * 100.0,)]; absolute = [abs(item["second_minus_first_percent"]) for item in observations]; material = [item for item in observations if item["material_phase_drift"]]; classification = "insufficient_evidence" if not observations else "unstable_phase_drift" if material else "stable"; return {"classification": classification, "material_threshold_percent": MATERIAL_PHASE_DRIFT_PERCENT, "valid_runs": len(observations), "material_run_count": len(material), "median_absolute_shift_percent": statistics.median(absolute) if absolute else None, "max_absolute_shift_percent": max(absolute) if absolute else None, "runs": observations, "does_not_prove": "A first/second-half shift exposes non-stationary goodput inside the measurement window but does_not_prove its cause; controller cycles, loss timing, scheduling, thermal state, or adjacent load may contribute."}
+
+
 def control_calibration(comparison):
-    """Classify same-binary control stability from valid paired goodput
-    deltas.  Stable only when every absolute valid paired goodput delta is
-    below 10%; records the median/maximum absolute delta and how many pairs
-    crossed the material-change threshold (false material changes on an
-    identical binary)."""
-    deltas = [
-        pair["metrics"]["goodput_mib_per_second"]["delta_percent"]
-        for pair in comparison.get("pairs", [])
-        if pair.get("valid")
-    ]
+    deltas = [pair["metrics"]["goodput_mib_per_second"]["delta_percent"] for pair in comparison.get("pairs", []) if pair.get("valid")]
     absolute = [abs(value) for value in deltas if value is not None]
-    stable = len(absolute) > 0 and all(value < 10.0 for value in absolute)
-    return {
-        "classification": "stable" if stable else "unstable",
-        "valid_pairs": len(absolute),
-        "median_absolute_delta_percent": (
-            statistics.median(absolute) if absolute else None
-        ),
-        "max_absolute_delta_percent": max(absolute) if absolute else None,
-        "false_material_change_count": sum(
-            1 for value in absolute if value >= 10.0
-        ),
-    }
+    phase_stability = within_run_phase_analysis(comparison)
+    paired_stable = len(absolute) > 0 and all(value < 10.0 for value in absolute)
+    stable = paired_stable and phase_stability["classification"] != "unstable_phase_drift"
+    return {"classification": "stable" if stable else "unstable", "paired_classification": "stable" if paired_stable else "unstable", "valid_pairs": len(absolute), "median_absolute_delta_percent": statistics.median(absolute) if absolute else None, "max_absolute_delta_percent": max(absolute) if absolute else None, "false_material_change_count": sum(1 for value in absolute if value >= 10.0), "within_run_phase_analysis": phase_stability}
 
 
 def execution_order_analysis(comparison, runs):
@@ -777,17 +772,47 @@ def command_run(args):
         raise ValueError(
             "--baseline-executable and --candidate-executable must be supplied together"
         )
+    source_manifests = {
+        "baseline": args.baseline_source_manifest,
+        "candidate": args.candidate_source_manifest,
+    }
+    if any(source_manifests.values()):
+        if not all(prebuilt.values()):
+            raise ValueError(
+                "--baseline-source-manifest and --candidate-source-manifest require "
+                "--baseline-executable and --candidate-executable"
+            )
+        if not all(source_manifests.values()):
+            raise ValueError(
+                "--baseline-source-manifest and --candidate-source-manifest "
+                "must be supplied together"
+            )
     output_root = safe_output_dir(args.output)
     revisions = {
         "baseline": jj_revision(baseline),
         "candidate": jj_revision(candidate),
     }
+    workspace_components = {
+        role: {
+            component: identity["commit_id"]
+            for component, identity in component_revisions(workspace).items()
+        }
+        for role, workspace in (("baseline", baseline), ("candidate", candidate))
+    }
+    source_manifest_paths = {}
     if all(prebuilt.values()):
         executables = {
             role: use_prebuilt_probe(prebuilt[role], role)
             for role in ("baseline", "candidate")
         }
         build_sources = {role: "prebuilt" for role in executables}
+        if all(source_manifests.values()):
+            for role in ("baseline", "candidate"):
+                source_manifest_paths[role] = load_probe_source_manifest(
+                    source_manifests[role], executables[role], role
+                )
+        else:
+            source_manifest_paths = {role: None for role in executables}
     else:
         # Prebuild both frozen executables once, before any timed run.
         executables = {}
@@ -800,6 +825,13 @@ def command_run(args):
                 target_dir=args.target_dir,
             )
         build_sources = {role: "built" for role in executables}
+        for role, workspace in (("baseline", baseline), ("candidate", candidate)):
+            source_manifest_paths[role] = write_probe_source_manifest(
+                output_root / f"{role}-probe-source.json",
+                executables[role],
+                workspace_components[role],
+                str(workspace),
+            )
     executable_hashes = {
         role: executable_sha256(executable)
         for role, executable in executables.items()
@@ -830,7 +862,7 @@ def command_run(args):
                 mss_bytes=args.mss_bytes,
                 window_seconds=args.window_seconds,
                 warmup_seconds=args.warmup_seconds,
-                revision=revisions[role],
+                revision=revisions[role]["commit_id"],
             )
             rows.append(row)
             runs.append(
@@ -860,15 +892,30 @@ def command_run(args):
     if (output_root / "comparison.json").exists():
         comparison = json.loads((output_root / "comparison.json").read_text(encoding="utf-8"))
     verdict = comparison.get("verdict", "insufficient_evidence")
+    phase_analysis = within_run_phase_analysis(comparison)
     calibration = control_calibration(comparison) if args.same_binary_control else None
     order_analysis = execution_order_analysis(comparison, runs)
     counterbalanced_analysis = counterbalanced_goodput_analysis(
         comparison, runs, order_analysis
     )
+    build_components = {}
+    components_sources = {}
+    for role, workspace in (("baseline", baseline), ("candidate", candidate)):
+        if source_manifest_paths.get(role) is not None:
+            build_components[role] = source_manifest_paths[role]
+            components_sources[role] = "probe_source_manifest"
+        else:
+            build_components[role] = workspace_components[role]
+            components_sources[role] = (
+                "build_workspace"
+                if build_sources[role] == "built"
+                else "execution_workspace_fallback"
+            )
     run_json = {
         "pair_execution_order": "alternating",
         "execution_order_analysis": order_analysis,
         "counterbalanced_goodput_analysis": counterbalanced_analysis,
+        "within_run_phase_analysis": phase_analysis,
         "link_profile": args.link_profile,
         "mss_bytes": args.mss_bytes,
         "baseline": str(baseline),
@@ -885,6 +932,13 @@ def command_run(args):
                 "executable": executables["baseline"],
                 "sha256": executable_hashes["baseline"],
                 "source": build_sources["baseline"],
+                "components_source": components_sources["baseline"],
+                "components": build_components["baseline"],
+                "source_manifest": (
+                    str(source_manifest_paths["baseline"])
+                    if source_manifest_paths.get("baseline") is not None
+                    else None
+                ),
                 "log": (
                     str(output_root / "build-baseline.log")
                     if build_sources["baseline"] == "built"
@@ -895,6 +949,13 @@ def command_run(args):
                 "executable": executables["candidate"],
                 "sha256": executable_hashes["candidate"],
                 "source": build_sources["candidate"],
+                "components_source": components_sources["candidate"],
+                "components": build_components["candidate"],
+                "source_manifest": (
+                    str(source_manifest_paths["candidate"])
+                    if source_manifest_paths.get("candidate") is not None
+                    else None
+                ),
                 "log": (
                     str(output_root / "build-candidate.log")
                     if build_sources["candidate"] == "built"
@@ -968,11 +1029,19 @@ def build_parser():
         "--source", required=True, help="source netem_test workspace"
     )
     snapshot.add_argument(
-        "--revision",
-        default="@-",
-        help="jj revision resolved independently in every component (default: @-)",
+        "--source-revision",
+        dest="revision",
+        default="-",
+        help="jj revision resolved independently in every component (default: -)",
     )
-    snapshot.add_argument("--output", default=None, help="output directory beneath $TMPDIR")
+    snapshot.add_argument(
+        "--component-revision",
+        action="append",
+        default=[],
+        metavar="COMPONENT=REVISION",
+        help="override one component's jj revision (repeatable)",
+    )
+    snapshot.add_argument("--output", required=True, help="output directory beneath $TMPDIR")
     snapshot.set_defaults(handler=command_snapshot)
 
     run = subparsers.add_parser("run", help="run a paired baseline/candidate capture")
@@ -1012,6 +1081,16 @@ def build_parser():
         "--candidate-executable",
         default=None,
         help="exact prebuilt candidate perf_probe; requires --baseline-executable",
+    )
+    run.add_argument(
+        "--baseline-source-manifest",
+        default=None,
+        help="probe source manifest for the prebuilt baseline; requires --candidate-source-manifest",
+    )
+    run.add_argument(
+        "--candidate-source-manifest",
+        default=None,
+        help="probe source manifest for the prebuilt candidate; requires --baseline-source-manifest",
     )
     run.add_argument("--output", type=Path, default=None, help="output directory beneath $TMPDIR")
     run.add_argument("--fail-on-regression", action="store_true")

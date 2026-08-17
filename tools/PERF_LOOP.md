@@ -8,13 +8,23 @@ frozen `netem_test` workspace (each with sibling `rtp`, `mux`, `rtp_mux`,
 Freeze the current completed suite without creating additional JJ workspaces:
 
 ```sh
-./tools/perf-loop snapshot --source . --revision @- \
---output $TMPDIR/rtp-before
+./tools/perf-loop snapshot --source . --source-revision @- \
+--component-revision rtp=<40-char-commit> --output $TMPDIR/rtp-before
 ```
 
-The snapshot exports exact committed trees for all six sibling components and
-writes `suite-revisions.json`. Paired runs read this manifest so archived trees
-remain revision-identifiable even though they are deliberately not mutable JJ workspaces.
+The snapshot exports the exact committed tree of every sibling component
+(`jj --no-pager log -r <revision>` resolving the 40-character `commit_id`
+plus `change_id`) into its own directory beneath the output, never the
+mutable working copy. `--source-revision` (default `-`) is resolved
+independently in every component; repeat `--component-revision
+COMPONENT=REVISION` to pin individual components (duplicates and unknown
+component names are rejected), and `--output` is required and must resolve
+beneath `$TMPDIR`. `suite-revisions.json` records the manifest schema
+(`PROBE_SOURCE_MANIFEST_SCHEMA`), the source workspace, the requested
+revision, `component_revision_overrides`, and each component's exact
+40-character `commit_id` plus `change_id`. Paired runs read this manifest so
+archived trees remain revision-identifiable even though they are
+deliberately not mutable JJ workspaces.
 
 ## Default hostile command
 
@@ -117,6 +127,32 @@ as isolated support. Repeated, directionally consistent goodput shifts of at
 least 10% are marked for attention. These are post-selection diagnostics, not
 causal evidence; every hint retains its does_not_prove constraint.
 
+Comparison schema 28 extends the normalized event metrics and hardens the
+acceptance rules. Send-driver protocol-timer wakes are exported per GiB of
+application data delivered for the sender and the peer
+(`sender_protocol_timer_wakes_per_gib_delivered`,
+`peer_protocol_timer_wakes_per_gib_delivered`); ACK-schedule signal wakes
+(`ack_schedule_signal` in each `send_driver_wakes` breakdown) are scheduler
+work that re-arms the driver's wait and are never counted as application
+progress. Retransmission-armor duplicates are aggregated outside trace rows
+and exposed raw plus per GiB for both endpoints
+(`sender_retransmission_armor_duplicates[_per_gib_delivered]` and peer
+equivalents); they count successful duplicate wire copies of an already
+encoded recovery datagram and are distinct from retransmission attempts.
+Application-data resume requests are normalized per GiB
+(`sender_application_data_resume_requests_per_gib_delivered`), and raw plus
+per-GiB sender/peer data-send WouldBlocks are exposed
+(`sender_data_send_would_blocks[_per_gib_delivered]`,
+`peer_data_send_would_blocks[_per_gib_delivered]`). A zero WouldBlock count
+only means no exhausted underlay outcome was observed under this bounded
+readiness policy; it does not prove the underlay never blocked. Event
+normalization is rejected unless both a concrete counter and positive
+delivered bytes exist, so absent schema fields stay `null` rather than being
+misread as zero. Split-window goodput is computed at the exact measurement
+midpoint only when progress samples bracket it; paired effects are ranked by
+the bounded median across pairs rather than a single outlier, and every
+guidance item retains its `does_not_prove` constraint.
+
 ## Clean lane
 
 ```sh
@@ -137,14 +173,31 @@ isolates endpoint and host throughput from proxy overhead.
 
 ## Frozen executables and counterbalanced order
 
-Both roles are prebuilt once (`cargo test --release -p tests --test
-perf_probe --no-run --message-format=json-render-diagnostics` per role,
-streamed to `build-ROLE.log`) before any timed run. Immediately after each
-build, the runner copies the artifact to a SHA-256-addressed sibling in the
-same Cargo artifact directory. This prevents a shared target directory from
-overwriting the baseline executable during the candidate build. Every seed
-invokes that preserved `perf_probe` executable directly, so no timed run
-compiles.
+Both roles are prebuilt once, baseline before candidate
+(`cargo test -j1 [--release] -p tests --test perf_probe --no-run
+--message-format=json-render-diagnostics` per role, streamed to
+`build-ROLE.log`) before any timed run. Every build runs with
+`CARGO_TARGET_DIR` set to a canonical hash-suffixed directory beneath
+`$TMPDIR` whose final path component is literally `target`, and with both
+`RUST_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` cleared so sccache or other
+inherited compiler wrappers cannot alter the build. The executable is parsed
+only from `compiler-artifact` messages whose target is `perf_probe` with a
+`test` kind. Immediately after each build — and before the next role builds —
+the runner copies the artifact to a SHA-256-addressed sibling in the same
+Cargo artifact directory (`perf_probe-<hash>.perf-loop-<sha256>`). This
+prevents a shared target directory from overwriting the baseline executable
+during the candidate build. Every seed invokes only that preserved
+`perf_probe` executable directly, so no timed run compiles.
+
+Each built role also writes a probe source manifest
+(`{baseline,candidate}-probe-source.json`) binding the exact executable
+SHA-256 to the workspace's exact component commit revisions. A prebuilt pair
+runs only when both `--baseline-executable` and `--candidate-executable` are
+supplied; paired `--baseline-source-manifest`/`--candidate-source-manifest`
+are accepted only in that mode and must match the executable bytes on load. A
+prebuilt binary without a matching source manifest runs only with its
+execution workspace recorded as the explicit `execution_workspace_fallback`
+component source.
 
 Pair execution order alternates per seed-major pair (baseline/candidate then
 candidate/baseline) to counterbalance first/second position across adjacent
@@ -181,10 +234,18 @@ for matching each binary to its workspace revisions.
 permits identical resolved workspaces; the resolved executable paths must
 also match) to calibrate run-to-run variance. `run.json` then records
 `control_calibration`, classified stable only when every absolute valid
-paired goodput delta is below 10% — with the median/maximum absolute delta
-and the number of pairs that crossed the material-change threshold (false
-material changes on an identical binary). With
-`--fail-on-control-instability`, an unstable calibration exits 4.
+paired goodput delta is below 10% AND the within-run phase analysis is not
+`unstable_phase_drift` — with the median/maximum absolute delta and the
+number of pairs that crossed the material-change threshold (false material
+changes on an identical binary). `within_run_phase_analysis` is also written
+into every `run.json`: it compares each run's first-half and second-half
+goodput at the exact midpoint, marking a `material_phase_drift` whenever one
+half differs from the other by at least `MATERIAL_PHASE_DRIFT_PERCENT`
+(20%). A same-binary pair whose paired deltas are all under 10% is still
+rejected as a control when either arm changed controller phase between its
+halves, because the delta can no longer be attributed to a stationary
+baseline. With `--fail-on-control-instability`, an unstable calibration
+exits 4.
 
 ## Artifacts
 
@@ -193,11 +254,13 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
 
 - `run.json` — top-level run record: `pair_execution_order` (`alternating`),
   role-independent `execution_order_analysis`, AB/BA
-  `counterbalanced_goodput_analysis`, `link_profile`, `mss_bytes`,
-  workspaces, seeds, window, target directories, warmup duration,
+  `counterbalanced_goodput_analysis`, `within_run_phase_analysis`, `link_profile`,
+  `mss_bytes`, workspaces, seeds, window, target directories, warmup duration,
   same-binary control flag, control calibration, per-role builds (frozen
-  executable + build log), per-role/seed runs (with the `executable`) and
-  their artifact paths, and the comparison verdict.
+  executable, SHA-256, built/prebuilt source, exact component revisions,
+  component-revision source, source-manifest path, build log), per-role/seed
+  runs (with the `executable`) and their artifact paths, and the comparison
+  verdict.
 - `manifest.csv` — one row per role/seed probe: runner exit, role, Cargo
   profile, sorted component-revision JSON, seed, link profile, MSS,
   resolved executable, trace dir.
@@ -205,7 +268,9 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
   peer/netem/progress) with the link profile and MSS recorded in its
   manifest.
 - `<role>-<seed>.log` — streamed probe log.
-- `comparison.json` / `comparison.html` — schema-15 comparison and report.
+- `comparison.json` / `comparison.html` — schema-28 comparison and report.
+- `{baseline,candidate}-probe-source.json` — probe source manifests binding
+  each preserved executable's SHA-256 to exact component revisions.
 
 Time-boxed goodput traces record `measurement_end_reason=timebox_elapsed`.
 When the probe completed and all three endpoint outcome trackers are still
@@ -283,9 +348,10 @@ was avoidable.
 
 ## RTP trace evidence
 
-The 68-column RTP trace carries the complete congestion-controller and
-retransmission-scheduler snapshot on every state row; event-only raw RTP
-rows leave all snapshot columns empty. The controller evidence:
+The 73-column RTP trace (schema 26) carries the complete
+congestion-controller and retransmission-scheduler snapshot on every state
+row; event-only raw RTP rows leave all snapshot columns empty. The
+controller evidence:
 
 - `congestion_control_rtt_us` — the control RTT last used by the controller;
   it paces probe spacing and the queue gate.
@@ -397,9 +463,15 @@ python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json --con
 python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json --contains tokio --thread tokio-rt-worker --limit 20 --json
 ```
 
-Every schema-7 summary includes a whole-profile thread inventory before any
-`--thread` filter is applied. It groups equal thread names, reports nonempty and
-CPU-active sample counts, and ranks each name's share of all CPU-active samples.
+Every schema-8 summary includes a whole-profile thread inventory before any
+`--thread` filter is applied. It groups equal thread names, reports nonempty
+and CPU-active sample counts plus total CPU delta, and ranks each name's
+share of all CPU-active samples. In CPU-active mode (`--cpu-active-only`),
+aligned nonnegative `threadCPUDelta` values are mandatory for every selected
+thread and zero-delta samples are excluded; the summary returns both
+count-ranked `hotspots` and CPU-ranked `cpu_hotspots` whose inclusive and
+leaf ownership are weighted by the sample delta. A profile without valid CPU
+deltas is an error, never a silent fallback to wall samples.
 Inspect this inventory before filtering: proxy workloads use dedicated
 `netem-c2s` and `netem-s2c` workers, so a Tokio-only summary does not cover the
 packet-forwarding path.

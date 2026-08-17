@@ -212,8 +212,10 @@ class PerfLoopTest(unittest.TestCase):
             for component in LOOP.COMPONENTS:
                 (source_root / component).mkdir(parents=True, exist_ok=True)
             output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-test-{os.getpid()}"
+            snapshot_calls = []
 
             def fake_snapshot(component_source, component_output, revision):
+                snapshot_calls.append((component_output.name, revision))
                 component_output.mkdir(parents=True)
                 if component_output.name == "netem_test":
                     self.make_workspace(component_output.parent, "netem_test")
@@ -224,18 +226,53 @@ class PerfLoopTest(unittest.TestCase):
 
             with mock.patch.object(LOOP, "snapshot_component", fake_snapshot):
                 args = argparse.Namespace(
-                    source=str(source), revision="@-", output=str(output)
+                    source=str(source),
+                    revision="@-",
+                    component_revision=[("rtp", "a" * 40)],
+                    output=str(output),
                 )
                 self.assertEqual(LOOP.command_snapshot(args), 0)
             manifest = json.loads(
                 (output / LOOP.SUITE_REVISION_MANIFEST).read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["schema"], 1)
+            self.assertEqual(manifest["schema"], LOOP.SUITE_REVISION_MANIFEST_SCHEMA)
+            self.assertEqual(manifest["requested_revision"], "@-")
+            self.assertEqual(
+                manifest["component_revision_overrides"], {"rtp": "a" * 40}
+            )
             self.assertEqual(set(manifest["components"]), set(LOOP.COMPONENTS))
             self.assertEqual(
-                LOOP.jj_revision(output / "rtp"),
                 manifest["components"]["rtp"]["commit_id"],
+                "r".encode().hex().ljust(40, "0")[:40],
             )
+            # The override revision reaches the rtp snapshot; the requested
+            # source revision is the fallback for every other component.
+            self.assertIn(("rtp", "a" * 40), snapshot_calls)
+            self.assertIn(("mux", "@-"), snapshot_calls)
+            self.assertEqual(
+                LOOP.jj_revision(output / "rtp"),
+                manifest["components"]["rtp"],
+            )
+            # Duplicate and unknown overrides are rejected before any archive.
+            for index, (revision_pairs, message) in enumerate(
+                (
+                    ([("rtp", "a" * 40), ("rtp", "b" * 40)], "duplicate component revision"),
+                    ([("missing", "a" * 40)], "unknown component revision"),
+                )
+            ):
+                reject_output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-reject-{os.getpid()}-{index}"
+                try:
+                    with self.assertRaisesRegex(ValueError, message):
+                        LOOP.command_snapshot(
+                            argparse.Namespace(
+                                source=str(source),
+                                revision="@-",
+                                component_revision=revision_pairs,
+                                output=str(reject_output),
+                            )
+                        )
+                finally:
+                    shutil.rmtree(reject_output, ignore_errors=True)
 
     def test_same_binary_control_calibration_detects_false_changes(self):
         comparison = {
@@ -282,6 +319,8 @@ class PerfLoopTest(unittest.TestCase):
                 release=True,
                 target_dir=None,
                 candidate_executable=None,
+                baseline_source_manifest=None,
+                candidate_source_manifest=None,
                 output=str(output_root),
                 link_profile="direct",
             )
@@ -622,9 +661,15 @@ class PerfLoopTest(unittest.TestCase):
     def test_run_parser_accepts_clean_link_and_rejects_nonpositive_mss(self):
         parser = LOOP.build_parser()
         snapshot = parser.parse_args(
-            ["snapshot", "--source", "suite/netem_test", "--revision", "@-"]
+            ["snapshot", "--source", "suite/netem_test",
+             "--source-revision", "@-", "--output", "/safe/snapshot"]
         )
         self.assertEqual(snapshot.revision, "@-")
+        override = parser.parse_args(
+            ["snapshot", "--source", "suite/netem_test", "--output", "/safe/snapshot",
+             "--component-revision", "rtp=abc", "--component-revision", "mux=def"]
+        )
+        self.assertEqual(override.component_revision, ["rtp=abc", "mux=def"])
         fake_parser = mock.Mock()
         fake_parser.parse_args.return_value = argparse.Namespace(handler=lambda _: 0)
         with mock.patch.object(LOOP, "build_parser", return_value=fake_parser):
@@ -735,6 +780,208 @@ class PerfLoopTest(unittest.TestCase):
                 ]
             )
         self.assertNotEqual(context.exception.code, 0)
+
+    def test_probe_source_manifest_is_bound_to_exact_executable_bytes(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            executable = root / "perf_probe-exact"
+            executable.write_bytes(b"#!/bin/sh\n")
+            executable.chmod(0o755)
+            components = {component: "a" * 40 for component in LOOP.COMPONENTS}
+            manifest_path = LOOP.write_probe_source_manifest(
+                root / "probe-source.json", executable, components, "suite/netem_test"
+            )
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema"], LOOP.PROBE_SOURCE_MANIFEST_SCHEMA)
+            self.assertEqual(
+                payload["executable_sha256"], LOOP.executable_sha256(executable)
+            )
+            # Loading validates the bound hash and returns the exact revisions.
+            self.assertEqual(
+                LOOP.load_probe_source_manifest(manifest_path, executable, "baseline"),
+                components,
+            )
+            # Different bytes on the same path must fail the SHA-256 binding.
+            executable.write_bytes(b"#!/bin/sh\n# changed\n")
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                LOOP.load_probe_source_manifest(manifest_path, executable, "baseline")
+
+    def test_within_run_phase_drift_makes_a_same_binary_control_unstable(self):
+        comparison = {
+            "evidence_quality": "healthy",
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {"goodput_mib_per_second": {"delta_percent": 3.0}},
+                }
+            ],
+            "runs": [
+                {
+                    "label": "same-11",
+                    "role": "baseline",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 8.0,
+                    },
+                },
+                {
+                    "label": "same-11",
+                    "role": "candidate",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 8.0,
+                    },
+                },
+            ],
+        }
+        phase = LOOP.within_run_phase_analysis(comparison)
+        self.assertEqual(phase["classification"], "unstable_phase_drift")
+        self.assertEqual(phase["material_run_count"], 2)
+        self.assertEqual(phase["valid_runs"], 2)
+        self.assertEqual(phase["median_absolute_shift_percent"], 20.0)
+        self.assertEqual(phase["max_absolute_shift_percent"], 20.0)
+        self.assertIn("does_not_prove", phase["does_not_prove"])
+        # A paired goodput delta below the 10% material threshold is still
+        # unstable as a control because both arms drifted a material 20%
+        # between their own first and second halves.
+        calibration = LOOP.control_calibration(comparison)
+        self.assertEqual(calibration["classification"], "unstable")
+        self.assertEqual(calibration["paired_classification"], "stable")
+        self.assertEqual(
+            calibration["within_run_phase_analysis"]["classification"],
+            "unstable_phase_drift",
+        )
+
+    def test_same_binary_run_records_and_can_fail_control_analysis(self):
+        comparison = {
+            "evidence_quality": "healthy",
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {"goodput_mib_per_second": {"delta_percent": -4.0}},
+                },
+                {
+                    "valid": True,
+                    "metrics": {"goodput_mib_per_second": {"delta_percent": 12.5}},
+                },
+            ],
+            "runs": [
+                {
+                    "label": "same-11",
+                    "role": "baseline",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 10.0,
+                    },
+                },
+                {
+                    "label": "same-11",
+                    "role": "candidate",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 10.0,
+                    },
+                },
+                {
+                    "label": "same-21",
+                    "role": "baseline",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 10.0,
+                    },
+                },
+                {
+                    "label": "same-21",
+                    "role": "candidate",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 10.0,
+                    },
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            workspace = self.make_workspace(root, "netem_test")
+            output_root = root / "out"
+            executable = root / "bin" / "perf_probe-frozen"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            args = argparse.Namespace(
+                mss_bytes=8192,
+                candidate=str(workspace),
+                baseline=str(workspace),
+                same_binary_control=True,
+                fail_on_control_instability=True,
+                fail_on_regression=False,
+                seeds=(11, 21),
+                window_seconds=10,
+                label=None,
+                warmup_seconds=LOOP.DEFAULT_WARMUP_SECONDS,
+                baseline_executable=None,
+                release=True,
+                target_dir=None,
+                candidate_executable=None,
+                baseline_source_manifest=None,
+                candidate_source_manifest=None,
+                output=str(output_root),
+                link_profile="direct",
+            )
+
+            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+                return str(executable.resolve())
+
+            def fake_run_probe(workspace, seed, role, output_root, **kwargs):
+                return {
+                    "runner_exit": 0,
+                    "role": role,
+                    "seed": str(seed),
+                    "executable": kwargs["executable"],
+                    "trace_dir": str(output_root / f"trace-{role}-{seed}"),
+                }
+
+            def fake_call_compare(baseline_dirs, candidate_dirs, output_root):
+                (Path(output_root) / "comparison.json").write_text(
+                    json.dumps(comparison), encoding="utf-8"
+                )
+                return subprocess.CompletedProcess([], 0, b"", b"")
+
+            with mock.patch.object(LOOP, "build_probe", fake_build_probe), mock.patch.object(
+                LOOP, "run_probe", fake_run_probe
+            ), mock.patch.object(LOOP, "call_compare", fake_call_compare):
+                exit_code = LOOP.command_run(args)
+            self.assertEqual(exit_code, 4)
+            run_json = json.loads(
+                (output_root / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(run_json["control_calibration"]["classification"], "unstable")
+            self.assertEqual(
+                run_json["control_calibration"]["within_run_phase_analysis"]["classification"],
+                "stable",
+            )
+            # The phase analysis is written into every run.json as its own key.
+            self.assertEqual(
+                run_json["within_run_phase_analysis"]["classification"], "stable"
+            )
+            self.assertEqual(run_json["within_run_phase_analysis"]["valid_runs"], 4)
+            self.assertEqual(run_json["within_run_phase_analysis"]["material_run_count"], 0)
+            # Execution-order and AB/BA analyses remain separate keys.
+            self.assertIn("execution_order_analysis", run_json)
+            self.assertIn("counterbalanced_goodput_analysis", run_json)
+            self.assertEqual(
+                run_json["builds"]["baseline"]["source"], "built"
+            )
+            self.assertEqual(
+                run_json["builds"]["baseline"]["source_manifest"],
+                str((output_root / "baseline-probe-source.json").resolve()),
+            )
+            self.assertEqual(
+                run_json["builds"]["baseline"]["components_source"],
+                "build_workspace",
+            )
+            self.assertTrue(
+                (output_root / "baseline-probe-source.json").is_file()
+            )
 
 
 if __name__ == "__main__":

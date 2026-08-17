@@ -137,16 +137,22 @@ class TraceCompareTest(unittest.TestCase):
             ["rtp_dropped_capacity", "0"],
             ["rtp_peer_dropped_capacity", "0"],
             ["rtp_send_driver_resume_signal_wakes", "11"],
+            ["rtp_send_driver_ack_schedule_signal_wakes", "14"],
             ["rtp_send_driver_pacing_timer_wakes", "12"],
             ["rtp_send_driver_protocol_timer_wakes", "13"],
             ["rtp_send_driver_kill_requested_wakes", "1"],
             ["rtp_peer_send_driver_resume_signal_wakes", "21"],
+            ["rtp_peer_send_driver_ack_schedule_signal_wakes", "24"],
             ["rtp_peer_send_driver_pacing_timer_wakes", "22"],
             ["rtp_peer_send_driver_protocol_timer_wakes", "23"],
             ["rtp_peer_send_driver_kill_requested_wakes", "2"],
             ["rtp_send_driver_resume_application_data_requests", "31"],
             ["rtp_send_driver_resume_peer_ack_requests", "32"],
             ["rtp_peer_send_driver_resume_ack_flush_requests", "41"],
+            ["rtp_retransmission_armor_duplicates", "17"],
+            ["rtp_peer_retransmission_armor_duplicates", "27"],
+            ["rtp_data_send_would_blocks", "5"],
+            ["rtp_peer_data_send_would_blocks", "6"],
             ["measurement_start_trace_elapsed_us", "1000000"],
             ["scenario_revision", revision],
             ["scenario", "mux_over_rtp_hostile_goodput_30s"],
@@ -298,11 +304,15 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 20)
+            self.assertEqual(comparison["schema_version"], 28)
             self.assertEqual(comparison["valid_pairs"], 1)
             self.assertEqual(comparison["total_pairs"], 1)
             self.assertEqual(comparison["verdict"], "likely_improvement")
             for run in comparison["runs"]:
+                if run["label"] == "before-1":
+                    mib_delivered = 30.0
+                else:
+                    mib_delivered = 60.0
                 self.assertEqual(
                     run["summary"]["goodput_first_half_mib_per_second"],
                     run["summary"]["goodput_mib_per_second"],
@@ -368,6 +378,7 @@ class TraceCompareTest(unittest.TestCase):
                     run["summary"]["send_driver_wakes"],
                     {
                         "resume_signal": 11.0,
+                        "ack_schedule_signal": 14.0,
                         "pacing_timer": 12.0,
                         "protocol_timer": 13.0,
                         "kill_requested": 1.0,
@@ -377,6 +388,7 @@ class TraceCompareTest(unittest.TestCase):
                     run["summary"]["peer_send_driver_wakes"],
                     {
                         "resume_signal": 21.0,
+                        "ack_schedule_signal": 24.0,
                         "pacing_timer": 22.0,
                         "protocol_timer": 23.0,
                         "kill_requested": 2.0,
@@ -393,6 +405,45 @@ class TraceCompareTest(unittest.TestCase):
                 self.assertEqual(
                     run["summary"]["peer_send_driver_resume_requests"]["ack_flush"],
                     41.0,
+                )
+                # Normalized scheduler/recovery metrics: protocol-timer wakes
+                # per GiB, application-data resume requests per GiB, armor
+                # duplicates raw + per GiB, and WouldBlocks raw + per GiB.
+                self.assertAlmostEqual(
+                    run["summary"]["sender_protocol_timer_wakes_per_gib_delivered"],
+                    13.0 * 1024 / mib_delivered,
+                )
+                self.assertAlmostEqual(
+                    run["summary"]["peer_protocol_timer_wakes_per_gib_delivered"],
+                    23.0 * 1024 / mib_delivered,
+                )
+                self.assertAlmostEqual(
+                    run["summary"]["sender_application_data_resume_requests_per_gib_delivered"],
+                    31.0 * 1024 / mib_delivered,
+                )
+                self.assertEqual(
+                    run["summary"]["sender_retransmission_armor_duplicates"], 17.0
+                )
+                self.assertAlmostEqual(
+                    run["summary"]["sender_retransmission_armor_duplicates_per_gib_delivered"],
+                    17.0 * 1024 / mib_delivered,
+                )
+                self.assertEqual(
+                    run["summary"]["peer_retransmission_armor_duplicates"], 27.0
+                )
+                self.assertAlmostEqual(
+                    run["summary"]["peer_retransmission_armor_duplicates_per_gib_delivered"],
+                    27.0 * 1024 / mib_delivered,
+                )
+                self.assertEqual(run["summary"]["sender_data_send_would_blocks"], 5.0)
+                self.assertAlmostEqual(
+                    run["summary"]["sender_data_send_would_blocks_per_gib_delivered"],
+                    5.0 * 1024 / mib_delivered,
+                )
+                self.assertEqual(run["summary"]["peer_data_send_would_blocks"], 6.0)
+                self.assertAlmostEqual(
+                    run["summary"]["peer_data_send_would_blocks_per_gib_delivered"],
+                    6.0 * 1024 / mib_delivered,
                 )
             pair_metrics = comparison["pairs"][0]["metrics"]
             self.assertAlmostEqual(
@@ -523,7 +574,7 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 20)
+            self.assertEqual(comparison["schema_version"], 28)
             self.assertEqual(comparison["evidence_quality"], "healthy")
             for run in comparison["runs"]:
                 self.assertEqual(run["evidence_quality"], "healthy")
@@ -538,7 +589,7 @@ class TraceCompareTest(unittest.TestCase):
     def test_schema_22_and_23_require_counter_baselines_after_warmup(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
             root = Path(directory)
-            for schema in ("22", "23"):
+            for schema in ("22", "23", "24", "25", "26"):
                 with self.subTest(schema=schema):
                     before = root / f"before-{schema}"
                     after = root / f"after-{schema}"
@@ -715,6 +766,31 @@ class TraceCompareTest(unittest.TestCase):
         self.assertGreater(repeat["delta_percent"], 1000.0)
         self.assertAlmostEqual(repeat["ranking_delta_percent"], 93.0)
 
+
+    def test_event_normalization_requires_a_counter_and_delivered_bytes(self):
+        # Both a concrete counter and positive delivered bytes are required;
+        # an absent counter or missing/zero bytes reject the normalization.
+        self.assertIsNone(COMPARE._per_gib(None, 1024 ** 3))
+        self.assertIsNone(COMPARE._per_gib(3.0, 0))
+        self.assertIsNone(COMPARE._per_gib(3.0, None))
+        self.assertEqual(COMPARE._per_gib(3.0, 1024 ** 3), 3.0)
+        # A present zero counter with bytes is a real zero, while an absent
+        # schema field stays unknown rather than being misread as zero.
+        manifest = {
+            "rtp_retransmission_armor_duplicates": "0",
+            "delivered_bytes": str(1024 ** 3),
+        }
+        summary = COMPARE.summarize_run(manifest, [], [], [], [], [], [], [], [])
+        self.assertEqual(summary["sender_retransmission_armor_duplicates"], 0.0)
+        self.assertEqual(
+            summary["sender_retransmission_armor_duplicates_per_gib_delivered"],
+            0.0,
+        )
+        summary_absent = COMPARE.summarize_run({}, [], [], [], [], [], [], [], [])
+        self.assertIsNone(summary_absent["sender_retransmission_armor_duplicates"])
+        self.assertIsNone(
+            summary_absent["sender_retransmission_armor_duplicates_per_gib_delivered"]
+        )
 
     def test_guidance_ranks_median_pair_effect_not_one_pair_outlier(self):
         def pair(goodput_candidate, rare_candidate):

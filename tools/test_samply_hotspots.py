@@ -416,6 +416,39 @@ class SamplyHotspotsTest(unittest.TestCase):
             result = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(result["total_samples"], 1)
             self.assertEqual(result["hotspots"][0]["name"], "work")
+    def test_cpu_delta_ranking_does_not_treat_every_active_sample_equally(self):
+        profile = sample_profile(
+            [[0], [1], [1], [1]],
+            frame_to_func=[0, 1],
+            funcs=[(0, 0x1000, 0), (1, 0x2000, 0)],
+            libs=[],
+            strings=["hot", "steady"],
+        )
+        profile["threads"][0]["samples"]["threadCPUDelta"] = [100, 10, 10, 10]
+
+        result = HOTSPOTS.summarize(
+            profile,
+            sidecar([], ["hot", "steady"]),
+            cpu_active_only=True,
+        )
+        self.assertEqual(result["sample_mode"], "cpu-active-only")
+        self.assertEqual(result["total_samples"], 4)
+        self.assertEqual(result["total_cpu_delta"], 130.0)
+        # Count-ranked hotspots favor the symbol seen in the most samples...
+        self.assertEqual([h["name"] for h in result["hotspots"]], ["steady", "hot"])
+        self.assertEqual(result["hotspots"][0]["inclusive_samples"], 3)
+        # ... while CPU-ranked hotspots weight ownership by threadCPUDelta.
+        self.assertEqual([h["name"] for h in result["cpu_hotspots"]], ["hot", "steady"])
+        by_cpu = {h["name"]: h for h in result["cpu_hotspots"]}
+        self.assertEqual(by_cpu["hot"]["inclusive_cpu"], 100.0)
+        self.assertEqual(by_cpu["steady"]["inclusive_cpu"], 30.0)
+        self.assertEqual(by_cpu["hot"]["leaf_cpu"], 100.0)
+        self.assertEqual(by_cpu["steady"]["leaf_cpu"], 30.0)
+        self.assertAlmostEqual(
+            by_cpu["hot"]["inclusive_cpu_percent"], 100.0 * 100.0 / 130.0
+        )
+        self.assertEqual(result["schema_version"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()
