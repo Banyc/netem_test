@@ -585,8 +585,184 @@ def call_compare(baseline_dirs, candidate_dirs, output_root):
     return result
 
 
+def _phase_stability_summary(observations):
+    absolute = [abs(item["second_minus_first_percent"]) for item in observations]
+    material = [item for item in observations if item["material_phase_drift"]]
+    classification = (
+        "insufficient_evidence"
+        if not observations
+        else "unstable_phase_drift"
+        if material
+        else "stable"
+    )
+    return {
+        "classification": classification,
+        "valid_runs": len(observations),
+        "material_run_count": len(material),
+        "median_absolute_shift_percent": statistics.median(absolute) if absolute else None,
+        "max_absolute_shift_percent": max(absolute) if absolute else None,
+    }
+
+
 def within_run_phase_analysis(comparison):
-    observations = [{"label": run.get("Label"), "role": run.get("role"), "first_half_mib_per_second": first, "second_half_mib_per_second": second, "second_minus_first_percent": shift, "material_phase_drift": abs(shift) >= MATERIAL_PHASE_DRIFT_PERCENT or math.isclose(abs(shift), MATERIAL_PHASE_DRIFT_PERCENT, rel_tol=1e-12, abs_tol=1e-12)} for run in comparison.get("runs", []) for summary in (run.get("summary", {}),) if isinstance(summary.get("goodput_first_half_mib_per_second"), (int, float)) and isinstance(summary.get("goodput_second_half_mib_per_second"), (int, float)) for first in (float(summary["goodput_first_half_mib_per_second"]),) for second in (float(summary["goodput_second_half_mib_per_second"]),) if math.isfinite(first) and math.isfinite(second) and first > 0.0 for shift in (((second - first) / first) * 100.0,)]; absolute = [abs(item["second_minus_first_percent"]) for item in observations]; material = [item for item in observations if item["material_phase_drift"]]; classification = "insufficient_evidence" if not observations else "unstable_phase_drift" if material else "stable"; return {"classification": classification, "material_threshold_percent": MATERIAL_PHASE_DRIFT_PERCENT, "valid_runs": len(observations), "material_run_count": len(material), "median_absolute_shift_percent": statistics.median(absolute) if absolute else None, "max_absolute_shift_percent": max(absolute) if absolute else None, "runs": observations, "does_not_prove": "A first/second-half shift exposes non-stationary goodput inside the measurement window but does_not_prove its cause; controller cycles, loss timing, scheduling, thermal state, or adjacent load may contribute."}
+    """Classify first/second-half goodput drift inside each run's window.
+
+    Only finite positive first-half and finite positive second-half goodput
+    are accepted; the shift is the multiplicative
+    ``((second - first) / first) * 100``. An exact/near-threshold shift is
+    material via ``math.isclose(..., rel_tol=1e-12, abs_tol=1e-12)``. Returns
+    overall plus by_role summaries, per-run observations, the threshold, and
+    does_not_prove.
+    """
+    observations = [
+        {
+            "label": run.get("label"),
+            "role": run.get("role"),
+            "first_half_mib_per_second": first,
+            "second_half_mib_per_second": second,
+            "second_minus_first_percent": shift,
+            "material_phase_drift": (
+                abs(shift) >= MATERIAL_PHASE_DRIFT_PERCENT
+                or math.isclose(
+                    abs(shift),
+                    MATERIAL_PHASE_DRIFT_PERCENT,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ),
+        }
+        for run in comparison.get("runs", [])
+        for summary in (run.get("summary", {}),)
+        if isinstance(summary.get("goodput_first_half_mib_per_second"), (int, float))
+        and isinstance(summary.get("goodput_second_half_mib_per_second"), (int, float))
+        for first in (float(summary["goodput_first_half_mib_per_second"]),)
+        for second in (float(summary["goodput_second_half_mib_per_second"]),)
+        if math.isfinite(first) and math.isfinite(second) and first > 0.0 and second > 0.0
+        for shift in (((second - first) / first) * 100.0,)
+    ]
+    overall = _phase_stability_summary(observations)
+    roles = {}
+    for role in ("baseline", "candidate"):
+        role_observations = [
+            item for item in observations if item["role"] == role
+        ]
+        roles[role] = _phase_stability_summary(role_observations)
+    return {
+        "classification": overall["classification"],
+        "material_threshold_percent": MATERIAL_PHASE_DRIFT_PERCENT,
+        "valid_runs": overall["valid_runs"],
+        "material_run_count": overall["material_run_count"],
+        "median_absolute_shift_percent": overall["median_absolute_shift_percent"],
+        "max_absolute_shift_percent": overall["max_absolute_shift_percent"],
+        "runs": observations,
+        "by_role": roles,
+        "does_not_prove": (
+            "A first/second-half shift exposes non-stationary goodput inside "
+            "the measurement window but does_not_prove its cause; controller "
+            "cycles, loss timing, scheduling, thermal state, or adjacent load "
+            "may contribute."
+        ),
+    }
+
+
+def comparison_readiness(
+    comparison, phase_analysis, order_analysis, counterbalanced_analysis
+):
+    """Structural readiness gate over healthy evidence, two complete
+    counterbalanced AB/BA blocks, and stable within-run phase behaviour.
+
+    Execution-order association is a caution, not a blocker. Readiness means
+    the capture passed structural evidence checks; it does_not_prove
+    causality, practical benefit, or the absence of an unmeasured regression.
+    """
+    blocking_reasons = []
+    blocking_reasons.append("trace_evidence_not_healthy") if comparison.get("evidence_quality") != "healthy" else None
+    blocking_reasons.append("fewer_than_two_counterbalanced_blocks") if counterbalanced_analysis.get("complete_blocks", 0) < 2 else None
+    blocking_reasons.append("within_run_phase_not_stable") if phase_analysis.get("classification") != "stable" else None
+    cautions = ["directional_execution_order_effect"] if order_analysis.get("directionally_confounded") else []
+    return {
+        "classification": "ready" if not blocking_reasons else "not_ready",
+        "blocking_reasons": blocking_reasons,
+        "cautions": cautions,
+        "does_not_prove": (
+            "Readiness means the capture passed structural evidence checks; "
+            "it does_not_prove causality, practical benefit, or the absence "
+            "of an unmeasured regression."
+        ),
+    }
+
+
+def paired_result_analysis(comparison, runs, *, same_binary_control=False):
+    """Derived aggregation over a completed paired run: execution order,
+    within-run phase drift, counterbalanced goodput, and the readiness gate;
+    control calibration only for a same-binary control run."""
+    order_analysis = execution_order_analysis(comparison, runs)
+    phase_analysis = within_run_phase_analysis(comparison)
+    counterbalanced_analysis = counterbalanced_goodput_analysis(
+        comparison, runs, order_analysis
+    )
+    return {
+        "execution_order_analysis": order_analysis,
+        "within_run_phase_analysis": phase_analysis,
+        "counterbalanced_goodput_analysis": counterbalanced_analysis,
+        "comparison_readiness": comparison_readiness(
+            comparison, phase_analysis, order_analysis, counterbalanced_analysis
+        ),
+        "control_calibration": (
+            control_calibration(comparison) if same_binary_control else None
+        ),
+    }
+
+
+def checked_result_dir(result_dir):
+    """Validate a preserved result directory and return it resolved."""
+    result_dir = Path(result_dir).expanduser().resolve()
+    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    (_ for _ in ()).throw(ValueError(f"result directory must remain beneath {safe_root}")) if not result_dir.is_relative_to(safe_root) else None
+    (_ for _ in ()).throw(ValueError(f"result directory is missing: {result_dir}")) if not result_dir.is_dir() else None
+    return result_dir
+
+
+def read_json_object(path):
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json_object_atomic(path, value):
+    """Write ``value`` to ``path`` atomically via a sibling temp file."""
+    path = Path(path)
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / f".{path.name}.{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def command_analyze(args):
+    result_dir = checked_result_dir(args.result)
+    comparison = read_json_object(result_dir / "comparison.json")
+    run_json_path = result_dir / "run.json"
+    run_json = read_json_object(run_json_path)
+    runs = run_json.get("runs")
+    (_ for _ in ()).throw(ValueError(f"expected a runs array in {run_json_path}")) if not isinstance(runs, list) else None
+    analysis = paired_result_analysis(
+        comparison,
+        runs,
+        same_binary_control=bool(run_json.get("same_binary_control")),
+    )
+    report = {
+        "result_dir": str(result_dir),
+        "evidence_quality": comparison.get("evidence_quality", "invalid"),
+        "verdict": comparison.get("verdict", "insufficient_evidence"),
+        **analysis,
+    }
+    run_json.update(analysis) if args.update_run_json else None
+    write_json_object_atomic(run_json_path, run_json) if args.update_run_json else None
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 def control_calibration(comparison):
@@ -940,12 +1116,16 @@ def command_run(args):
     if (output_root / "comparison.json").exists():
         comparison = json.loads((output_root / "comparison.json").read_text(encoding="utf-8"))
     verdict = comparison.get("verdict", "insufficient_evidence")
-    phase_analysis = within_run_phase_analysis(comparison)
-    calibration = control_calibration(comparison) if args.same_binary_control else None
-    order_analysis = execution_order_analysis(comparison, runs)
-    counterbalanced_analysis = counterbalanced_goodput_analysis(
-        comparison, runs, order_analysis
+    analysis = paired_result_analysis(
+        comparison,
+        runs,
+        same_binary_control=bool(args.same_binary_control),
     )
+    phase_analysis = analysis["within_run_phase_analysis"]
+    calibration = analysis["control_calibration"]
+    order_analysis = analysis["execution_order_analysis"]
+    counterbalanced_analysis = analysis["counterbalanced_goodput_analysis"]
+    readiness = analysis["comparison_readiness"]
     build_components = {}
     components_sources = {}
     for role, workspace in (("baseline", baseline), ("candidate", candidate)):
@@ -963,6 +1143,7 @@ def command_run(args):
         "execution_order_analysis": order_analysis,
         "counterbalanced_goodput_analysis": counterbalanced_analysis,
         "within_run_phase_analysis": phase_analysis,
+        "comparison_readiness": readiness,
         "link_profile": args.link_profile,
         "mss_bytes": args.mss_bytes,
         "baseline": str(baseline),
@@ -1090,6 +1271,21 @@ def build_parser():
     )
     snapshot.add_argument("--output", default=None, help="output directory beneath $TMPDIR (default: a safe-root output dir)")
     snapshot.set_defaults(handler=command_snapshot)
+
+    analyze = subparsers.add_parser(
+        "analyze", help="recompute readiness/phase/order analysis from a preserved result"
+    )
+    analyze.add_argument(
+        "--result",
+        required=True,
+        help="preserved result directory beneath $TMPDIR containing run.json and comparison.json",
+    )
+    analyze.add_argument(
+        "--update-run-json",
+        action="store_true",
+        help="write the recomputed analysis back into the preserved run.json",
+    )
+    analyze.set_defaults(handler=command_analyze)
 
     run = subparsers.add_parser("run", help="run a paired baseline/candidate capture")
     run.add_argument("--baseline", required=True, help="baseline netem_test workspace")

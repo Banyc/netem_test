@@ -1046,5 +1046,121 @@ class PerfLoopTest(unittest.TestCase):
             self.assertTrue(executable.is_file())
 
 
+    def test_comparison_readiness_separates_blockers_from_order_cautions(self):
+        healthy = {"evidence_quality": "healthy", "runs": []}
+        phase = {"classification": "stable"}
+        order = {"directionally_confounded": True}
+        counterbalanced = {"complete_blocks": 2}
+        readiness = LOOP.comparison_readiness(
+            healthy, phase, order, counterbalanced
+        )
+        self.assertEqual(readiness["classification"], "ready")
+        self.assertEqual(readiness["blocking_reasons"], [])
+        self.assertEqual(
+            readiness["cautions"], ["directional_execution_order_effect"]
+        )
+        # Order association is a caution, not a blocker.
+        blocked = LOOP.comparison_readiness(
+            {"evidence_quality": "degraded", "runs": []},
+            {"classification": "unstable_phase_drift"},
+            order,
+            {"complete_blocks": 1},
+        )
+        self.assertEqual(blocked["classification"], "not_ready")
+        self.assertIn("trace_evidence_not_healthy", blocked["blocking_reasons"])
+        self.assertIn(
+            "fewer_than_two_counterbalanced_blocks", blocked["blocking_reasons"]
+        )
+        self.assertIn("within_run_phase_not_stable", blocked["blocking_reasons"])
+        self.assertIn(
+            "does_not_prove", readiness["does_not_prove"].lower()
+        )
+
+    def test_analyze_existing_result_recomputes_and_optionally_updates_run_json(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            result_dir = Path(directory)
+            comparison = {
+                "evidence_quality": "healthy",
+                "verdict": "no_material_change",
+                "runs": [],
+                "pairs": [],
+            }
+            (result_dir / "comparison.json").write_text(
+                json.dumps(comparison), encoding="utf-8"
+            )
+            run_json = {
+                "runs": [
+                    {"role": "baseline", "seed": 11},
+                    {"role": "candidate", "seed": 11},
+                ],
+                "same_binary_control": True,
+            }
+            (result_dir / "run.json").write_text(
+                json.dumps(run_json), encoding="utf-8"
+            )
+            report = LOOP.command_analyze(
+                argparse.Namespace(
+                    result=str(result_dir), update_run_json=False
+                )
+            )
+            self.assertEqual(report, 0)
+            stored = json.loads(
+                (result_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("comparison_readiness", stored)
+            # With --update-run-json the recomputed analysis is written back.
+            LOOP.command_analyze(
+                argparse.Namespace(
+                    result=str(result_dir), update_run_json=True
+                )
+            )
+            updated = json.loads(
+                (result_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("comparison_readiness", updated)
+            self.assertIn("within_run_phase_analysis", updated)
+            self.assertIn("execution_order_analysis", updated)
+            self.assertIn("counterbalanced_goodput_analysis", updated)
+
+    def test_analyze_existing_result_rejects_paths_outside_safe_root(self):
+        outside = LOOP.SAFE_TEMP_ROOT.parent.parent / "perf-outside-safe-root-test"
+        with self.assertRaisesRegex(ValueError, "beneath"):
+            LOOP.checked_result_dir(str(outside))
+
+    def test_within_run_phase_drift_tolerates_rounding_at_threshold(self):
+        def comparison(first, second):
+            return {
+                "runs": [
+                    {
+                        "label": "run",
+                        "role": "baseline",
+                        "summary": {
+                            "goodput_first_half_mib_per_second": first,
+                            "goodput_second_half_mib_per_second": second,
+                        },
+                    }
+                ]
+            }
+
+        # Exactly at the 20% threshold: material.
+        analysis = LOOP.within_run_phase_analysis(comparison(1.0, 1.2))
+        self.assertEqual(analysis["classification"], "unstable_phase_drift")
+        self.assertTrue(analysis["runs"][0]["material_phase_drift"])
+        # Just below (well outside the 1e-12 tolerance): not material.
+        analysis = LOOP.within_run_phase_analysis(comparison(1.0, 1.199999))
+        self.assertEqual(analysis["classification"], "stable")
+        self.assertFalse(analysis["runs"][0]["material_phase_drift"])
+        # Floating-point rounding at the threshold (within isclose): material.
+        analysis = LOOP.within_run_phase_analysis(
+            comparison(1.0, 1.2000000000000002)
+        )
+        self.assertTrue(analysis["runs"][0]["material_phase_drift"])
+        self.assertEqual(analysis["classification"], "unstable_phase_drift")
+        # Non-positive second-half goodput is not accepted as evidence.
+        analysis = LOOP.within_run_phase_analysis(comparison(1.0, 0.0))
+        self.assertEqual(analysis["classification"], "insufficient_evidence")
+
+
+
 if __name__ == "__main__":
     unittest.main()

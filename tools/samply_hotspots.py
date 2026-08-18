@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _symbol_tables(profile, symbols):
@@ -158,6 +158,7 @@ def summarize(
     thread_names=(),
     callers_of=(),
     cpu_active_only=False,
+    rank_by="inclusive",
 ):
     """Reduce a profile's sidecar to owning-symbol hotspots. 
 
@@ -176,6 +177,10 @@ def summarize(
     'cpu_hotspots', whose inclusive and leaf ownership are weighted by the
     sample delta, while immediate distinct caller attribution stays exact.
     """
+    if rank_by not in ("inclusive", "leaf"):
+        raise ValueError(
+            "unknown hotspot ranking: " + str(rank_by)
+        )
     strings = symbols["string_table"]
     symbol_tables = _symbol_tables(profile, symbols)
     thread_inventory = _thread_inventory(profile)
@@ -333,7 +338,10 @@ def summarize(
         }
         for name in names
     ]
-    hotspots.sort(key=lambda h: (-h["inclusive_samples"], -h["leaf_samples"], h["name"]))
+    if rank_by == "leaf":
+        hotspots.sort(key=lambda h: (-h["leaf_samples"], -h["inclusive_samples"], h["name"]))
+    else:
+        hotspots.sort(key=lambda h: (-h["inclusive_samples"], -h["leaf_samples"], h["name"]))
     if limit is not None:
         hotspots = hotspots[:limit]
     cpu_hotspots = [
@@ -354,7 +362,10 @@ def summarize(
         }
         for name in names
     ]
-    cpu_hotspots.sort(key=lambda h: (-h["inclusive_cpu"], h["name"]))
+    if rank_by == "leaf":
+        cpu_hotspots.sort(key=lambda h: (-h["leaf_cpu"], -h["inclusive_cpu"], h["name"]))
+    else:
+        cpu_hotspots.sort(key=lambda h: (-h["inclusive_cpu"], -h["leaf_cpu"], h["name"]))
     if limit is not None:
         cpu_hotspots = cpu_hotspots[:limit]
     callers = [
@@ -382,6 +393,7 @@ def summarize(
     return {
         "schema_version": SCHEMA_VERSION,
         "sample_mode": "cpu-active-only" if cpu_active_only else "wall-samples",
+        "rank_by": rank_by,
         "total_samples": total,
         "examined_nonempty_samples": examined_nonempty,
         "excluded_zero_cpu_samples": excluded_zero_cpu,
@@ -516,6 +528,12 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--rank-by",
+        choices=("inclusive", "leaf"),
+        default="inclusive",
+        help="primary hotspot ranking dimension (default: inclusive)",
+    )
+    parser.add_argument(
         "--cpu-active-only",
         action="store_true",
         help=(
@@ -549,6 +567,7 @@ def main(argv=None):
             limit=args.limit,
             callers_of=args.callers_of,
             cpu_active_only=args.cpu_active_only,
+            rank_by=args.rank_by,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error

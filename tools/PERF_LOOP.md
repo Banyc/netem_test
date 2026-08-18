@@ -471,10 +471,14 @@ python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json --con
 python3 tools/samply_hotspots.py tmp/dir/netem-samply-handoff/profile.json --contains tokio --thread tokio-rt-worker --limit 20 --json
 ```
 
-Every schema-8 summary includes a whole-profile thread inventory before any
+Every schema-9 summary includes a whole-profile thread inventory before any
 `--thread` filter is applied. It groups equal thread names, reports nonempty
 and CPU-active sample counts plus total CPU delta, and ranks each name's
-share of all CPU-active samples. In CPU-active mode (`--cpu-active-only`),
+share of all CPU-active samples. Hotspot ranking is selected with
+`--rank-by {inclusive,leaf}` (default `inclusive`): both the count-ranked
+`hotspots` and the CPU-weighted `cpu_hotspots` sort by the selected primary
+dimension, then the other dimension, then name. In CPU-active mode
+(`--cpu-active-only`),
 aligned nonnegative `threadCPUDelta` values are mandatory for every selected
 thread and zero-delta samples are excluded; the summary returns both
 count-ranked `hotspots` and CPU-ranked `cpu_hotspots` whose inclusive and

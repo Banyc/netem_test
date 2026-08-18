@@ -416,7 +416,7 @@ class SamplyHotspotsTest(unittest.TestCase):
             result = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(result["total_samples"], 1)
             self.assertEqual(result["hotspots"][0]["name"], "work")
-    def test_cpu_delta_ranking_does_not_treat_every_active_sample_equally(self):
+    def test_cpu_delta_ranking_uses_weight_not_sample_count(self):
         profile = sample_profile(
             [[0], [1], [1], [1]],
             frame_to_func=[0, 1],
@@ -447,7 +447,81 @@ class SamplyHotspotsTest(unittest.TestCase):
         self.assertAlmostEqual(
             by_cpu["hot"]["inclusive_cpu_percent"], 100.0 * 100.0 / 130.0
         )
-        self.assertEqual(result["schema_version"], 8)
+        self.assertEqual(result["schema_version"], 9)
+
+
+    def test_leaf_ranking_surfaces_actual_work_beneath_shared_parents(self):
+        # Two samples share an inclusive parent (frame 0); the leaf (frame 1)
+        # holds the actual work. Rank-by-leaf must surface frame 1 first.
+        # Frame lists are leaf-first: samples 1-2 leaf on leaf_a, sample 3
+        # on leaf_b, all sharing caller frame 0 (the parent).
+        profile = sample_profile(
+            [[1, 0], [1, 0], [2, 0]],
+            frame_to_func=[0, 1, 2],
+            funcs=[(0, 0x1000, 0), (1, 0x2000, 0), (2, 0x3000, 0)],
+            libs=[],
+            strings=["parent", "leaf_a", "leaf_b"],
+        )
+        result = HOTSPOTS.summarize(
+            profile,
+            sidecar([], ["parent", "leaf_a", "leaf_b"]),
+            rank_by="leaf",
+        )
+        self.assertEqual(
+            [h["name"] for h in result["hotspots"]],
+            ["leaf_a", "leaf_b", "parent"],
+        )
+        self.assertEqual(result["hotspots"][0]["leaf_samples"], 2)
+        self.assertEqual(result["rank_by"], "leaf")
+        self.assertEqual(
+            [h["name"] for h in result["cpu_hotspots"]],
+            ["leaf_a", "leaf_b", "parent"],
+        )
+
+    def test_rejects_unknown_hotspot_ranking(self):
+        profile = sample_profile(
+            [[0]],
+            frame_to_func=[0],
+            funcs=[(0, 0x1000, 0)],
+            libs=[],
+            strings=["only"],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown hotspot ranking"):
+            HOTSPOTS.summarize(
+                profile,
+                sidecar([], ["only"]),
+                rank_by="self",
+            )
+
+    def test_cpu_delta_schema_records_weighted_totals(self):
+        profile = sample_profile(
+            [[0], [1], [1]],
+            frame_to_func=[0, 1],
+            funcs=[(0, 0x1000, 0), (1, 0x2000, 0)],
+            libs=[],
+            strings=["a", "b"],
+        )
+        profile["threads"][0]["samples"]["threadCPUDelta"] = [40, 20, 20]
+        result = HOTSPOTS.summarize(
+            profile,
+            sidecar([], ["a", "b"]),
+            cpu_active_only=True,
+        )
+        self.assertEqual(result["total_cpu_delta"], 80.0)
+        self.assertEqual(result["total_samples"], 3)
+        by_cpu = {h["name"]: h for h in result["cpu_hotspots"]}
+        self.assertEqual(by_cpu["a"]["inclusive_cpu"], 40.0)
+        self.assertEqual(by_cpu["b"]["inclusive_cpu"], 40.0)
+        self.assertEqual(
+            by_cpu["a"]["inclusive_cpu_percent"], 100.0 * 40.0 / 80.0
+        )
+        self.assertEqual(by_cpu["a"]["leaf_cpu"], 40.0)
+        self.assertEqual(by_cpu["b"]["leaf_cpu"], 40.0)
+        # Count ranking (wall samples) is unchanged by the CPU weights.
+        self.assertEqual(
+            [h["name"] for h in result["hotspots"]], ["b", "a"]
+        )
+
 
 
 if __name__ == "__main__":
