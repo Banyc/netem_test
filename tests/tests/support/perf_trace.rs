@@ -7,18 +7,18 @@ use std::time::{Duration, Instant};
 
 use netem_test::CountersSnapshot;
 use rtp::metrics::{
-    MetricsEvent, MetricsGentleExitCause, MetricsInterest, MetricsObservation, MetricsObserver,
-    MetricsRetransmissionCounters, MetricsSendDriverResumeSource, MetricsSendDriverWake,
-    MetricsSnapshot,
+    MetricsAckFlushReason, MetricsEvent, MetricsGentleExitCause, MetricsInterest,
+    MetricsObservation, MetricsObserver, MetricsRetransmissionCounters,
+    MetricsSendDriverResumeSource, MetricsSendDriverWake, MetricsSnapshot,
 };
 
-/// Trace schema 26: RTP rows carry the complete congestion-controller and
+/// Trace schema 27: RTP rows carry the complete congestion-controller and
 /// retransmission-scheduler snapshot (73 columns) plus `trace_elapsed_us` so
 /// endpoint, netem, and progress samples share one clock
 /// (`PerfTrace::trace_start`). Event-only rows leave every snapshot column
 /// empty; the retransmission-active/ready, RTO timing, and controller
 /// decision evidence is present only on snapshot rows.
-const TRACE_SCHEMA_VERSION: u16 = 26;
+const TRACE_SCHEMA_VERSION: u16 = 27;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 const RTP_TRACE_COLUMNS: usize = 73;
@@ -56,6 +56,44 @@ impl GentleExitCounters {
 
     fn load(&self, cause: MetricsGentleExitCause) -> u64 {
         self.counter(cause).load(Ordering::Relaxed)
+    }
+}
+
+/// Exact per-reason ACK-flush claim counters. Only successful transactional
+/// claims are counted (never resume wake requests), and the aggregate atomics
+/// never consume bounded state-row capacity.
+#[derive(Debug, Default)]
+struct AckFlushCounters {
+    initial: AtomicU64,
+    age: AtomicU64,
+    count: AtomicU64,
+    fin: AtomicU64,
+    explicit: AtomicU64,
+}
+
+impl AckFlushCounters {
+    fn counter(&self, reason: MetricsAckFlushReason) -> &AtomicU64 {
+        match reason {
+            MetricsAckFlushReason::Initial => &self.initial,
+            MetricsAckFlushReason::Age => &self.age,
+            MetricsAckFlushReason::Count => &self.count,
+            MetricsAckFlushReason::Fin => &self.fin,
+            MetricsAckFlushReason::Explicit => &self.explicit,
+        }
+    }
+
+    fn increment(&self, reason: MetricsAckFlushReason) {
+        self.counter(reason).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        for reason in MetricsAckFlushReason::ALL {
+            self.counter(reason).store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self, reason: MetricsAckFlushReason) -> u64 {
+        self.counter(reason).load(Ordering::Relaxed)
     }
 }
 
@@ -244,6 +282,7 @@ struct RtpCapture {
     retransmission_armor_duplicates: AtomicU64,
     data_send_would_blocks: AtomicU64,
     gentle_exits: GentleExitCounters,
+    ack_flushes: AckFlushCounters,
     sealed: AtomicBool,
     capacity: usize,
 }
@@ -272,6 +311,7 @@ impl RtpCapture {
             retransmission_armor_duplicates: AtomicU64::new(0),
             data_send_would_blocks: AtomicU64::new(0),
             gentle_exits: GentleExitCounters::default(),
+            ack_flushes: AckFlushCounters::default(),
             sealed: AtomicBool::new(false),
             capacity,
         }
@@ -361,6 +401,7 @@ impl RtpCapture {
             .store(0, Ordering::Relaxed);
         self.data_send_would_blocks.store(0, Ordering::Relaxed);
         self.gentle_exits.reset();
+        self.ack_flushes.reset();
     }
 
     fn claim_state_sample_at(&self, elapsed: Duration) -> bool {
@@ -439,6 +480,11 @@ impl RtpCapture {
             }
             MetricsEvent::DataSendWouldBlock => {
                 self.data_send_would_blocks.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::AckFlush(reason) => {
+                // A successful transactional claim, not a resume wake request.
+                self.ack_flushes.increment(reason);
                 return MetricsInterest::Skip;
             }
             _ => {}
@@ -739,6 +785,15 @@ fn write_capture_health(
                 .to_string(),
         ],
     )?;
+    for reason in MetricsAckFlushReason::ALL {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_ack_flush_{}_claims", reason.as_str()),
+                &capture.ack_flushes.load(reason).to_string(),
+            ],
+        )?;
+    }
     for (wake, count) in [
         (
             "resume_signal",
@@ -1230,6 +1285,50 @@ mod tests {
         let observations = capture.observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].observation.event_index, 3);
+    }
+
+    #[test]
+    fn ack_flush_reasons_are_counted_without_consuming_trace_rows() {
+        use rtp::metrics::MetricsAckFlushReason;
+        let capture = capture(Instant::now(), 8);
+        for (index, reason) in [
+            MetricsAckFlushReason::Initial,
+            MetricsAckFlushReason::Age,
+            MetricsAckFlushReason::Count,
+            MetricsAckFlushReason::Fin,
+            MetricsAckFlushReason::Explicit,
+            MetricsAckFlushReason::Initial,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::AckFlush(reason),
+                    Duration::from_millis(index as u64)
+                ),
+                MetricsInterest::Skip,
+                "a claim event is a counted aggregate, never a state row"
+            );
+        }
+        assert_eq!(
+            capture.observations.lock().unwrap().len(),
+            0,
+            "claim counters must not consume bounded state-row capacity"
+        );
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Initial), 2);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Age), 1);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Count), 1);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Fin), 1);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Explicit), 1);
+        // The measurement boundary rebases the claim counters alongside the
+        // other aggregates.
+        capture.begin_measurement(capture.trace_start.elapsed());
+        assert_eq!(
+            capture.ack_flushes.load(MetricsAckFlushReason::Initial),
+            0,
+            "begin_measurement must reset the claim counters"
+        );
     }
 
     #[test]

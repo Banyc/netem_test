@@ -315,6 +315,7 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     schema = manifest.get("trace_schema_version", "")
     row_schema = REPORT.field(rtp[0], "schema_version") if rtp else ""
     supported_schemas = (
+        "27",
         "26",
         "25",
         "24",

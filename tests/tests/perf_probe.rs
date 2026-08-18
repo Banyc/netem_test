@@ -638,7 +638,7 @@ async fn probe_hostile_goodput_30s() {
                     assert!(seconds.is_finite() && seconds >= 0.0);
                     seconds
                 })
-                .unwrap_or(5.0);
+                .unwrap_or(20.0);
             let link_profile = std::env::var("NETEM_PERF_LINK_PROFILE")
                 .unwrap_or_else(|_| "hostile".to_owned());
             assert!(
@@ -663,6 +663,21 @@ async fn probe_hostile_goodput_30s() {
                     mss
                 })
                 .unwrap_or(LOOPBACK_MSS);
+            // Paired run flags are parsed strictly: only 0|1|false|true are
+            // accepted, so a typo cannot silently flip FEC or armor on a
+            // timed run.
+            let parse_flag_env = |name: &str| -> bool {
+                match std::env::var(name).as_deref() {
+                    Ok("0") | Ok("false") => false,
+                    Ok("1") | Ok("true") => true,
+                    Ok(other) => panic!(
+                        "{name} must be exactly 0, 1, false, or true, got {other:?}"
+                    ),
+                    Err(_) => false,
+                }
+            };
+            let fec = parse_flag_env("NETEM_PERF_FEC");
+            let retransmission_armor = parse_flag_env("RTP_RTX_DUP");
             let make_link = || match link_profile.as_str() {
                 "hostile" => support::presets::hostile_real_link(),
                 "lossy-400kib" => support::presets::lossy_400kib_per_sec(),
@@ -684,7 +699,7 @@ async fn probe_hostile_goodput_30s() {
 
             let (server_addr, progress) = spawn_mux_over_rtp_counting_sink_server_observed_via(
                 &task_tx,
-                false,
+                fec,
                 mss_bytes,
                 trace.as_ref().and_then(PerfTrace::rtp_peer_observer),
             )
@@ -704,7 +719,7 @@ async fn probe_hostile_goodput_30s() {
             let (read, write) = rtp_connect_transient_observed(
                 &task_tx,
                 connect_addr,
-                false,
+                fec,
                 mss_bytes,
                 trace.as_ref().and_then(PerfTrace::rtp_observer),
             )
@@ -837,7 +852,8 @@ async fn probe_hostile_goodput_30s() {
                             },
                         ),
                         ("mss_bytes", mss_bytes.to_string()),
-                        ("fec", "false".to_owned()),
+                        ("fec", fec.to_string()),
+                        ("retransmission_armor", retransmission_armor.to_string()),
                         ("rtp_handshake", "false".to_owned()),
                         ("netem_sample_interval_micros", "50000".to_owned()),
                         ("delivered_bytes", delivered.to_string()),
