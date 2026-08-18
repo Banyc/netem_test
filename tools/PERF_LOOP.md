@@ -8,8 +8,16 @@ frozen `netem_test` workspace (each with sibling `rtp`, `mux`, `rtp_mux`,
 Freeze the current completed suite without creating additional JJ workspaces:
 
 ```sh
+<<<<<<< conflict 1 of 1
+%%%%%%% diff from: vqwrvwxl 3e638d4c "transport, pair-runner: connect fixed peers once and cache learned routes" (rebase destination)
+\\\\\\\        to: umsumulk 2d0a46f4 "tests/perf-trace, tools: bounded netem trace schema 26 with controller evidence and warmup boundary" (rebase destination)
+ ./tools/perf-loop snapshot --source . --revision @- \
+---output $TMPDIR/rtp-before
++--output $TMPDIR/rtp-before
++++++++ zuuwlpzo 10432820 "tools: reproducible perf suite snapshots, phase-drift rejection, and CPU-weighted diagnostics" (rebased revision)
 ./tools/perf-loop snapshot --source . --source-revision @- \
 --component-revision rtp=<40-char-commit> --output $TMPDIR/rtp-before
+>>>>>>> conflict 1 of 1 ends
 ```
 
 The snapshot exports the exact committed tree of every sibling component

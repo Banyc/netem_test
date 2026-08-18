@@ -248,6 +248,7 @@ def command_snapshot(args):
     missing = next((source_root / component for component in COMPONENTS if not (source_root / component).is_dir()), None)
     (_ for _ in ()).throw(ValueError(f"suite component is missing: {missing}")) if missing is not None else None
     components = {component: snapshot_component(source_root / component, output_root / component, component_revisions.get(component, args.revision)) for component in COMPONENTS}
+    validate_workspace(output_root / "netem_test", "snapshot")
     manifest = {"schema": SUITE_REVISION_MANIFEST_SCHEMA, "source": str(source), "requested_revision": args.revision, "component_revision_overrides": dict(sorted(component_revisions.items())), "components": dict(sorted(components.items()))}
     (output_root / SUITE_REVISION_MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output_root)
@@ -365,17 +366,42 @@ def executable_sha256(executable):
     return digest.hexdigest()
 
 
-def preserve_built_probe(executable):
+def preserve_built_probe(executable, destination=None):
     executable = Path(executable).expanduser().resolve()
     (_ for _ in ()).throw(ValueError(f"built perf_probe is not a file: {executable}")) if not executable.is_file() else None
     (_ for _ in ()).throw(ValueError(f"built perf_probe is not executable: {executable}")) if not os.access(executable, os.X_OK) else None
     digest = executable_sha256(executable)
-    preserved = executable.with_name(f"{executable.name}.perf-loop-{digest}")
+    destination_given = destination is not None
+    destination = executable.parent if destination is None else Path(destination).expanduser().resolve()
+    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    (_ for _ in ()).throw(ValueError(f"frozen probe destination must remain beneath {safe_root}")) if destination_given and not Path(destination).is_relative_to(safe_root) else None
+    Path(destination).mkdir(parents=True, exist_ok=True)
+    preserved = Path(destination) / f"{executable.name}.perf-loop-{digest}"
     (_ for _ in ()).throw(ValueError(f"preserved perf_probe does not match its content address: {preserved}")) if preserved.exists() and (not preserved.is_file() or executable_sha256(preserved) != digest) else None
     shutil.copy2(executable, preserved) if not preserved.exists() else None
     (_ for _ in ()).throw(ValueError(f"failed to preserve exact perf_probe bytes: {preserved}")) if executable_sha256(preserved) != digest else None
     (_ for _ in ()).throw(ValueError(f"preserved perf_probe is not executable: {preserved}")) if not os.access(preserved, os.X_OK) else None
     return str(preserved.resolve())
+
+
+def prune_built_role_target(target_dir, frozen_executable):
+    """Remove a disposable role Cargo target after verifying the frozen
+    probe executable lives outside it.
+
+    The role's frozen executable is preserved under
+    ``output_root/frozen/<role>/target/<profile>/deps`` before this runs, so
+    the build target holds only disposable artifacts; pruning it is refused
+    when the frozen executable is (still) inside it.
+    """
+    target = Path(target_dir).expanduser().resolve()
+    frozen = Path(frozen_executable).expanduser().resolve()
+    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    (_ for _ in ()).throw(ValueError(f"role target must remain beneath {safe_root}")) if not target.is_relative_to(safe_root) else None
+    (_ for _ in ()).throw(ValueError("role target must use a final 'target' path component")) if target.name != "target" else None
+    (_ for _ in ()).throw(ValueError(f"cannot prune the role target while the frozen perf_probe lives inside it: {frozen}")) if frozen.is_relative_to(target) else None
+    if target.is_dir():
+        shutil.rmtree(target)
+    return target
 
 
 def use_prebuilt_probe(executable, role):
@@ -434,7 +460,8 @@ def build_probe(workspace, role, output_root, *, release=True, target_dir=None):
             f"failed to build the frozen {role} perf_probe executable "
             f"(cargo exit {completed.returncode}); see {build_log}"
         )
-    return preserve_built_probe(executable)
+    frozen_destination = output_root / "frozen" / role / "target" / profile / "deps"
+    return preserve_built_probe(executable, frozen_destination)
 
 
 def run_probe(
@@ -845,6 +872,13 @@ def command_run(args):
                 workspace_components[role],
                 str(workspace),
             )
+        if getattr(args, "prune_role_target", False):
+            profile = "release" if args.release else "debug"
+            for role, workspace in (("baseline", baseline), ("candidate", candidate)):
+                build_root = safe_build_dir(
+                    args.target_dir, workspace.parent, profile
+                )
+                prune_built_role_target(build_root, executables[role])
     executable_hashes = {
         role: executable_sha256(executable)
         for role, executable in executables.items()
@@ -1054,7 +1088,7 @@ def build_parser():
         metavar="COMPONENT=REVISION",
         help="override one component's jj revision (repeatable)",
     )
-    snapshot.add_argument("--output", required=True, help="output directory beneath $TMPDIR")
+    snapshot.add_argument("--output", default=None, help="output directory beneath $TMPDIR (default: a safe-root output dir)")
     snapshot.set_defaults(handler=command_snapshot)
 
     run = subparsers.add_parser("run", help="run a paired baseline/candidate capture")
@@ -1084,6 +1118,16 @@ def build_parser():
     run.add_argument(
         "--target-dir", type=Path, default=None,
         help="shared Cargo target directory",
+    )
+    run.add_argument(
+        "--prune-role-target",
+        action="store_true",
+        default=False,
+        help=(
+            "prune each role's disposable Cargo target after freezing its "
+            "probe executable (the frozen executable must live outside the "
+            "target)"
+        ),
     )
     run.add_argument(
         "--baseline-executable",

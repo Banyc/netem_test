@@ -475,7 +475,13 @@ class PerfLoopTest(unittest.TestCase):
 
             preserved = Path(path)
             self.assertNotEqual(preserved, executable.resolve())
-            self.assertEqual(preserved.parent, executable.parent.resolve())
+            # The frozen executable is preserved OUTSIDE the build target
+            # (under output_root/frozen/<role>/target/<profile>/deps) so the
+            # disposable role target can be pruned without losing it.
+            self.assertEqual(
+                preserved.parent,
+                (output_root / "frozen" / "baseline" / "target" / "release" / "deps").resolve(),
+            )
             self.assertTrue(
                 preserved.name.startswith(f"{executable.name}.perf-loop-")
             )
@@ -982,6 +988,62 @@ class PerfLoopTest(unittest.TestCase):
             self.assertTrue(
                 (output_root / "baseline-probe-source.json").is_file()
             )
+
+
+    def test_suite_revisions_rejects_components_at_the_same_commit(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            workspace = self.make_workspace(root, "netem_test")
+            for component in LOOP.COMPONENTS:
+                (root / component).mkdir(parents=True, exist_ok=True)
+            identity = {"commit_id": "c" * 40, "change_id": "d" * 32}
+
+            def fake_jj_revision(directory, revision="@"):
+                return identity
+
+            with mock.patch.object(LOOP, "jj_revision", fake_jj_revision):
+                with self.assertRaisesRegex(ValueError, "share the same commit_id"):
+                    LOOP.component_revisions(workspace)
+            # An 'unknown' identity (missing sibling) is not a collision: the
+            # rejection only fires for two KNOWN components at the same commit.
+            def fake_jj_unknown(directory, revision="@"):
+                return {"commit_id": "unknown", "change_id": "unknown"}
+
+            with mock.patch.object(LOOP, "jj_revision", fake_jj_unknown):
+                revisions = LOOP.component_revisions(workspace)
+            self.assertEqual(set(revisions), set(LOOP.COMPONENTS))
+
+    def test_prune_built_role_target_keeps_frozen_probe(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            target = root / "target"
+            frozen_dir = root / "frozen"
+            deps = target / "release" / "deps"
+            deps.mkdir(parents=True)
+            executable = deps / "perf_probe-built"
+            executable.write_bytes(b"#!/bin/sh\n")
+            executable.chmod(0o755)
+            frozen = LOOP.preserve_built_probe(executable, frozen_dir)
+            self.assertTrue(Path(frozen).is_file())
+            # The frozen copy lives outside the target, so pruning the target
+            # is allowed and leaves the frozen executable intact.
+            LOOP.prune_built_role_target(target, frozen)
+            self.assertFalse(target.exists())
+            self.assertTrue(Path(frozen).is_file())
+
+    def test_prune_built_role_target_rejects_executable_inside_target(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            target = root / "target"
+            deps = target / "release" / "deps"
+            deps.mkdir(parents=True)
+            executable = deps / "perf_probe-inside"
+            executable.write_bytes(b"#!/bin/sh\n")
+            executable.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "inside it"):
+                LOOP.prune_built_role_target(target, str(executable.resolve()))
+            self.assertTrue(target.is_dir())
+            self.assertTrue(executable.is_file())
 
 
 if __name__ == "__main__":
