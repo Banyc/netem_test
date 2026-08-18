@@ -16,7 +16,7 @@ use support::stats::combined_stats;
 use support::{LANE_EVENT_CAPACITY, submit_test_task, try_send_observation};
 
 async fn spawn_echo_server_via(
-    task_tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    task_tx: &crate::support::TestTaskSubmitter,
 ) -> io::Result<(
     SocketAddr,
     SocketAddr,
@@ -64,7 +64,7 @@ async fn spawn_echo_server_via(
 }
 
 fn connector_via(
-    task_tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    task_tx: &crate::support::TestTaskSubmitter,
     bulk_proxy_addr: SocketAddr,
 ) -> RtpMuxConnector {
     let bind: BindSelector = Arc::new(|addr| match addr {
@@ -162,7 +162,7 @@ const PING_INTERVAL: Duration = Duration::from_millis(40);
 const CMD_DOWNLOAD: u8 = b'D';
 const CMD_PING: u8 = b'P';
 async fn spawn_cmd_server_via(
-    task_tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    task_tx: &crate::support::TestTaskSubmitter,
 ) -> io::Result<(SocketAddr, SocketAddr)> {
     let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
     let interactive_addr = server.listener().local_addr();

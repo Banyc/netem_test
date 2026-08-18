@@ -7,8 +7,8 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::support::{
-    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, submit_test_task, submit_test_task_required,
-    try_send_observation,
+    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, TestTaskSubmitter, submit_test_task,
+    submit_test_task_required, try_send_observation,
 };
 
 /// Shared core for [`spawn_rtp_echo_server_with_mss`] and its `_via`
@@ -103,7 +103,7 @@ pub async fn spawn_rtp_echo_server_with_mss(
 /// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
 /// unavailable. The server task is submitted as required through the handle.
 pub async fn spawn_rtp_echo_server_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
@@ -126,7 +126,7 @@ pub async fn spawn_rtp_echo_server(
 /// Spawn an `rtp` echo server using the default MSS through the bounded
 /// task-submission handle (for use inside run bodies).
 pub async fn spawn_rtp_echo_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
 ) -> std::io::Result<std::net::SocketAddr> {
     spawn_rtp_echo_server_with_mss_via(tx, fec, rtp::udp::NO_FEC_MSS).await
@@ -219,7 +219,7 @@ pub async fn rtp_connect_with_mss(
 /// unavailable. The supervisor keepalive is submitted as required through the
 /// handle.
 pub async fn rtp_connect_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
@@ -240,7 +240,7 @@ pub async fn rtp_connect_with_mss_via(
 /// [`TestScope::run`] bodies where `&mut TestScope` is unavailable. The
 /// supervisor keepalive is submitted as required through the handle.
 pub async fn rtp_connect_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> (
@@ -370,7 +370,7 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
 /// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
 /// is unavailable.
 pub async fn spawn_rtp_byte_sink_server_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
@@ -400,7 +400,7 @@ pub async fn spawn_rtp_byte_sink_server(
 /// Spawn an `rtp` byte sink server using the default MSS through the bounded
 /// task-submission handle (for use inside run bodies).
 pub async fn spawn_rtp_byte_sink_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     spawn_rtp_byte_sink_server_with_mss_via(tx, fec, rtp::udp::NO_FEC_MSS).await
@@ -431,7 +431,7 @@ pub async fn spawn_rtp_msg_latency_sink(
 /// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
 /// unavailable.
 pub async fn spawn_rtp_msg_latency_sink_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
@@ -567,7 +567,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_rtp_msg_latency_sink_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -632,7 +632,7 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
 /// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
 /// is unavailable.
 pub async fn spawn_rtp_bulk_upload_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
@@ -658,7 +658,7 @@ pub async fn spawn_rtp_bulk_upload(
 /// [`spawn_rtp_bulk_upload`] through the bounded task-submission handle, for
 /// use inside [`TestScope::run`] bodies.
 pub async fn spawn_rtp_bulk_upload_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {

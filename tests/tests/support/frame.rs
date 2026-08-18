@@ -2,7 +2,7 @@
 // Frame‑delivery adapter
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::support::{TestScope, TestTask, submit_test_task_required};
+use crate::support::{TestScope, TestTask, TestTaskSubmitter, submit_test_task_required};
 
 pub type RtpFrameReader = rtp::socket::FrameByteReader;
 pub type RtpFrameDeliveryWriter = rtp::socket::FrameByteWriter;
@@ -31,7 +31,7 @@ pub async fn rtp_frame_delivery_connect(
 /// unavailable. The supervisor keepalive is submitted as required through the
 /// handle.
 pub async fn rtp_frame_delivery_connect_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
@@ -64,7 +64,7 @@ pub async fn rtp_frame_delivery_connect_with_mss(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn rtp_frame_delivery_connect_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,

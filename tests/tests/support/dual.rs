@@ -19,7 +19,7 @@ use super::rtp::{rtp_connect, rtp_connect_via};
 use super::rtp_mux::spawn_tagged_stream_sink;
 use crate::support::{
     LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestScope, TestTask,
-    submit_test_task_required, try_send_observation,
+    TestTaskSubmitter, submit_test_task_required, try_send_observation,
 };
 
 /// Server that accepts two RTP connections (lane‑hello paired) and handles
@@ -300,7 +300,7 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss(
 /// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
 /// submitted as required through the handle.
 pub async fn spawn_dual_mux_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
@@ -317,7 +317,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_via(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_dual_mux_sized_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -350,7 +350,7 @@ pub async fn spawn_dual_msg_channel_server(
 /// is unavailable. The accept-loop and pairing tasks are submitted as
 /// required through the handle.
 pub async fn spawn_dual_msg_channel_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
     mode: mux::DeliveryMode,
@@ -603,7 +603,7 @@ pub async fn spawn_dual_mux_migrating_latency_bulk_server(
 /// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
 /// submitted as required through the handle.
 pub async fn spawn_dual_mux_migrating_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
@@ -884,7 +884,7 @@ pub async fn spawn_dual_mux_gaming_latency_bulk_server(
 /// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
 /// submitted as required through the handle.
 pub async fn spawn_dual_mux_gaming_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
@@ -1218,7 +1218,7 @@ pub async fn dual_mux_client_connect(
 /// unavailable. The lane rtp sessions ride `rtp_connect_via` and the
 /// dual-lane supervision is submitted as required through the handle.
 pub async fn dual_mux_client_connect_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
@@ -1333,7 +1333,7 @@ pub async fn dual_mux_client_connect_frame_reassembly(
 /// ride `rtp_frame_delivery_connect_via` and the dual-lane supervision is
 /// submitted as required through the handle.
 pub async fn dual_mux_client_connect_frame_reassembly_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
@@ -1477,7 +1477,7 @@ pub async fn dual_mux_client_connect_with_lane_modes(
 /// `rtp_connect_via` / `rtp_frame_delivery_connect_via` and the dual-lane
 /// supervision is submitted as required through the handle.
 pub async fn dual_mux_client_connect_with_lane_modes_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     int_proxy_addr: std::net::SocketAddr,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
@@ -1497,7 +1497,7 @@ pub async fn dual_mux_client_connect_with_lane_modes_via(
     type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
     type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
     async fn connect_lane(
-        tx: &tokio::sync::mpsc::Sender<TestTask>,
+        tx: &TestTaskSubmitter,
         addr: std::net::SocketAddr,
         fec: bool,
         frame: bool,
@@ -1900,7 +1900,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
-    mpsc::Sender<TestTask>,
+    TestTaskSubmitter,
 )> {
     // Tagged-stream sink tasks spawned by the pairing handler are submitted
     // through a bounded channel feeding one test-owned reaper (spawned into
@@ -1925,7 +1925,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
 /// of the caller's submission handle (which also feeds the reaper the
 /// tagged-stream sink tasks go through).
 pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
     interactive_frame: bool,
@@ -1935,7 +1935,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
-    mpsc::Sender<TestTask>,
+    TestTaskSubmitter,
 )> {
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
         |name, fut| submit_test_task_required(tx, name, fut),
@@ -1956,7 +1956,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
 /// it is returned so callers can keep it alive.
 async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
     mut spawn_required: impl FnMut(&'static str, TestTask),
-    task_tx: mpsc::Sender<TestTask>,
+    task_tx: TestTaskSubmitter,
     fec: bool,
     base: Instant,
     interactive_frame: bool,
@@ -1966,7 +1966,7 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
-    mpsc::Sender<TestTask>,
+    TestTaskSubmitter,
 )> {
     let int_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
     let bulk_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);

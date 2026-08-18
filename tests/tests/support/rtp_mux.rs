@@ -10,8 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::support::{
-    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, submit_test_task, submit_test_task_required,
-    try_send_observation,
+    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, TestTaskSubmitter, submit_test_task,
+    submit_test_task_required, try_send_observation,
 };
 
 /// Shared core for [`spawn_rtp_mux_latency_bulk_server`] and its `_via`
@@ -22,7 +22,7 @@ use crate::support::{
 /// callers can keep it alive and submit more.
 async fn spawn_rtp_mux_latency_bulk_server_core(
     spawn_required: impl FnOnce(&'static str, TestTask),
-    task_tx: mpsc::Sender<TestTask>,
+    task_tx: TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -30,7 +30,7 @@ async fn spawn_rtp_mux_latency_bulk_server_core(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
-    mpsc::Sender<TestTask>,
+    TestTaskSubmitter,
 )> {
     let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0", fec).await?;
     let interactive_addr = server.listener().local_addr();
@@ -89,7 +89,7 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
-    mpsc::Sender<TestTask>,
+    TestTaskSubmitter,
 )> {
     let task_tx = tasks.submitter(crate::support::TEST_TASK_QUEUE_BOUND);
     spawn_rtp_mux_latency_bulk_server_core(
@@ -106,7 +106,7 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
 /// is unavailable. The serve loop is submitted as required through the
 /// handle; the returned sender is a clone of the caller's submission handle.
 pub async fn spawn_rtp_mux_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -114,7 +114,7 @@ pub async fn spawn_rtp_mux_latency_bulk_server_via(
     std::net::SocketAddr,
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
-    mpsc::Sender<TestTask>,
+    TestTaskSubmitter,
 )> {
     spawn_rtp_mux_latency_bulk_server_core(
         |name, fut| submit_test_task_required(tx, name, fut),
@@ -171,7 +171,7 @@ pub fn rtp_mux_connector(
 /// inside [`TestScope::run`] bodies where `&mut TestScope` is unavailable.
 /// The connector driver is submitted as required through the handle.
 pub fn rtp_mux_connector_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     bulk_proxy_addr: std::net::SocketAddr,
     fec: bool,
 ) -> rtp_mux::RtpMuxConnector {
@@ -183,7 +183,7 @@ pub fn rtp_mux_connector_via(
 }
 
 pub fn spawn_tagged_stream_sink(
-    task_tx: &mpsc::Sender<TestTask>,
+    task_tx: &TestTaskSubmitter,
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     mut writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     tx: mpsc::Sender<(u8, f64)>,

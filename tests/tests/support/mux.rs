@@ -13,8 +13,8 @@ use rtp::FrameMode;
 
 use super::stats::{MuxSessionProgress, SinkProgress, SinkReadOutcome};
 use crate::support::{
-    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, submit_test_task, submit_test_task_required,
-    try_send_observation,
+    LATENCY_SAMPLE_CAPACITY, TestScope, TestTask, TestTaskSubmitter, submit_test_task,
+    submit_test_task_required, try_send_observation,
 };
 
 const PAYLOAD_PATTERN_PERIOD: usize = 251;
@@ -74,7 +74,7 @@ mod payload_pattern_tests {
             let expected = payload(verifier.phase, len);
             assert!(verifier.verify(&expected));
         }
-        
+
         let phase_before_corruption = verifier.phase;
         let mut corrupt = payload(phase_before_corruption, 64 * 1024 + 1);
         for index in [0, corrupt.len() / 2, corrupt.len() - 1] {
@@ -254,7 +254,7 @@ where
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_over_rtp_server_with_mss_via<F, Fut>(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     mss: usize,
     handle_stream: F,
@@ -322,7 +322,7 @@ pub async fn spawn_mux_over_rtp_echo_server_with_mss(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_over_rtp_echo_server_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
@@ -341,7 +341,7 @@ pub async fn spawn_mux_over_rtp_echo_server(
 /// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
 /// is unavailable.
 pub async fn spawn_mux_over_rtp_echo_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
 ) -> std::io::Result<std::net::SocketAddr> {
     spawn_mux_over_rtp_echo_server_with_mss_via(tx, fec, rtp::udp::NO_FEC_MSS).await
@@ -396,7 +396,7 @@ pub async fn spawn_mux_over_rtp_sink_server_with_mss(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_over_rtp_sink_server_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
@@ -415,7 +415,7 @@ pub async fn spawn_mux_over_rtp_sink_server(
 /// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
 /// is unavailable.
 pub async fn spawn_mux_over_rtp_sink_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
     spawn_mux_over_rtp_sink_server_with_mss_via(tx, fec, rtp::udp::NO_FEC_MSS).await
@@ -447,7 +447,7 @@ pub async fn spawn_mux_msg_latency_sink(
 /// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
 /// unavailable.
 pub async fn spawn_mux_msg_latency_sink_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
@@ -536,7 +536,7 @@ pub async fn spawn_mux_msg_latency_sink_with_mss(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_msg_latency_sink_with_mss_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -636,11 +636,7 @@ where
 /// [`mux_client_connect`] through the bounded task-submission handle, for use
 /// inside [`TestScope::run`] bodies where `&mut TestScope` is unavailable.
 /// The supervision drain is submitted as required through the handle.
-pub fn mux_client_connect_via<R, W>(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
-    read: R,
-    write: W,
-) -> mux::StreamOpener
+pub fn mux_client_connect_via<R, W>(tx: &TestTaskSubmitter, read: R, write: W) -> mux::StreamOpener
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -827,7 +823,7 @@ pub async fn spawn_mux_over_rtp_counting_sink_server(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_over_rtp_counting_sink_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
@@ -839,7 +835,7 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_via(
 /// transport observer: the observed counting sink is the only core caller
 /// that passes a non-`None` observer.
 pub async fn spawn_mux_over_rtp_counting_sink_server_observed_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     mss: usize,
     metrics_observer: Option<rtp::metrics::MetricsObserver>,
@@ -865,7 +861,7 @@ pub async fn spawn_mux_over_rtp_counting_sink_server_default(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_over_rtp_counting_sink_server_default_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<SinkProgress>)> {
     spawn_mux_over_rtp_counting_sink_server_via(tx, fec, rtp::udp::NO_FEC_MSS).await
@@ -996,7 +992,7 @@ pub async fn spawn_mux_latency_bulk_server(
 /// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
 /// is unavailable.
 pub async fn spawn_mux_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -1122,7 +1118,7 @@ pub async fn spawn_mux_sized_latency_bulk_server(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_sized_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
     mss: usize,
@@ -1255,7 +1251,7 @@ pub async fn spawn_mux_gaming_latency_bulk_server(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_gaming_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(
@@ -1477,7 +1473,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable.
 pub async fn spawn_mux_frame_delivery_latency_bulk_server_via(
-    tx: &tokio::sync::mpsc::Sender<TestTask>,
+    tx: &TestTaskSubmitter,
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(

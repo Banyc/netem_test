@@ -45,7 +45,7 @@ const CHUNK: usize = 262_044;
 /// by the number of bytes read from each stream until `Ok(0)`/Err. There is
 /// no payload verification; all bytes are counted.
 async fn spawn_mux_bulk_sink(
-    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    tx: &crate::support::TestTaskSubmitter,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_server = Arc::clone(&delivered);

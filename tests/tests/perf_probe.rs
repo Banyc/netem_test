@@ -39,7 +39,11 @@ fn controller_fat_pipe_has_only_fixed_shaping() {
     assert_eq!(config.latency, Duration::from_millis(150));
     assert_eq!(config.queue_limit_pkts, 16 * 1024);
     assert_eq!(config.loss, 0, "fixed shaping must not include random loss");
-    assert_eq!(config.jitter, Duration::ZERO, "fixed shaping must not include jitter");
+    assert_eq!(
+        config.jitter,
+        Duration::ZERO,
+        "fixed shaping must not include jitter"
+    );
     assert!(
         matches!(config.loss_model, netem_test::LossModel::Random),
         "fixed shaping must not include a stochastic loss model"
@@ -54,7 +58,7 @@ fn controller_fat_pipe_has_only_fixed_shaping() {
 /// expected teardown here, not a failure. The first terminal mux error is
 /// latched into the returned [`support::stats::MuxSessionProgress`].
 fn mux_client_connect_transient<R, W>(
-    task_tx: &tokio::sync::mpsc::Sender<support::TestTask>,
+    task_tx: &support::TestTaskSubmitter,
     read: R,
     write: W,
 ) -> (
@@ -99,7 +103,7 @@ where
 /// spawn, ending when the connection closes) rather than `spawn_required`
 /// (which would panic when the session ends before the body completes).
 async fn rtp_connect_transient(
-    task_tx: &tokio::sync::mpsc::Sender<support::TestTask>,
+    task_tx: &support::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
@@ -114,7 +118,7 @@ async fn rtp_connect_transient(
 /// tracing harness passes its RTP observer through here so the capture covers
 /// the client endpoint as well.
 async fn rtp_connect_transient_observed(
-    task_tx: &tokio::sync::mpsc::Sender<support::TestTask>,
+    task_tx: &support::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,

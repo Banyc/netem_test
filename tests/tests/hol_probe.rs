@@ -493,7 +493,7 @@ async fn run_delayed_mux_bulk_stream(
 /// Pump a plain-RTP bulk flow through a separate NetemPair, saturating or
 /// paced per `load` (see [`BULK_PACE_BYTES_PER_SEC`]).
 async fn run_rtp_bulk_flow(
-    task_tx: tokio::sync::mpsc::Sender<support::TestTask>,
+    task_tx: support::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     payload: Arc<Vec<u8>>,

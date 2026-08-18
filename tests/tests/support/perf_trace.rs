@@ -83,7 +83,8 @@ impl CumulativeCounters {
             retransmission: snapshot.retransmission_counters,
             rto_deadline_postponements: snapshot.rto_deadline_postponements,
             application_limited_detections: snapshot.application_limited_detections,
-            application_limited_suppressions: snapshot.application_limited_detections_suppressed_by_waiting_writer,
+            application_limited_suppressions: snapshot
+                .application_limited_detections_suppressed_by_waiting_writer,
             congestion_rate_samples: snapshot.congestion_rate_samples,
             congestion_probe_decisions: snapshot.congestion_bandwidth_probe_decisions,
             congestion_probe_increases: snapshot.congestion_bandwidth_probe_increases,
@@ -108,33 +109,91 @@ impl CumulativeCounters {
         snapshot.congestion_persistent_queue_resets = self.congestion_persistent_queue_resets;
         snapshot.congestion_delay_drains = self.congestion_delay_drains;
         snapshot.congestion_loss_backoffs = self.congestion_loss_backoffs;
-        snapshot.congestion_loss_backoff_floor_bindings = self.congestion_loss_backoff_floor_bindings;
+        snapshot.congestion_loss_backoff_floor_bindings =
+            self.congestion_loss_backoff_floor_bindings;
     }
 
     fn since(self, baseline: Self) -> Self {
         let since = |current: u64, previous: u64| current.saturating_sub(previous);
         Self {
             retransmission: MetricsRetransmissionCounters {
-                attempts: since(self.retransmission.attempts, baseline.retransmission.attempts),
-                first_attempts: since(self.retransmission.first_attempts, baseline.retransmission.first_attempts),
-                repeat_attempts: since(self.retransmission.repeat_attempts, baseline.retransmission.repeat_attempts),
-                rto_reason: since(self.retransmission.rto_reason, baseline.retransmission.rto_reason),
-                reorder_reason: since(self.retransmission.reorder_reason, baseline.retransmission.reorder_reason),
-                fast_loss_reason: since(self.retransmission.fast_loss_reason, baseline.retransmission.fast_loss_reason),
-                pre_outage_reason: since(self.retransmission.pre_outage_reason, baseline.retransmission.pre_outage_reason),
-                tail_probes: since(self.retransmission.tail_probes, baseline.retransmission.tail_probes),
+                attempts: since(
+                    self.retransmission.attempts,
+                    baseline.retransmission.attempts,
+                ),
+                first_attempts: since(
+                    self.retransmission.first_attempts,
+                    baseline.retransmission.first_attempts,
+                ),
+                repeat_attempts: since(
+                    self.retransmission.repeat_attempts,
+                    baseline.retransmission.repeat_attempts,
+                ),
+                rto_reason: since(
+                    self.retransmission.rto_reason,
+                    baseline.retransmission.rto_reason,
+                ),
+                reorder_reason: since(
+                    self.retransmission.reorder_reason,
+                    baseline.retransmission.reorder_reason,
+                ),
+                fast_loss_reason: since(
+                    self.retransmission.fast_loss_reason,
+                    baseline.retransmission.fast_loss_reason,
+                ),
+                pre_outage_reason: since(
+                    self.retransmission.pre_outage_reason,
+                    baseline.retransmission.pre_outage_reason,
+                ),
+                tail_probes: since(
+                    self.retransmission.tail_probes,
+                    baseline.retransmission.tail_probes,
+                ),
             },
-            rto_deadline_postponements: since(self.rto_deadline_postponements, baseline.rto_deadline_postponements),
-            application_limited_detections: since(self.application_limited_detections, baseline.application_limited_detections),
-            application_limited_suppressions: since(self.application_limited_suppressions, baseline.application_limited_suppressions),
-            congestion_rate_samples: since(self.congestion_rate_samples, baseline.congestion_rate_samples),
-            congestion_probe_decisions: since(self.congestion_probe_decisions, baseline.congestion_probe_decisions),
-            congestion_probe_increases: since(self.congestion_probe_increases, baseline.congestion_probe_increases),
-            congestion_probe_before_feedback: since(self.congestion_probe_before_feedback, baseline.congestion_probe_before_feedback),
-            congestion_persistent_queue_resets: since(self.congestion_persistent_queue_resets, baseline.congestion_persistent_queue_resets),
-            congestion_delay_drains: since(self.congestion_delay_drains, baseline.congestion_delay_drains),
-            congestion_loss_backoffs: since(self.congestion_loss_backoffs, baseline.congestion_loss_backoffs),
-            congestion_loss_backoff_floor_bindings: since(self.congestion_loss_backoff_floor_bindings, baseline.congestion_loss_backoff_floor_bindings),
+            rto_deadline_postponements: since(
+                self.rto_deadline_postponements,
+                baseline.rto_deadline_postponements,
+            ),
+            application_limited_detections: since(
+                self.application_limited_detections,
+                baseline.application_limited_detections,
+            ),
+            application_limited_suppressions: since(
+                self.application_limited_suppressions,
+                baseline.application_limited_suppressions,
+            ),
+            congestion_rate_samples: since(
+                self.congestion_rate_samples,
+                baseline.congestion_rate_samples,
+            ),
+            congestion_probe_decisions: since(
+                self.congestion_probe_decisions,
+                baseline.congestion_probe_decisions,
+            ),
+            congestion_probe_increases: since(
+                self.congestion_probe_increases,
+                baseline.congestion_probe_increases,
+            ),
+            congestion_probe_before_feedback: since(
+                self.congestion_probe_before_feedback,
+                baseline.congestion_probe_before_feedback,
+            ),
+            congestion_persistent_queue_resets: since(
+                self.congestion_persistent_queue_resets,
+                baseline.congestion_persistent_queue_resets,
+            ),
+            congestion_delay_drains: since(
+                self.congestion_delay_drains,
+                baseline.congestion_delay_drains,
+            ),
+            congestion_loss_backoffs: since(
+                self.congestion_loss_backoffs,
+                baseline.congestion_loss_backoffs,
+            ),
+            congestion_loss_backoff_floor_bindings: since(
+                self.congestion_loss_backoff_floor_bindings,
+                baseline.congestion_loss_backoff_floor_bindings,
+            ),
         }
     }
 }
@@ -254,7 +313,8 @@ impl RtpCapture {
     /// subtraction while serializing sealed observations.
     fn begin_measurement(&self, trace_elapsed: Duration) {
         let boundary = u64::try_from(trace_elapsed.as_micros()).unwrap_or(u64::MAX);
-        self.measurement_start_micros.store(boundary, Ordering::Release);
+        self.measurement_start_micros
+            .store(boundary, Ordering::Release);
         let mut observations = self.observations.lock().unwrap();
         let counter_baseline = observations
             .iter()
@@ -270,21 +330,35 @@ impl RtpCapture {
         *self.counter_baseline.lock().unwrap() = counter_baseline;
         observations.retain(|captured| captured.trace_elapsed >= trace_elapsed);
         drop(observations);
-        self.last_state_sample_micros.store(u64::MAX, Ordering::Relaxed);
+        self.last_state_sample_micros
+            .store(u64::MAX, Ordering::Relaxed);
         self.dropped_capacity.store(0, Ordering::Relaxed);
-        self.send_driver_resume_signal_wakes.store(0, Ordering::Relaxed);
-        self.send_driver_ack_schedule_signal_wakes.store(0, Ordering::Relaxed);
-        self.send_driver_pacing_timer_wakes.store(0, Ordering::Relaxed);
-        self.send_driver_protocol_timer_wakes.store(0, Ordering::Relaxed);
-        self.send_driver_kill_requested_wakes.store(0, Ordering::Relaxed);
-        self.send_driver_resume_application_data_requests.store(0, Ordering::Relaxed);
-        self.send_driver_resume_application_frame_requests.store(0, Ordering::Relaxed);
-        self.send_driver_resume_application_finish_requests.store(0, Ordering::Relaxed);
-        self.send_driver_resume_peer_ack_requests.store(0, Ordering::Relaxed);
-        self.send_driver_resume_ack_flush_requests.store(0, Ordering::Relaxed);
-        self.send_driver_resume_post_open_handshake_requests.store(0, Ordering::Relaxed);
-        self.send_driver_resume_receive_opportunity_requests.store(0, Ordering::Relaxed);
-        self.retransmission_armor_duplicates.store(0, Ordering::Relaxed);
+        self.send_driver_resume_signal_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_ack_schedule_signal_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_pacing_timer_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_protocol_timer_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_kill_requested_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_data_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_frame_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_finish_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_peer_ack_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_ack_flush_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_post_open_handshake_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_receive_opportunity_requests
+            .store(0, Ordering::Relaxed);
+        self.retransmission_armor_duplicates
+            .store(0, Ordering::Relaxed);
         self.data_send_would_blocks.store(0, Ordering::Relaxed);
         self.gentle_exits.reset();
     }
@@ -317,7 +391,9 @@ impl RtpCapture {
             MetricsEvent::SendDriverWake(wake) => {
                 let counter = match wake {
                     MetricsSendDriverWake::ResumeSignal => &self.send_driver_resume_signal_wakes,
-                    MetricsSendDriverWake::AckScheduleSignal => &self.send_driver_ack_schedule_signal_wakes,
+                    MetricsSendDriverWake::AckScheduleSignal => {
+                        &self.send_driver_ack_schedule_signal_wakes
+                    }
                     MetricsSendDriverWake::PacingTimer => &self.send_driver_pacing_timer_wakes,
                     MetricsSendDriverWake::ProtocolTimer => &self.send_driver_protocol_timer_wakes,
                     MetricsSendDriverWake::KillRequested => &self.send_driver_kill_requested_wakes,
@@ -336,8 +412,12 @@ impl RtpCapture {
                     MetricsSendDriverResumeSource::ApplicationFinish => {
                         &self.send_driver_resume_application_finish_requests
                     }
-                    MetricsSendDriverResumeSource::PeerAck => &self.send_driver_resume_peer_ack_requests,
-                    MetricsSendDriverResumeSource::AckFlush => &self.send_driver_resume_ack_flush_requests,
+                    MetricsSendDriverResumeSource::PeerAck => {
+                        &self.send_driver_resume_peer_ack_requests
+                    }
+                    MetricsSendDriverResumeSource::AckFlush => {
+                        &self.send_driver_resume_ack_flush_requests
+                    }
                     MetricsSendDriverResumeSource::PostOpenHandshake => {
                         &self.send_driver_resume_post_open_handshake_requests
                     }
@@ -353,7 +433,8 @@ impl RtpCapture {
                 return MetricsInterest::Skip;
             }
             MetricsEvent::RetransmissionArmorDuplicate => {
-                self.retransmission_armor_duplicates.fetch_add(1, Ordering::Relaxed);
+                self.retransmission_armor_duplicates
+                    .fetch_add(1, Ordering::Relaxed);
                 return MetricsInterest::Skip;
             }
             MetricsEvent::DataSendWouldBlock => {
@@ -621,7 +702,12 @@ fn write_capture_health(
         out,
         &[
             &format!("{prefix}_counter_baseline_present"),
-            &capture.counter_baseline.lock().unwrap().is_some().to_string(),
+            &capture
+                .counter_baseline
+                .lock()
+                .unwrap()
+                .is_some()
+                .to_string(),
         ],
     )?;
     for cause in MetricsGentleExitCause::ALL {
@@ -647,15 +733,43 @@ fn write_capture_health(
         out,
         &[
             &format!("{prefix}_data_send_would_blocks"),
-            &capture.data_send_would_blocks.load(Ordering::Relaxed).to_string(),
+            &capture
+                .data_send_would_blocks
+                .load(Ordering::Relaxed)
+                .to_string(),
         ],
     )?;
     for (wake, count) in [
-        ("resume_signal", capture.send_driver_resume_signal_wakes.load(Ordering::Relaxed)),
-        ("ack_schedule_signal", capture.send_driver_ack_schedule_signal_wakes.load(Ordering::Relaxed)),
-        ("pacing_timer", capture.send_driver_pacing_timer_wakes.load(Ordering::Relaxed)),
-        ("protocol_timer", capture.send_driver_protocol_timer_wakes.load(Ordering::Relaxed)),
-        ("kill_requested", capture.send_driver_kill_requested_wakes.load(Ordering::Relaxed)),
+        (
+            "resume_signal",
+            capture
+                .send_driver_resume_signal_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "ack_schedule_signal",
+            capture
+                .send_driver_ack_schedule_signal_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "pacing_timer",
+            capture
+                .send_driver_pacing_timer_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "protocol_timer",
+            capture
+                .send_driver_protocol_timer_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "kill_requested",
+            capture
+                .send_driver_kill_requested_wakes
+                .load(Ordering::Relaxed),
+        ),
     ] {
         write_csv_row(
             out,
@@ -666,13 +780,48 @@ fn write_capture_health(
         )?;
     }
     for (source, count) in [
-        ("application_data", capture.send_driver_resume_application_data_requests.load(Ordering::Relaxed)),
-        ("application_frame", capture.send_driver_resume_application_frame_requests.load(Ordering::Relaxed)),
-        ("application_finish", capture.send_driver_resume_application_finish_requests.load(Ordering::Relaxed)),
-        ("peer_ack", capture.send_driver_resume_peer_ack_requests.load(Ordering::Relaxed)),
-        ("ack_flush", capture.send_driver_resume_ack_flush_requests.load(Ordering::Relaxed)),
-        ("post_open_handshake", capture.send_driver_resume_post_open_handshake_requests.load(Ordering::Relaxed)),
-        ("receive_opportunity", capture.send_driver_resume_receive_opportunity_requests.load(Ordering::Relaxed)),
+        (
+            "application_data",
+            capture
+                .send_driver_resume_application_data_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "application_frame",
+            capture
+                .send_driver_resume_application_frame_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "application_finish",
+            capture
+                .send_driver_resume_application_finish_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "peer_ack",
+            capture
+                .send_driver_resume_peer_ack_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "ack_flush",
+            capture
+                .send_driver_resume_ack_flush_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "post_open_handshake",
+            capture
+                .send_driver_resume_post_open_handshake_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "receive_opportunity",
+            capture
+                .send_driver_resume_receive_opportunity_requests
+                .load(Ordering::Relaxed),
+        ),
     ] {
         write_csv_row(
             out,
@@ -726,8 +875,14 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
             snapshot.retransmission_counters.repeat_attempts.to_string(),
             snapshot.retransmission_counters.rto_reason.to_string(),
             snapshot.retransmission_counters.reorder_reason.to_string(),
-            snapshot.retransmission_counters.fast_loss_reason.to_string(),
-            snapshot.retransmission_counters.pre_outage_reason.to_string(),
+            snapshot
+                .retransmission_counters
+                .fast_loss_reason
+                .to_string(),
+            snapshot
+                .retransmission_counters
+                .pre_outage_reason
+                .to_string(),
             snapshot.retransmission_counters.tail_probes.to_string(),
             snapshot.next_send_sequence.to_string(),
             optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
@@ -1057,7 +1212,11 @@ mod tests {
         let trace_start = Instant::now();
         let capture = capture(trace_start, 2);
         for index in 0..3 {
-            capture.record(observation(index, index, MetricsEvent::SendDataPacketAttempt));
+            capture.record(observation(
+                index,
+                index,
+                MetricsEvent::SendDataPacketAttempt,
+            ));
         }
         // The third row overflows the bounded capacity while still warmup.
         assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 1);
@@ -1082,7 +1241,11 @@ mod tests {
         capture.record(warmup);
         std::thread::sleep(Duration::from_millis(2));
         let mut boundary_snapshot = observation(1, 1, MetricsEvent::ReceiveAckPacket);
-        boundary_snapshot.snapshot.as_mut().unwrap().rto_deadline_postponements = 17;
+        boundary_snapshot
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .rto_deadline_postponements = 17;
         capture.record(boundary_snapshot);
         std::thread::sleep(Duration::from_millis(2));
         let boundary = trace_start.elapsed();
@@ -1114,31 +1277,38 @@ mod tests {
             MetricsSendDriverWake::KillRequested,
         ] {
             assert_eq!(
-                capture.interest(
-                    MetricsEvent::SendDriverWake(wake),
-                    Duration::from_millis(1)
-                ),
+                capture.interest(MetricsEvent::SendDriverWake(wake), Duration::from_millis(1)),
                 MetricsInterest::Skip,
             );
         }
         assert_eq!(
-            capture.send_driver_resume_signal_wakes.load(Ordering::Relaxed),
+            capture
+                .send_driver_resume_signal_wakes
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(
-            capture.send_driver_ack_schedule_signal_wakes.load(Ordering::Relaxed),
+            capture
+                .send_driver_ack_schedule_signal_wakes
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(
-            capture.send_driver_pacing_timer_wakes.load(Ordering::Relaxed),
+            capture
+                .send_driver_pacing_timer_wakes
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(
-            capture.send_driver_protocol_timer_wakes.load(Ordering::Relaxed),
+            capture
+                .send_driver_protocol_timer_wakes
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(
-            capture.send_driver_kill_requested_wakes.load(Ordering::Relaxed),
+            capture
+                .send_driver_kill_requested_wakes
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
@@ -1175,7 +1345,9 @@ mod tests {
             MetricsInterest::Skip,
         );
         assert_eq!(
-            capture.retransmission_armor_duplicates.load(Ordering::Relaxed),
+            capture
+                .retransmission_armor_duplicates
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
@@ -1190,10 +1362,7 @@ mod tests {
             capture.interest(MetricsEvent::DataSendWouldBlock, Duration::from_millis(1)),
             MetricsInterest::Skip,
         );
-        assert_eq!(
-            capture.data_send_would_blocks.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(capture.data_send_would_blocks.load(Ordering::Relaxed), 1);
         assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
     }
 

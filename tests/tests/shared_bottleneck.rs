@@ -41,7 +41,7 @@ const OWD_MS: u64 = 50;
 /// the supervisor keepalive must be transient (ordinary submission, ending
 /// when the connection closes) rather than required.
 async fn rtp_connect_transient(
-    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    tx: &crate::support::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
 ) -> (
     impl AsyncRead + Unpin + Send + use<>,
@@ -77,7 +77,7 @@ async fn rtp_connect_transient(
 /// supervisor keepalive is submitted as REQUIRED: a session that ends early
 /// fails the test via the reaper.
 async fn rtp_connect_required(
-    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    tx: &crate::support::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
 ) -> (
     impl AsyncRead + Unpin + Send + use<>,
@@ -158,7 +158,7 @@ where
 /// read-keepalive and the pump task; the pump completes once `run_for`
 /// elapses or `stop` is set and is drained by the reaper.
 async fn spawn_bulk_flow(
-    tx: &tokio::sync::mpsc::Sender<crate::support::TestTask>,
+    tx: &crate::support::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     payload: Arc<Vec<u8>>,
     run_for: Duration,

@@ -18,6 +18,7 @@ pub mod report;
 mod loss;
 mod queue;
 mod rng;
+mod runner_threads;
 mod shaper;
 
 use std::cmp::Reverse;
@@ -34,6 +35,7 @@ use parking_lot::Mutex as ParkingMutex;
 use loss::FourStateState;
 use queue::Queued;
 use rng::CorRng;
+use runner_threads::RunnerThreads;
 #[cfg(test)]
 use shaper::exceeds_byte_limit;
 use shaper::{sample_delay, serialization_delay};
@@ -497,9 +499,7 @@ pub struct NetemLink {
     stats: Arc<AtomicCounters>,
     queue_len: Arc<AtomicU64>,
     blackout: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    /// Handle of the spawned runner thread; `None` once joined.
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    runners: RunnerThreads,
 }
 
 impl NetemLink {
@@ -543,7 +543,8 @@ impl NetemLink {
         let stats = Arc::new(AtomicCounters::default());
         let queue_len = Arc::new(AtomicU64::new(0));
         let blackout = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
+        let runners = RunnerThreads::new();
+        let stop = runners.stop_flag();
 
         let link = Self {
             client_addr,
@@ -551,8 +552,7 @@ impl NetemLink {
             stats: Arc::clone(&stats),
             queue_len: Arc::clone(&queue_len),
             blackout: Arc::clone(&blackout),
-            stop: Arc::clone(&stop),
-            thread: Mutex::new(None),
+            runners,
         };
 
         let runner = LinkRunner::new(RunnerConfig {
@@ -568,7 +568,7 @@ impl NetemLink {
         let thread = std::thread::Builder::new()
             .name("netem-link".into())
             .spawn(move || runner.run())?;
-        *link.thread.lock().unwrap() = Some(thread);
+        link.runners.adopt(thread);
 
         Ok(link)
     }
@@ -612,10 +612,7 @@ impl NetemLink {
     /// Signal the proxy thread to stop and wait for it to exit. Idempotent:
     /// once joined, subsequent calls are no-ops.
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.lock().unwrap().take() {
-            thread.join().unwrap();
-        }
+        self.runners.stop_and_join();
     }
 }
 
@@ -1411,11 +1408,7 @@ pub struct NetemPair {
     queue_len_s2c: Arc<AtomicU64>,
     blackout_c2s: Arc<AtomicBool>,
     blackout_s2c: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    /// Handle of the c2s runner thread; `None` once joined.
-    thread_c2s: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Handle of the s2c runner thread; `None` once joined.
-    thread_s2c: Mutex<Option<std::thread::JoinHandle<()>>>,
+    runners: RunnerThreads,
 }
 
 struct NetemPairConfig {
@@ -1580,7 +1573,8 @@ impl NetemPair {
         let queue_len_s2c = Arc::new(AtomicU64::new(0));
         let blackout_c2s = Arc::new(AtomicBool::new(false));
         let blackout_s2c = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
+        let runners = RunnerThreads::new();
+        let stop = runners.stop_flag();
         let learned_client = Arc::new(LearnedDestination::default());
 
         let pair = Self {
@@ -1592,9 +1586,7 @@ impl NetemPair {
             queue_len_s2c: Arc::clone(&queue_len_s2c),
             blackout_c2s: Arc::clone(&blackout_c2s),
             blackout_s2c: Arc::clone(&blackout_s2c),
-            stop: Arc::clone(&stop),
-            thread_c2s: Mutex::new(None),
-            thread_s2c: Mutex::new(None),
+            runners,
         };
 
         // Both sockets are shared between the two runners via `Arc`: each
@@ -1623,7 +1615,7 @@ impl NetemPair {
         let c2s_thread = std::thread::Builder::new()
             .name("netem-c2s".into())
             .spawn(move || c2s_runner.run())?;
-        *pair.thread_c2s.lock().unwrap() = Some(c2s_thread);
+        pair.runners.adopt(c2s_thread);
 
         // s2c: recv on server_sock, send on client_sock to the learned client
         // address.
@@ -1646,7 +1638,7 @@ impl NetemPair {
         let s2c_thread = std::thread::Builder::new()
             .name("netem-s2c".into())
             .spawn(move || s2c_runner.run())?;
-        *pair.thread_s2c.lock().unwrap() = Some(s2c_thread);
+        pair.runners.adopt(s2c_thread);
 
         Ok(pair)
     }
@@ -1726,13 +1718,7 @@ impl NetemPair {
     /// Signal both proxy threads to stop and wait for them to exit.
     /// Idempotent: once joined, subsequent calls are no-ops.
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread_c2s.lock().unwrap().take() {
-            thread.join().unwrap();
-        }
-        if let Some(thread) = self.thread_s2c.lock().unwrap().take() {
-            thread.join().unwrap();
-        }
+        self.runners.stop_and_join();
     }
 }
 

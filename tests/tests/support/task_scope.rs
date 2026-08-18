@@ -1,9 +1,20 @@
 //! An actively-polled root [`TestScope`] for the netem scenario tests.
 
-use std::{
-    future::Future,
-    ops::{Deref, DerefMut},
-};
+use std::future::Future;
+
+/// A boxed test-owned task future: session supervisors, per-stream sinks,
+/// and rtp_mux drivers all submit through [`spawn_test_task_reaper_with_shutdown`].
+pub(crate) type TestTask =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+/// Submission handle for the bounded test-task reaper.  Keep one clone alive
+/// for the channel to stay open; [`submit_test_task`] /
+/// [`submit_test_task_required`] are the only admission paths, so a full or
+/// closed channel always fails the test instead of silently dropping work.
+#[derive(Clone)]
+pub(crate) struct TestTaskSubmitter {
+    tx: tokio::sync::mpsc::Sender<TestTask>,
+}
 
 /// An actively-polled scope of test-owned background tasks. The test body
 /// runs through [`TestScope::run`], which races it against `join_next()` on
@@ -13,30 +24,10 @@ use std::{
 /// final epilog: after the body completes, admission closes, already-queued
 /// futures are adopted, live children are aborted, non-cancelled joins are
 /// unwrapped, and the reapers are joined before returning.
-///
-/// The wrapped `JoinSet` is exposed (via the `Deref` impls) so existing test
-/// code can keep calling `&mut tasks` / `tasks.spawn(..)` /
-/// `tasks.join_next()` unchanged.
 pub(crate) struct TestScope {
-    pub(crate) tasks: tokio::task::JoinSet<()>,
+    tasks: tokio::task::JoinSet<()>,
     reapers: tokio::task::JoinSet<()>,
     reaper_shutdown: tokio::sync::watch::Sender<bool>,
-}
-
-impl Deref for TestScope {
-    type Target = tokio::task::JoinSet<()>;
-    fn deref(&self) -> &Self::Target {
-        &self.tasks
-    }
-}
-
-// Deref-mut lets existing test code keep calling `&mut tasks` /
-// `tasks.spawn(..)` / `tasks.join_next()` unchanged while the scope adds the
-// actively-polled `run` wrapper around the test body.
-impl DerefMut for TestScope {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.tasks
-    }
 }
 
 impl TestScope {
@@ -49,6 +40,8 @@ impl TestScope {
         }
     }
 
+    /// Spawn an ordinary root task into this scope.  The task's panic (or a
+    /// panicked child join) fails the test when [`Self::run`] polls it.
     pub(crate) fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) {
         self.tasks.spawn(task);
     }
@@ -75,10 +68,9 @@ impl TestScope {
     /// observed by [`Self::run`] as soon as it begins polling the scope.
     /// Setup should therefore happen inside `run`'s body (submitting dynamic
     /// children through this handle) so a setup-time failure surfaces
-    /// immediately rather than waiting for the measurement body. Keep a
-    /// sender clone alive for the channel to stay open.
-    pub(crate) fn submitter(&mut self, bound: usize) -> tokio::sync::mpsc::Sender<super::TestTask> {
-        super::spawn_test_task_reaper_with_shutdown(
+    /// immediately rather than waiting for the measurement body.
+    pub(crate) fn submitter(&mut self, bound: usize) -> TestTaskSubmitter {
+        spawn_test_task_reaper_with_shutdown(
             &mut self.reapers,
             bound,
             self.reaper_shutdown.subscribe(),
@@ -91,10 +83,6 @@ impl TestScope {
             let selected = tokio::select! {
                 biased;
                 joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                    // A background task exited before the body. Re-raise any
-                    // panic it surfaced immediately; a normal completion is a
-                    // legitimate shutdown (e.g. a keepalive reader ending when
-                    // its session closes) and is drained silently.
                     let joined = joined.expect("background task exists");
                     joined.unwrap();
                     None
@@ -111,7 +99,7 @@ impl TestScope {
         };
         // Final epilog: close admission and reap every child before
         // returning so no completed value, error, or panic is hidden.
-        super::abort_and_reap_test_tasks(&mut self.tasks).await;
+        abort_and_reap_test_tasks(&mut self.tasks).await;
         self.reaper_shutdown.send_replace(true);
         while let Some(joined) = self.reapers.join_next().await {
             joined.unwrap();
@@ -120,9 +108,121 @@ impl TestScope {
     }
 }
 
+/// Add the bounded reaper to `reapers` and return its submission handle.  The
+/// reaper selects between new submissions and `join_next()` completions,
+/// unwrapping every completion so panics surface immediately.  On shutdown it
+/// closes admission, adopts any future still queued (a submitted future is
+/// never silently dropped), and reaps the owned set.
+pub(crate) fn spawn_test_task_reaper_with_shutdown(
+    reapers: &mut tokio::task::JoinSet<()>,
+    bound: usize,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> TestTaskSubmitter {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TestTask>(bound);
+    reapers.spawn(async move {
+        let mut owned = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                Some(fut) = rx.recv() => {
+                    owned.spawn(fut);
+                }
+                Some(joined) = owned.join_next() => {
+                    joined.unwrap();
+                }
+                _ = shutdown_rx.changed() => break,
+                else => break,
+            }
+        }
+        // The scope is shutting down: close admission, adopt every future
+        // still queued (a submitted future is never silently dropped), and
+        // reap the owned set so a completed panic still surfaces.
+        rx.close();
+        while let Ok(fut) = rx.try_recv() {
+            owned.spawn(fut);
+        }
+        abort_and_reap_test_tasks(&mut owned).await;
+    });
+    TestTaskSubmitter { tx }
+}
+
+/// Abort and reap every child of `tasks`: owner-requested cancellation is
+/// expected (cancelled joins are skipped), but a child that already
+/// completed — including a panic — is unwrapped and re-raised.
+pub(crate) async fn abort_and_reap_test_tasks(tasks: &mut tokio::task::JoinSet<()>) {
+    tasks.abort_all();
+    while let Some(joined) = tasks.join_next().await {
+        if joined
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+        {
+            continue;
+        }
+        joined.unwrap();
+    }
+}
+
+/// Submit a test-owned task future; panics if the bounded submission
+/// channel is full (the reaper is not draining) or closed (the reaper
+/// stopped unexpectedly), mirroring [`try_send_observation`]. A closed
+/// channel must fail the test too: silently dropping the submitted future
+/// would hide a task the test is relying on.
+pub(crate) fn submit_test_task(tx: &TestTaskSubmitter, fut: TestTask) {
+    match tx.tx.try_send(fut) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            panic!("test task submission channel is full; the reaper is not draining")
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            panic!("test task reaper stopped unexpectedly")
+        }
+    }
+}
+
+/// Submit a REQUIRED test-owned task: like [`submit_test_task`] but wraps
+/// the future so that completing before the test body does panics the
+/// reaper (mirroring [`TestScope::spawn_required`] for the bounded
+/// submission handle, for helpers called inside `run` bodies).
+pub(crate) fn submit_test_task_required(
+    tx: &TestTaskSubmitter,
+    name: &'static str,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            fut.await;
+            panic!("required task '{name}' exited before the test body completed");
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "test task submission channel is full; the reaper is not draining")]
+    fn submit_test_task_panics_when_channel_is_full() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<TestTask>(1);
+        let parked = Box::pin(std::future::pending::<()>());
+        submit_test_task(&TestTaskSubmitter { tx: tx.clone() }, parked);
+        let second = Box::pin(std::future::pending::<()>());
+        // The receiver is never polled, so the single slot stays occupied and
+        // the second submission must panic instead of being dropped silently.
+        submit_test_task(&TestTaskSubmitter { tx }, second);
+    }
+
+    #[test]
+    #[should_panic(expected = "test task reaper stopped unexpectedly")]
+    fn submit_test_task_panics_when_channel_is_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TestTask>(1);
+        drop(rx);
+        let fut = Box::pin(std::future::pending::<()>());
+        // The reaper stopped (the receiver is gone); submitting must panic
+        // rather than silently dropping the future.
+        submit_test_task(&TestTaskSubmitter { tx }, fut);
+    }
 
     #[tokio::test]
     async fn run_reaps_root_and_submitted_tasks_before_returning() {
@@ -133,11 +233,11 @@ mod tests {
             root_started_clone.notify_one();
             std::future::pending::<()>().await;
         });
-        let tx = scope.submitter(4);
+        let submitter = scope.submitter(4);
         let submitted_started = std::sync::Arc::new(tokio::sync::Notify::new());
         let submitted_started_clone = std::sync::Arc::clone(&submitted_started);
-        super::super::submit_test_task(
-            &tx,
+        submit_test_task(
+            &submitter,
             Box::pin(async move {
                 submitted_started_clone.notify_one();
                 std::future::pending::<()>().await;
@@ -163,11 +263,11 @@ mod tests {
     #[should_panic(expected = "submitted panic")]
     async fn run_cascades_a_submitted_panic_that_beat_shutdown() {
         let mut scope = TestScope::new();
-        let tx = scope.submitter(4);
+        let submitter = scope.submitter(4);
         let panicked = std::sync::Arc::new(tokio::sync::Notify::new());
         let panicked_clone = std::sync::Arc::clone(&panicked);
-        super::super::submit_test_task(
-            &tx,
+        submit_test_task(
+            &submitter,
             Box::pin(async move {
                 panicked_clone.notify_waiters();
                 panic!("submitted panic");
