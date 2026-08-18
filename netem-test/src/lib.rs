@@ -25,7 +25,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -422,7 +421,9 @@ impl Default for NetemConfig {
 }
 
 /// Live impairment counters – mirrors `struct tc_netem_xstats` plus the
-/// separate overflow-drop counter required by the packet queue limit.
+/// separate overflow-drop counter required by the packet queue limit, and the
+/// scheduler-drain counters describing non-empty FIFO/heap drains (never the
+/// direct forwarding paths).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     pub delayed: u64,
@@ -434,6 +435,13 @@ pub struct Counters {
     pub received: u64,
     /// Packets dropped because the per-direction queue exceeded `limit`.
     pub overflow_dropped: u64,
+    /// Number of non-empty FIFO/heap scheduler drains.
+    pub scheduled_drain_batches: u64,
+    /// Packets removed by scheduler drains (each failed send still belongs to
+    /// the drain that removed the packet).
+    pub scheduled_drain_packets: u64,
+    /// Largest single drain batch, in packets.
+    pub scheduled_drain_max_packets: u64,
 }
 
 /// Atomic backing store for [`Counters`] so the runner thread can update
@@ -449,6 +457,9 @@ struct AtomicCounters {
     forwarded: AtomicU64,
     received: AtomicU64,
     overflow_dropped: AtomicU64,
+    scheduled_drain_batches: AtomicU64,
+    scheduled_drain_packets: AtomicU64,
+    scheduled_drain_max_packets: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -468,6 +479,24 @@ impl AtomicCounters {
         );
     }
 
+    /// Record one non-empty scheduler drain of `packets` packets: one batch,
+    /// `packets` added to the running total, and a max.  Direct forwarding
+    /// never calls this.
+    fn record_scheduled_drain(&self, packets: u64) {
+        debug_assert_ne!(packets, 0);
+        self.inc_single_writer(|s| &s.scheduled_drain_batches);
+        let total = &self.scheduled_drain_packets;
+        total.store(
+            total.load(Ordering::Relaxed).wrapping_add(packets),
+            Ordering::Relaxed,
+        );
+        let maximum = &self.scheduled_drain_max_packets;
+        maximum.store(
+            maximum.load(Ordering::Relaxed).max(packets),
+            Ordering::Relaxed,
+        );
+    }
+
     fn snapshot(&self) -> Counters {
         Counters {
             delayed: self.delayed.load(Ordering::Relaxed),
@@ -478,6 +507,9 @@ impl AtomicCounters {
             forwarded: self.forwarded.load(Ordering::Relaxed),
             received: self.received.load(Ordering::Relaxed),
             overflow_dropped: self.overflow_dropped.load(Ordering::Relaxed),
+            scheduled_drain_batches: self.scheduled_drain_batches.load(Ordering::Relaxed),
+            scheduled_drain_packets: self.scheduled_drain_packets.load(Ordering::Relaxed),
+            scheduled_drain_max_packets: self.scheduled_drain_max_packets.load(Ordering::Relaxed),
         }
     }
 }
@@ -967,6 +999,7 @@ impl NetemState {
     }
 
     fn drain_ready(&mut self, now: Instant, send: &dyn UdpTransport) {
+        let mut drained = 0u64;
         loop {
             let ready = self
                 .queue
@@ -979,6 +1012,7 @@ impl NetemState {
             let Reverse(Queued { mut data, dst, .. }) = self.queue.pop().unwrap();
             self.queue_len
                 .store(self.queue.len() as u64, Ordering::Relaxed);
+            drained += 1;
             if send.send_to(&data, dst).is_ok() {
                 self.stats.inc(|s| &s.forwarded);
             }
@@ -986,6 +1020,11 @@ impl NetemState {
             if self.reused_packet_buffers.len() < MAX_REUSED_PACKET_BUFFERS {
                 self.reused_packet_buffers.push(data);
             }
+        }
+        // One counter record per non-empty drain; a failed send still belongs
+        // to the drain that removed the packet, so `drained` counts every pop.
+        if drained != 0 {
+            self.stats.record_scheduled_drain(drained);
         }
     }
 
@@ -1124,6 +1163,7 @@ impl NetemState {
     /// arrival order and recycling drained payload buffers subject to the FIFO
     /// count and capacity bounds.
     fn drain_ready_fifo(&mut self, fifo: &mut FifoQueue, now: Instant, send: &dyn UdpTransport) {
+        let mut drained = 0u64;
         while let Some(front) = fifo.packets.front() {
             if front.time_to_send > now {
                 break;
@@ -1131,10 +1171,16 @@ impl NetemState {
             let Queued { data, dst, .. } = fifo.packets.pop_front().unwrap();
             self.queue_len
                 .store(fifo.packets.len() as u64, Ordering::Relaxed);
+            drained += 1;
             if send.send_to(&data, dst).is_ok() {
                 self.stats.inc(|s| &s.forwarded);
             }
             fifo.recycle_packet_buffer(data);
+        }
+        // One counter record per non-empty drain; a failed send still belongs
+        // to the drain that removed the packet, so `drained` counts every pop.
+        if drained != 0 {
+            self.stats.record_scheduled_drain(drained);
         }
     }
 
@@ -1165,19 +1211,6 @@ struct RunnerConfig {
     stop: Arc<AtomicBool>,
     transport: Box<dyn UdpTransport>,
     clock: Option<Clock>,
-}
-
-impl Deref for LinkRunner {
-    type Target = NetemState;
-    fn deref(&self) -> &Self::Target {
-        &self.pipeline
-    }
-}
-
-impl DerefMut for LinkRunner {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.pipeline
-    }
 }
 
 impl LinkRunner {
@@ -1686,6 +1719,10 @@ impl NetemPair {
             forwarded: a.forwarded + b.forwarded,
             received: a.received + b.received,
             overflow_dropped: a.overflow_dropped + b.overflow_dropped,
+            scheduled_drain_batches: a.scheduled_drain_batches + b.scheduled_drain_batches,
+            scheduled_drain_packets: a.scheduled_drain_packets + b.scheduled_drain_packets,
+            scheduled_drain_max_packets: a.scheduled_drain_max_packets
+                + b.scheduled_drain_max_packets,
         }
     }
 
@@ -2260,11 +2297,11 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             Instant::now(),
         );
-        let s = runner.stats.snapshot();
+        let s = runner.pipeline.stats.snapshot();
         assert_eq!(s.received, 3);
         assert_eq!(s.dropped, 1);
         // Two packets enqueued (not yet forwarded since drain isn't called).
-        assert_eq!(runner.queue.len(), 2);
+        assert_eq!(runner.pipeline.queue.len(), 2);
     }
 
     /// In-memory transport that records sent payloads and can return them on
@@ -2410,9 +2447,9 @@ mod tests {
                 Instant::now(),
             );
         }
-        assert_eq!(runner.queue.len(), 11);
-        assert_eq!(runner.stats.snapshot().overflow_dropped, 0);
-        assert_eq!(runner.stats.snapshot().received, 11);
+        assert_eq!(runner.pipeline.queue.len(), 11);
+        assert_eq!(runner.pipeline.stats.snapshot().overflow_dropped, 0);
+        assert_eq!(runner.pipeline.stats.snapshot().received, 11);
         drop(sent);
     }
 
@@ -2436,8 +2473,8 @@ mod tests {
                 Instant::now(),
             );
         }
-        assert_eq!(runner.queue.len(), 4);
-        let s = runner.stats.snapshot();
+        assert_eq!(runner.pipeline.queue.len(), 4);
+        let s = runner.pipeline.stats.snapshot();
         assert_eq!(s.received, 11);
         assert_eq!(s.overflow_dropped, 7);
         assert_eq!(s.dropped, 0); // no loss model drops
@@ -2462,17 +2499,17 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             Instant::now(),
         );
-        let first_link_free_at = runner.link_free_at;
-        let first_counter = runner.reorder_counter;
+        let first_link_free_at = runner.pipeline.link_free_at;
+        let first_counter = runner.pipeline.reorder_counter;
         // The next packet must be tail-dropped, leaving state unchanged.
         runner.handle_datagram(
             b"overflow",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             Instant::now(),
         );
-        assert_eq!(runner.link_free_at, first_link_free_at);
-        assert_eq!(runner.reorder_counter, first_counter);
-        assert_eq!(runner.stats.snapshot().overflow_dropped, 1);
+        assert_eq!(runner.pipeline.link_free_at, first_link_free_at);
+        assert_eq!(runner.pipeline.reorder_counter, first_counter);
+        assert_eq!(runner.pipeline.stats.snapshot().overflow_dropped, 1);
         drop(sent);
     }
 
@@ -2490,16 +2527,16 @@ mod tests {
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             config,
         );
-        let rng_before = runner.rng;
+        let rng_before = runner.pipeline.rng;
         runner.handle_datagram(
             b"overflow",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             Instant::now(),
         );
-        assert_eq!(runner.rng.s1, rng_before.s1);
-        assert_eq!(runner.rng.s2, rng_before.s2);
-        assert_eq!(runner.rng.s3, rng_before.s3);
-        assert_eq!(runner.rng.s4, rng_before.s4);
+        assert_eq!(runner.pipeline.rng.s1, rng_before.s1);
+        assert_eq!(runner.pipeline.rng.s2, rng_before.s2);
+        assert_eq!(runner.pipeline.rng.s3, rng_before.s3);
+        assert_eq!(runner.pipeline.rng.s4, rng_before.s4);
         drop(sent);
     }
 
@@ -2517,7 +2554,7 @@ mod tests {
             config.clone(),
         );
         let clock = sent.clock();
-        runner.blackout.store(true, Ordering::Relaxed);
+        runner.pipeline.blackout.store(true, Ordering::Relaxed);
         runner.handle_datagram(
             b"after",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
@@ -2526,7 +2563,7 @@ mod tests {
         // Advance past the 1 ms latency so the first packet drains.
         clock.advance(Duration::from_millis(20));
         runner.drain_ready(clock.now());
-        let s = runner.stats.snapshot();
+        let s = runner.pipeline.stats.snapshot();
         assert_eq!(s.received, 2);
         assert_eq!(s.dropped, 1);
         assert_eq!(s.forwarded, 1);
@@ -3048,30 +3085,44 @@ mod tests {
         let config = NetemConfig::default();
         let (runner, sent) = mock_runner(config);
         assert!(
-            runner.direct_forward,
+            runner.pipeline.direct_forward,
             "a clean config must be direct-forward eligible"
         );
         assert!(
-            !runner.direct_stochastic,
+            !runner.pipeline.direct_stochastic,
             "a clean config must not need stochastic work"
         );
         // The direct path forwards without touching the heap.
         let dst = Some(server_addr);
-        assert!(runner.forward_direct(b"hello", dst, &*sent));
-        assert_eq!(runner.queue.len(), 0);
-        let s = runner.stats.snapshot();
+        assert!(runner.pipeline.forward_direct(b"hello", dst, &*sent));
+        assert_eq!(runner.pipeline.queue.len(), 0);
+        let s = runner.pipeline.stats.snapshot();
         assert_eq!(s.received, 1);
         assert_eq!(s.forwarded, 1);
         assert_eq!(sent.sent.lock().unwrap().len(), 1);
         // Blackout gates on the direct path: counted received, dropped,
         // nothing forwarded.
-        runner.blackout.store(true, Ordering::Relaxed);
-        assert!(runner.forward_direct(b"gated", dst, &*sent));
-        let s = runner.stats.snapshot();
+        runner.pipeline.blackout.store(true, Ordering::Relaxed);
+        assert!(runner.pipeline.forward_direct(b"gated", dst, &*sent));
+        let s = runner.pipeline.stats.snapshot();
         assert_eq!(s.received, 2);
         assert_eq!(s.dropped, 1);
         assert_eq!(s.forwarded, 1);
-        assert_eq!(runner.queue.len(), 0);
+        assert_eq!(runner.pipeline.queue.len(), 0);
+        // Direct forwarding is never a scheduler drain: all three drain
+        // counters stay zero.
+        assert_eq!(
+            s.scheduled_drain_batches, 0,
+            "direct forwarding must not record a scheduler drain batch"
+        );
+        assert_eq!(
+            s.scheduled_drain_packets, 0,
+            "direct forwarding must not record scheduler-drain packets"
+        );
+        assert_eq!(
+            s.scheduled_drain_max_packets, 0,
+            "direct forwarding must not record a scheduler-drain maximum"
+        );
         drop(sent);
     }
 
@@ -3083,17 +3134,17 @@ mod tests {
             ..Default::default()
         };
         let (mut runner, sent) = mock_runner(config);
-        assert!(!runner.direct_forward);
+        assert!(!runner.pipeline.direct_forward);
         let dst = Some(server_addr);
         assert!(
-            !runner.try_direct_forward(b"impaired", dst, &*sent),
+            !runner.pipeline.try_direct_forward(b"impaired", dst, &*sent),
             "an impaired config must refuse the direct path"
         );
-        assert_eq!(runner.stats.snapshot().received, 0);
+        assert_eq!(runner.pipeline.stats.snapshot().received, 0);
         // The queued path still handles the datagram.
         runner.handle_datagram(b"impaired", server_addr, sent.clock().now());
-        assert_eq!(runner.queue.len(), 1);
-        assert_eq!(runner.stats.snapshot().received, 1);
+        assert_eq!(runner.pipeline.queue.len(), 1);
+        assert_eq!(runner.pipeline.stats.snapshot().received, 1);
         drop(sent);
     }
 
@@ -3106,15 +3157,19 @@ mod tests {
         };
         let (runner, sent) = mock_runner(config);
         assert!(
-            runner.direct_forward,
+            runner.pipeline.direct_forward,
             "max_datagram_size is a deterministic filter and must not disqualify the direct path"
         );
-        assert!(runner.try_direct_forward(&[0u8; 600], Some(server_addr), &*sent));
-        let s = runner.stats.snapshot();
+        assert!(
+            runner
+                .pipeline
+                .try_direct_forward(&[0u8; 600], Some(server_addr), &*sent)
+        );
+        let s = runner.pipeline.stats.snapshot();
         assert_eq!(s.received, 1);
         assert_eq!(s.dropped, 1);
         assert_eq!(
-            runner.queue.len(),
+            runner.pipeline.queue.len(),
             0,
             "the oversized datagram must be dropped without entering the heap"
         );
@@ -3135,16 +3190,22 @@ mod tests {
 
         // Enqueue a large payload into the FIFO and drain it: the drained
         // buffer is recycled into the FIFO's own pool.
-        runner.handle_datagram_fifo(&payload, clock.now(), Some(server_addr), &mut fifo);
+        runner
+            .pipeline
+            .handle_datagram_fifo(&payload, clock.now(), Some(server_addr), &mut fifo);
         let queued_ptr = fifo.packets.front().unwrap().data.as_ptr();
         clock.advance(Duration::from_millis(20));
-        runner.drain_ready_fifo(&mut fifo, clock.now(), &*sent);
+        runner
+            .pipeline
+            .drain_ready_fifo(&mut fifo, clock.now(), &*sent);
         assert_eq!(fifo.reused_packet_buffers.len(), 1);
         assert_eq!(fifo.reused_capacity_bytes, payload.capacity());
 
         // The next enqueue pops the recycled buffer: the queued payload must
         // reuse the same allocation (pointer reuse).
-        runner.handle_datagram_fifo(&payload, clock.now(), Some(server_addr), &mut fifo);
+        runner
+            .pipeline
+            .handle_datagram_fifo(&payload, clock.now(), Some(server_addr), &mut fifo);
         let reused_ptr = fifo.packets.front().unwrap().data.as_ptr();
         assert_eq!(
             reused_ptr, queued_ptr,
@@ -3158,11 +3219,15 @@ mod tests {
         // never trips for 1-byte payloads).
         let small = [0x42u8; 1];
         for _ in 0..(MAX_FIFO_REUSED_PACKET_BUFFERS + 16) {
-            runner.handle_datagram_fifo(&small, clock.now(), Some(server_addr), &mut fifo);
+            runner
+                .pipeline
+                .handle_datagram_fifo(&small, clock.now(), Some(server_addr), &mut fifo);
         }
         clock.advance(Duration::from_millis(20));
         while !fifo.packets.is_empty() {
-            runner.drain_ready_fifo(&mut fifo, clock.now(), &*sent);
+            runner
+                .pipeline
+                .drain_ready_fifo(&mut fifo, clock.now(), &*sent);
         }
         assert_eq!(
             fifo.reused_packet_buffers.len(),
@@ -3176,11 +3241,18 @@ mod tests {
         let mut big_fifo = FifoQueue::default();
         let big = vec![0xCDu8; 64 * 1024];
         for _ in 0..100 {
-            runner.handle_datagram_fifo(&big, clock.now(), Some(server_addr), &mut big_fifo);
+            runner.pipeline.handle_datagram_fifo(
+                &big,
+                clock.now(),
+                Some(server_addr),
+                &mut big_fifo,
+            );
         }
         clock.advance(Duration::from_millis(20));
         while !big_fifo.packets.is_empty() {
-            runner.drain_ready_fifo(&mut big_fifo, clock.now(), &*sent);
+            runner
+                .pipeline
+                .drain_ready_fifo(&mut big_fifo, clock.now(), &*sent);
         }
         assert_eq!(
             big_fifo.reused_packet_buffers.len(),
@@ -3204,18 +3276,26 @@ mod tests {
         runner.handle_datagram(b"a", server_addr, t0);
         // The next deadline is 2 ms out, below the 5 ms idle poll, so the wait
         // tracks the queued deadline exactly.
-        assert_eq!(runner.next_receive_wait(t0), Duration::from_millis(2));
+        assert_eq!(
+            runner.pipeline.next_receive_wait(t0),
+            Duration::from_millis(2)
+        );
         // One ms later the remaining wait is 1 ms.
         assert_eq!(
-            runner.next_receive_wait(t0 + Duration::from_millis(1)),
+            runner
+                .pipeline
+                .next_receive_wait(t0 + Duration::from_millis(1)),
             Duration::from_millis(1)
         );
         // Once drained there is nothing queued: the wait falls back to the
         // idle poll.
         clock.advance(Duration::from_millis(10));
         runner.drain_ready(clock.now());
-        assert_eq!(runner.queue.len(), 0);
-        assert_eq!(runner.next_receive_wait(clock.now()), RUNNER_IDLE_POLL);
+        assert_eq!(runner.pipeline.queue.len(), 0);
+        assert_eq!(
+            runner.pipeline.next_receive_wait(clock.now()),
+            RUNNER_IDLE_POLL
+        );
         drop(sent);
     }
 
@@ -3229,7 +3309,7 @@ mod tests {
         let (mut runner, sent) = mock_runner(config);
         runner.handle_datagram(b"a", server_addr, sent.clock().now());
         assert_eq!(
-            runner.next_receive_wait(sent.clock().now()),
+            runner.pipeline.next_receive_wait(sent.clock().now()),
             RUNNER_IDLE_POLL,
             "long queued deadlines must be capped at the idle poll"
         );
@@ -3257,7 +3337,9 @@ mod tests {
         // Direct path: a clean config forwards without touching the heap.
         let (runner, sent) = mock_runner(NetemConfig::default());
         let direct = || {
-            let _ = runner.try_direct_forward(&payload, Some(server_addr), &*sent);
+            let _ = runner
+                .pipeline
+                .try_direct_forward(&payload, Some(server_addr), &*sent);
         };
         let direct_mpps = probe_mpps(direct);
 
@@ -3269,7 +3351,9 @@ mod tests {
         };
         let (runner_f, sent_f) = mock_runner(config);
         let filter = || {
-            let _ = runner_f.try_direct_forward(&payload, Some(server_addr), &*sent_f);
+            let _ = runner_f
+                .pipeline
+                .try_direct_forward(&payload, Some(server_addr), &*sent_f);
         };
         let filter_mpps = probe_mpps(filter);
 
@@ -3346,44 +3430,46 @@ mod tests {
         let (mut direct, direct_sent) = mock_runner(config.clone());
         let (mut queued, queued_sent) = mock_runner(config);
         assert!(
-            direct.direct_stochastic,
+            direct.pipeline.direct_stochastic,
             "stochastic-only config must take the direct stochastic path"
         );
         assert!(
-            !direct.direct_forward,
+            !direct.pipeline.direct_forward,
             "stochastic work disqualifies the clean direct path"
         );
         let now = Instant::now();
         let payload = b"stochastic-direct";
         for _ in 0..256 {
             // Both paths start each packet from an identical RNG state.
-            let before_direct = direct.rng;
-            let before_queued = queued.rng;
+            let before_direct = direct.pipeline.rng;
+            let before_queued = queued.pipeline.rng;
             assert_eq!(before_direct.s1, before_queued.s1);
             assert_eq!(before_direct.s2, before_queued.s2);
             assert_eq!(before_direct.s3, before_queued.s3);
             assert_eq!(before_direct.s4, before_queued.s4);
 
-            direct.forward_stochastic_direct(payload, Some(server_addr), &*direct_sent);
+            direct
+                .pipeline
+                .forward_stochastic_direct(payload, Some(server_addr), &*direct_sent);
             queued
                 .pipeline
                 .handle_datagram(payload, now, Some(server_addr));
             queued.pipeline.drain_ready(now, &*queued_sent);
 
-            let ds = direct.stats.snapshot();
-            let qs = queued.stats.snapshot();
+            let ds = direct.pipeline.stats.snapshot();
+            let qs = queued.pipeline.stats.snapshot();
             assert_eq!(ds.received, qs.received);
             assert_eq!(ds.dropped, qs.dropped);
             assert_eq!(ds.duplicated, qs.duplicated);
             assert_eq!(ds.forwarded, qs.forwarded);
             // Identical draw order leaves the RNG lanes bit-for-bit equal.
-            assert_eq!(direct.rng.s1, queued.rng.s1);
-            assert_eq!(direct.rng.s2, queued.rng.s2);
-            assert_eq!(direct.rng.s3, queued.rng.s3);
-            assert_eq!(direct.rng.s4, queued.rng.s4);
+            assert_eq!(direct.pipeline.rng.s1, queued.pipeline.rng.s1);
+            assert_eq!(direct.pipeline.rng.s2, queued.pipeline.rng.s2);
+            assert_eq!(direct.pipeline.rng.s3, queued.pipeline.rng.s3);
+            assert_eq!(direct.pipeline.rng.s4, queued.pipeline.rng.s4);
         }
-        let ds = direct.stats.snapshot();
-        let qs = queued.stats.snapshot();
+        let ds = direct.pipeline.stats.snapshot();
+        let qs = queued.pipeline.stats.snapshot();
         assert_eq!(ds.received, 256);
         assert_eq!(ds.forwarded, qs.forwarded);
         assert_eq!(
@@ -3406,7 +3492,7 @@ mod tests {
         let (mut fifo_runner, fifo_sent) = mock_runner(config.clone());
         let (mut heap_runner, heap_sent) = mock_runner(config);
         assert!(
-            fifo_runner.uses_fifo_scheduling(),
+            fifo_runner.pipeline.uses_fifo_scheduling(),
             "latency-only config must select the FIFO path"
         );
         // Two independent shapers with identical rates: both paths start from
@@ -3414,8 +3500,8 @@ mod tests {
         // schedule is deterministic for both.
         let fifo_shaper = BottleneckShaper::new(8_000_000, 0);
         let heap_shaper = BottleneckShaper::new(8_000_000, 0);
-        fifo_runner.shared = Some(fifo_shaper);
-        heap_runner.shared = Some(heap_shaper);
+        fifo_runner.pipeline.shared = Some(fifo_shaper);
+        heap_runner.pipeline.shared = Some(heap_shaper);
         let clock = fifo_sent.clock();
         // Advance past both shapers' creation instants so the first schedule
         // is deterministic for both paths.
@@ -3424,21 +3510,30 @@ mod tests {
         let payloads: [&[u8]; 6] = [b"aa", b"bbbb", b"c", b"dd", b"eeeee", b"ff"];
         let mut fifo = FifoQueue::default();
         for p in payloads {
-            fifo_runner.handle_datagram_fifo(p, now, Some(server_addr), &mut fifo);
+            fifo_runner
+                .pipeline
+                .handle_datagram_fifo(p, now, Some(server_addr), &mut fifo);
             heap_runner
                 .pipeline
                 .handle_datagram(p, now, Some(server_addr));
         }
         // Identical deadlines per packet.
         let fifo_times: Vec<Instant> = fifo.packets.iter().map(|q| q.time_to_send).collect();
-        let heap_times: Vec<Instant> = heap_runner.queue.iter().map(|q| q.0.time_to_send).collect();
+        let heap_times: Vec<Instant> = heap_runner
+            .pipeline
+            .queue
+            .iter()
+            .map(|q| q.0.time_to_send)
+            .collect();
         assert_eq!(
             fifo_times, heap_times,
             "FIFO and heap must schedule identically"
         );
         // Draining at the last deadline forwards everything in identical order.
         let last = *fifo_times.last().unwrap();
-        fifo_runner.drain_ready_fifo(&mut fifo, last, &*fifo_sent);
+        fifo_runner
+            .pipeline
+            .drain_ready_fifo(&mut fifo, last, &*fifo_sent);
         heap_runner.pipeline.drain_ready(last, &*heap_sent);
         let fifo_sent_payloads: Vec<Vec<u8>> = fifo_sent
             .sent
@@ -3455,10 +3550,27 @@ mod tests {
             .map(|(d, _)| d.clone())
             .collect();
         assert_eq!(fifo_sent_payloads, heap_sent_payloads);
+        let fifo_counters = fifo_runner.pipeline.stats.snapshot();
+        let heap_counters = heap_runner.pipeline.stats.snapshot();
         assert_eq!(
-            fifo_runner.stats.snapshot(),
-            heap_runner.stats.snapshot(),
+            fifo_counters, heap_counters,
             "FIFO and heap must count identically"
+        );
+        assert_eq!(
+            fifo_counters.scheduled_drain_batches,
+            1,
+            "one non-empty drain of all {payloads_len} packets must record exactly one batch",
+            payloads_len = payloads.len()
+        );
+        assert_eq!(
+            fifo_counters.scheduled_drain_packets as usize,
+            payloads.len(),
+            "the drain must count every removed packet"
+        );
+        assert_eq!(
+            fifo_counters.scheduled_drain_max_packets as usize,
+            payloads.len(),
+            "the single drain is also the maximum drain"
         );
         drop(fifo_sent);
         drop(heap_sent);
