@@ -236,6 +236,16 @@ validates both executables and records their paths and SHA-256 digests as
 prebuilt in `run.json`. Supply both flags or neither; the caller is responsible
 for matching each binary to its workspace revisions.
 
+## FEC and retransmission-armor pairing
+
+`--fec` and `--retransmission-armor` are paired run flags: when set, every
+probe runs with `NETEM_PERF_FEC=1` and `RTP_RTX_DUP=1` respectively (0
+otherwise). Both values are recorded in `run.json`, in every `manifest.csv`
+row, and in each `trace-<role>-<seed>` trace manifest (keys `fec` and
+`retransmission_armor`), so paired comparisons and archived traces stay
+config-honest. The probe parses both variables strictly as `0|1|false|true`
+and passes FEC to both RTP endpoints.
+
 ## Same-binary control
 
 `--same-binary-control` compares a workspace with itself (the only mode that
@@ -276,7 +286,7 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
   peer/netem/progress) with the link profile and MSS recorded in its
   manifest.
 - `<role>-<seed>.log` — streamed probe log.
-- `comparison.json` / `comparison.html` — schema-28 comparison and report.
+- `comparison.json` / `comparison.html` — schema-34 comparison and report.
 - `{baseline,candidate}-probe-source.json` — probe source manifests binding
   each preserved executable's SHA-256 to exact component revisions.
 
@@ -452,6 +462,28 @@ invalid evidence.
 - A frozen workspace has a `netem_test/` checkout with sibling `rtp`, `mux`,
   `rtp_mux`, `tokio_udp`, and `udp_listener` repositories; each component's
   jj revision is recorded in the manifest.
+
+## Re-running analysis on a preserved result
+
+A finished run can be re-analyzed without rerunning any probe (preserved
+probes are never re-executed during `analyze`):
+
+```sh
+./tools/perf-loop analyze --result $TMPDIR/<run-output> [--update-run-json]
+```
+
+`--result` must resolve beneath `$TMPDIR` and contain `run.json` plus
+`comparison.json`; the subcommand recomputes `execution_order_analysis`,
+`within_run_phase_analysis`, `counterbalanced_goodput_analysis`,
+`comparison_readiness`, and (for a same-binary control run) the control
+calibration, printing the report as JSON. `--update-run-json` writes the
+recomputed analysis back into the preserved `run.json` atomically.
+
+Readiness is a structural gate: healthy trace evidence, at least two complete
+adjacent AB/BA blocks, and stable first/second-half behaviour for both roles
+are required; execution-order association is a caution, not a blocker.
+Readiness means the capture passed structural evidence checks and does_not_prove
+causality, practical benefit, or the absence of an unmeasured regression.
 
 ## Sampling
 
