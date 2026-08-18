@@ -269,21 +269,20 @@ def suite_revisions(workspace):
 def component_revisions(workspace):
     """Revision of every suite component for a workspace, sorted keys."""
     components = suite_revisions(workspace)
-    if components is None:
-        return None
-    identity = {component: commit_id for component, commit_id in components.items()}
-    for component in COMPONENTS:
-        if component not in identity:
+    seen = {}
+    for component, identity in components.items():
+        commit_id = identity["commit_id"]
+        if commit_id == "unknown":
             continue
-        for other in COMPONENTS:
-            if other == component or other not in identity:
-                continue
-            if identity[component] == identity[other] and component != other:
-                raise ValueError(
-                    f"workspace {workspace} component {component} and {other} "
-                    f"share the same commit_id {identity[component]!r}"
-                )
-    return validate_component_revisions(components, "workspace components", allow_unknown=True)
+        other = seen.get(commit_id)
+        if other is not None:
+            raise ValueError(
+                f"workspace {workspace} component {component} and "
+                f"{other} "
+                f"share the same commit_id {commit_id!r}"
+            )
+        seen[commit_id] = component
+    return components
 
 
 def validate_component_revisions(components, context, *, allow_unknown=False):
@@ -453,6 +452,7 @@ def run_probe(
     mss_bytes=8192,
     warmup_seconds=DEFAULT_WARMUP_SECONDS,
     revision="unspecified",
+    components=None,
     diagnostic_mode="1",
     subprocess_runner=subprocess.run,
 ):
@@ -488,7 +488,16 @@ def run_probe(
         completed = subprocess_runner(
             command, cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT
         )
-    components = component_revisions(workspace)
+    components = (
+        {component: identity["commit_id"]
+        for component, identity in component_revisions(workspace).items()}
+        if components is None
+        else validate_component_revisions(
+            components,
+            f"{role} probe components",
+            allow_unknown=True,
+        )
+    )
     append_trace_manifest(
         trace_dir,
         ["perf_loop_runner_exit_code", completed.returncode],
@@ -550,7 +559,7 @@ def call_compare(baseline_dirs, candidate_dirs, output_root):
 
 
 def within_run_phase_analysis(comparison):
-    observations = [{"label": run.get("label"), "role": run.get("role"), "first_half_mib_per_second": first, "second_half_mib_per_second": second, "second_minus_first_percent": shift, "material_phase_drift": abs(shift) >= MATERIAL_PHASE_DRIFT_PERCENT} for run in comparison.get("runs", []) for summary in (run.get("summary", {}),) if isinstance(summary.get("goodput_first_half_mib_per_second"), (int, float)) and isinstance(summary.get("goodput_second_half_mib_per_second"), (int, float)) for first in (float(summary["goodput_first_half_mib_per_second"]),) for second in (float(summary["goodput_second_half_mib_per_second"]),) if math.isfinite(first) and math.isfinite(second) and first > 0.0 for shift in ((second / first - 1.0) * 100.0,)]; absolute = [abs(item["second_minus_first_percent"]) for item in observations]; material = [item for item in observations if item["material_phase_drift"]]; classification = "insufficient_evidence" if not observations else "unstable_phase_drift" if material else "stable"; return {"classification": classification, "material_threshold_percent": MATERIAL_PHASE_DRIFT_PERCENT, "valid_runs": len(observations), "material_run_count": len(material), "median_absolute_shift_percent": statistics.median(absolute) if absolute else None, "max_absolute_shift_percent": max(absolute) if absolute else None, "runs": observations, "does_not_prove": "A first/second-half shift exposes non-stationary goodput inside the measurement window but does_not_prove its cause; controller cycles, loss timing, scheduling, thermal state, or adjacent load may contribute."}
+    observations = [{"label": run.get("Label"), "role": run.get("role"), "first_half_mib_per_second": first, "second_half_mib_per_second": second, "second_minus_first_percent": shift, "material_phase_drift": abs(shift) >= MATERIAL_PHASE_DRIFT_PERCENT or math.isclose(abs(shift), MATERIAL_PHASE_DRIFT_PERCENT, rel_tol=1e-12, abs_tol=1e-12)} for run in comparison.get("runs", []) for summary in (run.get("summary", {}),) if isinstance(summary.get("goodput_first_half_mib_per_second"), (int, float)) and isinstance(summary.get("goodput_second_half_mib_per_second"), (int, float)) for first in (float(summary["goodput_first_half_mib_per_second"]),) for second in (float(summary["goodput_second_half_mib_per_second"]),) if math.isfinite(first) and math.isfinite(second) and first > 0.0 for shift in (((second - first) / first) * 100.0,)]; absolute = [abs(item["second_minus_first_percent"]) for item in observations]; material = [item for item in observations if item["material_phase_drift"]]; classification = "insufficient_evidence" if not observations else "unstable_phase_drift" if material else "stable"; return {"classification": classification, "material_threshold_percent": MATERIAL_PHASE_DRIFT_PERCENT, "valid_runs": len(observations), "material_run_count": len(material), "median_absolute_shift_percent": statistics.median(absolute) if absolute else None, "max_absolute_shift_percent": max(absolute) if absolute else None, "runs": observations, "does_not_prove": "A first/second-half shift exposes non-stationary goodput inside the measurement window but does_not_prove its cause; controller cycles, loss timing, scheduling, thermal state, or adjacent load may contribute."}
 
 
 def control_calibration(comparison):
@@ -808,9 +817,13 @@ def command_run(args):
         build_sources = {role: "prebuilt" for role in executables}
         if all(source_manifests.values()):
             for role in ("baseline", "candidate"):
-                source_manifest_paths[role] = load_probe_source_manifest(
-                    source_manifests[role], executables[role], role
+                manifest_path = Path(source_manifests[role]).expanduser().resolve()
+                workspace_components[role] = load_probe_source_manifest(
+                    manifest_path,
+                    executables[role],
+                    role,
                 )
+                source_manifest_paths[role] = manifest_path
         else:
             source_manifest_paths = {role: None for role in executables}
     else:
@@ -863,6 +876,7 @@ def command_run(args):
                 window_seconds=args.window_seconds,
                 warmup_seconds=args.warmup_seconds,
                 revision=revisions[role]["commit_id"],
+                components=workspace_components[role],
             )
             rows.append(row)
             runs.append(
@@ -901,11 +915,10 @@ def command_run(args):
     build_components = {}
     components_sources = {}
     for role, workspace in (("baseline", baseline), ("candidate", candidate)):
-        if source_manifest_paths.get(role) is not None:
-            build_components[role] = source_manifest_paths[role]
+        build_components[role] = workspace_components[role]
+        if source_manifests[role] is not None:
             components_sources[role] = "probe_source_manifest"
         else:
-            build_components[role] = workspace_components[role]
             components_sources[role] = (
                 "build_workspace"
                 if build_sources[role] == "built"
