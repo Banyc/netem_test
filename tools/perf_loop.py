@@ -477,6 +477,8 @@ def run_probe(
     window_seconds=30,
     link_profile="hostile",
     mss_bytes=8192,
+    fec=False,
+    retransmission_armor=False,
     warmup_seconds=DEFAULT_WARMUP_SECONDS,
     revision="unspecified",
     components=None,
@@ -507,6 +509,8 @@ def run_probe(
     env["NETEM_PERF_WARMUP_SECONDS"] = str(warmup_seconds)
     env["NETEM_PERF_LINK_PROFILE"] = link_profile
     env["NETEM_PERF_MSS_BYTES"] = str(mss_bytes)
+    env["NETEM_PERF_FEC"] = "1" if fec else "0"
+    env["RTP_RTX_DUP"] = "1" if retransmission_armor else "0"
     env["NETEM_PERF_REVISION"] = revision
     env["NETEM_PERF_DIAGNOSTIC_MODE"] = diagnostic_mode
 
@@ -540,6 +544,8 @@ def run_probe(
         "seed": str(seed),
         "link_profile": link_profile,
         "mss_bytes": str(mss_bytes),
+        "fec": "true" if fec else "false",
+        "retransmission_armor": "true" if retransmission_armor else "false",
         "warmup_seconds": str(warmup_seconds),
         "executable": str(executable),
         "trace_dir": str(trace_dir),
@@ -565,6 +571,8 @@ def write_manifest(output_root, rows):
                 "seed",
                 "link_profile",
                 "mss_bytes",
+                "fec",
+                "retransmission_armor",
                 "executable",
                 "trace_dir",
                 "warmup_seconds",
@@ -1083,6 +1091,8 @@ def command_run(args):
                 target_dir=args.target_dir,
                 link_profile=args.link_profile,
                 mss_bytes=args.mss_bytes,
+                fec=args.fec,
+                retransmission_armor=args.retransmission_armor,
                 window_seconds=args.window_seconds,
                 warmup_seconds=args.warmup_seconds,
                 revision=revisions[role]["commit_id"],
@@ -1146,6 +1156,8 @@ def command_run(args):
         "comparison_readiness": readiness,
         "link_profile": args.link_profile,
         "mss_bytes": args.mss_bytes,
+        "fec": bool(args.fec),
+        "retransmission_armor": bool(args.retransmission_armor),
         "baseline": str(baseline),
         "candidate": str(candidate),
         "label": args.label,
@@ -1309,6 +1321,19 @@ def build_parser():
     )
     run.add_argument("--link-profile", choices=LINK_PROFILES, default="hostile")
     run.add_argument("--mss-bytes", type=int, default=8192)
+    run.add_argument(
+        "--fec",
+        action="store_true",
+        default=False,
+        help="enable FEC for every probe (NETEM_PERF_FEC=1)",
+    )
+    run.add_argument(
+        "--retransmission-armor",
+        dest="retransmission_armor",
+        action="store_true",
+        default=False,
+        help="enable retransmission-armor duplicate protection for every probe (RTP_RTX_DUP=1)",
+    )
     run.add_argument("--release", action="store_true", default=True, help=argparse.SUPPRESS)
     run.add_argument("--no-release", dest="release", action="store_false")
     run.add_argument(

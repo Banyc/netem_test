@@ -18,9 +18,26 @@ import math
 import statistics
 from pathlib import Path
 
-COMPARISON_SCHEMA_VERSION = 28
+COMPARISON_SCHEMA_VERSION = 34
 
 GENTLE_EXIT_CAUSES = ("loss", "gate_open", "drain_guard", "outage_reset")
+
+ACK_FLUSH_REASONS = ("initial", "age", "count", "fin", "explicit")
+
+
+def ack_flush_metric_keys():
+    keys = []
+    for reason in ACK_FLUSH_REASONS:
+        keys.append(f"ack_flush_{reason}_claims_per_gib_delivered")
+        keys.append(f"peer_ack_flush_{reason}_claims_per_gib_delivered")
+        keys.append(f"ack_flush_{reason}_claim_share")
+        keys.append(f"peer_ack_flush_{reason}_claim_share")
+    keys.append("ack_flush_claims_total_per_gib_delivered")
+    keys.append("peer_ack_flush_claims_total_per_gib_delivered")
+    return tuple(keys)
+
+
+ACK_FLUSH_METRICS = ack_flush_metric_keys()
 
 MODULE_PATH = Path(__file__).with_name("rtp_trace_report.py")
 SPEC = importlib.util.spec_from_file_location("rtp_trace_report", MODULE_PATH)
@@ -643,6 +660,28 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
     sender_would_blocks = metric_number(manifest.get("rtp_data_send_would_blocks"))
     peer_would_blocks = metric_number(manifest.get("rtp_peer_data_send_would_blocks"))
 
+    def ack_flush_claim_counts(prefix):
+        counts = {
+            reason: metric_number(manifest.get(f"{prefix}_ack_flush_{reason}_claims"))
+            for reason in ACK_FLUSH_REASONS
+        }
+        total = (
+            sum(counts.values())
+            if all(count is not None for count in counts.values())
+            else None
+        )
+        return counts, total
+
+    sender_ack_flush_claims, sender_ack_flush_total = ack_flush_claim_counts("rtp")
+    peer_ack_flush_claims, peer_ack_flush_total = ack_flush_claim_counts("rtp_peer")
+
+    def claim_share(count, total):
+        if total is None or total <= 0:
+            return 0.0
+        if count is None:
+            return None
+        return count / total
+
     return {
         "count": count,
         "actions": actions,
@@ -771,6 +810,46 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "peer_data_send_would_blocks_per_gib_delivered": _per_gib(
             peer_would_blocks, delivered_bytes
         ),
+        **{
+            f"ack_flush_{reason}_claims": sender_ack_flush_claims[reason]
+            for reason in ACK_FLUSH_REASONS
+        },
+        **{
+            f"peer_ack_flush_{reason}_claims": peer_ack_flush_claims[reason]
+            for reason in ACK_FLUSH_REASONS
+        },
+        "ack_flush_claims_total": sender_ack_flush_total,
+        "peer_ack_flush_claims_total": peer_ack_flush_total,
+        **{
+            f"ack_flush_{reason}_claims_per_gib_delivered": _per_gib(
+                sender_ack_flush_claims[reason], delivered_bytes
+            )
+            for reason in ACK_FLUSH_REASONS
+        },
+        **{
+            f"peer_ack_flush_{reason}_claims_per_gib_delivered": _per_gib(
+                peer_ack_flush_claims[reason], delivered_bytes
+            )
+            for reason in ACK_FLUSH_REASONS
+        },
+        "ack_flush_claims_total_per_gib_delivered": _per_gib(
+            sender_ack_flush_total, delivered_bytes
+        ),
+        "peer_ack_flush_claims_total_per_gib_delivered": _per_gib(
+            peer_ack_flush_total, delivered_bytes
+        ),
+        **{
+            f"ack_flush_{reason}_claim_share": claim_share(
+                sender_ack_flush_claims[reason], sender_ack_flush_total
+            )
+            for reason in ACK_FLUSH_REASONS
+        },
+        **{
+            f"peer_ack_flush_{reason}_claim_share": claim_share(
+                peer_ack_flush_claims[reason], peer_ack_flush_total
+            )
+            for reason in ACK_FLUSH_REASONS
+        },
         "final_netem_counters": final_netem_counters(netem),
         "delivered_bytes": delivered_bytes,
         "elapsed_seconds": elapsed if elapsed is not None else (progress[-1][0] if progress else 0),
@@ -897,6 +976,7 @@ METRICS = (
     "application_limited_suppression_percent",
     "retransmission_attempts_per_gib_delivered",
     "retransmission_repeat_attempts_per_gib_delivered",
+    *ACK_FLUSH_METRICS,
 )
 
 NEUTRAL_DIRECTION_METRICS = {
@@ -924,6 +1004,7 @@ NEUTRAL_DIRECTION_METRICS = {
     "peer_retransmission_armor_duplicates",
     "sender_data_send_would_blocks",
     "peer_data_send_would_blocks",
+    *ACK_FLUSH_METRICS,
 }
 
 LOWER_IS_BETTER_METRICS = {
@@ -954,6 +1035,7 @@ CONDITIONED_OUTCOME_METRICS = (
     "rtt_p50_ms",
     "retransmission_attempts_per_gib_delivered",
     "retransmission_repeat_attempts_per_gib_delivered",
+    *ACK_FLUSH_METRICS,
 )
 
 

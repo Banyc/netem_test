@@ -304,7 +304,7 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 28)
+            self.assertEqual(comparison["schema_version"], 34)
             self.assertEqual(comparison["valid_pairs"], 1)
             self.assertEqual(comparison["total_pairs"], 1)
             self.assertEqual(comparison["verdict"], "likely_improvement")
@@ -574,7 +574,7 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 28)
+            self.assertEqual(comparison["schema_version"], 34)
             self.assertEqual(comparison["evidence_quality"], "healthy")
             for run in comparison["runs"]:
                 self.assertEqual(run["evidence_quality"], "healthy")
@@ -1041,6 +1041,159 @@ class TraceCompareTest(unittest.TestCase):
         with path.open("w", newline="", encoding="utf-8") as output:
             csv.writer(output).writerows(rows)
 
+
+    def test_ack_flush_claim_reasons_are_normalized_and_direction_neutral(self):
+        manifest = {
+            "rtp_ack_flush_initial_claims": "10",
+            "rtp_ack_flush_age_claims": "30",
+            "rtp_ack_flush_count_claims": "40",
+            "rtp_ack_flush_fin_claims": "15",
+            "rtp_ack_flush_explicit_claims": "5",
+            "rtp_peer_ack_flush_initial_claims": "2",
+            "rtp_peer_ack_flush_age_claims": "8",
+            "rtp_peer_ack_flush_count_claims": "6",
+            "rtp_peer_ack_flush_fin_claims": "2",
+            "rtp_peer_ack_flush_explicit_claims": "2",
+            "rtp_send_driver_resume_ack_flush_requests": "500",
+            "rtp_peer_send_driver_resume_ack_flush_requests": "300",
+            "delivered_bytes": str(1024 ** 3),
+        }
+        summary = COMPARE.summarize_run(manifest, [], [], [], [], [], [], [], [])
+        self.assertEqual(summary["ack_flush_claims_total"], 100.0)
+        self.assertEqual(summary["peer_ack_flush_claims_total"], 20.0)
+        self.assertEqual(summary["ack_flush_claims_total_per_gib_delivered"], 100.0)
+        self.assertEqual(summary["peer_ack_flush_claims_total_per_gib_delivered"], 20.0)
+        for reason, count in (
+            ("initial", 10.0),
+            ("age", 30.0),
+            ("count", 40.0),
+            ("fin", 15.0),
+            ("explicit", 5.0),
+        ):
+            self.assertEqual(summary[f"ack_flush_{reason}_claims"], count)
+            self.assertEqual(
+                summary[f"ack_flush_{reason}_claims_per_gib_delivered"], count
+            )
+        for reason, share in (
+            ("initial", 0.10),
+            ("age", 0.30),
+            ("count", 0.40),
+            ("fin", 0.15),
+            ("explicit", 0.05),
+        ):
+            self.assertAlmostEqual(summary[f"ack_flush_{reason}_claim_share"], share)
+        for reason, count in (
+            ("initial", 2.0),
+            ("age", 8.0),
+            ("count", 6.0),
+            ("fin", 2.0),
+            ("explicit", 2.0),
+        ):
+            self.assertEqual(summary[f"peer_ack_flush_{reason}_claims"], count)
+            self.assertEqual(
+                summary[f"peer_ack_flush_{reason}_claims_per_gib_delivered"], count
+            )
+        for reason, share in (
+            ("initial", 0.10),
+            ("age", 0.40),
+            ("count", 0.30),
+            ("fin", 0.10),
+            ("explicit", 0.10),
+        ):
+            self.assertAlmostEqual(
+                summary[f"peer_ack_flush_{reason}_claim_share"], share
+            )
+        self.assertEqual(summary["send_driver_resume_requests"]["ack_flush"], 500.0)
+        self.assertEqual(
+            summary["peer_send_driver_resume_requests"]["ack_flush"], 300.0
+        )
+        for metric in COMPARE.ACK_FLUSH_METRICS:
+            self.assertIn(metric, COMPARE.METRICS)
+            self.assertIn(metric, COMPARE.NEUTRAL_DIRECTION_METRICS)
+            self.assertEqual(COMPARE.metric_direction(metric, 1.0), "changed")
+            self.assertEqual(COMPARE.metric_direction(metric, -1.0), "changed")
+        zero = {
+            f"rtp_ack_flush_{reason}_claims": "0"
+            for reason in COMPARE.ACK_FLUSH_REASONS
+        }
+        summary_zero = COMPARE.summarize_run(
+            {**zero, "delivered_bytes": str(1024 ** 3)},
+            [], [], [], [], [], [], [], [],
+        )
+        self.assertEqual(summary_zero["ack_flush_claims_total"], 0.0)
+        self.assertEqual(summary_zero["ack_flush_initial_claim_share"], 0.0)
+        summary_absent = COMPARE.summarize_run({}, [], [], [], [], [], [], [], [])
+        self.assertEqual(summary_absent["ack_flush_initial_claim_share"], 0.0)
+        self.assertIsNone(summary_absent["ack_flush_initial_claims"])
+
+    def test_split_window_goodput_uses_the_exact_midpoint(self):
+        mib = 1024 * 1024
+        first, second = COMPARE.split_window_goodput(
+            [(0.0, 0.0), (9.8, 9.8 * mib), (10.2, 10.6 * mib), (20.0, 40 * mib)],
+            20.0,
+            40 * mib,
+        )
+        self.assertAlmostEqual(first, 1.02)
+        self.assertAlmostEqual(second, 2.98)
+        first, second = COMPARE.split_window_goodput(
+            [(0.0, 0.0), (10.25, 10.25 * mib), (20.5, 20.5 * mib)],
+            20.5,
+            20.5 * mib,
+        )
+        self.assertAlmostEqual(first, 1.0)
+        self.assertAlmostEqual(second, 1.0)
+        self.assertEqual(
+            COMPARE.split_window_goodput(
+                [(12.0, 12 * mib), (20.0, 40 * mib)], 20.0, 40 * mib
+            ),
+            (None, None),
+        )
+        self.assertEqual(
+            COMPARE.split_window_goodput(
+                [(0.0, 0.0), (10.8, 10.8 * mib), (20.0, 40 * mib)],
+                20.0,
+                40 * mib,
+            ),
+            (None, None),
+        )
+
+    def test_event_normalization_requires_a_counter_and_delivered_bytes(self):
+        self.assertIsNone(COMPARE._per_gib(None, 1024 ** 3))
+        self.assertIsNone(COMPARE._per_gib(3.0, 0))
+        self.assertIsNone(COMPARE._per_gib(3.0, None))
+        self.assertEqual(COMPARE._per_gib(3.0, 1024 ** 3), 3.0)
+        manifest = {
+            "rtp_retransmission_armor_duplicates": "0",
+            "delivered_bytes": str(1024 ** 3),
+        }
+        summary = COMPARE.summarize_run(manifest, [], [], [], [], [], [], [], [])
+        self.assertEqual(summary["sender_retransmission_armor_duplicates"], 0.0)
+        self.assertEqual(
+            summary["sender_retransmission_armor_duplicates_per_gib_delivered"],
+            0.0,
+        )
+        summary_absent = COMPARE.summarize_run({}, [], [], [], [], [], [], [], [])
+        self.assertIsNone(summary_absent["sender_retransmission_armor_duplicates"])
+        self.assertIsNone(
+            summary_absent["sender_retransmission_armor_duplicates_per_gib_delivered"]
+        )
+        claims = {
+            f"rtp_ack_flush_{reason}_claims": "4"
+            for reason in COMPARE.ACK_FLUSH_REASONS
+        }
+        summary_with_bytes = COMPARE.summarize_run(
+            {**claims, "delivered_bytes": str(1024 ** 3)},
+            [], [], [], [], [], [], [], [],
+        )
+        self.assertEqual(summary_with_bytes["ack_flush_claims_total"], 20.0)
+        self.assertEqual(
+            summary_with_bytes["ack_flush_claims_total_per_gib_delivered"], 20.0
+        )
+        summary_no_bytes = COMPARE.summarize_run(
+            claims, [], [], [], [], [], [], [], []
+        )
+        self.assertEqual(summary_no_bytes["ack_flush_claims_total"], 20.0)
+        self.assertIsNone(summary_no_bytes["ack_flush_claims_total_per_gib_delivered"])
 
 if __name__ == "__main__":
     unittest.main()

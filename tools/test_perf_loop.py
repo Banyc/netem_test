@@ -306,6 +306,8 @@ class PerfLoopTest(unittest.TestCase):
             executable.write_text("#!/bin/sh\n", encoding="utf-8")
             args = argparse.Namespace(
                 mss_bytes=8192,
+                fec=False,
+                retransmission_armor=False,
                 candidate=str(workspace),
                 baseline=str(workspace),
                 same_binary_control=True,
@@ -415,6 +417,8 @@ class PerfLoopTest(unittest.TestCase):
             env = calls[0]["env"]
             self.assertEqual(env["NETEM_PERF_LINK_PROFILE"], "clean")
             self.assertEqual(env["NETEM_PERF_MSS_BYTES"], "1400")
+            self.assertEqual(env["NETEM_PERF_FEC"], "0")
+            self.assertEqual(env["RTP_RTX_DUP"], "0")
             self.assertEqual(env["NETEM_PERF_DIAGNOSTIC_MODE"], "1")
             self.assertEqual(env["NETEM_PERF_SEED"], "11")
             self.assertEqual(env["NETEM_PERF_WINDOW_SECONDS"], "10")
@@ -436,6 +440,8 @@ class PerfLoopTest(unittest.TestCase):
             self.assertEqual(row["role"], "baseline")
             self.assertEqual(row["link_profile"], "clean")
             self.assertEqual(row["mss_bytes"], "1400")
+            self.assertEqual(row["fec"], "false")
+            self.assertEqual(row["retransmission_armor"], "false")
             self.assertEqual(row["warmup_seconds"], "2.5")
             self.assertEqual(row["executable"], str(executable.resolve()))
             components = json.loads(row["components"])
@@ -663,6 +669,18 @@ class PerfLoopTest(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 LOOP.use_prebuilt_probe(Path(directory) / "missing", "candidate")
+
+    def test_run_parser_accepts_fec_and_retransmission_armor_flags(self):
+        parser = LOOP.build_parser()
+        fec_armor = parser.parse_args(
+            ["run", "--baseline", "/suite/b", "--candidate", "/suite/c",
+             "--fec", "--retransmission-armor"]
+        )
+        self.assertTrue(fec_armor.fec)
+        self.assertTrue(fec_armor.retransmission_armor)
+        plain = parser.parse_args(["run", "--baseline", "/suite/b", "--candidate", "/suite/c"])
+        self.assertFalse(plain.fec)
+        self.assertFalse(plain.retransmission_armor)
 
     def test_run_parser_accepts_clean_link_and_rejects_nonpositive_mss(self):
         parser = LOOP.build_parser()
@@ -915,6 +933,8 @@ class PerfLoopTest(unittest.TestCase):
             executable.write_text("#!/bin/sh\n", encoding="utf-8")
             args = argparse.Namespace(
                 mss_bytes=8192,
+                fec=False,
+                retransmission_armor=False,
                 candidate=str(workspace),
                 baseline=str(workspace),
                 same_binary_control=True,
