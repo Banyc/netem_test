@@ -73,17 +73,12 @@ fn connector_via(
     });
     let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
     let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
-        bind,
         bulk_addr,
-        interactive_fec_tuning: rtp::FecTuning::default(),
-        interactive_instream_group_fec: false,
-        interactive_metrics_observer: None,
-        bulk_metrics_observer: None,
-        handshake: true,
         explorer: ExplorerConfig {
             enabled: false,
             ..ExplorerConfig::default()
         },
+        ..RtpMuxConnectorConfig::standard(bind)
     });
     support::submit_test_task_required(task_tx, "rtp_mux connector driver", driver);
     connector
@@ -781,19 +776,14 @@ async fn run_explorer_arm() -> ExplorerArm {
             let bulk_addr: BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
             let connector = {
                 let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
-                    bind,
                     bulk_addr,
-                    interactive_fec_tuning: rtp::FecTuning::default(),
-                    interactive_instream_group_fec: false,
-                    interactive_metrics_observer: None,
-                    bulk_metrics_observer: None,
-                    handshake: true,
                     explorer: ExplorerConfig {
                         enabled: true,
                         probe_mean_interval: Duration::from_millis(250),
                         rotation_period: Duration::from_secs(60),
                         ..ExplorerConfig::default()
                     },
+                    ..RtpMuxConnectorConfig::standard(bind)
                 });
                 support::submit_test_task_required(&task_tx, "rtp_mux connector driver", driver);
                 connector

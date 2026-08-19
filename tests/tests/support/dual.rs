@@ -1921,7 +1921,7 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
 /// [`spawn_dual_mux_latency_bulk_server_two_listeners`] through the bounded
 /// task-submission handle, for use inside [`TestScope::run`] bodies where
 /// `&mut TestScope` is unavailable. The accept-loop and pairing tasks are
-/// submitted as required through the handle; the returned sender is a clone
+/// submitted as required through the handle; the returned handle is a clone
 /// of the caller's submission handle (which also feeds the reaper the
 /// tagged-stream sink tasks go through).
 pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(

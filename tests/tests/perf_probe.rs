@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use netem_test::{CountersSnapshot, NetemPair};
 use support::mux::{
-    mux_send_payload, mux_timed_echo_round_trip,
+    mux_send_payload, mux_timed_echo_round_trip, send_timestamped_messages,
     spawn_mux_over_rtp_counting_sink_server_observed_via, spawn_mux_over_rtp_echo_server_via,
     spawn_mux_over_rtp_echo_server_with_mss_via, spawn_mux_over_rtp_sink_server_via,
     spawn_mux_over_rtp_sink_server_with_mss_via,
@@ -26,7 +26,7 @@ use support::rtp::{
     rtp_echo_payload, spawn_rtp_echo_server_via, spawn_rtp_echo_server_with_mss_via,
 };
 use support::stats::{combined_stats, print_median_worst, print_perf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
 
@@ -650,8 +650,17 @@ async fn probe_hostile_goodput_30s() {
                         | "controller-fat-pipe"
                         | "clean"
                         | "direct"
+                        | "hostile-bottleneck-20ms"
+                        | "hostile-bottleneck-100ms"
+                        | "hostile-bottleneck-300ms"
+                        | "fec-recoverable-bottleneck"
+                        | "fec-gaming-fat-pipe"
+                        | "fec-paired-saturated"
+                        | "hostile-periodic-bottleneck-20ms"
+                        | "hostile-periodic-bottleneck-100ms"
+                        | "hostile-periodic-bottleneck-300ms"
                 ),
-                "NETEM_PERF_LINK_PROFILE must be exactly 'hostile', 'lossy-400kib', 'hostile-fat-pipe', 'controller-fat-pipe', 'clean', or 'direct', got {link_profile:?}"
+                "NETEM_PERF_LINK_PROFILE must be one of the hostile/controller/fec calibration profiles, got {link_profile:?}"
             );
             let direct = link_profile == "direct";
             let mss_bytes = std::env::var("NETEM_PERF_MSS_BYTES")
@@ -684,6 +693,25 @@ async fn probe_hostile_goodput_30s() {
                 "hostile-fat-pipe" => support::presets::hostile_fat_pipe(),
                 "controller-fat-pipe" => support::presets::controller_fat_pipe(),
                 "clean" | "direct" => support::presets::clean(),
+                "hostile-bottleneck-20ms" => support::presets::hostile_steady_bottleneck_20ms(),
+                "hostile-bottleneck-100ms" => support::presets::hostile_steady_bottleneck_100ms(),
+                "hostile-bottleneck-300ms" => support::presets::hostile_steady_bottleneck(),
+                "fec-recoverable-bottleneck" => support::presets::fec_recoverable_bottleneck(),
+                "fec-gaming-fat-pipe" => support::presets::fec_gaming_fat_pipe(),
+                // The runtime FEC flag selects the paired-saturated key
+                // offset: the FEC-on arm wraps the data packet in the 10-byte
+                // FEC envelope, so the netem key must point past it at the
+                // same logical codec sequence the FEC-off arm keys on.
+                "fec-paired-saturated" => support::presets::fec_paired_saturated_bottleneck(fec),
+                "hostile-periodic-bottleneck-20ms" => {
+                    support::presets::hostile_periodic_bottleneck_20ms()
+                }
+                "hostile-periodic-bottleneck-100ms" => {
+                    support::presets::hostile_periodic_bottleneck_100ms()
+                }
+                "hostile-periodic-bottleneck-300ms" => {
+                    support::presets::hostile_periodic_bottleneck_300ms()
+                }
                 _ => unreachable!("link profile was validated above"),
             };
             let c2s_seed = std::env::var("NETEM_PERF_SEED")
@@ -891,7 +919,18 @@ async fn probe_hostile_goodput_30s() {
                 eprintln!("[stats] {stats:?}");
                 if matches!(
                     link_profile.as_str(),
-                    "hostile" | "lossy-400kib" | "hostile-fat-pipe"
+                    "hostile"
+                        | "lossy-400kib"
+                        | "hostile-fat-pipe"
+                        | "hostile-bottleneck-20ms"
+                        | "hostile-bottleneck-100ms"
+                        | "hostile-bottleneck-300ms"
+                        | "fec-recoverable-bottleneck"
+                        | "fec-gaming-fat-pipe"
+                        | "fec-paired-saturated"
+                        | "hostile-periodic-bottleneck-20ms"
+                        | "hostile-periodic-bottleneck-100ms"
+                        | "hostile-periodic-bottleneck-300ms"
                 ) {
                     assert!(
                         stats.dropped > 0 && stats.delayed > 0,
@@ -942,6 +981,473 @@ async fn probe_hostile_goodput_30s() {
             // Keep the stream read half alive until after the delivered
             // snapshot.
             let _ = stream_read;
+        })
+        .await;
+}
+
+/// Sparse-message probe constants: 64-byte timestamped messages every 100 ms.
+const MESSAGE_BYTES: usize = 64;
+const MESSAGE_CADENCE: Duration = Duration::from_millis(100);
+/// Straggler allowance after the measurement window before the latency
+/// samples are drained.
+const MESSAGE_GRACE: Duration = Duration::from_secs(4);
+
+/// Parse one accepted mux stream as length-prefixed timestamped frames
+/// (`u32` LE length, payload, `u64` LE send timestamp in the last 8 bytes)
+/// and push the one-way latency of each complete frame into `latency_tx`;
+/// verified frame bytes accumulate in `delivered`.
+async fn parse_message_latency_stream(
+    mut stream_read: mux::StreamReader,
+    mut stream_write: mux::StreamWriter,
+    latency_tx: tokio::sync::mpsc::Sender<f64>,
+    delivered: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    base: Instant,
+) {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut offset = 0usize;
+    while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
+        if n == 0 {
+            break;
+        }
+        offset += n;
+        loop {
+            if offset < 4 {
+                break;
+            }
+            let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if frame_len < 12 || offset < frame_len {
+                break;
+            }
+            let payload_end = frame_len - 8;
+            let sent_us = u64::from_le_bytes(buf[payload_end..payload_end + 8].try_into().unwrap());
+            let now_us = base.elapsed().as_micros() as u64;
+            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+            if !support::try_send_observation(&latency_tx, latency_ms, "message latency sample") {
+                break;
+            }
+            delivered.fetch_add(frame_len as u64, std::sync::atomic::Ordering::Relaxed);
+            buf.copy_within(frame_len..offset, 0);
+            offset -= frame_len;
+        }
+    }
+    let _ = stream_write.shutdown();
+}
+
+/// Sparse-message latency server: accepts one mux-over-RTP connection with
+/// the requested FEC/MSS, runs each accepted stream through
+/// [`parse_message_latency_stream`], and reports one-way latencies plus the
+/// mux session outcome for the trace evidence.
+async fn spawn_message_latency_server_via(
+    task_tx: &support::TestTaskSubmitter,
+    fec: bool,
+    mss: usize,
+    base: Instant,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<support::stats::MuxSessionProgress>,
+)> {
+    let (latency_tx, latency_rx) = tokio::sync::mpsc::channel(support::LATENCY_SAMPLE_CAPACITY);
+    let delivered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mux_session = std::sync::Arc::new(support::stats::MuxSessionProgress::new());
+    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr();
+    let listener = std::sync::Arc::new(listener);
+    let delivered_for_handlers = std::sync::Arc::clone(&delivered);
+    support::submit_test_task_required(task_tx, "message latency server", {
+        let listener = std::sync::Arc::clone(&listener);
+        let mux_session = std::sync::Arc::clone(&mux_session);
+        Box::pin(async move {
+            // First (and only) rtp connection. An accept failure is a
+            // scenario failure; panic so the root JoinError unwrap crashes
+            // the test.
+            let accepted = listener
+                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                    fec,
+                    mss: rtp::udp::MssConfig::Custom(mss),
+                    metrics_observer,
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+                .unwrap();
+            // The extra-accept drainer loop keeps driving `udp_listener`'s
+            // dispatcher for the server's lifetime; without it the
+            // dispatcher stops after the first connection and the reliable
+            // layer stalls. It ends only by panicking on an accept error.
+            let drainer = {
+                let listener = std::sync::Arc::clone(&listener);
+                async move {
+                    loop {
+                        listener
+                            .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                                fec,
+                                mss: rtp::udp::MssConfig::Custom(mss),
+                                ..rtp::udp::AcceptConfig::default()
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+            };
+            tokio::pin!(drainer);
+            let read = accepted.read.into_async_read();
+            let write = accepted.write.into_async_write();
+            // The accepted lane's rtp session supervisor owns the session
+            // drivers; poll it from the select loop below so a panicked
+            // driver terminates the server instead of being silently dropped.
+            let supervisor = accepted.supervisor;
+            tokio::pin!(supervisor);
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Server,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
+            };
+            let mut spawner = tokio::task::JoinSet::new();
+            let (_opener, mut accepter) =
+                mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+            let mut handlers = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    () = &mut supervisor => break,
+                    () = &mut drainer => {
+                        panic!("accept drainer finished before the message-latency scenario completed");
+                    }
+                    accepted = accepter.accept() => {
+                        match accepted {
+                            Ok((stream_read, stream_write)) => {
+                                let latency_tx = latency_tx.clone();
+                                let delivered = std::sync::Arc::clone(&delivered_for_handlers);
+                                handlers.spawn(parse_message_latency_stream(
+                                    stream_read,
+                                    stream_write,
+                                    latency_tx,
+                                    delivered,
+                                    base,
+                                ));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Some(joined) = handlers.join_next(), if !handlers.is_empty() => {
+                        joined.unwrap();
+                    }
+                    Some(joined) = spawner.join_next() => {
+                        let error = joined.unwrap();
+                        mux_session.record_error(&error);
+                        break;
+                    }
+                }
+            }
+            // Drain remaining handler/supervision joins so panics surface.
+            while let Some(result) = handlers.join_next().await {
+                result.unwrap();
+            }
+            while let Some(result) = spawner.join_next().await {
+                result.unwrap();
+            }
+        })
+    });
+    Ok((addr, latency_rx, delivered, mux_session))
+}
+
+/// Time-boxed sparse-message latency probe across the periodic hostile
+/// bottleneck lanes. 64-byte timestamped messages are sent every 100 ms for
+/// `NETEM_PERF_WINDOW_SECONDS` (30 s default) and one-way latency plus
+/// delivery are recorded as p50/p95/p99; netem is sampled every 50 ms and a
+/// four-second straggler allowance precedes sample collection. Only the
+/// periodic 300/20/100 ms profiles are accepted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn probe_hostile_message_latency() {
+    let mut tasks = support::TestScope::new();
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
+        .run(async {
+            let mut trace = PerfTrace::from_env();
+            let window_seconds = std::env::var("NETEM_PERF_WINDOW_SECONDS")
+                .map(|value| {
+                    let seconds = value
+                        .parse::<f64>()
+                        .expect("NETEM_PERF_WINDOW_SECONDS must be a number");
+                    assert!(seconds.is_finite() && seconds > 0.0);
+                    seconds
+                })
+                .unwrap_or(30.0);
+            let warmup_seconds = std::env::var("NETEM_PERF_WARMUP_SECONDS")
+                .map(|value| {
+                    let seconds = value
+                        .parse::<f64>()
+                        .expect("NETEM_PERF_WARMUP_SECONDS must be a number");
+                    assert!(seconds.is_finite() && seconds >= 0.0);
+                    seconds
+                })
+                .unwrap_or(5.0);
+            let link_profile = std::env::var("NETEM_PERF_LINK_PROFILE")
+                .unwrap_or_else(|_| "hostile-periodic-bottleneck-300ms".to_owned());
+            assert!(
+                matches!(
+                    link_profile.as_str(),
+                    "hostile-periodic-bottleneck-300ms"
+                        | "hostile-periodic-bottleneck-100ms"
+                        | "hostile-periodic-bottleneck-20ms"
+                ),
+                "NETEM_PERF_LINK_PROFILE for the message-latency probe must be exactly 'hostile-periodic-bottleneck-300ms', 'hostile-periodic-bottleneck-100ms', or 'hostile-periodic-bottleneck-20ms', got {link_profile:?}"
+            );
+            let mss_bytes = std::env::var("NETEM_PERF_MSS_BYTES")
+                .map(|value| {
+                    let mss = value
+                        .parse::<usize>()
+                        .expect("NETEM_PERF_MSS_BYTES must be a positive usize");
+                    assert!(mss > 0, "NETEM_PERF_MSS_BYTES must be positive");
+                    mss
+                })
+                .unwrap_or(1400);
+            // Paired run flags are parsed strictly: only 0|1|false|true are
+            // accepted, so a typo cannot silently flip FEC or armor on a
+            // timed run.
+            let parse_flag_env = |name: &str| -> bool {
+                match std::env::var(name).as_deref() {
+                    Ok("0") | Ok("false") => false,
+                    Ok("1") | Ok("true") => true,
+                    Ok(other) => panic!(
+                        "{name} must be exactly 0, 1, false, or true, got {other:?}"
+                    ),
+                    Err(_) => false,
+                }
+            };
+            let fec = parse_flag_env("NETEM_PERF_FEC");
+            let retransmission_armor = parse_flag_env("RTP_RTX_DUP");
+            let make_link = || match link_profile.as_str() {
+                "hostile-periodic-bottleneck-300ms" => {
+                    support::presets::hostile_periodic_bottleneck_300ms()
+                }
+                "hostile-periodic-bottleneck-100ms" => {
+                    support::presets::hostile_periodic_bottleneck_100ms()
+                }
+                "hostile-periodic-bottleneck-20ms" => {
+                    support::presets::hostile_periodic_bottleneck_20ms()
+                }
+                _ => unreachable!("link profile was validated above"),
+            };
+            let c2s_seed = std::env::var("NETEM_PERF_SEED")
+                .map(|value| value.parse::<u64>().expect("NETEM_PERF_SEED must be a u64"))
+                .unwrap_or(4);
+            let s2c_seed = c2s_seed.wrapping_add(1);
+            let mut c2s = make_link();
+            c2s.seed = c2s_seed;
+            let mut s2c = make_link();
+            s2c.seed = s2c_seed;
+            let c2s_description = format!("{c2s:?}");
+            let s2c_description = format!("{s2c:?}");
+
+            let base = Instant::now();
+            let (server_addr, mut latencies, server_delivered, server_mux) =
+                spawn_message_latency_server_via(
+                    &task_tx,
+                    fec,
+                    mss_bytes,
+                    base,
+                    trace.as_ref().and_then(PerfTrace::rtp_peer_observer),
+                )
+                .await
+                .unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+            let (read, write) = rtp_connect_transient_observed(
+                &task_tx,
+                pair.client_addr(),
+                fec,
+                mss_bytes,
+                trace.as_ref().and_then(PerfTrace::rtp_observer),
+            )
+            .await;
+            let (opener, client_mux) = mux_client_connect_transient(&task_tx, read, write);
+
+            // Open the stream under a generous timeout before we start the clock.
+            let (mut stream_read, mut stream_write) = with_timeout(
+                Duration::from_secs(30),
+                "open mux stream for message latency",
+                async { opener.open().await.unwrap() },
+            )
+            .await;
+            // Parked until the stream closes; the owning JoinSet aborts it at scope end.
+            support::submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = stream_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }),
+            );
+            // Unmeasured warmup: let the live session reach steady state
+            // before the measurement boundary is anchored on the shared trace
+            // clock. Warmup latency samples are drained below and excluded
+            // from the measurement window.
+            let warmup_sent = send_timestamped_messages(
+                &mut stream_write,
+                base,
+                MESSAGE_BYTES,
+                MESSAGE_CADENCE,
+                Duration::from_secs_f64(warmup_seconds),
+            )
+            .await;
+            let mut warmup_received = 0u64;
+            while let Ok(_latency) = latencies.try_recv() {
+                warmup_received += 1;
+            }
+            let warmup_delivered = server_delivered.load(std::sync::atomic::Ordering::Relaxed);
+            let start = Instant::now();
+            // Anchor the measurement boundary on the shared trace clock so
+            // netem/latency samples line up with the RTP endpoint rows.
+            trace.as_mut().map(|trace| trace.mark_measurement_start(start));
+            let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
+            netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let mut sender: tokio::task::JoinSet<(u64, mux::StreamWriter)> =
+                tokio::task::JoinSet::new();
+            sender.spawn(async move {
+                let sent = send_timestamped_messages(
+                    &mut stream_write,
+                    base,
+                    MESSAGE_BYTES,
+                    MESSAGE_CADENCE,
+                    Duration::from_secs_f64(window_seconds),
+                )
+                .await;
+                (sent, stream_write)
+            });
+            let window = tokio::time::sleep(Duration::from_secs_f64(window_seconds));
+            tokio::pin!(window);
+            let mut sender_error = None;
+            let (measurement_sent, mut stream_write) = loop {
+                tokio::select! {
+                    joined = sender.join_next(), if !sender.is_empty() => {
+                        // The sender ended before the window elapsed unless
+                        // both ended together at the boundary.
+                        let (sent, writer) = joined.expect("message sender exists").unwrap();
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if elapsed < window_seconds {
+                            sender_error = Some(format!(
+                                "message sender ended {elapsed:.3}s into the {window_seconds}s window"
+                            ));
+                        }
+                        break (sent, writer);
+                    }
+                    _ = netem_tick.tick(), if trace.is_some() => {
+                        trace.as_mut().unwrap().record_netem(
+                            start.elapsed(),
+                            pair.snapshot_c2s(),
+                            pair.snapshot_s2c(),
+                            server_delivered.load(std::sync::atomic::Ordering::Relaxed)
+                                - warmup_delivered,
+                        );
+                    }
+                    _ = &mut window => {
+                        // The window elapsed; the sender ends around the same
+                        // time — join it for the final count.
+                        let (sent, writer) = sender
+                            .join_next()
+                            .await
+                            .expect("message sender exists")
+                            .unwrap();
+                        break (sent, writer);
+                    }
+                }
+            };
+            let _ = stream_write.shutdown();
+            // Allow four seconds for stragglers before draining the samples.
+            tokio::time::sleep(MESSAGE_GRACE).await;
+            let mut samples = Vec::new();
+            while let Ok(latency) = latencies.try_recv() {
+                samples.push(latency);
+            }
+            let received = samples.len() as u64;
+            let delivered = server_delivered.load(std::sync::atomic::Ordering::Relaxed)
+                - warmup_delivered;
+            let elapsed = start.elapsed();
+            assert!(
+                measurement_sent > 0,
+                "probe must send messages, got {measurement_sent}"
+            );
+            assert!(
+                received > 0,
+                "probe must deliver messages, got {received}"
+            );
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = support::stats::percentile(&samples, 0.50);
+            let p95 = support::stats::percentile(&samples, 0.95);
+            let p99 = support::stats::percentile(&samples, 0.99);
+            let delivery_pct = received as f64 / measurement_sent as f64;
+            eprintln!(
+                "[perf] message latency {link_profile}: sent={measurement_sent} recv={received} delivery={delivery_pct:.3} p50={p50:.1} p95={p95:.1} p99={p99:.1} ms bytes={delivered}"
+            );
+
+            if let Some(trace) = trace {
+                let revision = std::env::var("NETEM_PERF_REVISION")
+                    .unwrap_or_else(|_| "unspecified".to_owned());
+                let output_dir = trace
+                    .finish(&[
+                        (
+                            "scenario",
+                            format!("mux_over_rtp_{link_profile}_message_latency_window"),
+                        ),
+                        ("link_profile", link_profile.clone()),
+                        ("revision", revision),
+                        ("seed", c2s_seed.to_string()),
+                        ("window_seconds", window_seconds.to_string()),
+                        ("warmup_seconds", warmup_seconds.to_string()),
+                        ("warmup_messages_sent", warmup_sent.to_string()),
+                        ("warmup_messages_received", warmup_received.to_string()),
+                        ("messages_sent", measurement_sent.to_string()),
+                        ("messages_received", received.to_string()),
+                        ("message_delivery_percent", delivery_pct.to_string()),
+                        ("message_latency_p50_ms", p50.to_string()),
+                        ("message_latency_p95_ms", p95.to_string()),
+                        ("message_latency_p99_ms", p99.to_string()),
+                        (
+                            "measurement_end_reason",
+                            if sender_error.is_none() {
+                                "timebox_elapsed".to_owned()
+                            } else {
+                                "sender_ended_early".to_owned()
+                            },
+                        ),
+                        ("mss_bytes", mss_bytes.to_string()),
+                        ("fec", fec.to_string()),
+                        ("retransmission_armor", retransmission_armor.to_string()),
+                        ("rtp_handshake", "false".to_owned()),
+                        ("netem_sample_interval_micros", "50000".to_owned()),
+                        ("delivered_bytes", delivered.to_string()),
+                        ("elapsed_seconds", elapsed.as_secs_f64().to_string()),
+                        ("netem_c2s_seed", c2s_seed.to_string()),
+                        ("netem_s2c_seed", s2c_seed.to_string()),
+                        (
+                            "probe_outcome",
+                            sender_error.clone().unwrap_or_else(|| "completed".to_owned()),
+                        ),
+                        ("client_mux_outcome", client_mux.outcome().as_label()),
+                        ("server_mux_outcome", server_mux.outcome().as_label()),
+                        ("netem_c2s", c2s_description),
+                        ("netem_s2c", s2c_description),
+                    ])
+                    .expect("write perf trace");
+                eprintln!("[trace] {}", output_dir.display());
+            }
+
+            pair.stop();
+            let stats = combined_stats(&pair);
+            eprintln!("[stats] {stats:?}");
+            assert!(
+                stats.forwarded > 0 && stats.dropped > 0,
+                "periodic lossy link should forward and drop packets, got {stats:?}"
+            );
+            if let Some(error) = sender_error {
+                panic!("{error}; failed after {:.3} s", elapsed.as_secs_f64());
+            }
         })
         .await;
 }

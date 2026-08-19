@@ -61,7 +61,10 @@ use support::presets::gilbert_elliott_loss;
 use support::rtp::{
     rtp_connect_with_mss_via, spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via,
 };
-use support::rtp_mux::{rtp_mux_connector_via, spawn_rtp_mux_latency_bulk_server_via};
+use support::rtp_mux::{
+    LaneFecEvidence, RtpMuxFecCapture, rtp_mux_connector_observed_via,
+    spawn_rtp_mux_latency_bulk_server_observed_via,
+};
 use support::stats::{HolSummary, combined_stats, summarize};
 use support::{submit_test_task, submit_test_task_required};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -670,6 +673,23 @@ fn rtt40_ge1_loss1(seed: u64) -> NetemConfig {
 
 fn hostile_real_link_seeded(seed: u64) -> NetemConfig {
     let mut c = support::presets::hostile_real_link();
+    c.seed = seed;
+    c
+}
+
+/// [`support::presets::fec_gaming_fat_pipe`] with an explicit seed, so
+/// paired default-on-FEC HOL runs stay reproducible.
+fn fec_gaming_fat_pipe_seeded(seed: u64) -> NetemConfig {
+    let mut c = support::presets::fec_gaming_fat_pipe();
+    c.seed = seed;
+    c
+}
+
+/// [`support::presets::controller_fat_pipe`] with an explicit seed, so the
+/// bulk controller-retention lane of a paired default-on-FEC HOL run stays
+/// reproducible.
+fn controller_fat_pipe_seeded(seed: u64) -> NetemConfig {
+    let mut c = support::presets::controller_fat_pipe();
     c.seed = seed;
     c
 }
@@ -1286,6 +1306,61 @@ async fn hol_cap400_fec_solo() {
     .await;
 }
 
+/// Production default-on interactive FEC policy probe: the `rtp_mux`
+/// composition must enable `FecTuning::max_diversity()` plus in-stream group
+/// FEC on the interactive RTP lane with no caller toggle, while the bulk
+/// lane stays FEC-free. Every lane endpoint asserts its typed
+/// `MetricsFecCounters` independently, and the interactive lanes must
+/// actually emit parity and recover symbols on the lossy gaming fat pipe.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "slow default-on FEC policy probe; run in-release mode with --ignored --nocapture --test-threads=1"]
+async fn hol_rtp_mux_fec_default_on_recovery() {
+    let traffic = TrafficConfig {
+        msg_bytes: DEFAULT_MSG_BYTES,
+        cadence: DEFAULT_CADENCE,
+        run_for: DEFAULT_RUN_FOR,
+        grace: DEFAULT_GRACE,
+    };
+    for (label, seed) in [
+        ("rtp_mux default FEC A", 171),
+        ("rtp_mux default FEC B", 181),
+    ] {
+        let result = with_timeout(
+            Duration::from_secs(180),
+            label,
+            run_hol_probe_rtp_mux(
+                label,
+                fec_gaming_fat_pipe_seeded(seed),
+                fec_gaming_fat_pipe_seeded(seed + 1),
+                controller_fat_pipe_seeded(seed + 2),
+                controller_fat_pipe_seeded(seed + 3),
+                traffic,
+            ),
+        )
+        .await;
+        result.assert_lane_observability();
+        assert!(
+            result.summary.delivery_pct > 0.0,
+            "{label} delivered no messages"
+        );
+        assert!(
+            result.summary.bulk_mibps > 0.0,
+            "{label} bulk lane was not active"
+        );
+        let sent = result.client_interactive_fec.counters.unwrap();
+        let received = result.server_interactive_fec.counters.unwrap();
+        assert!(
+            sent.parity_sent > 0,
+            "{label} did not activate default FEC after path-recovery evidence: {sent:?}"
+        );
+        assert!(
+            received.recovered_symbols > 0,
+            "{label} emitted parity but recovered no symbols: sender={sent:?} receiver={received:?}"
+        );
+        eprintln!("[hol {label}] default FEC evidence: sender={sent:?} receiver={received:?}");
+    }
+}
+
 // ────────────────────────────── hostile rows ──────────────────────────────────
 
 hol_test!(
@@ -1456,9 +1531,59 @@ async fn run_hol_probe_frame_delivery_shared(
         .await
 }
 
+/// Head-of-line summary plus per-lane-endpoint typed FEC evidence from a
+/// production `rtp_mux` HOL probe.
+#[derive(Clone, Debug)]
+struct RtpMuxHolResult {
+    summary: HolSummary,
+    client_interactive_fec: LaneFecEvidence,
+    client_bulk_fec: LaneFecEvidence,
+    server_interactive_fec: LaneFecEvidence,
+    server_bulk_fec: LaneFecEvidence,
+}
+
+impl RtpMuxHolResult {
+    /// Gate the lane observability contract: every lane endpoint must have
+    /// reported RTP metrics, the interactive lanes must have enabled FEC by
+    /// default (typed counters present), and the bulk lanes must have stayed
+    /// FEC-free (typed counters absent — never a fabricated zero).
+    fn assert_lane_observability(&self) {
+        for (name, evidence) in [
+            ("client interactive", self.client_interactive_fec),
+            ("client bulk", self.client_bulk_fec),
+            ("server interactive", self.server_interactive_fec),
+            ("server bulk", self.server_bulk_fec),
+        ] {
+            assert!(evidence.observed, "{name} RTP metrics were not observed");
+        }
+        assert!(
+            self.client_interactive_fec.counters.is_some(),
+            "client interactive lane did not enable FEC by default"
+        );
+        assert!(
+            self.server_interactive_fec.counters.is_some(),
+            "server interactive lane did not enable FEC by default"
+        );
+        assert!(
+            self.client_bulk_fec.counters.is_none(),
+            "client bulk lane unexpectedly activated FEC: {:?}",
+            self.client_bulk_fec.counters
+        );
+        assert!(
+            self.server_bulk_fec.counters.is_none(),
+            "server bulk lane unexpectedly activated FEC: {:?}",
+            self.server_bulk_fec.counters
+        );
+    }
+}
+
 /// Run an HOL probe through production `rtp_mux`.  Both lanes use
 /// frame‑delivery RTP; the connector routes the interactive stream through
-/// the interactive lane and the bulk stream through the bulk lane.
+/// the interactive lane and the bulk stream through the bulk lane.  The
+/// probe attaches independent [`RtpMuxFecCapture`]s to the server and client
+/// lanes, requires the bulk pump to stay live until the interactive
+/// measurement finishes, and joins the pump before the straggler grace so
+/// the bulk byte snapshot is stable.
 async fn run_hol_probe_rtp_mux(
     label: &str,
     int_c2s: NetemConfig,
@@ -1466,7 +1591,7 @@ async fn run_hol_probe_rtp_mux(
     bulk_c2s: NetemConfig,
     bulk_s2c: NetemConfig,
     traffic: TrafficConfig,
-) -> HolSummary {
+) -> RtpMuxHolResult {
     let TrafficConfig {
         msg_bytes,
         cadence,
@@ -1478,26 +1603,31 @@ async fn run_hol_probe_rtp_mux(
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
+            let server_metrics = RtpMuxFecCapture::default();
+            let client_metrics = RtpMuxFecCapture::default();
             let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
-                spawn_rtp_mux_latency_bulk_server_via(&task_tx, false, base)
-                    .await
-                    .unwrap();
+                spawn_rtp_mux_latency_bulk_server_observed_via(
+                    &task_tx,
+                    base,
+                    server_metrics.observers(),
+                )
+                .await
+                .unwrap();
             let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
             let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
-            let connector = Arc::new(rtp_mux_connector_via(
+            let connector = Arc::new(rtp_mux_connector_observed_via(
                 &task_tx,
                 bulk_pair.client_addr(),
-                false,
+                client_metrics.observers(),
             ));
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let active_for = run_for - BULK_RAMP;
             let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-            let mut bulk_tasks = tokio::task::JoinSet::new();
-            {
+            let mut bulk_pump = {
                 let connector = Arc::clone(&connector);
                 let payload = Arc::clone(&payload);
                 let int_proxy_addr = int_pair.client_addr();
-                bulk_tasks.spawn(async move {
+                tokio::spawn(async move {
                     let mut stream = match connector
                         .connect_stream_with_lane(int_proxy_addr, mux::LaneClass::Bulk)
                         .await
@@ -1522,20 +1652,34 @@ async fn run_hol_probe_rtp_mux(
                         ) => {}
                     }
                     let _ = stream.shutdown().await;
-                });
-            }
+                })
+            };
             let body = async {
                 let mut stream = connector
                     .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
                     .await
                     .unwrap();
-                let sent =
-                    run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for)
-                        .await;
+                // The bulk pump must stay live until the interactive
+                // measurement finishes: if it ends early, fail the test
+                // instead of measuring without contention.
+                let sent = tokio::select! {
+                    joined = &mut bulk_pump => {
+                        joined.expect("bulk pump exists");
+                        panic!("bulk pump ended before the interactive measurement completed");
+                    }
+                    sent = run_mux_interactive_stream(
+                        &mut stream,
+                        base,
+                        msg_bytes,
+                        cadence,
+                        run_for,
+                    ) => sent,
+                };
                 let _ = stream.shutdown().await;
-                // Signal the pump to stop before the straggler grace; the
-                // epilog join happens after the raced body.
+                // Signal the pump to stop and join it before the straggler
+                // grace, so the bulk byte counter snapshot is stable.
                 bulk_stop_tx.send(true).unwrap();
+                let _ = bulk_pump.await.unwrap();
                 tokio::time::sleep(grace).await;
                 let mut samples = Vec::new();
                 while let Ok((_tag, latency)) = latencies.try_recv() {
@@ -1553,24 +1697,15 @@ async fn run_hol_probe_rtp_mux(
                 );
                 int_pair.stop();
                 bulk_pair.stop();
-                summary
-            };
-            tokio::pin!(body);
-            let summary = tokio::select! {
-                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
-                    // The bulk pump ended before the interactive measurement
-                    // completed: fail the test instead of measuring without
-                    // contention.
-                    joined.expect("bulk pump exists").unwrap();
-                    panic!("bulk pump ended before the interactive measurement completed");
+                RtpMuxHolResult {
+                    summary,
+                    client_interactive_fec: client_metrics.interactive(),
+                    client_bulk_fec: client_metrics.bulk(),
+                    server_interactive_fec: server_metrics.interactive(),
+                    server_bulk_fec: server_metrics.bulk(),
                 }
-                summary = &mut body => summary,
             };
-            // Epilog: join the pump so any panic surfaces.
-            while let Some(result) = bulk_tasks.join_next().await {
-                result.unwrap();
-            }
-            summary
+            body.await
         })
         .await
 }
@@ -1594,7 +1729,8 @@ async fn run_hol_probe_dual_lane(
 ) -> HolSummary {
     if config.interactive_frame && config.bulk_frame {
         return run_hol_probe_rtp_mux(label, int_c2s, int_s2c, bulk_c2s, bulk_s2c, config.traffic)
-            .await;
+            .await
+            .summary;
     }
     let DualLaneProbeConfig {
         interactive_frame,

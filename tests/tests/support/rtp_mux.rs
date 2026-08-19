@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -14,6 +15,94 @@ use crate::support::{
     submit_test_task_required, try_send_observation,
 };
 
+/// Production interactive-lane FEC policy: maximum-diversity tuning plus
+/// in-stream group FEC, owned by the `rtp_mux` composition with no caller
+/// toggle. The bulk lane stays non-FEC by construction.
+fn interactive_fec_tuning() -> (rtp::FecTuning, bool) {
+    (rtp::FecTuning::max_diversity(), true)
+}
+
+/// Per-lane typed RTP metrics observers: the interactive lane keeps its own
+/// observer and the bulk lane keeps its own, independent of the lane-aware
+/// FEC policy.
+#[derive(Clone, Default)]
+pub struct RtpMuxMetricsObservers {
+    pub interactive: Option<rtp::metrics::MetricsObserver>,
+    pub bulk: Option<rtp::metrics::MetricsObserver>,
+}
+
+/// Typed FEC evidence for one lane endpoint: whether any RTP metrics were
+/// observed at all, plus the connection-lifetime FEC counters when the lane
+/// enabled FEC (`None` when the lane is non-FEC — never a fabricated zero).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaneFecEvidence {
+    pub observed: bool,
+    pub counters: Option<rtp::metrics::MetricsFecCounters>,
+}
+
+/// Captures per-lane FEC evidence through sampled RTP metrics observers.
+/// Evidence is sampled at most every 50 ms so snapshot cost stays bounded.
+pub struct RtpMuxFecCapture {
+    interactive: Arc<Mutex<LaneFecEvidence>>,
+    bulk: Arc<Mutex<LaneFecEvidence>>,
+}
+
+impl RtpMuxFecCapture {
+    pub fn observers(&self) -> RtpMuxMetricsObservers {
+        RtpMuxMetricsObservers {
+            interactive: Some(sampled_fec_observer(Arc::clone(&self.interactive))),
+            bulk: Some(sampled_fec_observer(Arc::clone(&self.bulk))),
+        }
+    }
+
+    pub fn interactive(&self) -> LaneFecEvidence {
+        *self.interactive.lock().unwrap()
+    }
+
+    pub fn bulk(&self) -> LaneFecEvidence {
+        *self.bulk.lock().unwrap()
+    }
+}
+
+impl Default for RtpMuxFecCapture {
+    fn default() -> Self {
+        Self {
+            interactive: Arc::new(Mutex::new(LaneFecEvidence::default())),
+            bulk: Arc::new(Mutex::new(LaneFecEvidence::default())),
+        }
+    }
+}
+
+/// An RTP metrics observer that captures a state snapshot at most every
+/// `SAMPLE_INTERVAL_US`, recording the observed flag and the snapshot's
+/// typed FEC counters into `evidence`.
+fn sampled_fec_observer(evidence: Arc<Mutex<LaneFecEvidence>>) -> rtp::metrics::MetricsObserver {
+    const SAMPLE_INTERVAL_US: u64 = 50_000;
+    let last_sample_us = Arc::new(AtomicU64::new(u64::MAX));
+    let filter_clock = Arc::clone(&last_sample_us);
+    rtp::metrics::MetricsObserver::filtered(
+        move |_, elapsed| {
+            let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+            let previous = filter_clock.load(Ordering::Relaxed);
+            if previous != u64::MAX && elapsed_us.saturating_sub(previous) < SAMPLE_INTERVAL_US {
+                return false;
+            }
+            filter_clock
+                .compare_exchange(previous, elapsed_us, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        },
+        move |observation| {
+            let Some(snapshot) = observation.snapshot else {
+                return;
+            };
+            *evidence.lock().unwrap() = LaneFecEvidence {
+                observed: true,
+                counters: snapshot.fec_counters,
+            };
+        },
+    )
+}
+
 /// Shared core for [`spawn_rtp_mux_latency_bulk_server`] and its `_via`
 /// variant: binds the server and hands the required serve loop to
 /// `spawn_required` (either a [`TestScope`] spawn or the bounded reaper
@@ -23,8 +112,8 @@ use crate::support::{
 async fn spawn_rtp_mux_latency_bulk_server_core(
     spawn_required: impl FnOnce(&'static str, TestTask),
     task_tx: TestTaskSubmitter,
-    fec: bool,
     base: Instant,
+    observers: RtpMuxMetricsObservers,
 ) -> std::io::Result<(
     std::net::SocketAddr,
     std::net::SocketAddr,
@@ -32,9 +121,11 @@ async fn spawn_rtp_mux_latency_bulk_server_core(
     Arc<AtomicU64>,
     TestTaskSubmitter,
 )> {
+    let (fec_tuning, instream_group_fec) = interactive_fec_tuning();
     let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0")
         .await?
-        .with_interactive_fec_tuning(rtp::FecTuning::default(), fec);
+        .with_metrics_observers(observers.interactive, observers.bulk)
+        .with_interactive_fec_tuning(fec_tuning, instream_group_fec);
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
@@ -80,11 +171,10 @@ async fn spawn_rtp_mux_latency_bulk_server_core(
 /// tasks are submitted through a bounded channel feeding one test-owned
 /// reaper (spawned into `tasks`), which selects between submissions and
 /// `join_next()` completions and unwraps every completion. The returned
-/// sender is the submission channel; keep it alive to hold the channel open
+/// handle is the submission channel; keep it alive to hold the channel open
 /// and submit additional test tasks.
 pub async fn spawn_rtp_mux_latency_bulk_server(
     tasks: &mut TestScope,
-    fec: bool,
     base: Instant,
 ) -> std::io::Result<(
     std::net::SocketAddr,
@@ -97,8 +187,8 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
     spawn_rtp_mux_latency_bulk_server_core(
         |name, fut| tasks.spawn_required(name, fut),
         task_tx.clone(),
-        fec,
         base,
+        RtpMuxMetricsObservers::default(),
     )
     .await
 }
@@ -106,10 +196,9 @@ pub async fn spawn_rtp_mux_latency_bulk_server(
 /// [`spawn_rtp_mux_latency_bulk_server`] through the bounded task-submission
 /// handle, for use inside [`TestScope::run`] bodies where `&mut TestScope`
 /// is unavailable. The serve loop is submitted as required through the
-/// handle; the returned sender is a clone of the caller's submission handle.
+/// handle; the returned handle is a clone of the caller's submission handle.
 pub async fn spawn_rtp_mux_latency_bulk_server_via(
     tx: &TestTaskSubmitter,
-    fec: bool,
     base: Instant,
 ) -> std::io::Result<(
     std::net::SocketAddr,
@@ -121,8 +210,31 @@ pub async fn spawn_rtp_mux_latency_bulk_server_via(
     spawn_rtp_mux_latency_bulk_server_core(
         |name, fut| submit_test_task_required(tx, name, fut),
         tx.clone(),
-        fec,
         base,
+        RtpMuxMetricsObservers::default(),
+    )
+    .await
+}
+
+/// [`spawn_rtp_mux_latency_bulk_server_via`] with per-lane RTP metrics
+/// observers attached to the interactive and bulk lanes. The serve loop is
+/// submitted as required through the handle.
+pub async fn spawn_rtp_mux_latency_bulk_server_observed_via(
+    tx: &TestTaskSubmitter,
+    base: Instant,
+    observers: RtpMuxMetricsObservers,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+    TestTaskSubmitter,
+)> {
+    spawn_rtp_mux_latency_bulk_server_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        tx.clone(),
+        base,
+        observers,
     )
     .await
 }
@@ -133,21 +245,22 @@ pub async fn spawn_rtp_mux_latency_bulk_server_via(
 fn rtp_mux_connector_core(
     spawn_required: impl FnOnce(&'static str, TestTask),
     bulk_proxy_addr: std::net::SocketAddr,
-    fec: bool,
+    observers: RtpMuxMetricsObservers,
 ) -> rtp_mux::RtpMuxConnector {
     let bind: rtp_mux::BindSelector = Arc::new(|addr| match addr {
         std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
         std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
     });
     let bulk_addr: rtp_mux::BulkAddrSelector = Arc::new(move |_| Ok(bulk_proxy_addr));
+    let (interactive_fec_tuning, interactive_instream_group_fec) = interactive_fec_tuning();
     let (connector, driver) =
         rtp_mux::RtpMuxConnector::with_config(rtp_mux::RtpMuxConnectorConfig {
             bind,
             bulk_addr,
-            interactive_fec_tuning: rtp::FecTuning::default(),
-            interactive_instream_group_fec: fec,
-            interactive_metrics_observer: None,
-            bulk_metrics_observer: None,
+            interactive_fec_tuning,
+            interactive_instream_group_fec,
+            interactive_metrics_observer: observers.interactive,
+            bulk_metrics_observer: observers.bulk,
             handshake: true,
             explorer: rtp_mux::ExplorerConfig {
                 enabled: false,
@@ -163,12 +276,11 @@ fn rtp_mux_connector_core(
 pub fn rtp_mux_connector(
     tasks: &mut TestScope,
     bulk_proxy_addr: std::net::SocketAddr,
-    fec: bool,
 ) -> rtp_mux::RtpMuxConnector {
     rtp_mux_connector_core(
         |name, fut| tasks.spawn_required(name, fut),
         bulk_proxy_addr,
-        fec,
+        RtpMuxMetricsObservers::default(),
     )
 }
 
@@ -178,12 +290,26 @@ pub fn rtp_mux_connector(
 pub fn rtp_mux_connector_via(
     tx: &TestTaskSubmitter,
     bulk_proxy_addr: std::net::SocketAddr,
-    fec: bool,
 ) -> rtp_mux::RtpMuxConnector {
     rtp_mux_connector_core(
         |name, fut| submit_test_task_required(tx, name, fut),
         bulk_proxy_addr,
-        fec,
+        RtpMuxMetricsObservers::default(),
+    )
+}
+
+/// [`rtp_mux_connector_via`] with per-lane RTP metrics observers attached to
+/// the interactive and bulk lanes. The connector driver is submitted as
+/// required through the handle.
+pub fn rtp_mux_connector_observed_via(
+    tx: &TestTaskSubmitter,
+    bulk_proxy_addr: std::net::SocketAddr,
+    observers: RtpMuxMetricsObservers,
+) -> rtp_mux::RtpMuxConnector {
+    rtp_mux_connector_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        bulk_proxy_addr,
+        observers,
     )
 }
 
