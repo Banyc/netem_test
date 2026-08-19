@@ -32,6 +32,42 @@ CONGESTION_ACTION_LANES = {
     "loss_backoff": 8.0,
     "huge_loss_backoff": 9.0,
 }
+
+
+# Trace schema 31 typed FEC work/recovery snapshot columns. They render only
+# when present; absent FEC stays absent rather than being drawn as zero work.
+FEC_COUNTER_FIELDS = (
+    "fec_parity_sent",
+    "fec_groups_flushed",
+    "fec_flushed_groups_one",
+    "fec_flushed_groups_two_to_four",
+    "fec_flushed_groups_five_to_seven",
+    "fec_flushed_groups_full_eight",
+    "fec_groups_skipped_no_surplus_tokens",
+    "fec_no_surplus_groups_one",
+    "fec_no_surplus_groups_two_to_four",
+    "fec_no_surplus_groups_five_to_seven",
+    "fec_no_surplus_groups_full_eight",
+    "fec_groups_skipped_burst_end",
+    "fec_burst_end_groups_one",
+    "fec_burst_end_groups_two_to_four",
+    "fec_burst_end_groups_five_to_seven",
+    "fec_burst_end_groups_full_eight",
+    "fec_groups_skipped_loss_gate",
+    "fec_loss_gate_groups_one",
+    "fec_loss_gate_groups_two_to_four",
+    "fec_loss_gate_groups_five_to_seven",
+    "fec_loss_gate_groups_full_eight",
+    "fec_groups_skipped_no_spare_capacity",
+    "fec_no_spare_capacity_groups_one",
+    "fec_no_spare_capacity_groups_two_to_four",
+    "fec_no_spare_capacity_groups_five_to_seven",
+    "fec_no_spare_capacity_groups_full_eight",
+    "fec_recovered_symbols",
+    "fec_dropped_malformed_packets",
+    "fec_dropped_decoder_panics",
+)
+
 WIDTH = 960
 HEIGHT = 300
 PAD_LEFT = 72
@@ -49,6 +85,15 @@ def optional_float(value):
     return None if value in (None, "") else float(value)
 
 
+def _fmt_number(value):
+    """Format a possibly-absent counter value for a table cell."""
+    if value is None:
+        return "n/a"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def field(row, name, legacy_name=None, default=""):
     if name in row:
         return row[name]
@@ -59,6 +104,30 @@ def field(row, name, legacy_name=None, default=""):
 
 def boolean(value):
     return str(value).lower() in ("1", "true", "yes")
+
+
+def congestion_action_lane(action):
+    """Map a congestion action name to its fixed display lane (0 = none)."""
+    return CONGESTION_ACTION_LANES.get(action, 0.0)
+
+
+def scheduled_drain_summary(netem_rows):
+    """Final per-direction scheduled-drain counters from the last row of each
+    direction, never summed across snapshots."""
+    summary = {}
+    for row in reversed(netem_rows):
+        direction = field(row, "direction")
+        if not direction or direction in summary:
+            continue
+        summary[direction] = {
+            key: optional_float(field(row, key))
+            for key in (
+                "scheduled_drain_batches",
+                "scheduled_drain_packets",
+                "scheduled_drain_max_packets",
+            )
+        }
+    return summary
 
 
 def timeline_seconds(row, manifest):
@@ -243,9 +312,7 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
                 "accepts_new_packet": boolean(field(row, "accepts_new_packet")),
                 "loss": optional_float(row["loss_ratio"]),
                 "cc_loss": optional_float(field(row, "congestion_loss_ratio")),
-                "cc_action": CONGESTION_ACTION_LANES.get(
-                    field(row, "congestion_action"), 0.0
-                ),
+                "cc_action": congestion_action_lane(field(row, "congestion_action")),
                 "rtx": float(row["retransmitted_packets"]),
                 "pipe": float(row["packets_in_pipe"]),
                 "send_seq": int(row["next_send_sequence"]),
@@ -312,6 +379,10 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
                     field(row, "congestion_last_bandwidth_probe_interval_us")
                 ),
                 "cc_delay_drains": optional_float(field(row, "congestion_delay_drains")),
+                **{
+                    field_name: optional_float(field(row, field_name))
+                    for field_name in FEC_COUNTER_FIELDS
+                },
             }
         )
     raw_rtt_points = [
@@ -383,6 +454,31 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
     action_series = [
         ("Last CC action", [(row["time"], row["cc_action"]) for row in rtp]),
     ]
+    # Distinct queue-hold and delay-drain timelines: each action gets its own
+    # 0/1 lane instead of being folded into the aggregate action line.
+    hold_drain_series = [
+        (
+            "queue hold",
+            [(row["time"], 1.0 if row["cc_action"] == 6.0 else 0.0) for row in rtp],
+        ),
+        (
+            "delay drain",
+            [(row["time"], 1.0 if row["cc_action"] == 7.0 else 0.0) for row in rtp],
+        ),
+    ]
+    fec_series = [
+        ("parity sent", [(row["time"], row["fec_parity_sent"]) for row in rtp if row["fec_parity_sent"] is not None]),
+        ("groups flushed", [(row["time"], row["fec_groups_flushed"]) for row in rtp if row["fec_groups_flushed"] is not None]),
+        ("recovered symbols", [(row["time"], row["fec_recovered_symbols"]) for row in rtp if row["fec_recovered_symbols"] is not None]),
+        ("dropped malformed packets", [(row["time"], row["fec_dropped_malformed_packets"]) for row in rtp if row["fec_dropped_malformed_packets"] is not None]),
+        ("dropped decoder panics", [(row["time"], row["fec_dropped_decoder_panics"]) for row in rtp if row["fec_dropped_decoder_panics"] is not None]),
+    ]
+    fec_skip_series = [
+        ("skipped no surplus tokens", [(row["time"], row["fec_groups_skipped_no_surplus_tokens"]) for row in rtp if row["fec_groups_skipped_no_surplus_tokens"] is not None]),
+        ("skipped burst end", [(row["time"], row["fec_groups_skipped_burst_end"]) for row in rtp if row["fec_groups_skipped_burst_end"] is not None]),
+        ("skipped loss gate", [(row["time"], row["fec_groups_skipped_loss_gate"]) for row in rtp if row["fec_groups_skipped_loss_gate"] is not None]),
+        ("skipped no spare capacity", [(row["time"], row["fec_groups_skipped_no_spare_capacity"]) for row in rtp if row["fec_groups_skipped_no_spare_capacity"] is not None]),
+    ]
     controller_rtt_series = [
         ("controller RTT", [(row["time"], row["cc_control_rtt"] / 1000.0) for row in rtp if row["cc_control_rtt"] is not None]),
         ("controller RTT floor", [(row["time"], row["cc_rtt_floor"] / 1000.0) for row in rtp if row["cc_rtt_floor"] is not None]),
@@ -451,6 +547,40 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
         f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
         for key, value in manifest.items()
     )
+    fec_final = {}
+    for field_name in FEC_COUNTER_FIELDS:
+        value = next(
+            (row[field_name] for row in reversed(rtp) if row[field_name] is not None),
+            None,
+        )
+        if value is not None:
+            fec_final[field_name] = value
+    fec_table_rows = "".join(
+        f"<tr><th>{html.escape(key)}</th><td>{html.escape(_fmt_number(value))}</td></tr>"
+        for key, value in fec_final.items()
+    )
+    scheduled_drain = scheduled_drain_summary(netem_rows)
+    scheduled_drain_rows = "".join(
+        "<tr>"
+        f"<th>{html.escape(direction)}</th>"
+        f"<td>{html.escape(_fmt_number(counters['scheduled_drain_batches']))}</td>"
+        f"<td>{html.escape(_fmt_number(counters['scheduled_drain_packets']))}</td>"
+        f"<td>{html.escape(_fmt_number(counters['scheduled_drain_max_packets']))}</td>"
+        "</tr>"
+        for direction, counters in sorted(scheduled_drain.items())
+    )
+    fec_section = (
+        "<section><h2>Forward error correction</h2><table>"
+        "<thead><tr><th>counter</th><th>final value</th></tr></thead>"
+        f"<tbody>{fec_table_rows or '<tr><td colspan=\"2\">No typed FEC evidence captured.</td></tr>'}</tbody>"
+        "</table></section>"
+    )
+    scheduled_drain_section = (
+        "<section><h2>Netem scheduled drain</h2><table>"
+        "<thead><tr><th>direction</th><th>batches</th><th>packets</th><th>max packets</th></tr></thead>"
+        f"<tbody>{scheduled_drain_rows or '<tr><td colspan=\"4\">No scheduled-drain evidence captured.</td></tr>'}</tbody>"
+        "</table></section>"
+    )
     content = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>RTP performance trace</title>
@@ -482,6 +612,11 @@ th {{ width: 18rem; }}
 {svg_line_chart("Retransmission causes", "elapsed time (s)", "cumulative transmissions", retransmission_count_series)}
 {svg_line_chart("Controller modes", "elapsed time (s)", "active lane (0 = inactive)", mode_series, (0.0, 7.0))}
 {svg_line_chart("Congestion-control action", "elapsed time (s)", "action lane (1 reset, 2 censored, 3 slow start, 4 probe, 5 gentle, 6 hold, 7 drain, 8 loss, 9 huge loss)", action_series, (0.0, 10.0))}
+{svg_line_chart("Queue hold and delay drain timelines", "elapsed time (s)", "active lane (0 = inactive)", hold_drain_series, (0.0, 1.0))}
+{svg_line_chart("FEC work and recovery", "elapsed time (s)", "cumulative counters", fec_series)}
+{svg_line_chart("FEC groups skipped", "elapsed time (s)", "cumulative counters", fec_skip_series)}
+{fec_section}
+{scheduled_drain_section}
 {svg_line_chart("Peer liveness waits", "elapsed time (s)", "seconds", liveness_series)}
 {svg_line_chart("RTP send staging", "elapsed time (s)", "bytes", send_stage_series)}
 {svg_line_chart("Estimated packet loss", "elapsed time (s)", "loss (%)", loss_series)}

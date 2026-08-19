@@ -416,6 +416,45 @@ class SamplyHotspotsTest(unittest.TestCase):
             result = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(result["total_samples"], 1)
             self.assertEqual(result["hotspots"][0]["name"], "work")
+    def test_cpu_delta_ranking_does_not_treat_every_active_sample_equally(self):
+        # Every sample is CPU-active (delta > 0), but the deltas differ; the
+        # CPU ranking must weight ownership by the delta instead of counting
+        # each active sample equally.
+        profile = sample_profile(
+            [[0], [0], [1]],
+            frame_to_func=[0, 1],
+            funcs=[(0, 0x1000, 0), (1, 0x2000, 0)],
+            libs=[],
+            strings=["heavy", "light"],
+        )
+        profile["threads"][0]["samples"]["threadCPUDelta"] = [50, 20, 100]
+        result = HOTSPOTS.summarize(
+            profile,
+            sidecar([], ["heavy", "light"]),
+            cpu_active_only=True,
+        )
+        self.assertEqual(result["sample_mode"], "cpu-active-only")
+        self.assertEqual(result["total_samples"], 3)
+        self.assertEqual(result["excluded_zero_cpu_samples"], 0)
+        self.assertEqual(result["total_cpu_delta"], 170.0)
+        # Wall-sample ranking follows sample count: heavy appears twice.
+        self.assertEqual(
+            [h["name"] for h in result["hotspots"]], ["heavy", "light"]
+        )
+        # CPU ranking follows the weighted delta: light's single 100-delta
+        # sample outranks heavy's 50+20 despite fewer samples.
+        self.assertEqual(
+            [h["name"] for h in result["cpu_hotspots"]], ["light", "heavy"]
+        )
+        by_cpu = {h["name"]: h for h in result["cpu_hotspots"]}
+        self.assertEqual(by_cpu["light"]["inclusive_cpu"], 100.0)
+        self.assertEqual(by_cpu["heavy"]["inclusive_cpu"], 70.0)
+        self.assertEqual(by_cpu["light"]["leaf_cpu"], 100.0)
+        self.assertEqual(by_cpu["heavy"]["leaf_cpu"], 70.0)
+        self.assertAlmostEqual(
+            by_cpu["light"]["inclusive_cpu_percent"], 100.0 * 100.0 / 170.0
+        )
+
     def test_cpu_delta_ranking_uses_weight_not_sample_count(self):
         profile = sample_profile(
             [[0], [1], [1], [1]],
@@ -437,7 +476,8 @@ class SamplyHotspotsTest(unittest.TestCase):
         # Count-ranked hotspots favor the symbol seen in the most samples...
         self.assertEqual([h["name"] for h in result["hotspots"]], ["steady", "hot"])
         self.assertEqual(result["hotspots"][0]["inclusive_samples"], 3)
-        # ... while CPU-ranked hotspots weight ownership by threadCPUDelta.
+        # ... while CPU-ranked hotspots weight ownership by threadCPUDelta:
+        # hot owns a single 100-delta sample against steady's three 10s.
         self.assertEqual([h["name"] for h in result["cpu_hotspots"]], ["hot", "steady"])
         by_cpu = {h["name"]: h for h in result["cpu_hotspots"]}
         self.assertEqual(by_cpu["hot"]["inclusive_cpu"], 100.0)
@@ -449,10 +489,10 @@ class SamplyHotspotsTest(unittest.TestCase):
         )
         self.assertEqual(result["schema_version"], 9)
 
-
     def test_leaf_ranking_surfaces_actual_work_beneath_shared_parents(self):
         # Two samples share an inclusive parent (frame 0); the leaf (frame 1)
-        # holds the actual work. Rank-by-leaf must surface frame 1 first.
+        # holds the actual work. Rank-by-leaf must surface frame 1 first, and
+        # CPU-weighted leaf attribution must follow the per-sample deltas.
         # Frame lists are leaf-first: samples 1-2 leaf on leaf_a, sample 3
         # on leaf_b, all sharing caller frame 0 (the parent).
         profile = sample_profile(
@@ -462,10 +502,12 @@ class SamplyHotspotsTest(unittest.TestCase):
             libs=[],
             strings=["parent", "leaf_a", "leaf_b"],
         )
+        profile["threads"][0]["samples"]["threadCPUDelta"] = [10, 60, 30]
         result = HOTSPOTS.summarize(
             profile,
             sidecar([], ["parent", "leaf_a", "leaf_b"]),
             rank_by="leaf",
+            cpu_active_only=True,
         )
         self.assertEqual(
             [h["name"] for h in result["hotspots"]],
@@ -473,10 +515,18 @@ class SamplyHotspotsTest(unittest.TestCase):
         )
         self.assertEqual(result["hotspots"][0]["leaf_samples"], 2)
         self.assertEqual(result["rank_by"], "leaf")
+        # Weighted leaf attribution: leaf_a owns 70 delta against leaf_b's 30,
+        # while the shared parent still accounts for the whole 100.
         self.assertEqual(
             [h["name"] for h in result["cpu_hotspots"]],
             ["leaf_a", "leaf_b", "parent"],
         )
+        by_cpu = {h["name"]: h for h in result["cpu_hotspots"]}
+        self.assertEqual(by_cpu["leaf_a"]["leaf_cpu"], 70.0)
+        self.assertEqual(by_cpu["leaf_b"]["leaf_cpu"], 30.0)
+        self.assertEqual(by_cpu["leaf_a"]["inclusive_cpu"], 70.0)
+        self.assertEqual(by_cpu["parent"]["inclusive_cpu"], 100.0)
+        self.assertEqual(result["total_cpu_delta"], 100.0)
 
     def test_rejects_unknown_hotspot_ranking(self):
         profile = sample_profile(

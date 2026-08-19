@@ -159,6 +159,7 @@ class TraceCompareTest(unittest.TestCase):
             ["window_seconds", "30"],
             ["mss_bytes", "8192"],
             ["fec", "false"],
+            ["retransmission_armor", "false"],
             ["rtp_handshake", "false"],
             ["link_profile", "hostile"],
             ["netem_c2s_seed", c2s_seed],
@@ -304,7 +305,7 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 34)
+            self.assertEqual(comparison["schema_version"], 38)
             self.assertEqual(comparison["valid_pairs"], 1)
             self.assertEqual(comparison["total_pairs"], 1)
             self.assertEqual(comparison["verdict"], "likely_improvement")
@@ -574,7 +575,7 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 34)
+            self.assertEqual(comparison["schema_version"], 38)
             self.assertEqual(comparison["evidence_quality"], "healthy")
             for run in comparison["runs"]:
                 self.assertEqual(run["evidence_quality"], "healthy")
@@ -1040,6 +1041,342 @@ class TraceCompareTest(unittest.TestCase):
             rows = rows[0]
         with path.open("w", newline="", encoding="utf-8") as output:
             csv.writer(output).writerows(rows)
+
+    @staticmethod
+    def state_row(**overrides):
+        """Minimal summarize_run state row with every read key present."""
+        row = {
+            "time": 0.0,
+            "send_rate": 128.0,
+            "raw_rtt": None,
+            "action": "none",
+            "outage": False,
+            "delivery_sample_app_limited": False,
+            "application_write_waiters": None,
+            "application_limited_detections": None,
+            "application_limited_detections_suppressed_by_waiting_writer": None,
+            "pending_send_bytes": None,
+            "accepts_new_packet": None,
+            "no_response": None,
+            "no_progress": None,
+            "retransmitted": 0.0,
+            "retransmission_active": 0.0,
+            "retransmission_ready": 0.0,
+            "retransmission_attempts": 0.0,
+            "retransmission_first_attempts": 0.0,
+            "retransmission_repeat_attempts": 0.0,
+            "retransmission_rto_reason": 0.0,
+            "retransmission_reorder_reason": 0.0,
+            "retransmission_fast_loss_reason": 0.0,
+            "retransmission_pre_outage_reason": 0.0,
+            "tail_probe_attempts": 0.0,
+            "rto_postponements": None,
+            "cc_rate_samples": 0.0,
+            "cc_probe_decisions": 0.0,
+            "cc_probe_increases": 0.0,
+            "cc_probe_before_feedback": 0.0,
+            "cc_persistent_queue_available": False,
+            "cc_persistent_queue_for": None,
+            "cc_persistent_queue_resets": None,
+            "cc_delay_drains": 0.0,
+            "cc_loss_backoff_floor": None,
+            "cc_loss_backoff_raw": None,
+            "cc_loss_backoff_target": None,
+            "cc_loss_backoffs": 0.0,
+            "cc_loss_backoff_floor_bindings": 0.0,
+            "loss": None,
+            "cc_loss": None,
+            "event": "",
+            "context": "unknown",
+            **{field: None for field in COMPARE.FEC_COUNTER_FIELDS},
+        }
+        row.update(overrides)
+        return row
+
+    def test_fec_counters_are_normalized_without_inventing_legacy_zeroes(self):
+        manifest = {"delivered_bytes": str(1024 ** 3)}
+        summary = COMPARE.summarize_run(manifest, [], [], [], [], [], [], [], [])
+        self.assertFalse(summary["fec_counters_present"])
+        self.assertIsNone(summary["fec_counters"]["parity_sent"])
+        self.assertIsNone(summary["fec_counters"]["recovered_symbols"])
+        self.assertIsNone(summary["fec_parity_sent_per_gib_delivered"])
+        self.assertIsNone(summary["fec_recovered_symbols_per_gib_delivered"])
+        # Present typed counters with bytes normalize to real values; a
+        # present zero stays a real zero, never a fabricated None.
+        state = [
+            self.state_row(
+                fec_parity_sent=10.0,
+                fec_groups_flushed=4.0,
+                fec_recovered_symbols=2.0,
+                fec_dropped_malformed_packets=0.0,
+                fec_dropped_decoder_panics=0.0,
+            )
+        ]
+        summary_fec = COMPARE.summarize_run(manifest, state, [], [], [], [], [], [], [])
+        self.assertTrue(summary_fec["fec_counters_present"])
+        self.assertEqual(summary_fec["fec_counters"]["parity_sent"], 10.0)
+        self.assertEqual(summary_fec["fec_counters"]["recovered_symbols"], 2.0)
+        self.assertEqual(summary_fec["fec_parity_sent_per_gib_delivered"], 10.0)
+        self.assertEqual(summary_fec["fec_recovered_symbols_per_gib_delivered"], 2.0)
+        self.assertEqual(summary_fec["fec_dropped_malformed_packets_per_gib_delivered"], 0.0)
+        self.assertIsNone(
+            summary_fec["fec_counters"]["groups_skipped_no_spare_capacity"]
+        )
+        # Wire cost stays None when the capture lacks forwarded_bytes, and
+        # computes from the final per-direction totals when present.
+        no_wire = COMPARE.summarize_run(
+            manifest, [], [], [], [],
+            [{"direction": "c2s", "received": "10", "forwarded": "9"}],
+            [], [], [],
+        )
+        self.assertIsNone(no_wire["wire_bytes_per_delivered_byte"])
+        with_wire = COMPARE.summarize_run(
+            manifest, [], [], [], [],
+            [
+                {
+                    "direction": "c2s",
+                    "received": "10",
+                    "forwarded": "9",
+                    "forwarded_bytes": "5000",
+                    "scheduled_drain_packets": "4",
+                },
+                {
+                    "direction": "s2c",
+                    "received": "10",
+                    "forwarded": "9",
+                    "forwarded_bytes": "3000",
+                    "scheduled_drain_packets": "6",
+                },
+            ],
+            [], [], [],
+        )
+        self.assertEqual(
+            with_wire["wire_bytes_per_delivered_byte"], 8000.0 / (1024 ** 3)
+        )
+        self.assertEqual(with_wire["scheduled_drain_packets"], 10.0)
+
+    def test_explicit_fec_treatment_allows_only_its_declared_difference(self):
+        baseline = {
+            "warmup_seconds": "0",
+            "window_seconds": "30",
+            "mss_bytes": "8192",
+            "retransmission_armor": "false",
+            "rtp_handshake": "false",
+            "fec": "false",
+            "instream_group_fec": "false",
+            "netem_c2s": "cfg-a",
+            "netem_s2c": "cfg-b",
+            "link_d": "link",
+            "perf_loop_profile": "release",
+        }
+        candidate = {**baseline, "fec": "true", "instream_group_fec": "true"}
+        self.assertEqual(
+            COMPARE.pair_config_agrees(baseline, candidate),
+            ["fec", "instream_group_fec"],
+        )
+        self.assertEqual(
+            COMPARE.pair_config_agrees(baseline, candidate, ("fec",)),
+            ["instream_group_fec"],
+        )
+        self.assertEqual(
+            COMPARE.pair_config_agrees(
+                baseline, candidate, ("fec", "instream_group_fec")
+            ),
+            [],
+        )
+        # An unrelated difference stays a mismatch even when FEC is allowed.
+        other = {**candidate, "mss_bytes": "4096"}
+        self.assertEqual(
+            COMPARE.pair_config_agrees(
+                baseline, other, ("fec", "instream_group_fec")
+            ),
+            ["mss_bytes"],
+        )
+
+    def test_retransmission_armor_mismatch_is_configuration_mismatch(self):
+        base = {"retransmission_armor": "false"}
+        self.assertEqual(
+            COMPARE.pair_config_agrees(base, {"retransmission_armor": "true"}),
+            ["retransmission_armor"],
+        )
+        # Absent armor against an explicit value is a mismatch, and a
+        # non-boolean value is a mismatch too.
+        self.assertEqual(
+            COMPARE.pair_config_agrees(base, {}),
+            ["retransmission_armor"],
+        )
+        self.assertEqual(
+            COMPARE.pair_config_agrees(base, {"retransmission_armor": "maybe"}),
+            ["retransmission_armor"],
+        )
+        # Only the explicit allowlist can suppress the armor key.
+        self.assertEqual(
+            COMPARE.pair_config_agrees(base, {}, ("retransmission_armor",)),
+            [],
+        )
+
+    def test_unknown_rows_stay_out_of_clean(self):
+        state = [
+            self.state_row(loss=0.0, context="clean"),
+            self.state_row(loss=0.0, context="clean"),
+            self.state_row(loss=None, context="unknown"),
+            self.state_row(loss=0.02, context="positive_loss"),
+        ]
+        summary = COMPARE.summarize_run(
+            {"delivered_bytes": str(1024 ** 3)}, state, [], [], [], [], [], [], []
+        )
+        context = summary["context"]
+        self.assertEqual(context["known_rows"], 3)
+        self.assertEqual(context["unknown_rows"], 1)
+        self.assertEqual(context["coverage_percent"], 75.0)
+        self.assertAlmostEqual(context["clean_occupancy"], 100.0 * 2 / 3)
+        self.assertAlmostEqual(context["positive_loss_occupancy"], 100.0 * 1 / 3)
+
+    def test_sparse_message_tail_and_wire_tradeoff_is_not_neutral(self):
+        def pair(p95, p99, wire, goodput_delta):
+            return {
+                "baseline": {
+                    "manifest": {"scenario": "mux_over_rtp_hostile_message_latency"}
+                },
+                "metrics": {
+                    "message_latency_p95_ms": {"delta_percent": p95},
+                    "message_latency_p99_ms": {"delta_percent": p99},
+                    "wire_bytes_per_delivered_byte": {"delta_percent": wire},
+                    "goodput_mib_per_second": {"delta_percent": goodput_delta},
+                },
+            }
+
+        # Tail improves materially while wire cost regresses: a latency/
+        # overhead tradeoff is mixed, never neutral, even though goodput
+        # barely moved.
+        pairs = [
+            pair(-25.0, -30.0, 15.0, 0.5),
+            pair(-20.0, -22.0, 18.0, -0.3),
+        ]
+        self.assertEqual(COMPARE.classify(pairs), "mixed_results")
+        self.assertNotEqual(COMPARE.classify(pairs), "no_material_change")
+        # Clean improvement on both axes.
+        self.assertEqual(
+            COMPARE.classify([pair(-25.0, -30.0, -15.0, 0.5)]),
+            "likely_improvement",
+        )
+        # Neither tail nor wire moves materially.
+        self.assertEqual(
+            COMPARE.classify([pair(-1.0, 2.0, 3.0, 0.0)]),
+            "no_material_change",
+        )
+
+    def test_controller_activation_coverage_separates_pair_states(self):
+        def run(label, gentle, hold):
+            return {
+                "label": label,
+                "summary": {
+                    "controller_state_occupancy": {
+                        "slow_start": 0.0,
+                        "gentle_mode": gentle,
+                        "gentle_draining": 0.0,
+                        "queue_building": 0.0,
+                        "drain_floor_binding": 0.0,
+                        "outage_recovery": 0.0,
+                    },
+                    "queue_hold_occupancy": hold,
+                    "delay_drain_occupancy": 0.0,
+                },
+            }
+
+        pairs = [
+            {"baseline": run("b1", 100.0, 0.0), "candidate": run("c1", 80.0, 0.0)},
+            {"baseline": run("b2", 100.0, 0.0), "candidate": run("c2", 0.0, 0.0)},
+            {"baseline": run("b3", 0.0, 0.0), "candidate": run("c3", 50.0, 0.0)},
+            {"baseline": run("b4", 0.0, 0.0), "candidate": run("c4", 0.0, 0.0)},
+            {
+                "baseline": run("b5", float("nan"), 0.0),
+                "candidate": run("c5", 0.0, 0.0),
+            },
+        ]
+        coverage = COMPARE.controller_activation_coverage(pairs)
+        gentle = coverage["gentle_mode"]
+        self.assertEqual(
+            gentle["counts"],
+            {
+                "both_active": 1,
+                "baseline_only": 1,
+                "candidate_only": 1,
+                "neither_active": 1,
+                "unknown": 1,
+            },
+        )
+        self.assertEqual(len(gentle["pairs"]), 5)
+        self.assertEqual(
+            [item["state"] for item in gentle["pairs"]],
+            [
+                "both_active",
+                "baseline_only",
+                "candidate_only",
+                "neither_active",
+                "unknown",
+            ],
+        )
+        # queue_hold_occupancy is read from the summary directly and stays
+        # inactive for every pair.
+        hold = coverage["queue_hold_occupancy"]
+        self.assertEqual(hold["counts"]["neither_active"], 5)
+
+    def test_pairwise_rtt_cdf_skips_invalid_pairs(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            before = root / "before"
+            after = root / "after"
+            self.write_trace(before, "old", "1.0", 11, 12)
+            self.write_trace(after, "new", "0.5", 11, 12, broken=True)
+            output = root / "comparison"
+            COMPARE.render_comparison(
+                [("before-1", before)],
+                [("after-1", after)],
+                output,
+            )
+            document = (output / "comparison.html").read_text(encoding="utf-8")
+            self.assertIn("No valid paired RTT samples.", document)
+            self.assertIn("does_not_prove", document)
+
+            # A valid pair renders one baseline/candidate CDF panel.
+            self.write_trace(root / "after2", "new", "1.2", 11, 12)
+            output2 = root / "comparison2"
+            COMPARE.render_comparison(
+                [("before-1", before)],
+                [("after-1", root / "after2")],
+                output2,
+            )
+            document2 = (output2 / "comparison.html").read_text(encoding="utf-8")
+            self.assertIn("Paired raw RTT CDF: before-1 vs after-1", document2)
+            self.assertNotIn("No valid paired RTT samples.", document2)
+
+    def test_render_emits_activation_coverage_and_allowlist(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            before = root / "before"
+            after = root / "after"
+            self.write_trace(before, "old", "1.0", 11, 12)
+            self.write_trace(after, "new", "1.2", 11, 12)
+            output = root / "comparison"
+            COMPARE.render_comparison(
+                [("before-1", before)],
+                [("after-1", after)],
+                output,
+                ("fec",),
+            )
+            comparison = json.loads(
+                (output / "comparison.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(comparison["allowed_config_mismatches"], ["fec"])
+            self.assertIn("controller_activation_coverage", comparison)
+            self.assertEqual(
+                comparison["controller_activation_coverage"]["gentle_mode"]["counts"]["unknown"],
+                0,
+            )
+            document = (output / "comparison.html").read_text(encoding="utf-8")
+            self.assertIn("Comparison readiness", document)
+            self.assertIn("Controller activation coverage", document)
 
 
     def test_ack_flush_claim_reasons_are_normalized_and_direction_neutral(self):

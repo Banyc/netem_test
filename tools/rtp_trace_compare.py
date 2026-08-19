@@ -18,11 +18,19 @@ import math
 import statistics
 from pathlib import Path
 
-COMPARISON_SCHEMA_VERSION = 34
+COMPARISON_SCHEMA_VERSION = 38
 
 GENTLE_EXIT_CAUSES = ("loss", "gate_open", "drain_guard", "outage_reset")
 
 ACK_FLUSH_REASONS = ("initial", "age", "count", "fin", "explicit")
+
+# Exact ACK-claim metrics retained for older traces that predate the
+# per-reason derivation and only recorded the aggregate peer total and the
+# count-reason share.
+ACK_FLUSH_COMPAT_METRICS = (
+    "peer_ack_flush_total_claims_per_gib_delivered",
+    "peer_ack_flush_count_share_percent",
+)
 
 
 def ack_flush_metric_keys():
@@ -37,7 +45,51 @@ def ack_flush_metric_keys():
     return tuple(keys)
 
 
-ACK_FLUSH_METRICS = ack_flush_metric_keys()
+ACK_FLUSH_METRICS = ack_flush_metric_keys() + ACK_FLUSH_COMPAT_METRICS
+
+# Trace schema 31 snapshot columns: the 29 typed FEC work/recovery counters
+# recorded on state rows. They stay None when the trace predates them or the
+# lane never enabled FEC; a present zero is a real zero.
+FEC_COUNTER_FIELDS = (
+    "fec_parity_sent",
+    "fec_groups_flushed",
+    "fec_flushed_groups_one",
+    "fec_flushed_groups_two_to_four",
+    "fec_flushed_groups_five_to_seven",
+    "fec_flushed_groups_full_eight",
+    "fec_groups_skipped_no_surplus_tokens",
+    "fec_no_surplus_groups_one",
+    "fec_no_surplus_groups_two_to_four",
+    "fec_no_surplus_groups_five_to_seven",
+    "fec_no_surplus_groups_full_eight",
+    "fec_groups_skipped_burst_end",
+    "fec_burst_end_groups_one",
+    "fec_burst_end_groups_two_to_four",
+    "fec_burst_end_groups_five_to_seven",
+    "fec_burst_end_groups_full_eight",
+    "fec_groups_skipped_loss_gate",
+    "fec_loss_gate_groups_one",
+    "fec_loss_gate_groups_two_to_four",
+    "fec_loss_gate_groups_five_to_seven",
+    "fec_loss_gate_groups_full_eight",
+    "fec_groups_skipped_no_spare_capacity",
+    "fec_no_spare_capacity_groups_one",
+    "fec_no_spare_capacity_groups_two_to_four",
+    "fec_no_spare_capacity_groups_five_to_seven",
+    "fec_no_spare_capacity_groups_full_eight",
+    "fec_recovered_symbols",
+    "fec_dropped_malformed_packets",
+    "fec_dropped_decoder_panics",
+)
+
+
+FEC_GROUP_SIZE_SUFFIXES = (
+    "flushed",
+    "no_surplus",
+    "burst_end",
+    "loss_gate",
+    "no_spare_capacity",
+)
 
 MODULE_PATH = Path(__file__).with_name("rtp_trace_report.py")
 SPEC = importlib.util.spec_from_file_location("rtp_trace_report", MODULE_PATH)
@@ -147,9 +199,26 @@ def state_rows(rows, manifest):
                 "loss": metric_number(REPORT.field(row, "loss_ratio")),
                 "cc_loss": metric_number(REPORT.field(row, "congestion_loss_ratio")),
                 "event": REPORT.field(row, "event"),
+                "context": sampled_row_context(row),
+                **{
+                    field: metric_number(REPORT.field(row, field))
+                    for field in FEC_COUNTER_FIELDS
+                },
             }
         )
     return state
+
+
+def sampled_row_context(row):
+    """Classify one sampled row into a clean or positive-loss context.
+
+    Only rows with a known loss ratio are classified; rows whose loss is
+    absent stay 'unknown' so they can never inflate clean occupancy.
+    """
+    loss = metric_number(REPORT.field(row, "loss_ratio"))
+    if loss is None:
+        return "unknown"
+    return "clean" if loss == 0.0 else "positive_loss"
 
 
 def raw_rtt_ms(rows):
@@ -186,6 +255,15 @@ def has_terminal_event(rows):
     )
 
 
+def netem_field(row, name):
+    """Read a netem counter tolerating the historical ' received_bytes'
+    header spelling emitted by schema-31 capture."""
+    value = REPORT.field(row, name)
+    if value == "" and f" {name}" in row:
+        value = row[f" {name}"]
+    return value
+
+
 def final_netem_counters(netem_rows):
     counters = {}
     for row in reversed(netem_rows):
@@ -193,10 +271,13 @@ def final_netem_counters(netem_rows):
         if not direction or direction in counters:
             continue
         counters[direction] = {
-            key: metric_number(REPORT.field(row, key), 0.0)
+            key: metric_number(netem_field(row, key), 0.0)
             for key in (
                 "received", "forwarded", "delayed", "dropped",
                 "duplicated", "reordered", "rate_limited", "overflow_dropped",
+                "forwarded_bytes", "received_bytes",
+                "scheduled_drain_batches", "scheduled_drain_packets",
+                "scheduled_drain_max_packets",
             )
         }
     return counters
@@ -332,6 +413,10 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     schema = manifest.get("trace_schema_version", "")
     row_schema = REPORT.field(rtp[0], "schema_version") if rtp else ""
     supported_schemas = (
+        "31",
+        "30",
+        "29",
+        "28",
         "27",
         "26",
         "25",
@@ -682,6 +767,88 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
             return None
         return count / total
 
+    known_contexts = [
+        row["context"] for row in state if row["context"] != "unknown"
+    ]
+    clean_contexts = sum(value == "clean" for value in known_contexts)
+    positive_loss_contexts = sum(
+        value == "positive_loss" for value in known_contexts
+    )
+    context = {
+        "known_rows": len(known_contexts),
+        "unknown_rows": len(state) - len(known_contexts),
+        "coverage_percent": _percent(len(known_contexts), len(state)),
+        "clean_occupancy": _percent(clean_contexts, len(known_contexts)),
+        "positive_loss_occupancy": _percent(
+            positive_loss_contexts, len(known_contexts)
+        ),
+    }
+    final_fec = {field: final_counter(field) for field in FEC_COUNTER_FIELDS}
+    fec_group_sizes = {}
+    for group in FEC_GROUP_SIZE_SUFFIXES:
+        prefix = f"fec_{group}_groups"
+        fec_group_sizes[group] = {
+            "one": final_fec[f"{prefix}_one"],
+            "two_to_four": final_fec[f"{prefix}_two_to_four"],
+            "five_to_seven": final_fec[f"{prefix}_five_to_seven"],
+            "full_eight": final_fec[f"{prefix}_full_eight"],
+        }
+    final_netem = final_netem_counters(netem)
+    # Only compute wire cost / drain work when the capture actually recorded
+    # the columns; an absent column stays None rather than being read as a
+    # zero wire cost or zero drain work.
+    has_wire_bytes = any(
+        "forwarded_bytes" in row or " forwarded_bytes" in row for row in netem
+    )
+    forwarded_bytes_total = None
+    if has_wire_bytes:
+        forwarded_bytes_values = [
+            direction["forwarded_bytes"]
+            for direction in final_netem.values()
+            if direction["forwarded_bytes"] is not None
+        ]
+        forwarded_bytes_total = (
+            sum(forwarded_bytes_values) if forwarded_bytes_values else 0.0
+        )
+    has_scheduled_drain = any(
+        "scheduled_drain_packets" in row for row in netem
+    )
+    scheduled_drain_batches_total = None
+    scheduled_drain_packets_total = None
+    scheduled_drain_max_packets = None
+    if has_scheduled_drain:
+        scheduled_drain_batches_values = [
+            direction["scheduled_drain_batches"]
+            for direction in final_netem.values()
+            if direction["scheduled_drain_batches"] is not None
+        ]
+        scheduled_drain_packets_values = [
+            direction["scheduled_drain_packets"]
+            for direction in final_netem.values()
+            if direction["scheduled_drain_packets"] is not None
+        ]
+        scheduled_drain_max_values = [
+            direction["scheduled_drain_max_packets"]
+            for direction in final_netem.values()
+            if direction["scheduled_drain_max_packets"] is not None
+        ]
+        scheduled_drain_batches_total = (
+            sum(scheduled_drain_batches_values)
+            if scheduled_drain_batches_values
+            else None
+        )
+        scheduled_drain_packets_total = (
+            sum(scheduled_drain_packets_values)
+            if scheduled_drain_packets_values
+            else None
+        )
+        scheduled_drain_max_packets = (
+            max(scheduled_drain_max_values) if scheduled_drain_max_values else None
+        )
+    peer_ack_flush_count_share = claim_share(
+        peer_ack_flush_claims["count"], peer_ack_flush_total
+    )
+
     return {
         "count": count,
         "actions": actions,
@@ -725,6 +892,7 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "gentle_gate_open_streak_max_ms": action_streak_max_ms(
             state, "gentle_probe"
         ),
+        "context": context,
         **{
             f"gentle_mode_exit_{cause}": total_gentle_mode_exits[cause]
             for cause in GENTLE_EXIT_CAUSES
@@ -850,7 +1018,76 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
             )
             for reason in ACK_FLUSH_REASONS
         },
-        "final_netem_counters": final_netem_counters(netem),
+        "final_netem_counters": final_netem,
+        "wire_bytes_per_delivered_byte": (
+            forwarded_bytes_total / delivered_bytes
+            if forwarded_bytes_total is not None
+            and delivered_bytes is not None
+            and delivered_bytes > 0
+            else None
+        ),
+        "scheduled_drain_batches": scheduled_drain_batches_total,
+        "scheduled_drain_packets": scheduled_drain_packets_total,
+        "scheduled_drain_max_packets": scheduled_drain_max_packets,
+        "fec_counters_present": any(
+            value is not None for value in final_fec.values()
+        ),
+        "fec_counters": {
+            "parity_sent": final_fec["fec_parity_sent"],
+            "groups_flushed": final_fec["fec_groups_flushed"],
+            "flushed_group_sizes": fec_group_sizes["flushed"],
+            "groups_skipped_no_surplus_tokens": final_fec[
+                "fec_groups_skipped_no_surplus_tokens"
+            ],
+            "no_surplus_group_sizes": fec_group_sizes["no_surplus"],
+            "groups_skipped_burst_end": final_fec["fec_groups_skipped_burst_end"],
+            "burst_end_group_sizes": fec_group_sizes["burst_end"],
+            "groups_skipped_loss_gate": final_fec["fec_groups_skipped_loss_gate"],
+            "loss_gate_group_sizes": fec_group_sizes["loss_gate"],
+            "groups_skipped_no_spare_capacity": final_fec[
+                "fec_groups_skipped_no_spare_capacity"
+            ],
+            "no_spare_capacity_group_sizes": fec_group_sizes["no_spare_capacity"],
+            "recovered_symbols": final_fec["fec_recovered_symbols"],
+            "dropped_malformed_packets": final_fec[
+                "fec_dropped_malformed_packets"
+            ],
+            "dropped_decoder_panics": final_fec["fec_dropped_decoder_panics"],
+        },
+        "fec_parity_sent_per_gib_delivered": _per_gib(
+            final_fec["fec_parity_sent"], delivered_bytes
+        ),
+        "fec_recovered_symbols_per_gib_delivered": _per_gib(
+            final_fec["fec_recovered_symbols"], delivered_bytes
+        ),
+        "fec_dropped_malformed_packets_per_gib_delivered": _per_gib(
+            final_fec["fec_dropped_malformed_packets"], delivered_bytes
+        ),
+        "fec_dropped_decoder_panics_per_gib_delivered": _per_gib(
+            final_fec["fec_dropped_decoder_panics"], delivered_bytes
+        ),
+        "message_latency_p50_ms": metric_number(
+            manifest.get("message_latency_p50_ms")
+        ),
+        "message_latency_p95_ms": metric_number(
+            manifest.get("message_latency_p95_ms")
+        ),
+        "message_latency_p99_ms": metric_number(
+            manifest.get("message_latency_p99_ms")
+        ),
+        "message_delivery_percent": metric_number(
+            manifest.get("message_delivery_percent")
+        ),
+        "rtt_p90_ms": REPORT.quantile(rtt, 0.9) if rtt else math.nan,
+        "rtt_p99_ms": REPORT.quantile(rtt, 0.99) if rtt else math.nan,
+        "peer_ack_flush_total_claims_per_gib_delivered": _per_gib(
+            peer_ack_flush_total, delivered_bytes
+        ),
+        "peer_ack_flush_count_share_percent": (
+            100.0 * peer_ack_flush_count_share
+            if peer_ack_flush_count_share is not None
+            else None
+        ),
         "delivered_bytes": delivered_bytes,
         "elapsed_seconds": elapsed if elapsed is not None else (progress[-1][0] if progress else 0),
         "goodput_mib_per_second": metric_number(manifest.get("goodput_mib_per_second")),
@@ -868,23 +1105,50 @@ CONFIG_KEYS = (
     "warmup_seconds",
     "window_seconds",
     "mss_bytes",
-    "fec",
+    "retransmission_armor",
     "rtp_handshake",
-    "perf_loop_profile",
-    "netem_s2c",
-    "link_profile",
+    "fec",
+    "instream_group_fec",
     "netem_c2s",
-    "scenario",
+    "netem_s2c",
+    "link_d",
+    "perf_loop_profile",
 )
 
 
-def pair_config_agrees(baseline, candidate):
+def _retransmission_armor(value):
+    """Parse a retransmission-armor boolean; None marks absent/invalid."""
+    normalized = str(value).strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return True
+    if normalized in ("0", "false", "no"):
+        return False
+    return None
+
+
+def pair_config_agrees(baseline, candidate, allowed_config_mismatches=()):
+    """Compare every CONFIG_KEYS entry in order; only keys explicitly named
+    by the frozen allowlist are suppressed. Only 'warmup_seconds' defaults
+    (to '"0"'); an absent, non-boolean, or different 'retransmission_armor'
+    is always a mismatch unless explicitly allowed."""
+    allowed = frozenset(allowed_config_mismatches)
     mismatches = []
     for key in CONFIG_KEYS:
+        if key in allowed:
+            continue
         default = "0" if key == "warmup_seconds" else ""
         left = baseline.get(key, default)
         right = candidate.get(key, default)
-        if left and right and left != right:
+        if key == "retransmission_armor":
+            left_boolean = _retransmission_armor(left)
+            right_boolean = _retransmission_armor(right)
+            if (
+                left_boolean is None
+                or right_boolean is None
+                or left_boolean != right_boolean
+            ):
+                mismatches.append(key)
+        elif left != right and (left or right):
             mismatches.append(key)
     return mismatches
 
@@ -976,6 +1240,20 @@ METRICS = (
     "application_limited_suppression_percent",
     "retransmission_attempts_per_gib_delivered",
     "retransmission_repeat_attempts_per_gib_delivered",
+    "message_latency_p50_ms",
+    "message_latency_p95_ms",
+    "message_latency_p99_ms",
+    "message_delivery_percent",
+    "rtt_p90_ms",
+    "rtt_p99_ms",
+    "wire_bytes_per_delivered_byte",
+    "scheduled_drain_batches",
+    "scheduled_drain_packets",
+    "scheduled_drain_max_packets",
+    "fec_parity_sent_per_gib_delivered",
+    "fec_recovered_symbols_per_gib_delivered",
+    "fec_dropped_malformed_packets_per_gib_delivered",
+    "fec_dropped_decoder_panics_per_gib_delivered",
     *ACK_FLUSH_METRICS,
 )
 
@@ -1004,11 +1282,21 @@ NEUTRAL_DIRECTION_METRICS = {
     "peer_retransmission_armor_duplicates",
     "sender_data_send_would_blocks",
     "peer_data_send_would_blocks",
+    "scheduled_drain_batches",
+    "scheduled_drain_packets",
+    "scheduled_drain_max_packets",
+    "fec_recovered_symbols_per_gib_delivered",
     *ACK_FLUSH_METRICS,
 }
 
 LOWER_IS_BETTER_METRICS = {
     "rtt_p50_ms",
+    "rtt_p90_ms",
+    "rtt_p99_ms",
+    "message_latency_p50_ms",
+    "message_latency_p95_ms",
+    "message_latency_p99_ms",
+    "wire_bytes_per_delivered_byte",
     "congestion_bandwidth_probe_before_feedback_percent",
     "low_send_rate_occupancy",
     "outage_recovery_occupancy",
@@ -1023,6 +1311,9 @@ LOWER_IS_BETTER_METRICS = {
     "peer_retransmission_armor_duplicates_per_gib_delivered",
     "sender_data_send_would_blocks_per_gib_delivered",
     "peer_data_send_would_blocks_per_gib_delivered",
+    "fec_parity_sent_per_gib_delivered",
+    "fec_dropped_malformed_packets_per_gib_delivered",
+    "fec_dropped_decoder_panics_per_gib_delivered",
 }
 
 CONDITIONING_METRICS = tuple(
@@ -1171,6 +1462,85 @@ def behavior_conditioned_observations(pairs):
     return observations
 
 
+# Controller-state occupancy entries whose per-pair activation state the
+# comparison coverage reports. An 'active' state is any positive finite
+# occupancy; absent/NaN occupancy stays 'unknown'.
+CONTROLLER_ACTIVATION_METRICS = (
+    "slow_start",
+    "gentle_mode",
+    "gentle_draining",
+    "queue_building",
+    "drain_floor_binding",
+    "outage_recovery",
+    "queue_hold_occupancy",
+    "delay_drain_occupancy",
+)
+
+
+def controller_activation_value(summary, metric):
+    if metric in ("queue_hold_occupancy", "delay_drain_occupancy"):
+        return summary.get(metric)
+    return summary.get("controller_state_occupancy", {}).get(metric)
+
+
+def activation_pair_state(baseline, candidate):
+    """Classify one pair's activation for a controller metric."""
+    def active(value):
+        if value is None:
+            return None
+        try:
+            if not math.isfinite(value):
+                return None
+        except TypeError:
+            return None
+        return value > 0
+
+    baseline_active = active(baseline)
+    candidate_active = active(candidate)
+    if baseline_active is None or candidate_active is None:
+        return "unknown"
+    if baseline_active and candidate_active:
+        return "both_active"
+    if baseline_active:
+        return "baseline_only"
+    if candidate_active:
+        return "candidate_only"
+    return "neither_active"
+
+
+def controller_activation_coverage(valid_pairs):
+    """Per-metric activation coverage: both/baseline/candidate/neither/unknown
+    counts plus per-pair states, so coverage never invents occupancy."""
+    coverage = {}
+    for metric in CONTROLLER_ACTIVATION_METRICS:
+        counts = {
+            "both_active": 0,
+            "baseline_only": 0,
+            "candidate_only": 0,
+            "neither_active": 0,
+            "unknown": 0,
+        }
+        pairs = []
+        for pair in valid_pairs:
+            baseline = controller_activation_value(
+                pair["baseline"]["summary"], metric
+            )
+            candidate = controller_activation_value(
+                pair["candidate"]["summary"], metric
+            )
+            state = activation_pair_state(baseline, candidate)
+            counts[state] += 1
+            pairs.append(
+                {
+                    "baseline": pair["baseline"]["label"],
+                    "candidate": pair["candidate"]["label"],
+                    "state": state,
+                }
+            )
+        coverage[metric] = {"counts": counts, "pairs": pairs}
+    return coverage
+
+
 def pair_metrics(pair):
     baseline = pair["baseline"]
     candidate = pair["candidate"]
@@ -1201,9 +1571,61 @@ def pair_metrics(pair):
     return out
 
 
+def _material_direction(deltas, threshold=10.0):
+    """Direction of a material paired change: 'improved', 'regressed',
+    'unchanged', 'mixed', or None when no delta is available."""
+    deltas = [value for value in deltas if value is not None]
+    if not deltas:
+        return None
+    if all(value <= -threshold for value in deltas):
+        return "improved"
+    if all(value >= threshold for value in deltas):
+        return "regressed"
+    if all(-threshold < value < threshold for value in deltas):
+        return "unchanged"
+    return "mixed"
+
+
+def material_directions(valid_pairs):
+    """Median paired direction per metric with lower-is-better normalized;
+    only material directions are returned."""
+    by_metric = {}
+    for pair in valid_pairs:
+        for metric, values in pair["metrics"].items():
+            difference = values["difference"]
+            if difference is None:
+                continue
+            ranking_delta = ranking_delta_percent(
+                values["candidate"], values["baseline"]
+            )
+            if ranking_delta is None:
+                continue
+            by_metric.setdefault(metric, []).append(ranking_delta)
+    directions = {}
+    for metric, deltas in by_metric.items():
+        median = statistics.median(deltas)
+        if median == 0.0:
+            continue
+        normalized = -median if metric in LOWER_IS_BETTER_METRICS else median
+        if abs(normalized) < 10.0:
+            continue
+        directions[metric] = "better" if normalized > 0 else "worse"
+    return directions
+
+
 def classify(valid_pairs):
     if not valid_pairs:
         return "insufficient_evidence"
+    scenarios = [
+        pair["baseline"]["manifest"].get("scenario", "")
+        for pair in valid_pairs
+    ]
+    if any("message" in scenario.lower() for scenario in scenarios):
+        return classify_message_scenario(valid_pairs)
+    return classify_bulk_scenario(valid_pairs)
+
+
+def classify_bulk_scenario(valid_pairs):
     deltas = [
         pair["metrics"]["goodput_mib_per_second"]["delta_percent"]
         for pair in valid_pairs
@@ -1217,6 +1639,49 @@ def classify(valid_pairs):
         return "likely_improvement"
     if all(-10.0 < value < 10.0 for value in deltas):
         return "no_material_change"
+    return "mixed_results"
+
+
+def classify_message_scenario(valid_pairs):
+    """Sparse-message scenarios classify the p95/p99 tail direction together
+    with wire-byte cost. A material latency/overhead tradeoff is
+    'mixed_results', never neutral, even when goodput barely moved."""
+    tail_metrics = ("message_latency_p95_ms", "message_latency_p99_ms")
+    tail_directions = [
+        _material_direction(
+            [
+                pair["metrics"][metric]["delta_percent"]
+                for pair in valid_pairs
+                if pair["metrics"][metric]["delta_percent"] is not None
+            ]
+        )
+        for metric in tail_metrics
+    ]
+    wire_direction = _material_direction(
+        [
+            pair["metrics"]["wire_bytes_per_delivered_byte"]["delta_percent"]
+            for pair in valid_pairs
+            if pair["metrics"]["wire_bytes_per_delivered_byte"]["delta_percent"]
+            is not None
+        ]
+    )
+    if any(direction is None for direction in tail_directions) or wire_direction is None:
+        return "insufficient_evidence"
+    if "mixed" in tail_directions or wire_direction == "mixed":
+        return "mixed_results"
+    tail_improved = all(direction == "improved" for direction in tail_directions)
+    tail_regressed = all(direction == "regressed" for direction in tail_directions)
+    tail_unchanged = all(direction == "unchanged" for direction in tail_directions)
+    if tail_improved and wire_direction != "regressed":
+        return "likely_improvement"
+    if tail_regressed and wire_direction != "improved":
+        return "likely_regression"
+    if tail_unchanged:
+        if wire_direction == "unchanged":
+            return "no_material_change"
+        if wire_direction == "improved":
+            return "likely_improvement"
+        return "likely_regression"
     return "mixed_results"
 
 
@@ -1339,7 +1804,7 @@ def guidance_hints(pairs, verdict):
     return hints
 
 
-def build_comparison(baseline_specs, candidate_specs):
+def build_comparison(baseline_specs, candidate_specs, allowed_config_mismatches=()):
     runs = []
     for spec in baseline_specs:
         run = read_run(spec)
@@ -1359,7 +1824,11 @@ def build_comparison(baseline_specs, candidate_specs):
     for pair in pairs:
         baseline = pair["baseline"]
         candidate = pair["candidate"]
-        mismatches = pair_config_agrees(baseline["manifest"], candidate["manifest"])
+        mismatches = pair_config_agrees(
+            baseline["manifest"],
+            candidate["manifest"],
+            allowed_config_mismatches,
+        )
         reasons = []
         reasons.extend(f"{key} mismatch" for key in mismatches)
         for role in ("baseline", "candidate"):
@@ -1432,6 +1901,8 @@ def build_comparison(baseline_specs, candidate_specs):
             if "baseline" in change
         ],
         "behavior_conditioned_observations": conditioned,
+        "controller_activation_coverage": controller_activation_coverage(valid_pairs),
+        "allowed_config_mismatches": list(allowed_config_mismatches),
         "agent_guidance": hints,
     }
 
@@ -1472,6 +1943,53 @@ def _guidance_change(hint):
 
 def escape(value):
     return html.escape(str(value))
+
+
+def empirical_cdf_points(samples):
+    return [(value, (index + 1) / len(samples) * 100.0) for index, value in enumerate(samples)]
+
+
+def pairwise_rtt_cdf_charts(comparison, runs):
+    """One baseline/candidate empirical RTT CDF panel per valid pair; a
+    'No valid paired RTT samples.' section when none qualify. CDFs describe
+    distribution consistency, not causation: the explanatory note carries a
+    does_not_prove boundary."""
+    by_label = {run["label"]: run for run in runs}
+    sections = []
+    for pair in comparison["pairs"]:
+        if not pair["valid"]:
+            continue
+        baseline_rtt = by_label.get(pair["baseline"], {}).get("rtt", [])
+        candidate_rtt = by_label.get(pair["candidate"], {}).get("rtt", [])
+        if not baseline_rtt or not candidate_rtt:
+            continue
+        sections.append(
+            REPORT.svg_line_chart(
+                f"Paired raw RTT CDF: {pair['baseline']} vs {pair['candidate']}",
+                "raw RTT (ms)",
+                "samples ≤ x (%)",
+                [
+                    (
+                        f"{pair['baseline']} baseline",
+                        empirical_cdf_points(sorted(baseline_rtt)),
+                    ),
+                    (
+                        f"{pair['candidate']} candidate",
+                        empirical_cdf_points(sorted(candidate_rtt)),
+                    ),
+                ],
+                (0.0, 100.0),
+            )
+        )
+    if not sections:
+        return (
+            "<section><h2>Paired raw RTT CDF</h2>"
+            "<p>No valid paired RTT samples.</p>"
+            "<p class=\"note\">CDF comparisons describe distribution-shape "
+            "consistency only and does_not_prove that any specific change "
+            "caused the difference.</p></section>"
+        )
+    return "".join(sections)
 
 
 def render_html(comparison, runs):
@@ -1605,6 +2123,33 @@ def render_html(comparison, runs):
                     [(0, counters.get("forwarded", 0))],
                 )
             )
+    activation_rows = []
+    for metric, entry in comparison["controller_activation_coverage"].items():
+        counts = entry["counts"]
+        counts_text = ", ".join(
+            f"{state}: {count}" for state, count in counts.items()
+        )
+        pair_states = ", ".join(
+            f"{item['baseline']}/{item['candidate']}={item['state']}"
+            for item in entry["pairs"]
+        ) or "-"
+        activation_rows.append(
+            "<tr>"
+            f"<th>{escape(metric)}</th>"
+            f"<td>{escape(counts_text)}</td>"
+            f"<td>{escape(pair_states)}</td>"
+            "</tr>"
+        )
+    allowed_mismatches = ", ".join(
+        comparison["allowed_config_mismatches"]
+    ) or "none"
+    readiness = (
+        f"<p>verdict: {escape(comparison['verdict'])}; "
+        f"{comparison['valid_pairs']} valid / {comparison['total_pairs']} "
+        f"total pairs; evidence quality: "
+        f"{escape(comparison['evidence_quality'])}; allowed config "
+        f"mismatches: {escape(allowed_mismatches)}</p>"
+    )
 
     content = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -1625,25 +2170,30 @@ th, td {{ text-align: left; border-bottom: 1px solid #e5e7eb; padding: .4rem .55
 <h1>Netem paired comparison</h1>
 <p class="note">The verdict is a consistency label derived from valid paired seed identities only; it is not statistical confidence and does not prove causality. Every hint below carries a does_not_prove constraint.</p>
 <p class="verdict">verdict: {escape(comparison['verdict'])} - {comparison['valid_pairs']} valid / {comparison['total_pairs']} total pairs</p>
+<section><h2>Comparison readiness</h2>{readiness}</section>
 <section><h2>Run health</h2><table><thead><tr><th>run</th><th>role</th><th>evidence</th><th>c2s/s2c seed</th><th>goodput MiB/s</th><th>first / second half MiB/s</th><th>RTT p50 ms</th><th>low rate %</th><th>terminations</th><th>peer terminations</th><th>send-driver wakes</th><th>peer send-driver wakes</th><th>resume requests</th><th>peer resume requests</th><th>netem counters</th><th>probe/sink</th><th>mux outcomes</th></tr></thead><tbody>{''.join(health_rows)}</tbody></table></section>
 <section><h2>Paired outcomes</h2><table><thead><tr><th>#</th><th>baseline</th><th>candidate</th><th>valid</th><th>excluded</th>{''.join(f'<th>{escape(metric)}</th>' for metric in METRICS)}</tr></thead><tbody>{''.join(pair_rows)}</tbody></table></section>
-<section><h2>Behavior-conditioned observations</h2><table><thead><tr><th>counter</th><th>condition</th><th>pairs</th><th>support</th><th>attention</th><th>outcomes</th><th>boundary</th></tr></thead><tbody>{''.join(conditioned_rows)}</tbody></table></section>
+<section><h2>Behavior-conditioned observations (phase/behavior conditioning)</h2><table><thead><tr><th>counter</th><th>condition</th><th>pairs</th><th>support</th><th>attention</th><th>outcomes</th><th>boundary</th></tr></thead><tbody>{''.join(conditioned_rows)}</tbody></table></section>
+<section><h2>Controller activation coverage</h2><table><thead><tr><th>metric</th><th>pair states</th><th>per-pair</th></tr></thead><tbody>{''.join(activation_rows)}</tbody></table></section>
 <section><h2>Controller-state occupancy</h2><table><thead><tr><th>run</th><th>slow start</th><th>gentle</th><th>gentle drain</th><th>queue building</th><th>drain floor</th><th>outage recovery</th></tr></thead><tbody>{controller_rows}</tbody></table></section>
 {REPORT.svg_line_chart("Rolling application goodput (shared timeline)", "trace time (s)", "MiB/s over ~1 s", timeline_series)}
 {REPORT.svg_line_chart("Raw RTT empirical CDF", "raw RTT (ms)", "samples ≤ x (%)", cdf_series, (0.0, 100.0))}
+{pairwise_rtt_cdf_charts(comparison, runs)}
 <section><h2>Agent guidance</h2><ul>{guidance}</ul></section>
 </body></html>"""
     return content
 
 
-def render_comparison(baseline_specs, candidate_specs, output_dir):
+def render_comparison(baseline_specs, candidate_specs, output_dir, allowed_config_mismatches=()):
     output_dir = Path(output_dir)
     runs = []
     for spec in list(baseline_specs) + list(candidate_specs):
         run = read_run(spec)
         run["role"] = "baseline" if spec in baseline_specs else "candidate"
         runs.append(run)
-    comparison = build_comparison(baseline_specs, candidate_specs)
+    comparison = build_comparison(
+        baseline_specs, candidate_specs, allowed_config_mismatches
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "comparison.json").write_text(
         json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1683,10 +2233,25 @@ def main():
         help="candidate run (repeatable)",
     )
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--allow-config-mismatch",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help=(
+            "permit this named CONFIG_KEYS difference between paired runs "
+            "(repeatable; only explicitly named keys are suppressed)"
+        ),
+    )
     args = parser.parse_args()
     if not args.baseline or not args.candidate:
         parser.error("at least one --baseline and one --candidate trace are required")
-    output_dir = render_comparison(args.baseline, args.candidate, args.out)
+    output_dir = render_comparison(
+        args.baseline,
+        args.candidate,
+        args.out,
+        tuple(args.allow_config_mismatch),
+    )
     print(output_dir)
 
 

@@ -18,9 +18,14 @@ SPEC.loader.exec_module(REPORT)
 class TraceReportTest(unittest.TestCase):
     def test_queue_hold_has_a_distinct_lane_before_delay_drain(self):
         # queue_hold must occupy lane 6 and delay_drain lane 7 so a hold is
-        # visually distinct from (and plotted before) the drain that follows.
+        # visually distinct from (and plotted before) the drain that follows,
+        # and the report must emit distinct queue-hold and delay-drain
+        # timelines rather than folding them together.
         self.assertEqual(REPORT.CONGESTION_ACTION_LANES["queue_hold"], 6.0)
         self.assertEqual(REPORT.CONGESTION_ACTION_LANES["delay_drain"], 7.0)
+        self.assertEqual(REPORT.congestion_action_lane("queue_hold"), 6.0)
+        self.assertEqual(REPORT.congestion_action_lane("delay_drain"), 7.0)
+        self.assertEqual(REPORT.congestion_action_lane("unknown_action"), 0.0)
         safe_tmp = os.environ["TMPDIR"]
         with tempfile.TemporaryDirectory(dir=safe_tmp) as directory:
             trace_dir = Path(directory)
@@ -36,14 +41,23 @@ class TraceReportTest(unittest.TestCase):
                     "congestion_window_packets", "retransmitted_packets",
                     "packets_in_pipe", "next_send_sequence",
                     "next_receive_sequence", "loss_ratio", "congestion_action",
+                    "fec_parity_sent", "fec_groups_flushed",
+                    "fec_recovered_symbols", "fec_dropped_malformed_packets",
+                    "fec_dropped_decoder_panics",
                 ],
-                [0, 100000, 100000, 100000, 128, 500000, 10, 0, 2, 3, 2, 0.0, "queue_hold"],
-                [100000, 200000, 100000, 200000, 300, 600000, 31, 4, 20, 4, 2, 0.2, "delay_drain"],
+                [0, 100000, 100000, 100000, 128, 500000, 10, 0, 2, 3, 2, 0.0, "queue_hold", 8, 4, 2, 0, 0],
+                [100000, 200000, 100000, 200000, 300, 600000, 31, 4, 20, 4, 2, 0.2, "delay_drain", 16, 8, 4, 0, 0],
             )
             self.write_csv(
                 trace_dir / "netem.csv",
-                ["elapsed_us", "direction", "delayed", "dropped", "duplicated", "reordered", "rate_limited", "forwarded", "received", "overflow_dropped", "queue_len"],
-                [0, "c2s", 1, 0, 0, 0, 1, 1, 1, 0, 2],
+                [
+                    "elapsed_us", "direction", "delayed", "dropped", "duplicated",
+                    "reordered", "rate_limited", "forwarded", "received",
+                    "overflow_dropped", "scheduled_drain_batches",
+                    "scheduled_drain_packets", "scheduled_drain_max_packets",
+                    "queue_len",
+                ],
+                [0, "c2s", 1, 0, 0, 0, 1, 1, 1, 0, 3, 12, 4, 2],
             )
             self.write_csv(
                 trace_dir / "progress.csv",
@@ -75,6 +89,24 @@ class TraceReportTest(unittest.TestCase):
             self.assertAlmostEqual(first_lane, 6.0)
             self.assertAlmostEqual(second_lane, 7.0)
             self.assertLess(points[0][0], points[1][0])
+            # Distinct 0/1 queue-hold and delay-drain timelines render beside
+            # the aggregate lane chart.
+            self.assertIn("Queue hold and delay drain timelines", document)
+            hold_section = document.split(
+                "<h2>Queue hold and delay drain timelines</h2>", 1
+            )[1].split("</section>", 1)[0]
+            self.assertIn("queue hold", hold_section)
+            self.assertIn("delay drain", hold_section)
+            self.assertEqual(hold_section.count("<polyline"), 2)
+            # Typed FEC series render with the captured final counters.
+            self.assertIn("FEC work and recovery", document)
+            self.assertIn("parity sent", document)
+            self.assertIn("Forward error correction", document)
+            self.assertIn("16.0", document)
+            self.assertIn("4.0", document)
+            # Scheduled-drain counters render per direction.
+            self.assertIn("Netem scheduled drain", document)
+            self.assertIn("12.0", document)
 
     def test_render_reads_trace_and_emits_all_figures(self):
         safe_tmp = os.environ["TMPDIR"]
