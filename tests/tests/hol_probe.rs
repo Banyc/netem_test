@@ -99,6 +99,37 @@ const BULK_PACE_BYTES_PER_SEC: u64 = 256 * 1024;
 /// interleaving with the 25 ms interactive cadence is deterministic.
 const BULK_PACE_CHUNK_BYTES: usize = 8 * 1024;
 
+#[test]
+fn fec_gaming_treatment_has_bad_path_and_large_capacity_headroom() {
+    let link = support::presets::fec_gaming_fat_pipe();
+    let offered_bits_per_second = DEFAULT_MSG_BYTES as f64 * 8.0 / DEFAULT_CADENCE.as_secs_f64();
+    assert!(
+        offered_bits_per_second < link.rate as f64 / 100.0,
+        "interactive offered load must stay below 1% of shaped capacity"
+    );
+    assert_eq!(link.loss_model, netem_test::LossModel::Random);
+    assert_eq!(link.loss, u32::MAX / 20);
+    assert_eq!(link.latency, Duration::from_millis(300));
+}
+
+#[test]
+fn fec_saturated_pair_keys_loss_to_the_same_rtp_sequence() {
+    let off = support::presets::fec_paired_saturated_bottleneck(false);
+    let on = support::presets::fec_paired_saturated_bottleneck(true);
+    assert_eq!(
+        off.loss_model,
+        netem_test::LossModel::PacketKeyed { key_offset: 1 }
+    );
+    assert_eq!(
+        on.loss_model,
+        netem_test::LossModel::PacketKeyed { key_offset: 11 }
+    );
+    assert_eq!(off.loss, on.loss);
+    assert_eq!(off.rate, on.rate);
+    assert_eq!(off.latency, on.latency);
+    assert_eq!(off.queue_limit_pkts, on.queue_limit_pkts);
+}
+
 /// How a competing bulk flow shares the bottleneck with the interactive stream.
 #[derive(Clone, Debug)]
 pub enum BulkMode {

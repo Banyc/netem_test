@@ -166,3 +166,124 @@ pub fn random_loss_link(loss_pct: f64, owd: Duration, seed: u64) -> NetemConfig 
         ..NetemConfig::default()
     }
 }
+
+// ─────────────────────── hostile / FEC calibration presets ───────────────────────
+
+/// Hostile steady-state link with no shaping: ~15% random loss, ~300 ms
+/// latency. Used to calibrate the interactive/bulk FEC treatment pair.
+pub fn hostile_steady_link() -> NetemConfig {
+    NetemConfig {
+        loss: u32::MAX / 100 * 15,
+        latency: Duration::from_millis(300),
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
+pub fn hostile_steady_bottleneck() -> NetemConfig {
+    hostile_steady_bottleneck_at(Duration::from_millis(300))
+}
+
+fn hostile_steady_bottleneck_at(latency: Duration) -> NetemConfig {
+    NetemConfig {
+        rate: 50 * 1000 * 1000,
+        latency,
+        loss: u32::MAX / 100 * 15,
+        queue_limit_pkts: 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
+pub fn hostile_steady_bottleneck_20ms() -> NetemConfig {
+    hostile_steady_bottleneck_at(Duration::from_millis(20))
+}
+
+pub fn hostile_steady_bottleneck_100ms() -> NetemConfig {
+    hostile_steady_bottleneck_at(Duration::from_millis(100))
+}
+
+/// Shaped 50 Mbps lane with a single evenly-spread deterministic drop per 20
+/// packets: the erasure-recovery lane FEC must transparently survive.
+pub fn fec_recoverable_bottleneck() -> NetemConfig {
+    NetemConfig {
+        rate: 50 * 1000 * 1000,
+        latency: Duration::from_millis(300),
+        loss_model: LossModel::PeriodicSpread {
+            period: 20,
+            losses: 1,
+        },
+        queue_limit_pkts: 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
+/// Fat pipe with ~5% random loss: the interactive default-on FEC gaming
+/// treatment lane (no bottleneck shaping, plenty of capacity headroom).
+pub fn fec_gaming_fat_pipe() -> NetemConfig {
+    NetemConfig {
+        rate: 50 * 1000 * 1000,
+        latency: Duration::from_millis(300),
+        loss: u32::MAX / 20,
+        loss_model: LossModel::Random,
+        queue_limit_pkts: 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
+/// Paired-saturated bottleneck: FEC-off and FEC-on arms lose the same
+/// logical RTP sequence. `key_offset` points at the eight-byte codec
+/// sequence immediately after the command byte; the 10-byte FEC data
+/// envelope shifts the key on the FEC-on arm.
+pub fn fec_paired_saturated_bottleneck(fec_envelope: bool) -> NetemConfig {
+    const CODEC_SEQUENCE_OFFSET: u16 = 1;
+    const FEC_DATA_ENVELOPE_BYTES: u16 = 10;
+    NetemConfig {
+        rate: 50 * 1000 * 1000,
+        latency: Duration::from_millis(300),
+        loss: u32::MAX / 20,
+        loss_model: LossModel::PacketKeyed {
+            key_offset: CODEC_SEQUENCE_OFFSET
+                + if fec_envelope {
+                    FEC_DATA_ENVELOPE_BYTES
+                } else {
+                    0
+                },
+        },
+        queue_limit_pkts: 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
+pub fn hostile_periodic_bottleneck() -> NetemConfig {
+    hostile_periodic_bottleneck_at(Duration::from_millis(300))
+}
+
+fn hostile_periodic_bottleneck_at(latency: Duration) -> NetemConfig {
+    NetemConfig {
+        rate: 50 * 1000 * 1000,
+        latency,
+        loss_model: LossModel::Periodic {
+            period: 20,
+            losses: 3,
+        },
+        queue_limit_pkts: 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
+pub fn hostile_periodic_bottleneck_20ms() -> NetemConfig {
+    hostile_periodic_bottleneck_at(Duration::from_millis(20))
+}
+
+pub fn hostile_periodic_bottleneck_100ms() -> NetemConfig {
+    hostile_periodic_bottleneck_at(Duration::from_millis(100))
+}
+
+pub fn hostile_periodic_bottleneck_300ms() -> NetemConfig {
+    hostile_periodic_bottleneck_at(Duration::from_millis(300))
+}

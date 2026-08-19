@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as ParkingMutex;
 
-use loss::FourStateState;
+use loss::{FourStateState, PacketKeyedLossState};
 use queue::Queued;
 use rng::CorRng;
 use runner_threads::RunnerThreads;
@@ -688,6 +688,12 @@ struct NetemState {
     dup_cor: CorRng,
     reorder_cor: CorRng,
     state: FourStateState,
+    /// Wrapping per-direction packet index for the deterministic loss
+    /// schedules, initialized from [`NetemConfig::seed`].
+    loss_packet_index: u64,
+    /// Remembers already-dropped packet identities for the packet-keyed loss
+    /// model, so a retransmission of a selected first transmission passes.
+    packet_keyed_loss: PacketKeyedLossState,
     /// Earliest time the next packet may be serialized (send-time shaper).
     /// Tracks the per-direction serialization backlog for rate limiting.
     link_free_at: Instant,
@@ -724,6 +730,7 @@ impl NetemState {
         let direct_stochastic = no_scheduling && has_stochastic_work;
         let direct_forward = no_scheduling && !has_stochastic_work;
         let rng = RndState::seed(config.seed);
+        let loss_packet_index = config.seed;
         let link_free_at = match &clock {
             Some(c) => c.now(),
             None => Instant::now(),
@@ -744,6 +751,8 @@ impl NetemState {
             shared,
             rng,
             state: FourStateState::default(),
+            loss_packet_index,
+            packet_keyed_loss: PacketKeyedLossState::default(),
             clock,
             queue: BinaryHeap::new(),
             reused_packet_buffers: Vec::new(),
@@ -812,7 +821,7 @@ impl NetemState {
     /// Preserves the kernel's duplicate-before-loss draw order and the
     /// duplicated/dropped counters; shared by the heap, FIFO, and direct
     /// stochastic paths so every path consumes PRNG draws identically.
-    fn surviving_copies(&mut self) -> u32 {
+    fn surviving_copies(&mut self, packet: &[u8]) -> u32 {
         // ── duplication ──────────────────────────────────────────────
         let mut count = 1u32;
         if self.config.duplicate != 0 && self.config.duplicate >= self.dup_cor.next(&mut self.rng) {
@@ -826,6 +835,9 @@ impl NetemState {
             &mut self.loss_cor,
             &mut self.rng,
             self.config.loss,
+            &mut self.loss_packet_index,
+            packet,
+            &mut self.packet_keyed_loss,
         ) {
             self.stats.inc(|s| &s.dropped);
             // A lost packet still consumes a duplication slot.
@@ -853,7 +865,7 @@ impl NetemState {
             self.stats.inc_single_writer(|s| &s.dropped);
             return true;
         }
-        let count = self.surviving_copies();
+        let count = self.surviving_copies(data);
         for _ in 0..count {
             if let Some(dst) = dst
                 && send.send_to(data, dst).is_ok()
@@ -883,7 +895,7 @@ impl NetemState {
             return;
         }
 
-        let count = self.surviving_copies();
+        let count = self.surviving_copies(data);
         if count == 0 {
             return;
         }
@@ -1077,7 +1089,7 @@ impl NetemState {
             return;
         }
 
-        let count = self.surviving_copies();
+        let count = self.surviving_copies(data);
         if count == 0 {
             return;
         }
@@ -2231,11 +2243,28 @@ mod tests {
         let mut state = FourStateState::TxInGap;
         let mut cor = CorRng::new(0);
         let mut rng = RndState::seed(42);
+        let mut packet_index = 0;
         // first packet: rnd < p14 => lost, transition to LostInGap
-        assert!(model.loss(&mut state, &mut cor, &mut rng, 0));
+        assert!(model.loss(
+            &mut state,
+            &mut cor,
+            &mut rng,
+            0,
+            &mut packet_index,
+            &[],
+            &mut PacketKeyedLossState::default()
+        ));
         assert_eq!(state, FourStateState::LostInGap);
         // next packet: LostInGap -> TxInGap, transmit
-        assert!(!model.loss(&mut state, &mut cor, &mut rng, 0));
+        assert!(!model.loss(
+            &mut state,
+            &mut cor,
+            &mut rng,
+            0,
+            &mut packet_index,
+            &[],
+            &mut PacketKeyedLossState::default()
+        ));
         assert_eq!(state, FourStateState::TxInGap);
     }
 
@@ -2245,8 +2274,17 @@ mod tests {
         let mut state = FourStateState::default();
         let mut cor = CorRng::new(0);
         let mut rng = RndState::seed(1);
+        let mut packet_index = 0;
         for _ in 0..1000 {
-            assert!(!model.loss(&mut state, &mut cor, &mut rng, 0));
+            assert!(!model.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                0,
+                &mut packet_index,
+                &[],
+                &mut PacketKeyedLossState::default()
+            ));
         }
     }
 
@@ -2256,9 +2294,139 @@ mod tests {
         let mut state = FourStateState::default();
         let mut cor = CorRng::new(0);
         let mut rng = RndState::seed(1);
+        let mut packet_index = 0;
         for _ in 0..1000 {
-            assert!(model.loss(&mut state, &mut cor, &mut rng, u32::MAX));
+            assert!(model.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                u32::MAX,
+                &mut packet_index,
+                &[],
+                &mut PacketKeyedLossState::default()
+            ));
         }
+    }
+
+    #[test]
+    fn periodic_loss_repeats_and_advances_through_u64_wrap() {
+        let model = LossModel::Periodic {
+            period: 5,
+            losses: 2,
+        };
+        let mut state = FourStateState::default();
+        let mut cor = CorRng::new(0);
+        let mut rng = RndState::seed(1);
+        let mut packet_index = u64::MAX - 1;
+        let outcomes = (0..7)
+            .map(|_| {
+                model.loss(
+                    &mut state,
+                    &mut cor,
+                    &mut rng,
+                    0,
+                    &mut packet_index,
+                    &[],
+                    &mut PacketKeyedLossState::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes, [false, true, true, true, false, false, false]);
+        assert_eq!(packet_index, 5);
+    }
+
+    #[test]
+    fn periodic_spread_distributes_losses_evenly() {
+        let model = LossModel::PeriodicSpread {
+            period: 20,
+            losses: 3,
+        };
+        let mut state = FourStateState::default();
+        let mut cor = CorRng::new(0);
+        let mut rng = RndState::seed(1);
+        let mut packet_index = 0;
+        let losses = (0..20)
+            .filter(|_| {
+                model.loss(
+                    &mut state,
+                    &mut cor,
+                    &mut rng,
+                    0,
+                    &mut packet_index,
+                    &[],
+                    &mut PacketKeyedLossState::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(losses, [6, 13, 19]);
+    }
+
+    #[test]
+    fn packet_keyed_loss_is_stable_across_envelope_offsets() {
+        let raw = LossModel::PacketKeyed { key_offset: 1 };
+        let enveloped = LossModel::PacketKeyed { key_offset: 11 };
+        let mut state = FourStateState::default();
+        let mut cor = CorRng::new(0);
+        let mut rng = RndState::seed(9);
+        let mut seed = 171;
+        let mut raw_keyed = PacketKeyedLossState::default();
+        let mut enveloped_keyed = PacketKeyedLossState::default();
+        let mut saw_drop = false;
+        let mut saw_forward = false;
+        let mut dropped_packet = None;
+        for key in 0u64..256 {
+            let mut raw_packet = vec![3];
+            raw_packet.extend_from_slice(&key.to_be_bytes());
+            let mut enveloped_packet = vec![0; 11];
+            enveloped_packet[10] = 3;
+            enveloped_packet.extend_from_slice(&key.to_be_bytes());
+            let raw_lost = raw.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                u32::MAX / 20,
+                &mut seed,
+                &raw_packet,
+                &mut raw_keyed,
+            );
+            let enveloped_lost = enveloped.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                u32::MAX / 20,
+                &mut seed,
+                &enveloped_packet,
+                &mut enveloped_keyed,
+            );
+            assert_eq!(raw_lost, enveloped_lost, "key {key} changed decision");
+            saw_drop |= raw_lost;
+            saw_forward |= !raw_lost;
+            if raw_lost && dropped_packet.is_none() {
+                dropped_packet = Some(raw_packet);
+            }
+        }
+        assert!(saw_drop && saw_forward);
+        assert!(
+            !raw.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                u32::MAX / 20,
+                &mut seed,
+                &dropped_packet.unwrap(),
+                &mut raw_keyed,
+            ),
+            "a retransmission of a selected key must pass"
+        );
+        assert!(!raw.loss(
+            &mut state,
+            &mut cor,
+            &mut rng,
+            u32::MAX,
+            &mut seed,
+            &[3],
+            &mut raw_keyed
+        ));
     }
 
     #[test]

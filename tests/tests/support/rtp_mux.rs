@@ -32,7 +32,9 @@ async fn spawn_rtp_mux_latency_bulk_server_core(
     Arc<AtomicU64>,
     TestTaskSubmitter,
 )> {
-    let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0", fec).await?;
+    let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0")
+        .await?
+        .with_interactive_fec_tuning(rtp::FecTuning::default(), fec);
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
@@ -142,7 +144,10 @@ fn rtp_mux_connector_core(
         rtp_mux::RtpMuxConnector::with_config(rtp_mux::RtpMuxConnectorConfig {
             bind,
             bulk_addr,
-            fec,
+            interactive_fec_tuning: rtp::FecTuning::default(),
+            interactive_instream_group_fec: fec,
+            interactive_metrics_observer: None,
+            bulk_metrics_observer: None,
             handshake: true,
             explorer: rtp_mux::ExplorerConfig {
                 enabled: false,

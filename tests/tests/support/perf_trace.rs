@@ -1123,6 +1123,7 @@ mod tests {
                 delivery_rate_packets_per_second: None,
                 delivery_sample_app_limited: None,
                 retransmission_counters: MetricsRetransmissionCounters::default(),
+                fec_counters: None,
                 application_write_waiters: 0,
                 application_limited_detections: 0,
                 application_limited_detections_suppressed_by_waiting_writer: 0,
