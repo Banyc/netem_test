@@ -433,6 +433,10 @@ pub struct Counters {
     pub rate_limited: u64,
     pub forwarded: u64,
     pub received: u64,
+    /// Payload bytes emitted by successful `send_to` calls.
+    pub forwarded_bytes: u64,
+    /// Payload bytes accepted before impairment.
+    pub received_bytes: u64,
     /// Packets dropped because the per-direction queue exceeded `limit`.
     pub overflow_dropped: u64,
     /// Number of non-empty FIFO/heap scheduler drains.
@@ -456,6 +460,8 @@ struct AtomicCounters {
     rate_limited: AtomicU64,
     forwarded: AtomicU64,
     received: AtomicU64,
+    forwarded_bytes: AtomicU64,
+    received_bytes: AtomicU64,
     overflow_dropped: AtomicU64,
     scheduled_drain_batches: AtomicU64,
     scheduled_drain_packets: AtomicU64,
@@ -475,6 +481,18 @@ impl AtomicCounters {
         let counter = f(self);
         counter.store(
             counter.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Add `amount` to a counter owned by exactly one writer (the direction's
+    /// runner thread): a relaxed load + store instead of a fetch_add
+    /// round-trip. Used for the wire-byte totals.
+    #[inline]
+    fn add_single_writer(&self, f: impl Fn(&AtomicCounters) -> &AtomicU64, amount: usize) {
+        let counter = f(self);
+        counter.store(
+            counter.load(Ordering::Relaxed).wrapping_add(amount as u64),
             Ordering::Relaxed,
         );
     }
@@ -506,6 +524,8 @@ impl AtomicCounters {
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             forwarded: self.forwarded.load(Ordering::Relaxed),
             received: self.received.load(Ordering::Relaxed),
+            forwarded_bytes: self.forwarded_bytes.load(Ordering::Relaxed),
+            received_bytes: self.received_bytes.load(Ordering::Relaxed),
             overflow_dropped: self.overflow_dropped.load(Ordering::Relaxed),
             scheduled_drain_batches: self.scheduled_drain_batches.load(Ordering::Relaxed),
             scheduled_drain_packets: self.scheduled_drain_packets.load(Ordering::Relaxed),
@@ -800,6 +820,8 @@ impl NetemState {
         send: &dyn UdpTransport,
     ) -> bool {
         self.stats.inc_single_writer(|s| &s.received);
+        self.stats
+            .add_single_writer(|s| &s.received_bytes, data.len());
         if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
             self.stats.inc_single_writer(|s| &s.dropped);
             return true;
@@ -812,6 +834,8 @@ impl NetemState {
             && send.send_to(data, dst).is_ok()
         {
             self.stats.inc_single_writer(|s| &s.forwarded);
+            self.stats
+                .add_single_writer(|s| &s.forwarded_bytes, data.len());
         }
         true
     }
@@ -857,6 +881,8 @@ impl NetemState {
         send: &dyn UdpTransport,
     ) -> bool {
         self.stats.inc_single_writer(|s| &s.received);
+        self.stats
+            .add_single_writer(|s| &s.received_bytes, data.len());
         if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
             self.stats.inc_single_writer(|s| &s.dropped);
             return true;
@@ -871,6 +897,8 @@ impl NetemState {
                 && send.send_to(data, dst).is_ok()
             {
                 self.stats.inc_single_writer(|s| &s.forwarded);
+                self.stats
+                    .add_single_writer(|s| &s.forwarded_bytes, data.len());
             }
         }
         true
@@ -878,6 +906,8 @@ impl NetemState {
 
     fn handle_datagram(&mut self, data: &[u8], now: Instant, dst: Option<SocketAddr>) {
         self.stats.inc(|s| &s.received);
+        self.stats
+            .add_single_writer(|s| &s.received_bytes, data.len());
 
         // ── max datagram size filter ──────────────────────────────────
         // Drop oversized datagrams before any other processing.
@@ -1027,6 +1057,8 @@ impl NetemState {
             drained += 1;
             if send.send_to(&data, dst).is_ok() {
                 self.stats.inc(|s| &s.forwarded);
+                self.stats
+                    .add_single_writer(|s| &s.forwarded_bytes, data.len());
             }
             data.clear();
             if self.reused_packet_buffers.len() < MAX_REUSED_PACKET_BUFFERS {
@@ -1076,6 +1108,8 @@ impl NetemState {
         fifo: &mut FifoQueue,
     ) {
         self.stats.inc(|s| &s.received);
+        self.stats
+            .add_single_writer(|s| &s.received_bytes, data.len());
 
         // ── max datagram size filter ──────────────────────────────────
         if self.config.max_datagram_size > 0 && data.len() > self.config.max_datagram_size {
@@ -1186,6 +1220,8 @@ impl NetemState {
             drained += 1;
             if send.send_to(&data, dst).is_ok() {
                 self.stats.inc(|s| &s.forwarded);
+                self.stats
+                    .add_single_writer(|s| &s.forwarded_bytes, data.len());
             }
             fifo.recycle_packet_buffer(data);
         }
@@ -1730,6 +1766,8 @@ impl NetemPair {
             rate_limited: a.rate_limited + b.rate_limited,
             forwarded: a.forwarded + b.forwarded,
             received: a.received + b.received,
+            forwarded_bytes: a.forwarded_bytes + b.forwarded_bytes,
+            received_bytes: a.received_bytes + b.received_bytes,
             overflow_dropped: a.overflow_dropped + b.overflow_dropped,
             scheduled_drain_batches: a.scheduled_drain_batches + b.scheduled_drain_batches,
             scheduled_drain_packets: a.scheduled_drain_packets + b.scheduled_drain_packets,

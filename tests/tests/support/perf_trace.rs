@@ -7,22 +7,24 @@ use std::time::{Duration, Instant};
 
 use netem_test::CountersSnapshot;
 use rtp::metrics::{
-    MetricsAckFlushReason, MetricsEvent, MetricsGentleExitCause, MetricsInterest,
-    MetricsObservation, MetricsObserver, MetricsRetransmissionCounters,
-    MetricsSendDriverResumeSource, MetricsSendDriverWake, MetricsSnapshot,
+    MetricsAckFlushReason, MetricsEvent, MetricsFecCounters, MetricsFecGroupSizeBuckets,
+    MetricsGentleExitCause, MetricsInterest, MetricsObservation, MetricsObserver,
+    MetricsRetransmissionCounters, MetricsSendDriverResumeSource, MetricsSendDriverWake,
+    MetricsSnapshot,
 };
 
-/// Trace schema 27: RTP rows carry the complete congestion-controller and
-/// retransmission-scheduler snapshot (73 columns) plus `trace_elapsed_us` so
-/// endpoint, netem, and progress samples share one clock
-/// (`PerfTrace::trace_start`). Event-only rows leave every snapshot column
-/// empty; the retransmission-active/ready, RTO timing, and controller
-/// decision evidence is present only on snapshot rows.
-const TRACE_SCHEMA_VERSION: u16 = 27;
+/// Trace schema 31: RTP rows carry the complete congestion-controller and
+/// retransmission-scheduler snapshot (73 columns) plus the 29 typed FEC
+/// work/recovery columns and `trace_elapsed_us` so endpoint, netem, and
+/// progress samples share one clock (`PerfTrace::trace_start`). Event-only
+/// rows leave every snapshot column empty; the retransmission-active/ready,
+/// RTO timing, controller-decision, and FEC evidence is present only on
+/// snapshot rows.
+const TRACE_SCHEMA_VERSION: u16 = 31;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
-const RTP_TRACE_COLUMNS: usize = 73;
-const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
+const RTP_TRACE_COLUMNS: usize = 102;
+const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,fec_parity_sent,fec_groups_flushed,fec_flushed_groups_one,fec_flushed_groups_two_to_four,fec_flushed_groups_five_to_seven,fec_flushed_groups_full_eight,fec_groups_skipped_no_surplus_tokens,fec_no_surplus_groups_one,fec_no_surplus_groups_two_to_four,fec_no_surplus_groups_five_to_seven,fec_no_surplus_groups_full_eight,fec_groups_skipped_burst_end,fec_burst_end_groups_one,fec_burst_end_groups_two_to_four,fec_burst_end_groups_five_to_seven,fec_burst_end_groups_full_eight,fec_groups_skipped_loss_gate,fec_loss_gate_groups_one,fec_loss_gate_groups_two_to_four,fec_loss_gate_groups_five_to_seven,fec_loss_gate_groups_full_eight,fec_groups_skipped_no_spare_capacity,fec_no_spare_capacity_groups_one,fec_no_spare_capacity_groups_two_to_four,fec_no_spare_capacity_groups_five_to_seven,fec_no_spare_capacity_groups_full_eight,fec_recovered_symbols,fec_dropped_malformed_packets,fec_dropped_decoder_panics,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
 
 /// Exact per-cause gentle-mode exit counters. Rare transitions are aggregated
 /// atomically and never consume bounded state-row capacity.
@@ -102,6 +104,7 @@ impl AckFlushCounters {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CumulativeCounters {
     retransmission: MetricsRetransmissionCounters,
+    fec: Option<MetricsFecCounters>,
     rto_deadline_postponements: u64,
     application_limited_detections: u64,
     application_limited_suppressions: u64,
@@ -119,6 +122,7 @@ impl CumulativeCounters {
     fn from_snapshot(snapshot: MetricsSnapshot) -> Self {
         Self {
             retransmission: snapshot.retransmission_counters,
+            fec: snapshot.fec_counters,
             rto_deadline_postponements: snapshot.rto_deadline_postponements,
             application_limited_detections: snapshot.application_limited_detections,
             application_limited_suppressions: snapshot
@@ -136,6 +140,7 @@ impl CumulativeCounters {
 
     fn apply_to(self, snapshot: &mut MetricsSnapshot) {
         snapshot.retransmission_counters = self.retransmission;
+        snapshot.fec_counters = self.fec;
         snapshot.rto_deadline_postponements = self.rto_deadline_postponements;
         snapshot.application_limited_detections = self.application_limited_detections;
         snapshot.application_limited_detections_suppressed_by_waiting_writer =
@@ -153,6 +158,67 @@ impl CumulativeCounters {
 
     fn since(self, baseline: Self) -> Self {
         let since = |current: u64, previous: u64| current.saturating_sub(previous);
+        let group_sizes_since =
+            |current: MetricsFecGroupSizeBuckets, previous: MetricsFecGroupSizeBuckets| {
+                MetricsFecGroupSizeBuckets {
+                    one: since(current.one, previous.one),
+                    two_to_four: since(current.two_to_four, previous.two_to_four),
+                    five_to_seven: since(current.five_to_seven, previous.five_to_seven),
+                    full_eight: since(current.full_eight, previous.full_eight),
+                }
+            };
+        let fec = self.fec.map(|current| {
+            let previous = baseline.fec.unwrap_or_default();
+            MetricsFecCounters {
+                parity_sent: since(current.parity_sent, previous.parity_sent),
+                groups_flushed: since(current.groups_flushed, previous.groups_flushed),
+                flushed_group_sizes: group_sizes_since(
+                    current.flushed_group_sizes,
+                    previous.flushed_group_sizes,
+                ),
+                groups_skipped_no_surplus_tokens: since(
+                    current.groups_skipped_no_surplus_tokens,
+                    previous.groups_skipped_no_surplus_tokens,
+                ),
+                no_surplus_group_sizes: group_sizes_since(
+                    current.no_surplus_group_sizes,
+                    previous.no_surplus_group_sizes,
+                ),
+                groups_skipped_burst_end: since(
+                    current.groups_skipped_burst_end,
+                    previous.groups_skipped_burst_end,
+                ),
+                burst_end_group_sizes: group_sizes_since(
+                    current.burst_end_group_sizes,
+                    previous.burst_end_group_sizes,
+                ),
+                groups_skipped_loss_gate: since(
+                    current.groups_skipped_loss_gate,
+                    previous.groups_skipped_loss_gate,
+                ),
+                loss_gate_group_sizes: group_sizes_since(
+                    current.loss_gate_group_sizes,
+                    previous.loss_gate_group_sizes,
+                ),
+                groups_skipped_no_spare_capacity: since(
+                    current.groups_skipped_no_spare_capacity,
+                    previous.groups_skipped_no_spare_capacity,
+                ),
+                no_spare_capacity_group_sizes: group_sizes_since(
+                    current.no_spare_capacity_group_sizes,
+                    previous.no_spare_capacity_group_sizes,
+                ),
+                recovered_symbols: since(current.recovered_symbols, previous.recovered_symbols),
+                dropped_malformed_packets: since(
+                    current.dropped_malformed_packets,
+                    previous.dropped_malformed_packets,
+                ),
+                dropped_decoder_panics: since(
+                    current.dropped_decoder_panics,
+                    previous.dropped_decoder_panics,
+                ),
+            }
+        });
         Self {
             retransmission: MetricsRetransmissionCounters {
                 attempts: since(
@@ -188,6 +254,7 @@ impl CumulativeCounters {
                     baseline.retransmission.tail_probes,
                 ),
             },
+            fec,
             rto_deadline_postponements: since(
                 self.rto_deadline_postponements,
                 baseline.rto_deadline_postponements,
@@ -688,7 +755,7 @@ impl PerfTrace {
         let mut out = csv_writer(self.output_dir.join("netem.csv"))?;
         writeln!(
             out,
-            "elapsed_us,trace_elapsed_us,direction,delayed,dropped,duplicated,reordered,rate_limited,forwarded,received,overflow_dropped,queue_len"
+            "elapsed_us,trace_elapsed_us,direction,delayed,dropped,duplicated,reordered,rate_limited,forwarded,received,forwarded_bytes, received_bytes,overflow_dropped,scheduled_drain_batches,scheduled_drain_packets,scheduled_drain_max_packets,queue_len"
         )?;
         for observation in &self.netem {
             write_netem_row(
@@ -939,6 +1006,43 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
                 .pre_outage_reason
                 .to_string(),
             snapshot.retransmission_counters.tail_probes.to_string(),
+        ]);
+        if let Some(fec) = snapshot.fec_counters {
+            fields.extend([
+                fec.parity_sent.to_string(),
+                fec.groups_flushed.to_string(),
+                fec.flushed_group_sizes.one.to_string(),
+                fec.flushed_group_sizes.two_to_four.to_string(),
+                fec.flushed_group_sizes.five_to_seven.to_string(),
+                fec.flushed_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_no_surplus_tokens.to_string(),
+                fec.no_surplus_group_sizes.one.to_string(),
+                fec.no_surplus_group_sizes.two_to_four.to_string(),
+                fec.no_surplus_group_sizes.five_to_seven.to_string(),
+                fec.no_surplus_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_burst_end.to_string(),
+                fec.burst_end_group_sizes.one.to_string(),
+                fec.burst_end_group_sizes.two_to_four.to_string(),
+                fec.burst_end_group_sizes.five_to_seven.to_string(),
+                fec.burst_end_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_loss_gate.to_string(),
+                fec.loss_gate_group_sizes.one.to_string(),
+                fec.loss_gate_group_sizes.two_to_four.to_string(),
+                fec.loss_gate_group_sizes.five_to_seven.to_string(),
+                fec.loss_gate_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_no_spare_capacity.to_string(),
+                fec.no_spare_capacity_group_sizes.one.to_string(),
+                fec.no_spare_capacity_group_sizes.two_to_four.to_string(),
+                fec.no_spare_capacity_group_sizes.five_to_seven.to_string(),
+                fec.no_spare_capacity_group_sizes.full_eight.to_string(),
+                fec.recovered_symbols.to_string(),
+                fec.dropped_malformed_packets.to_string(),
+                fec.dropped_decoder_panics.to_string(),
+            ]);
+        } else {
+            fields.extend(std::iter::repeat_with(String::new).take(29));
+        }
+        fields.extend([
             snapshot.next_send_sequence.to_string(),
             optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
             snapshot.smoothed_rtt.as_micros().to_string(),
@@ -1042,7 +1146,7 @@ fn write_netem_row(
     let stats = snapshot.stats;
     writeln!(
         out,
-        "{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         elapsed.as_micros(),
         trace_elapsed.as_micros(),
         direction,
@@ -1053,7 +1157,12 @@ fn write_netem_row(
         stats.rate_limited,
         stats.forwarded,
         stats.received,
+        stats.forwarded_bytes,
+        stats.received_bytes,
         stats.overflow_dropped,
+        stats.scheduled_drain_batches,
+        stats.scheduled_drain_packets,
+        stats.scheduled_drain_max_packets,
         snapshot.queue_len,
     )
 }
@@ -1223,14 +1332,56 @@ mod tests {
 
     #[test]
     fn event_only_and_snapshot_rows_match_the_schema_width() {
-        assert_eq!(RTP_TRACE_HEADER.split(',').count(), 73);
-        let snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
+        assert_eq!(RTP_TRACE_HEADER.split(',').count(), 102);
+        let mut snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
+        snapshot.snapshot.as_mut().unwrap().fec_counters = Some(MetricsFecCounters {
+            parity_sent: 1,
+            groups_flushed: 2,
+            flushed_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 3,
+                two_to_four: 4,
+                five_to_seven: 5,
+                full_eight: 6,
+            },
+            groups_skipped_no_surplus_tokens: 7,
+            no_surplus_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 8,
+                two_to_four: 9,
+                five_to_seven: 10,
+                full_eight: 11,
+            },
+            groups_skipped_burst_end: 12,
+            burst_end_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 13,
+                two_to_four: 14,
+                five_to_seven: 15,
+                full_eight: 16,
+            },
+            groups_skipped_loss_gate: 17,
+            loss_gate_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 18,
+                two_to_four: 19,
+                five_to_seven: 20,
+                full_eight: 21,
+            },
+            groups_skipped_no_spare_capacity: 22,
+            no_spare_capacity_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 23,
+                two_to_four: 24,
+                five_to_seven: 25,
+                full_eight: 26,
+            },
+            recovered_symbols: 27,
+            dropped_malformed_packets: 28,
+            dropped_decoder_panics: 29,
+        });
         let mut event_only = observation(1, 1, MetricsEvent::RttSample);
         event_only.snapshot = None;
         let trace_elapsed = Duration::from_micros(123);
-        assert_eq!(rtp_fields(snapshot, trace_elapsed).len(), 73);
+        let snapshot_fields = rtp_fields(snapshot, trace_elapsed);
+        assert_eq!(snapshot_fields.len(), 102);
         let event_only_fields = rtp_fields(event_only, trace_elapsed);
-        assert_eq!(event_only_fields.len(), 73);
+        assert_eq!(event_only_fields.len(), 102);
         assert_eq!(event_only_fields[7], "20000");
         assert!(
             event_only_fields[8..RTP_TRACE_COLUMNS - 1]
@@ -1238,6 +1389,38 @@ mod tests {
                 .all(String::is_empty)
         );
         assert_eq!(event_only_fields[RTP_TRACE_COLUMNS - 1], "123");
+
+        // The 29 typed FEC columns sit immediately after `tail_probe_attempts`.
+        let columns: Vec<&str> = RTP_TRACE_HEADER.split(',').collect();
+        let fec_start = columns
+            .iter()
+            .position(|column| *column == "tail_probe_attempts")
+            .unwrap()
+            + 1;
+        let fec_end = columns
+            .iter()
+            .position(|column| *column == "next_send_sequence")
+            .unwrap();
+        assert_eq!(fec_end - fec_start, 29);
+        for (index, column) in columns[fec_start..fec_end].iter().enumerate() {
+            assert!(
+                column.starts_with("fec_"),
+                "column {} must be an FEC column: {column}",
+                index
+            );
+        }
+        // Snapshot rows serialize every FEC member in header order ...
+        let expected_fec: Vec<&str> = vec![
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+            "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
+        ];
+        assert_eq!(&snapshot_fields[fec_start..fec_end], &expected_fec);
+        // ... while event-only rows leave them empty, preserving the width.
+        assert!(
+            event_only_fields[fec_start..fec_end]
+                .iter()
+                .all(String::is_empty)
+        );
     }
 
     #[test]
@@ -1279,9 +1462,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         let boundary = trace_start.elapsed();
         capture.begin_measurement(boundary);
-        // Warmup rows are discarded and the capacity state is reset.
+        // Warmup rows are discarded and the capacity state is reset, but the
+        // last pre-boundary snapshot is retained as the counter baseline.
         assert_eq!(capture.observations.lock().unwrap().len(), 0);
         assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 0);
+        assert!(
+            capture.counter_baseline.lock().unwrap().is_some(),
+            "begin_measurement must retain the last pre-boundary snapshot as the counter baseline"
+        );
         capture.record(observation(3, 3, MetricsEvent::SendDataPacketAttempt));
         let observations = capture.observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
@@ -1334,18 +1522,85 @@ mod tests {
 
     #[test]
     fn cumulative_counters_start_at_the_measurement_boundary() {
+        fn fec(base: u64, malformed: u64) -> MetricsFecCounters {
+            MetricsFecCounters {
+                parity_sent: base,
+                groups_flushed: base,
+                flushed_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_no_surplus_tokens: base,
+                no_surplus_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_burst_end: base,
+                burst_end_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_loss_gate: base,
+                loss_gate_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_no_spare_capacity: base,
+                no_spare_capacity_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                recovered_symbols: base,
+                dropped_malformed_packets: malformed,
+                dropped_decoder_panics: base,
+            }
+        }
+        // Stamp every cumulative retransmission and FEC member onto a
+        // snapshot; `malformed` lets the malformed-packet input decrease so
+        // the saturating subtraction is exercised.
+        fn stamp(snapshot: &mut MetricsSnapshot, base: u64, malformed: u64) {
+            snapshot.retransmission_counters = MetricsRetransmissionCounters {
+                attempts: base,
+                first_attempts: base,
+                repeat_attempts: base,
+                rto_reason: base,
+                reorder_reason: base,
+                fast_loss_reason: base,
+                pre_outage_reason: base,
+                tail_probes: base,
+            };
+            snapshot.fec_counters = Some(fec(base, malformed));
+            snapshot.rto_deadline_postponements = base;
+            snapshot.application_limited_detections = base;
+            snapshot.application_limited_detections_suppressed_by_waiting_writer = base;
+            snapshot.congestion_rate_samples = base;
+            snapshot.congestion_bandwidth_probe_decisions = base;
+            snapshot.congestion_bandwidth_probe_increases = base;
+            snapshot.congestion_bandwidth_probe_before_feedback = base;
+            snapshot.congestion_persistent_queue_resets = base;
+            snapshot.congestion_delay_drains = base;
+            snapshot.congestion_loss_backoffs = base;
+            snapshot.congestion_loss_backoff_floor_bindings = base;
+        }
+
         let trace_start = Instant::now();
         let capture = capture(trace_start, 8);
         let mut warmup = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
-        warmup.snapshot.as_mut().unwrap().rto_deadline_postponements = 10;
+        stamp(warmup.snapshot.as_mut().unwrap(), 10, 10);
         capture.record(warmup);
         std::thread::sleep(Duration::from_millis(2));
         let mut boundary_snapshot = observation(1, 1, MetricsEvent::ReceiveAckPacket);
-        boundary_snapshot
-            .snapshot
-            .as_mut()
-            .unwrap()
-            .rto_deadline_postponements = 17;
+        stamp(boundary_snapshot.snapshot.as_mut().unwrap(), 17, 17);
         capture.record(boundary_snapshot);
         std::thread::sleep(Duration::from_millis(2));
         let boundary = trace_start.elapsed();
@@ -1354,14 +1609,59 @@ mod tests {
         let baseline = capture.counter_baseline.lock().unwrap().unwrap();
         assert_eq!(baseline.rto_deadline_postponements, 17);
         let mut after = observation(2, 2, MetricsEvent::SendDataPacketAttempt);
-        after.snapshot.as_mut().unwrap().rto_deadline_postponements = 23;
+        // The malformed-packet input decreases from 17 to 12: saturating
+        // subtraction must rebase it to zero, never wrapping.
+        stamp(after.snapshot.as_mut().unwrap(), 23, 12);
         capture.record(after);
         let retained = capture.observations.lock().unwrap();
         assert_eq!(retained.len(), 1);
         let snapshot = retained[0].observation.snapshot.unwrap();
         drop(retained);
         let rebased = CumulativeCounters::from_snapshot(snapshot).since(baseline);
+        // Every retransmission member rebases 23 - 17.
+        assert_eq!(
+            rebased.retransmission,
+            MetricsRetransmissionCounters {
+                attempts: 6,
+                first_attempts: 6,
+                repeat_attempts: 6,
+                rto_reason: 6,
+                reorder_reason: 6,
+                fast_loss_reason: 6,
+                pre_outage_reason: 6,
+                tail_probes: 6,
+            }
+        );
+        // Every FEC member rebases 23 - 17 except the decreasing malformed
+        // input, which saturates to zero; the lane stays `Some` throughout.
+        assert_eq!(rebased.fec, Some(fec(6, 0)));
         assert_eq!(rebased.rto_deadline_postponements, 6);
+        assert_eq!(rebased.application_limited_detections, 6);
+        assert_eq!(rebased.application_limited_suppressions, 6);
+        assert_eq!(rebased.congestion_rate_samples, 6);
+        assert_eq!(rebased.congestion_probe_decisions, 6);
+        assert_eq!(rebased.congestion_probe_increases, 6);
+        assert_eq!(rebased.congestion_probe_before_feedback, 6);
+        assert_eq!(rebased.congestion_persistent_queue_resets, 6);
+        assert_eq!(rebased.congestion_delay_drains, 6);
+        assert_eq!(rebased.congestion_loss_backoffs, 6);
+        assert_eq!(rebased.congestion_loss_backoff_floor_bindings, 6);
+        // apply_to restores the typed FEC counters onto the snapshot.
+        let mut applied = snapshot;
+        rebased.apply_to(&mut applied);
+        assert_eq!(applied.fec_counters, Some(fec(6, 0)));
+        assert_eq!(applied.retransmission_counters.attempts, 6);
+        // A non-FEC lane stays `None`, never fabricated zero.
+        let mut no_fec = observation(3, 3, MetricsEvent::SendDataPacketAttempt);
+        stamp(no_fec.snapshot.as_mut().unwrap(), 23, 12);
+        no_fec.snapshot.as_mut().unwrap().fec_counters = None;
+        let mut no_fec_baseline = observation(4, 4, MetricsEvent::SendDataPacketAttempt);
+        stamp(no_fec_baseline.snapshot.as_mut().unwrap(), 17, 17);
+        no_fec_baseline.snapshot.as_mut().unwrap().fec_counters = None;
+        let rebased_none = CumulativeCounters::from_snapshot(no_fec.snapshot.unwrap()).since(
+            CumulativeCounters::from_snapshot(no_fec_baseline.snapshot.unwrap()),
+        );
+        assert_eq!(rebased_none.fec, None);
     }
 
     #[test]

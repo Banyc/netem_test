@@ -22,7 +22,7 @@ async fn spawn_echo_server_via(
     SocketAddr,
     tokio::sync::mpsc::Receiver<LaneClass>,
 )> {
-    let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
+    let server = RtpMuxServer::bind("127.0.0.1:0").await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     let (lane_tx, lane_rx) = tokio::sync::mpsc::channel(LANE_EVENT_CAPACITY);
@@ -75,7 +75,10 @@ fn connector_via(
     let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
         bind,
         bulk_addr,
-        fec: false,
+        interactive_fec_tuning: rtp::FecTuning::default(),
+        interactive_instream_group_fec: false,
+        interactive_metrics_observer: None,
+        bulk_metrics_observer: None,
         handshake: true,
         explorer: ExplorerConfig {
             enabled: false,
@@ -164,7 +167,7 @@ const CMD_PING: u8 = b'P';
 async fn spawn_cmd_server_via(
     task_tx: &crate::support::TestTaskSubmitter,
 ) -> io::Result<(SocketAddr, SocketAddr)> {
-    let server = RtpMuxServer::bind("127.0.0.1:0", false).await?;
+    let server = RtpMuxServer::bind("127.0.0.1:0").await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     // Session futures spawned by the SessionSpawner and the per-stream
@@ -780,7 +783,10 @@ async fn run_explorer_arm() -> ExplorerArm {
                 let (connector, driver) = RtpMuxConnector::with_config(RtpMuxConnectorConfig {
                     bind,
                     bulk_addr,
-                    fec: false,
+                    interactive_fec_tuning: rtp::FecTuning::default(),
+                    interactive_instream_group_fec: false,
+                    interactive_metrics_observer: None,
+                    bulk_metrics_observer: None,
                     handshake: true,
                     explorer: ExplorerConfig {
                         enabled: true,
