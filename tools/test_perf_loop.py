@@ -16,6 +16,15 @@ SPEC = importlib.util.spec_from_file_location("perf_loop", TOOLS)
 LOOP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(LOOP)
 
+# perf_loop refuses every output/temp path that escapes its safe root, so
+# unit-test scratch directories must live beneath ~/code/tmp regardless of
+# the ambient TMPDIR.
+_SAFE_TEST_TMP = LOOP.SAFE_TEMP_ROOT / "perf-loop-unit-tests"
+_SAFE_TEST_TMP.mkdir(parents=True, exist_ok=True)
+os.environ["TMPDIR"] = str(_SAFE_TEST_TMP)
+os.environ["TMP"] = str(_SAFE_TEST_TMP)
+os.environ["TEMP"] = str(_SAFE_TEST_TMP)
+
 
 class PerfLoopTest(unittest.TestCase):
     def make_workspace(self, root, name):
@@ -311,6 +320,10 @@ class PerfLoopTest(unittest.TestCase):
                 candidate=str(workspace),
                 baseline=str(workspace),
                 same_binary_control=True,
+                same_workspace_treatment=False,
+                candidate_fec="same",
+                instream_group_fec=False,
+                scenario="bulk",
                 fail_on_control_instability=True,
                 fail_on_regression=False,
                 seeds=(11, 21),
@@ -337,9 +350,11 @@ class PerfLoopTest(unittest.TestCase):
                     "seed": str(seed),
                     "executable": kwargs["executable"],
                     "trace_dir": str(output_root / f"trace-{role}-{seed}"),
+                    "fec": "true" if kwargs["fec"] else "false",
+                    "scenario": kwargs["scenario"],
                 }
 
-            def fake_call_compare(baseline_dirs, candidate_dirs, output_root):
+            def fake_call_compare(baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()):
                 (Path(output_root) / "comparison.json").write_text(
                     json.dumps(comparison), encoding="utf-8"
                 )
@@ -354,6 +369,11 @@ class PerfLoopTest(unittest.TestCase):
                 (output_root / "run.json").read_text(encoding="utf-8")
             )
             self.assertEqual(run_json["pair_execution_order"], "alternating")
+            self.assertEqual(run_json["scenario"], "bulk")
+            self.assertEqual(run_json["candidate_fec"], "same")
+            self.assertFalse(run_json["instream_group_fec"])
+            self.assertFalse(run_json["same_workspace_treatment"])
+            self.assertEqual(run_json["allowed_config_mismatches"], [])
             self.assertTrue(run_json["same_binary_control"])
             self.assertEqual(
                 run_json["control_calibration"]["classification"], "unstable"
@@ -411,14 +431,21 @@ class PerfLoopTest(unittest.TestCase):
                 warmup_seconds=2.5,
                 mss_bytes=1400,
                 revision="abc123",
+                scenario="message-latency",
+                fec=True,
+                instream_group_fec=True,
+                retransmission_armor=True,
+                candidate_fec="off",
                 subprocess_runner=fake_run,
             )
             self.assertEqual(len(calls), 1)
             env = calls[0]["env"]
             self.assertEqual(env["NETEM_PERF_LINK_PROFILE"], "clean")
             self.assertEqual(env["NETEM_PERF_MSS_BYTES"], "1400")
-            self.assertEqual(env["NETEM_PERF_FEC"], "0")
-            self.assertEqual(env["RTP_RTX_DUP"], "0")
+            self.assertEqual(env["NETEM_PERF_FEC"], "1")
+            self.assertEqual(env["NETEM_PERF_INSTREAM_GROUP_FEC"], "1")
+            self.assertEqual(env["NETEM_PERF_SCENARIO"], "message-latency")
+            self.assertEqual(env["RTP_RTX_DUP"], "1")
             self.assertEqual(env["NETEM_PERF_DIAGNOSTIC_MODE"], "1")
             self.assertEqual(env["NETEM_PERF_SEED"], "11")
             self.assertEqual(env["NETEM_PERF_WINDOW_SECONDS"], "10")
@@ -429,19 +456,25 @@ class PerfLoopTest(unittest.TestCase):
             self.assertTrue(str(env["TMPDIR"]).startswith(str(LOOP.SAFE_TEMP_ROOT)))
             self.assertTrue(str(env["CARGO_TARGET_DIR"]).startswith(str(LOOP.SAFE_TEMP_ROOT)))
             # The frozen executable is invoked directly: the command begins
-            # with its resolved path and contains no cargo.
+            # with its resolved path, selects the scenario's probe test, and
+            # contains no cargo.
             command = calls[0]["command"]
             self.assertEqual(command[0], str(executable.resolve()))
+            self.assertEqual(command[1], LOOP.PROBE_TESTS["message-latency"])
+            self.assertNotEqual(command[1], LOOP.PERF_TEST)
             self.assertTrue(all("cargo" not in part for part in command))
-            self.assertIn(LOOP.PERF_TEST, command)
+            self.assertIn("--ignored", command)
             # Manifest component metadata is present and sorted, and the row
-            # records the resolved executable.
+            # records the resolved executable plus scenario/FEC evidence.
             self.assertEqual(row["runner_exit"], 0)
             self.assertEqual(row["role"], "baseline")
             self.assertEqual(row["link_profile"], "clean")
             self.assertEqual(row["mss_bytes"], "1400")
-            self.assertEqual(row["fec"], "false")
-            self.assertEqual(row["retransmission_armor"], "false")
+            self.assertEqual(row["fec"], "true")
+            self.assertEqual(row["instream_group_fec"], "true")
+            self.assertEqual(row["retransmission_armor"], "true")
+            self.assertEqual(row["scenario"], "message-latency")
+            self.assertEqual(row["candidate_fec"], "off")
             self.assertEqual(row["warmup_seconds"], "2.5")
             self.assertEqual(row["executable"], str(executable.resolve()))
             components = json.loads(row["components"])
@@ -449,6 +482,13 @@ class PerfLoopTest(unittest.TestCase):
                 list(components.keys()),
                 sorted(LOOP.COMPONENTS),
             )
+            # The scenario and FEC settings are recorded in the trace manifest.
+            manifest = (
+                output_root / f"trace-baseline-{row['seed']}" / "manifest.csv"
+            ).read_text(encoding="utf-8")
+            self.assertIn("scenario,message-latency", manifest)
+            self.assertIn("instream_group_fec,true", manifest)
+            self.assertIn("candidate_fec,off", manifest)
 
     def test_build_probe_freezes_executable_before_measurement(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
@@ -511,6 +551,13 @@ class PerfLoopTest(unittest.TestCase):
             self.assertTrue(
                 calls[0]["env"]["CARGO_TARGET_DIR"].startswith(str(LOOP.SAFE_TEMP_ROOT))
             )
+            # Inherited compiler wrappers and flags cannot alter the frozen
+            # bytes: RUSTC_WRAPPER and RUSTFLAGS are cleared beside the two
+            # existing wrapper clears.
+            self.assertEqual(calls[0]["env"]["RUST_WRAPPER"], "")
+            self.assertEqual(calls[0]["env"]["RUSTC_WORKSPACE_WRAPPER"], "")
+            self.assertEqual(calls[0]["env"]["RUSTC_WRAPPER"], "")
+            self.assertEqual(calls[0]["env"]["RUSTFLAGS"], "")
 
 
     def test_build_probe_preserves_roles_when_cargo_reuses_one_artifact_path(self):
@@ -693,7 +740,7 @@ class PerfLoopTest(unittest.TestCase):
             ["snapshot", "--source", "suite/netem_test", "--output", "/safe/snapshot",
              "--component-revision", "rtp=abc", "--component-revision", "mux=def"]
         )
-        self.assertEqual(override.component_revision, ["rtp=abc", "mux=def"])
+        self.assertEqual(override.component_revision, [("rtp", "abc"), ("mux", "def")])
         fake_parser = mock.Mock()
         fake_parser.parse_args.return_value = argparse.Namespace(handler=lambda _: 0)
         with mock.patch.object(LOOP, "build_parser", return_value=fake_parser):
@@ -825,6 +872,28 @@ class PerfLoopTest(unittest.TestCase):
                 LOOP.load_probe_source_manifest(manifest_path, executable, "baseline"),
                 components,
             )
+            # A same-workspace treatment writes role-specific manifests
+            # against the SAME frozen executable bytes.
+            baseline_manifest = LOOP.write_probe_source_manifest(
+                root / "baseline-probe-source.json",
+                executable,
+                components,
+                "suite/netem_test",
+            )
+            candidate_manifest = LOOP.write_probe_source_manifest(
+                root / "candidate-probe-source.json",
+                executable,
+                components,
+                "suite/netem_test",
+            )
+            self.assertEqual(
+                json.loads(baseline_manifest.read_text(encoding="utf-8"))[
+                    "executable_sha256"
+                ],
+                json.loads(candidate_manifest.read_text(encoding="utf-8"))[
+                    "executable_sha256"
+                ],
+            )
             # Different bytes on the same path must fail the SHA-256 binding.
             executable.write_bytes(b"#!/bin/sh\n# changed\n")
             with self.assertRaisesRegex(ValueError, "SHA-256"):
@@ -938,6 +1007,10 @@ class PerfLoopTest(unittest.TestCase):
                 candidate=str(workspace),
                 baseline=str(workspace),
                 same_binary_control=True,
+                same_workspace_treatment=False,
+                candidate_fec="same",
+                instream_group_fec=False,
+                scenario="bulk",
                 fail_on_control_instability=True,
                 fail_on_regression=False,
                 seeds=(11, 21),
@@ -964,9 +1037,11 @@ class PerfLoopTest(unittest.TestCase):
                     "seed": str(seed),
                     "executable": kwargs["executable"],
                     "trace_dir": str(output_root / f"trace-{role}-{seed}"),
+                    "fec": "true" if kwargs["fec"] else "false",
+                    "scenario": kwargs["scenario"],
                 }
 
-            def fake_call_compare(baseline_dirs, candidate_dirs, output_root):
+            def fake_call_compare(baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()):
                 (Path(output_root) / "comparison.json").write_text(
                     json.dumps(comparison), encoding="utf-8"
                 )
@@ -1009,6 +1084,293 @@ class PerfLoopTest(unittest.TestCase):
                 (output_root / "baseline-probe-source.json").is_file()
             )
 
+    def test_same_workspace_fec_treatment_builds_once_and_reuses_exact_binary(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            workspace = self.make_workspace(root, "netem_test")
+            output_root = root / "out"
+            executable = root / "bin" / "perf_probe-frozen"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            build_roles = []
+            run_calls = []
+            compare_allowlists = []
+
+            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+                build_roles.append(role)
+                return str(executable.resolve())
+
+            def fake_run_probe(workspace, seed, role, output_root, **kwargs):
+                run_calls.append(
+                    {
+                        "role": role,
+                        "seed": seed,
+                        "fec": kwargs["fec"],
+                        "scenario": kwargs["scenario"],
+                        "instream_group_fec": kwargs["instream_group_fec"],
+                    }
+                )
+                return {
+                    "runner_exit": 0,
+                    "role": role,
+                    "seed": str(seed),
+                    "executable": kwargs["executable"],
+                    "trace_dir": str(output_root / f"trace-{role}-{seed}"),
+                    "fec": "true" if kwargs["fec"] else "false",
+                    "scenario": kwargs["scenario"],
+                }
+
+            def fake_call_compare(baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()):
+                compare_allowlists.append(tuple(sorted(allowed_config_mismatches)))
+                (Path(output_root) / "comparison.json").write_text(
+                    json.dumps(
+                        {
+                            "evidence_quality": "healthy",
+                            "verdict": "no_material_change",
+                            "runs": [],
+                            "pairs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess([], 0, b"", b"")
+
+            args = argparse.Namespace(
+                mss_bytes=8192,
+                fec=False,
+                retransmission_armor=False,
+                candidate=str(workspace),
+                baseline=str(workspace),
+                same_binary_control=False,
+                same_workspace_treatment=True,
+                candidate_fec="on",
+                instream_group_fec=False,
+                scenario="bulk",
+                fail_on_control_instability=False,
+                fail_on_regression=False,
+                seeds=(11, 21),
+                window_seconds=10,
+                label=None,
+                warmup_seconds=LOOP.DEFAULT_WARMUP_SECONDS,
+                baseline_executable=None,
+                release=True,
+                target_dir=None,
+                candidate_executable=None,
+                baseline_source_manifest=None,
+                candidate_source_manifest=None,
+                output=str(output_root),
+                link_profile="fec-paired-saturated",
+            )
+
+            with mock.patch.object(LOOP, "build_probe", fake_build_probe), mock.patch.object(
+                LOOP, "run_probe", fake_run_probe
+            ), mock.patch.object(LOOP, "call_compare", fake_call_compare):
+                exit_code = LOOP.command_run(args)
+            self.assertEqual(exit_code, 0)
+            # The treatment builds and freezes ONE executable before timing;
+            # baseline and candidate are never compiled separately.
+            self.assertEqual(build_roles, ["treatment"])
+            self.assertEqual(compare_allowlists, [("fec",)])
+            baseline_fec = [call["fec"] for call in run_calls if call["role"] == "baseline"]
+            candidate_fec = [call["fec"] for call in run_calls if call["role"] == "candidate"]
+            self.assertEqual(baseline_fec, [False, False])
+            self.assertEqual(candidate_fec, [True, True])
+            self.assertEqual(len(run_calls), 4)
+            run_json = json.loads(
+                (output_root / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(run_json["same_workspace_treatment"])
+            self.assertEqual(run_json["scenario"], "bulk")
+            self.assertEqual(run_json["candidate_fec"], "on")
+            self.assertFalse(run_json["instream_group_fec"])
+            self.assertEqual(run_json["allowed_config_mismatches"], ["fec"])
+            self.assertEqual(
+                run_json["builds"]["baseline"]["executable"],
+                str(executable.resolve()),
+            )
+            self.assertEqual(
+                run_json["builds"]["baseline"]["sha256"],
+                run_json["builds"]["candidate"]["sha256"],
+            )
+            self.assertEqual(
+                run_json["builds"]["baseline"]["log"],
+                str((output_root / "build-treatment.log").resolve()),
+            )
+            self.assertEqual(
+                run_json["builds"]["candidate"]["log"],
+                str((output_root / "build-treatment.log").resolve()),
+            )
+            # Role-specific source manifests bind the same executable bytes,
+            # and every timed run reuses that exact frozen binary.
+            self.assertTrue((output_root / "baseline-probe-source.json").is_file())
+            self.assertTrue((output_root / "candidate-probe-source.json").is_file())
+            self.assertTrue(
+                all(
+                    run["executable"] == str(executable.resolve())
+                    for run in run_json["runs"]
+                )
+            )
+            self.assertTrue(
+                all(run["fec"] == "true" for run in run_json["runs"] if run["role"] == "candidate")
+            )
+            self.assertTrue(
+                all(run["fec"] == "false" for run in run_json["runs"] if run["role"] == "baseline")
+            )
+            # The per-role manifest.csv records the scenario and FEC evidence.
+            manifest_rows = (output_root / "manifest.csv").read_text(encoding="utf-8")
+            self.assertIn("scenario", manifest_rows)
+            self.assertIn("candidate_fec", manifest_rows)
+
+    def test_parser_accepts_component_revisions_scenarios_and_treatments(self):
+        parser = LOOP.build_parser()
+        self.assertEqual(LOOP.parse_component_revision("rtp=abc"), ("rtp", "abc"))
+        self.assertEqual(
+            LOOP.parse_component_revision("rtp=rev=with=equals"),
+            ("rtp", "rev=with=equals"),
+        )
+        for invalid in ("rtp", "=abc", "rtp=", ""):
+            with self.assertRaisesRegex(argparse.ArgumentTypeError, "COMPONENT=REVISION"):
+                LOOP.parse_component_revision(invalid)
+        snapshot = parser.parse_args(
+            ["snapshot", "--source", "suite/netem_test", "--output", "/safe/snapshot",
+             "--component-revision", "rtp=abc", "--component-revision", "mux=def"]
+        )
+        self.assertEqual(snapshot.component_revision, [("rtp", "abc"), ("mux", "def")])
+        treatment = parser.parse_args(
+            [
+                "run",
+                "--baseline", "/suite/b",
+                "--candidate", "/suite/c",
+                "--scenario", "message-latency",
+                "--candidate-fec", "on",
+                "--instream-group-fec",
+                "--same-workspace-treatment",
+            ]
+        )
+        self.assertEqual(treatment.scenario, "message-latency")
+        self.assertEqual(treatment.candidate_fec, "on")
+        self.assertTrue(treatment.instream_group_fec)
+        self.assertTrue(treatment.same_workspace_treatment)
+        defaults = parser.parse_args(["run", "--baseline", "/b", "--candidate", "/c"])
+        self.assertEqual(defaults.scenario, "bulk")
+        self.assertEqual(defaults.candidate_fec, "same")
+        self.assertFalse(defaults.instream_group_fec)
+        self.assertFalse(defaults.same_workspace_treatment)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["run", "--baseline", "/b", "--candidate", "/c", "--scenario", "bogus"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["run", "--baseline", "/b", "--candidate", "/c", "--candidate-fec", "bogus"])
+        source_manifests = parser.parse_args(
+            [
+                "run",
+                "--baseline", "/suite/b",
+                "--candidate", "/suite/c",
+                "--baseline-source-manifest", "/safe/base.json",
+                "--candidate-source-manifest", "/safe/cand.json",
+            ]
+        )
+        self.assertEqual(source_manifests.baseline_source_manifest, Path("/safe/base.json"))
+        self.assertEqual(source_manifests.candidate_source_manifest, Path("/safe/cand.json"))
+
+    def test_treatment_rejects_every_invalid_combination(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            workspace = self.make_workspace(root, "netem_test")
+            other = self.make_workspace(root, "other")
+
+            def make_args(**overrides):
+                values = dict(
+                    mss_bytes=8192,
+                    fec=False,
+                    retransmission_armor=False,
+                    same_binary_control=False,
+                    same_workspace_treatment=False,
+                    candidate_fec="same",
+                    instream_group_fec=False,
+                    scenario="bulk",
+                    fail_on_control_instability=False,
+                    fail_on_regression=False,
+                    seeds=(11,),
+                    window_seconds=10,
+                    label=None,
+                    warmup_seconds=LOOP.DEFAULT_WARMUP_SECONDS,
+                    baseline_executable=None,
+                    release=True,
+                    target_dir=None,
+                    candidate_executable=None,
+                    baseline_source_manifest=None,
+                    candidate_source_manifest=None,
+                    output=str(root / "out"),
+                    link_profile="fec-paired-saturated",
+                )
+                values.update(overrides)
+                return argparse.Namespace(**values)
+
+            # A treatment cannot ride a same-binary control.
+            with self.assertRaisesRegex(SystemExit, "same-binary-control"):
+                LOOP.command_run(
+                    make_args(
+                        baseline=str(workspace),
+                        candidate=str(workspace),
+                        same_binary_control=True,
+                        same_workspace_treatment=True,
+                        candidate_fec="on",
+                    )
+                )
+            # A treatment cannot cross distinct workspaces.
+            with self.assertRaisesRegex(SystemExit, "identical resolved workspaces"):
+                LOOP.command_run(
+                    make_args(
+                        baseline=str(workspace),
+                        candidate=str(other),
+                        same_workspace_treatment=True,
+                        candidate_fec="on",
+                    )
+                )
+            # A treatment needs an explicit role difference.
+            with self.assertRaisesRegex(SystemExit, "explicit role difference"):
+                LOOP.command_run(
+                    make_args(
+                        baseline=str(workspace),
+                        candidate=str(workspace),
+                        same_workspace_treatment=True,
+                        candidate_fec="same",
+                    )
+                )
+            # Requested but not actual: --candidate-fec on with --fec already on
+            # leaves no runtime difference to treat.
+            with self.assertRaisesRegex(SystemExit, "explicit role difference"):
+                LOOP.command_run(
+                    make_args(
+                        baseline=str(workspace),
+                        candidate=str(workspace),
+                        same_workspace_treatment=True,
+                        candidate_fec="on",
+                        fec=True,
+                    )
+                )
+            # A runtime FEC difference outside treatment mode is confounded
+            # across distinct workspaces or binaries.
+            with self.assertRaisesRegex(SystemExit, "requires --same-workspace-treatment"):
+                LOOP.command_run(
+                    make_args(
+                        baseline=str(workspace),
+                        candidate=str(other),
+                        candidate_fec="on",
+                    )
+                )
+            # Prebuilt role executables break the single-binary treatment contract.
+            with self.assertRaisesRegex(SystemExit, "builds and freezes one executable"):
+                LOOP.command_run(
+                    make_args(
+                        baseline=str(workspace),
+                        candidate=str(workspace),
+                        same_workspace_treatment=True,
+                        candidate_fec="on",
+                        baseline_executable="/bin/base",
+                        candidate_executable="/bin/cand",
+                    )
+                )
 
     def test_suite_revisions_rejects_components_at_the_same_commit(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:

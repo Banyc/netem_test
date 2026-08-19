@@ -186,9 +186,10 @@ Both roles are prebuilt once, baseline before candidate
 --message-format=json-render-diagnostics` per role, streamed to
 `build-ROLE.log`) before any timed run. Every build runs with
 `CARGO_TARGET_DIR` set to a canonical hash-suffixed directory beneath
-`$TMPDIR` whose final path component is literally `target`, and with both
-`RUST_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` cleared so sccache or other
-inherited compiler wrappers cannot alter the build. The executable is parsed
+`$TMPDIR` whose final path component is literally `target`, and with
+`RUST_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_WRAPPER`, and `RUSTFLAGS`
+cleared so sccache or other inherited compiler wrappers or flags cannot
+alter the build. The executable is parsed
 only from `compiler-artifact` messages whose target is `perf_probe` with a
 `test` kind. Immediately after each build — and before the next role builds —
 the runner copies the artifact to a SHA-256-addressed sibling in the same
@@ -236,15 +237,109 @@ validates both executables and records their paths and SHA-256 digests as
 prebuilt in `run.json`. Supply both flags or neither; the caller is responsible
 for matching each binary to its workspace revisions.
 
+A `--same-workspace-treatment` run builds and freezes exactly one executable
+before any timed run (into `build-treatment.log` and
+`output_root/frozen/treatment/...`) and reuses those exact bytes for both
+roles, so baseline and candidate are never compiled separately; role-specific
+source manifests are written against that one SHA-256 and the role hashes are
+verified identical.
+
 ## FEC and retransmission-armor pairing
 
 `--fec` and `--retransmission-armor` are paired run flags: when set, every
 probe runs with `NETEM_PERF_FEC=1` and `RTP_RTX_DUP=1` respectively (0
-otherwise). Both values are recorded in `run.json`, in every `manifest.csv`
-row, and in each `trace-<role>-<seed>` trace manifest (keys `fec` and
-`retransmission_armor`), so paired comparisons and archived traces stay
-config-honest. The probe parses both variables strictly as `0|1|false|true`
+otherwise). `--instream-group-fec` is the paired in-stream group FEC switch
+(`NETEM_PERF_INSTREAM_GROUP_FEC=1`). All three values are recorded in
+`run.json`, in every `manifest.csv` row, and in each `trace-<role>-<seed>`
+trace manifest, so paired comparisons and archived traces stay
+config-honest. The probe parses both FEC variables strictly as `0|1|false|true`
 and passes FEC to both RTP endpoints.
+
+## Same-executable FEC treatment
+
+A treatment run compares one workspace with itself using ONE frozen
+executable; only explicit runtime FEC settings may differ between the
+baseline and candidate roles. `--same-workspace-treatment` requires
+identical resolved workspaces, refuses to ride `--same-binary-control`,
+rejects prebuilt role executables, and demands an explicit role difference:
+`--candidate-fec on|off` moves only the candidate's runtime FEC setting
+relative to the `--fec` baseline, and the comparator allowlist admits only
+`--allow-config-mismatch` keys that actually differ (`fec`, never anything
+else). The same-binary control remains a variance calibration and cannot
+carry a treatment.
+
+The runner builds and freezes the executable once before any timed run,
+reuses those exact bytes for both roles, writes role-specific source
+manifests (`{baseline,candidate}-probe-source.json`) against the same
+SHA-256, fails if the role hashes differ, and continues the counterbalanced
+role order and safe target/temp roots. Every build, run, and temporary
+artifact stays beneath `~/code/tmp`, and both roles record exact executable
+hashes, component revisions, scenario, FEC settings, and allowed mismatches.
+
+Treatment contracts: never compile baseline and candidate separately
+(different bytes would confound the runtime treatment), and do not use the
+`clean` lane as the primary FEC-win lane (without erasures it measures
+overhead, not recovery value).
+
+### Stochastic interactive default-on validation
+
+Validate the stochastic gaming lane with the default-on interactive FEC
+policy:
+
+```sh
+./tools/perf-loop run --baseline . --candidate . --same-workspace-treatment \
+--candidate-fec on --link-profile fec-gaming-fat-pipe --mss-bytes 1400 \
+--scenario bulk --seeds 11,21 --window-seconds 30
+```
+
+### Same-workspace paired-saturated treatment
+
+The paired-saturated lane keys loss to the same logical RTP sequence with
+and without the 10-byte FEC data envelope, so the treatment isolates
+recovery value rather than packetization. The deterministic erasure
+complement is `--link-profile fec-recoverable-bottleneck`; the
+hostile-steady bottleneck lanes `hostile-bottleneck-20ms`/`-100ms`/`-300ms`
+add a rate-shaped 15% loss floor on top.
+
+```sh
+./tools/perf-loop run --baseline . --candidate . --same-workspace-treatment \
+--candidate-fec on --link-profile fec-paired-saturated --mss-bytes 8192 \
+--scenario bulk --seeds 11,21 --window-seconds 30
+```
+
+### 20/100/300 ms RTT lanes and sparse-message scenarios
+
+Sparse-message calibration runs the message-latency probe on the periodic
+bottleneck lanes; it sends 64-byte timestamped messages every 100 ms and
+records delivery plus p50/p95/p99 latency. Copy-paste the 300 ms lane and
+swap `hostile-periodic-bottleneck-300ms` for `-100ms` or `-20ms`:
+
+```sh
+./tools/perf-loop run --baseline . --candidate . --same-workspace-treatment \
+--candidate-fec on --link-profile hostile-periodic-bottleneck-300ms \
+--mss-bytes 1400 --scenario message-latency --seeds 11,21 --window-seconds 30
+```
+
+The comparison classifies message scenarios by the p95/p99 tail direction
+together with wire-byte cost, so a near-zero goodput change is never treated
+as neutral when latency or wire overhead moved materially.
+
+### Reanalysis, exact evidence limits, and what to inspect
+
+Re-run the analysis on a preserved treatment result without rerunning any
+probe:
+
+```sh
+./tools/perf-loop analyze --result $TMPDIR/<run-output> [--update-run-json]
+```
+
+Before reading the verdict, inspect the trace health (`evidence_quality`),
+the paired deltas, the one largest material change in `largest_changes`, and
+`comparison.json`; every guidance item retains its `does_not_prove`
+boundary and no hint identifies a branch as causal. The allowlist recorded
+in `comparison.json` (`allowed_config_mismatches`) lists exactly the keys
+that differed (`fec`), so a treatment can never paper over an accidental
+`mss_bytes`, seed, link, or workspace difference.
 
 ## Same-binary control
 
@@ -274,14 +369,17 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
   role-independent `execution_order_analysis`, AB/BA
   `counterbalanced_goodput_analysis`, `within_run_phase_analysis`, `link_profile`,
   `mss_bytes`, workspaces, seeds, window, target directories, warmup duration,
-  same-binary control flag, control calibration, per-role builds (frozen
+  scenario, candidate FEC treatment, in-stream group FEC, retransmission-armor,
+  same-workspace-treatment flag, `allowed_config_mismatches`, same-binary control
+  flag, control calibration, per-role builds (frozen
   executable, SHA-256, built/prebuilt source, exact component revisions,
   component-revision source, source-manifest path, build log), per-role/seed
-  runs (with the `executable`) and their artifact paths, and the comparison
-  verdict.
+  runs (with the `executable`, per-role `fec`, and `scenario`) and their
+  artifact paths, and the comparison verdict.
 - `manifest.csv` — one row per role/seed probe: runner exit, role, Cargo
   profile, sorted component-revision JSON, seed, link profile, MSS,
-  resolved executable, trace dir.
+  scenario, FEC, in-stream group FEC, candidate FEC treatment, resolved
+  executable, trace dir.
 - `trace-<role>-<seed>/` — the probe's trace directory (manifest/rtp/rtp_
   peer/netem/progress) with the link profile and MSS recorded in its
   manifest.
@@ -430,6 +528,22 @@ Retransmission-scheduler evidence:
 - `tail_probe_attempts` — tail-loss probes emitted outside the ordinary
   retransmission-ready path.
 
+### FEC treatment evidence
+
+The typed FEC counters (`fec_parity_sent`, `fec_groups_flushed`, the four
+`fec_flushed_groups_*` size buckets, `fec_groups_skipped_*` with their four
+size buckets each, `fec_recovered_symbols`, `fec_dropped_malformed_packets`,
+and `fec_dropped_decoder_panics`) are connection-lifetime counters rebased at
+the measurement boundary. A lane without FEC records `None`, never a
+fabricated zero, so a treatment with FEC on must show real `parity_sent`
+work and, under erasure lanes, positive `recovered_symbols`. Sparse-message
+lanes additionally carry `message_latency_p50_ms`/`p95`/`p99`,
+`message_delivery_percent`, and `delivered_bytes`, with the netem
+`forwarded_bytes`/`received_bytes` totals letting the comparison price the
+wire cost per delivered byte. Inspect the trace health, the paired deltas,
+and the one largest material change before trusting any `does_not_prove`-
+bounded verdict.
+
 ## Verdicts and exit codes
 
 - `0` — the paired run completed and the comparison is valid.
@@ -455,10 +569,13 @@ invalid evidence.
 ## Safe paths and workspace topology
 
 - Baseline and candidate must be distinct resolved workspaces outside
-  same-binary control mode; `--same-binary-control` is the only mode that
-  permits identical workspaces, and it additionally requires the resolved
-  executable paths to match. A mutable workspace must not be used as both
-  roles, and debug/release evidence must not be mixed.
+  same-binary control and same-workspace-treatment modes;
+  `--same-binary-control` and `--same-workspace-treatment` are the only
+  modes that permit identical workspaces (the former for variance
+  calibration, the latter for a single-binary FEC treatment), and
+  `--same-binary-control` additionally requires the resolved executable
+  paths to match. A mutable workspace must not be used as both roles, and
+  debug/release evidence must not be mixed.
 - A frozen workspace has a `netem_test/` checkout with sibling `rtp`, `mux`,
   `rtp_mux`, `tokio_udp`, and `udp_listener` repositories; each component's
   jj revision is recorded in the manifest.
@@ -527,4 +644,8 @@ matches nothing is an error). The workload-owning thread is required when
 it avoids unrelated runtime samples.
 
 When comparing workloads that differ, compare samples per forwarded packet
-rather than raw sample counts.
+rather than raw sample counts. For sparse-message calibration lanes
+(`--scenario message-latency`), compare samples per delivered message and
+inspect p50/p95/p99 message latency and `message_delivery_percent` rather
+than raw sample counts or near-zero goodput; a tail shift with a wire-byte
+cost is material even when the delivered-byte rate barely moves.

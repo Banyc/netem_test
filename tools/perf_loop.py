@@ -27,6 +27,14 @@ DEFAULT_SEEDS = (11, 21)
 DEFAULT_WARMUP_SECONDS = 5.0
 MATERIAL_PHASE_DRIFT_PERCENT = 20.0
 PERF_TEST = "probe_hostile_goodput_30s"
+# Executable probes driven by the perf loop. The bulk goodput probe covers
+# the hostile-steady bottleneck, recoverable, gaming, and paired-saturated
+# lanes; the message-latency probe covers the 20/100/300 ms periodic
+# bottleneck lanes (both are ignored release-mode executable tests).
+PROBE_TESTS = {
+    "bulk": "probe_hostile_goodput_30s",
+    "message-latency": "probe_hostile_message_latency",
+}
 LINK_PROFILES = (
     "hostile",
     "lossy-400kib",
@@ -34,6 +42,15 @@ LINK_PROFILES = (
     "controller-fat-pipe",
     "clean",
     "direct",
+    "hostile-bottleneck-20ms",
+    "hostile-bottleneck-100ms",
+    "hostile-bottleneck-300ms",
+    "fec-recoverable-bottleneck",
+    "fec-gaming-fat-pipe",
+    "fec-paired-saturated",
+    "hostile-periodic-bottleneck-20ms",
+    "hostile-periodic-bottleneck-100ms",
+    "hostile-periodic-bottleneck-300ms",
 )
 COMPONENTS = ("netem_test", "rtp", "mux", "rtp_mux", "tokio_udp", "udp_listener")
 SUITE_REVISION_MANIFEST = "suite-revisions.json"
@@ -76,6 +93,20 @@ def parse_nonnegative_seconds(value):
     if not math.isfinite(seconds) or seconds < 0.0:
         raise argparse.ArgumentTypeError("seconds must be a finite non-negative number")
     return seconds
+
+
+def parse_component_revision(value):
+    """Parse one repeatable snapshot 'COMPONENT=REVISION' override.
+
+    Partition exactly once on '='; any missing part or an empty revision
+    part is a usage error, and the result is the (component, revision) pair.
+    """
+    component, separator, revision = value.partition("=")
+    if not separator or not component or not revision:
+        raise argparse.ArgumentTypeError(
+            "component revision must use COMPONENT=REVISION"
+        )
+    return (component, revision)
 
 
 def safe_output_dir(requested=None):
@@ -421,6 +452,8 @@ def stream_build_command(role, workspace, build_root, build_log, *, release=True
     env["CARGO_TARGET_DIR"] = str(build_root)
     env["RUST_WRAPPER"] = ""
     env["RUSTC_WORKSPACE_WRAPPER"] = ""
+    env["RUSTC_WRAPPER"] = ""
+    env["RUSTFLAGS"] = ""
     command = ["cargo", "test", "-j1"]
     if release:
         command.append("--release")
@@ -484,9 +517,16 @@ def run_probe(
     components=None,
     diagnostic_mode="1",
     subprocess_runner=subprocess.run,
+    scenario="bulk",
+    instream_group_fec=False,
+    candidate_fec="same",
 ):
     """Run one role/seed probe directly from its frozen executable;
     returns a manifest row.
+
+    The scenario selects the executable probe test; FEC, in-stream group
+    FEC, and retransmission-armor are explicit runtime settings recorded in
+    the run evidence, never inferred from the binary or the lane.
     """
     workspace = validate_workspace(workspace, role)
     executable = Path(executable).expanduser().resolve()
@@ -510,11 +550,14 @@ def run_probe(
     env["NETEM_PERF_LINK_PROFILE"] = link_profile
     env["NETEM_PERF_MSS_BYTES"] = str(mss_bytes)
     env["NETEM_PERF_FEC"] = "1" if fec else "0"
+    env["NETEM_PERF_INSTREAM_GROUP_FEC"] = "1" if instream_group_fec else "0"
+    env["NETEM_PERF_SCENARIO"] = scenario
     env["RTP_RTX_DUP"] = "1" if retransmission_armor else "0"
     env["NETEM_PERF_REVISION"] = revision
     env["NETEM_PERF_DIAGNOSTIC_MODE"] = diagnostic_mode
 
-    command = [str(executable), PERF_TEST, "--ignored", "--nocapture", "--test-threads=1"]
+    test = PROBE_TESTS[scenario]
+    command = [str(executable), test, "--ignored", "--nocapture", "--test-threads=1"]
     with open(log_path, "wb") as log:
         completed = subprocess_runner(
             command, cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT
@@ -535,6 +578,9 @@ def run_probe(
         ["perf_loop_role", role],
         ["perf_loop_profile", profile],
         ["perf_loop_components_json", json.dumps(components, sort_keys=True)],
+        ["scenario", scenario],
+        ["instream_group_fec", "true" if instream_group_fec else "false"],
+        ["candidate_fec", candidate_fec],
     )
     row = {
         "runner_exit": int(completed.returncode),
@@ -546,6 +592,9 @@ def run_probe(
         "mss_bytes": str(mss_bytes),
         "fec": "true" if fec else "false",
         "retransmission_armor": "true" if retransmission_armor else "false",
+        "scenario": scenario,
+        "instream_group_fec": "true" if instream_group_fec else "false",
+        "candidate_fec": candidate_fec,
         "warmup_seconds": str(warmup_seconds),
         "executable": str(executable),
         "trace_dir": str(trace_dir),
@@ -573,6 +622,9 @@ def write_manifest(output_root, rows):
                 "mss_bytes",
                 "fec",
                 "retransmission_armor",
+                "scenario",
+                "instream_group_fec",
+                "candidate_fec",
                 "executable",
                 "trace_dir",
                 "warmup_seconds",
@@ -582,12 +634,18 @@ def write_manifest(output_root, rows):
         writer.writerows(rows)
 
 
-def call_compare(baseline_dirs, candidate_dirs, output_root):
+def call_compare(
+    baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()
+):
+    """Run the paired comparison tool; the frozen allowlist suppresses only
+    the named CONFIG_KEYS that actually differ between the roles."""
     command = ["python3", str(Path(__file__).with_name("rtp_trace_compare.py"))]
     for label, trace_dir in baseline_dirs:
         command += ["--baseline", f"{label}={trace_dir}"]
     for label, trace_dir in candidate_dirs:
         command += ["--candidate", f"{label}={trace_dir}"]
+    for key in sorted(set(allowed_config_mismatches)):
+        command += ["--allow-config-mismatch", key]
     command += ["--out", str(output_root)]
     result = subprocess.run(command, capture_output=True, text=True)
     return result
@@ -970,18 +1028,73 @@ def counterbalanced_goodput_analysis(comparison, runs, order_analysis=None):
     }
 
 
+def role_fec_configuration(args, role):
+    """Explicit runtime FEC setting for one role of a paired run.
+
+    '--fec' fixes the baseline role; '--candidate-fec' selects whether the
+    candidate runs same/on/off relative to that baseline. The treatment is
+    only the explicit runtime FEC setting this creates, never the build.
+    """
+    candidate_fec = {"same": bool(args.fec), "on": True, "off": False}[args.candidate_fec]
+    return candidate_fec if role == "candidate" else bool(args.fec)
+
+
+def treatment_config_differences(args):
+    """CONFIG_KEYS that actually differ between the treatment roles.
+
+    Only explicit runtime FEC settings may differ in a same-workspace
+    treatment; the allowlist never admits a key whose values match.
+    """
+    differences = []
+    if bool(args.fec) != role_fec_configuration(args, "candidate"):
+        differences.append("fec")
+    return tuple(differences)
+
+
 def command_run(args):
     if args.mss_bytes <= 0:
         raise argparse.ArgumentTypeError("-mss-bytes must be positive")
     baseline = validate_workspace(Path(args.baseline), "baseline")
     candidate = validate_workspace(Path(args.candidate), "candidate")
-    if args.same_binary_control:
+    treatment = bool(args.same_workspace_treatment)
+    if treatment:
+        if args.same_binary_control:
+            raise SystemExit(
+                "--same-workspace-treatment cannot carry a treatment on "
+                "--same-binary-control; a same-binary control calibrates "
+                "variance only"
+            )
         if baseline != candidate:
             raise SystemExit(
-                "--same-binary-control requires identical resolved workspaces"
+                "--same-workspace-treatment requires identical resolved workspaces"
             )
-    elif baseline == candidate:
-        raise SystemExit("refusing to compare a workspace with itself")
+        if any((args.baseline_executable, args.candidate_executable)):
+            raise SystemExit(
+                "--same-workspace-treatment builds and freezes one executable; "
+                "prebuilt role executables would break the single-binary contract"
+            )
+        mismatches = treatment_config_differences(args)
+        if not mismatches:
+            raise SystemExit(
+                "--same-workspace-treatment requires an explicit role difference; "
+                "use --candidate-fec on|off so only the runtime FEC setting "
+                "actually differs"
+            )
+    else:
+        mismatches = ()
+        if args.candidate_fec != "same":
+            raise SystemExit(
+                "--candidate-fec on|off requires --same-workspace-treatment; a "
+                "runtime FEC difference across distinct workspaces or binaries "
+                "would confound the treatment"
+            )
+        if args.same_binary_control:
+            if baseline != candidate:
+                raise SystemExit(
+                    "--same-binary-control requires identical resolved workspaces"
+                )
+        elif baseline == candidate:
+            raise SystemExit("refusing to compare a workspace with itself")
     if args.label and args.label in (".", ".."):
         raise SystemExit("label must name a run")
     prebuilt = {
@@ -1020,12 +1133,14 @@ def command_run(args):
         for role, workspace in (("baseline", baseline), ("candidate", candidate))
     }
     source_manifest_paths = {}
+    build_logs = {}
     if all(prebuilt.values()):
         executables = {
             role: use_prebuilt_probe(prebuilt[role], role)
             for role in ("baseline", "candidate")
         }
         build_sources = {role: "prebuilt" for role in executables}
+        build_logs = {role: None for role in executables}
         if all(source_manifests.values()):
             for role in ("baseline", "candidate"):
                 manifest_path = Path(source_manifests[role]).expanduser().resolve()
@@ -1037,6 +1152,38 @@ def command_run(args):
                 source_manifest_paths[role] = manifest_path
         else:
             source_manifest_paths = {role: None for role in executables}
+    elif treatment:
+        # Build and freeze ONE exact executable before any timed run; both
+        # roles reuse those same bytes so only the explicit runtime FEC
+        # treatment differs. Never compile baseline and candidate separately.
+        executable = build_probe(
+            baseline,
+            "treatment",
+            output_root,
+            release=args.release,
+            target_dir=args.target_dir,
+        )
+        executables = {"baseline": executable, "candidate": executable}
+        build_sources = {role: "built" for role in executables}
+        build_logs = {
+            role: output_root / "build-treatment.log"
+            for role in executables
+        }
+        for role in ("baseline", "candidate"):
+            # Role-specific source manifests bound to the same executable bytes.
+            source_manifest_paths[role] = write_probe_source_manifest(
+                output_root / f"{role}-probe-source.json",
+                executable,
+                workspace_components[role],
+                str(baseline),
+            )
+        if getattr(args, "prune_role_target", False):
+            profile = "release" if args.release else "debug"
+            build_root = safe_build_dir(
+                args.target_dir, baseline.parent, profile
+            )
+            # Prune only after the frozen probe lives outside the target.
+            prune_built_role_target(build_root, executables["baseline"])
     else:
         # Prebuild both frozen executables once, before any timed run.
         executables = {}
@@ -1049,6 +1196,10 @@ def command_run(args):
                 target_dir=args.target_dir,
             )
         build_sources = {role: "built" for role in executables}
+        build_logs = {
+            role: output_root / f"build-{role}.log"
+            for role in executables
+        }
         for role, workspace in (("baseline", baseline), ("candidate", candidate)):
             source_manifest_paths[role] = write_probe_source_manifest(
                 output_root / f"{role}-probe-source.json",
@@ -1067,6 +1218,10 @@ def command_run(args):
         role: executable_sha256(executable)
         for role, executable in executables.items()
     }
+    if treatment and executable_hashes["baseline"] != executable_hashes["candidate"]:
+        raise SystemExit(
+            "--same-workspace-treatment requires executables with identical contents"
+        )
     if args.same_binary_control and (
         executable_hashes["baseline"] != executable_hashes["candidate"]
     ):
@@ -1091,8 +1246,11 @@ def command_run(args):
                 target_dir=args.target_dir,
                 link_profile=args.link_profile,
                 mss_bytes=args.mss_bytes,
-                fec=args.fec,
+                fec=role_fec_configuration(args, role),
                 retransmission_armor=args.retransmission_armor,
+                scenario=args.scenario,
+                instream_group_fec=args.instream_group_fec,
+                candidate_fec=args.candidate_fec,
                 window_seconds=args.window_seconds,
                 warmup_seconds=args.warmup_seconds,
                 revision=revisions[role]["commit_id"],
@@ -1106,6 +1264,8 @@ def command_run(args):
                     "runner_exit": row["runner_exit"],
                     "executable": row["executable"],
                     "trace_dir": row["trace_dir"],
+                    "fec": row["fec"],
+                    "scenario": row["scenario"],
                     "log": str(output_root / f"{role}-{seed}.log"),
                 }
             )
@@ -1121,7 +1281,12 @@ def command_run(args):
         for row in rows
         if row["role"] == "candidate"
     ]
-    compare = call_compare(baseline_dirs, candidate_dirs, output_root)
+    compare = call_compare(
+        baseline_dirs,
+        candidate_dirs,
+        output_root,
+        allowed_config_mismatches=mismatches,
+    )
     comparison = {}
     if (output_root / "comparison.json").exists():
         comparison = json.loads((output_root / "comparison.json").read_text(encoding="utf-8"))
@@ -1157,7 +1322,12 @@ def command_run(args):
         "link_profile": args.link_profile,
         "mss_bytes": args.mss_bytes,
         "fec": bool(args.fec),
+        "candidate_fec": args.candidate_fec,
+        "instream_group_fec": bool(args.instream_group_fec),
         "retransmission_armor": bool(args.retransmission_armor),
+        "scenario": args.scenario,
+        "same_workspace_treatment": bool(args.same_workspace_treatment),
+        "allowed_config_mismatches": sorted(mismatches),
         "baseline": str(baseline),
         "candidate": str(candidate),
         "label": args.label,
@@ -1180,7 +1350,7 @@ def command_run(args):
                     else None
                 ),
                 "log": (
-                    str(output_root / "build-baseline.log")
+                    str(build_logs["baseline"])
                     if build_sources["baseline"] == "built"
                     else None
                 ),
@@ -1197,7 +1367,7 @@ def command_run(args):
                     else None
                 ),
                 "log": (
-                    str(output_root / "build-candidate.log")
+                    str(build_logs["candidate"])
                     if build_sources["candidate"] == "built"
                     else None
                 ),
@@ -1278,6 +1448,7 @@ def build_parser():
         "--component-revision",
         action="append",
         default=[],
+        type=parse_component_revision,
         metavar="COMPONENT=REVISION",
         help="override one component's jj revision (repeatable)",
     )
@@ -1328,6 +1499,36 @@ def build_parser():
         help="enable FEC for every probe (NETEM_PERF_FEC=1)",
     )
     run.add_argument(
+        "--candidate-fec",
+        choices=("same", "on", "off"),
+        default="same",
+        help=(
+            "candidate FEC treatment relative to --fec; on|off require "
+            "--same-workspace-treatment so only the runtime FEC setting differs"
+        ),
+    )
+    run.add_argument(
+        "--instream-group-fec",
+        action="store_true",
+        default=False,
+        help="enable in-stream group FEC for every probe (NETEM_PERF_INSTREAM_GROUP_FEC=1)",
+    )
+    run.add_argument(
+        "--scenario",
+        choices=("bulk", "message-latency"),
+        default="bulk",
+        help="probe scenario: bulk goodput or sparse-message latency",
+    )
+    run.add_argument(
+        "--same-workspace-treatment",
+        action="store_true",
+        default=False,
+        help=(
+            "compare one workspace with itself using one frozen executable; "
+            "only the explicit runtime FEC treatment may differ"
+        ),
+    )
+    run.add_argument(
         "--retransmission-armor",
         dest="retransmission_armor",
         action="store_true",
@@ -1362,11 +1563,13 @@ def build_parser():
     )
     run.add_argument(
         "--baseline-source-manifest",
+        type=Path,
         default=None,
         help="probe source manifest for the prebuilt baseline; requires --candidate-source-manifest",
     )
     run.add_argument(
         "--candidate-source-manifest",
+        type=Path,
         default=None,
         help="probe source manifest for the prebuilt candidate; requires --baseline-source-manifest",
     )
