@@ -220,6 +220,49 @@ class SamplyHotspotsTest(unittest.TestCase):
         self.assertEqual(by_name["netem-c2s"]["cpu_active_samples"], 2)
         self.assertEqual(by_name["netem-c2s"]["cpu_active_percent"], 50.0)
 
+    def test_thread_inventory_reports_weighted_cpu_delta_shares(self):
+        def thread_with(name, cpu_deltas):
+            profile = sample_profile(
+                [[0] for _ in cpu_deltas],
+                frame_to_func=[0],
+                funcs=[(0, 0x1000, 0)],
+                libs=[],
+                strings=["work"],
+            )
+            thread = profile["threads"][0]
+            thread["name"] = name
+            thread["samples"]["threadCPUDelta"] = cpu_deltas
+            return thread
+
+        profile = {
+            "threads": [
+                thread_with("tokio-rt-worker", [0, 4]),
+                thread_with("tokio-rt-worker", [2]),
+                thread_with("netem-c2s", [3, 0, 1]),
+            ]
+        }
+        result = HOTSPOTS.summarize(
+            profile,
+            sidecar([], []),
+            thread_names=["tokio-rt-worker"],
+            cpu_active_only=True,
+        )
+
+        inventory = result["thread_inventory"]
+        self.assertTrue(inventory["cpu_active_complete"])
+        self.assertEqual(inventory["total_cpu_active_samples"], 4)
+        self.assertEqual(inventory["total_cpu_delta"], 10)
+        by_name = {entry["name"]: entry for entry in inventory["threads"]}
+        self.assertEqual(by_name["tokio-rt-worker"]["thread_count"], 2)
+        self.assertEqual(by_name["tokio-rt-worker"]["cpu_active_samples"], 2)
+        self.assertEqual(by_name["tokio-rt-worker"]["cpu_active_percent"], 50.0)
+        self.assertEqual(by_name["tokio-rt-worker"]["cpu_delta"], 6)
+        self.assertEqual(by_name["tokio-rt-worker"]["cpu_delta_percent"], 60.0)
+        self.assertEqual(by_name["netem-c2s"]["cpu_active_samples"], 2)
+        self.assertEqual(by_name["netem-c2s"]["cpu_active_percent"], 50.0)
+        self.assertEqual(by_name["netem-c2s"]["cpu_delta"], 4)
+        self.assertEqual(by_name["netem-c2s"]["cpu_delta_percent"], 40.0)
+
     def test_thread_filter_rejects_a_name_absent_from_the_profile(self):
         profile = sample_profile(
             [[0]],
@@ -267,6 +310,32 @@ class SamplyHotspotsTest(unittest.TestCase):
         self.assertEqual(result["total_samples"], 2)
         self.assertEqual([h["name"] for h in result["hotspots"]], ["active"])
         self.assertEqual(result["hotspots"][0]["inclusive_percent"], 100.0)
+
+    def test_cpu_active_only_reports_weighted_hotspot_totals(self):
+        profile = sample_profile(
+            [[0], [1], [1]],
+            frame_to_func=[0, 1],
+            funcs=[(0, 0x1000, 0), (1, 0x2000, 0)],
+            libs=[],
+            strings=["idle", "active"],
+        )
+        profile["threads"][0]["samples"]["threadCPUDelta"] = [0, 4, 2]
+
+        result = HOTSPOTS.summarize(
+            profile,
+            sidecar([], []),
+            cpu_active_only=True,
+        )
+
+        self.assertEqual(result["sample_mode"], "cpu-active-only")
+        self.assertEqual(result["examined_nonempty_samples"], 3)
+        self.assertEqual(result["excluded_zero_cpu_samples"], 1)
+        self.assertEqual(result["total_samples"], 2)
+        self.assertEqual(result["total_cpu_delta"], 6)
+        self.assertEqual([h["name"] for h in result["hotspots"]], ["active"])
+        self.assertEqual(result["hotspots"][0]["inclusive_percent"], 100.0)
+        self.assertEqual(result["cpu_hotspots"][0]["inclusive_cpu"], 6)
+        self.assertEqual(result["cpu_hotspots"][0]["inclusive_cpu_percent"], 100.0)
 
     def test_cpu_active_only_rejects_missing_or_misaligned_deltas(self):
         profile = sample_profile(
