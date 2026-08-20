@@ -37,6 +37,16 @@ deliberately not mutable JJ workspaces.
 The historical/default scenario is hostile with MSS 8192
 (`--link-profile hostile --mss-bytes 8192`).
 
+# Reanalyze an existing capture
+
+Recompute phase stability, execution-order effects, AB/BA role effects, readiness, and same-binary calibration from a preserved result without building or running the network again:
+
+```sh
+./tools/perf-loop analyze --result $TMPDIR/existing-perf-result
+```
+
+The command prints the recomputed analysis and leaves the artifact untouched. Pass '--update-run-json' to replace only those five derived fields in the existing 'run.json'. Both modes require the result directory to remain beneath `$TMPDIR`; neither mode edits 'comparison.json' or its trace inputs.
+
 ## Lossy narrow-link safety lane
 
 Use the existing 400 KiB/s lossy narrow-link preset as a safety lane when
