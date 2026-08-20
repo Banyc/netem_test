@@ -379,8 +379,12 @@ half differs from the other by at least `MATERIAL_PHASE_DRIFT_PERCENT`
 (20%). A same-binary pair whose paired deltas are all under 10% is still
 rejected as a control when either arm changed controller phase between its
 halves, because the delta can no longer be attributed to a stationary
-baseline. With `--fail-on-control-instability`, an unstable calibration
-exits 4.
+baseline. The same analysis includes `by_role.baseline` and
+`by_role.candidate` summaries, which distinguish role-local convergence from
+role-local instability without manually filtering individual runs. The global
+classification stays conservative: material drift in either role makes the
+evidence unstable. With `--fail-on-control-instability`, an unstable
+calibration exits 4.
 
 ## Artifacts
 

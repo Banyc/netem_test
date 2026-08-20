@@ -946,6 +946,58 @@ class PerfLoopTest(unittest.TestCase):
             "unstable_phase_drift",
         )
 
+    def test_role_local_phase_drift_is_reported_for_both_roles(self):
+        comparison = {
+            "evidence_quality": "healthy",
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {"goodput_mib_per_second": {"delta_percent": 3.0}},
+                }
+            ],
+            "runs": [
+                {
+                    "label": "same-11",
+                    "role": "baseline",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 8.0,
+                    },
+                },
+                {
+                    "label": "same-11",
+                    "role": "candidate",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 8.0,
+                    },
+                },
+            ],
+        }
+        phase = LOOP.within_run_phase_analysis(comparison)
+        self.assertEqual(phase["classification"], "unstable_phase_drift")
+        self.assertEqual(phase["material_run_count"], 2)
+        self.assertEqual(phase["valid_runs"], 2)
+        self.assertEqual(phase["median_absolute_shift_percent"], 20.0)
+        self.assertEqual(phase["max_absolute_shift_percent"], 20.0)
+        self.assertIn("does_not_prove", phase["does_not_prove"])
+        self.assertEqual(
+            phase["by_role"]["baseline"]["classification"],
+            "unstable_phase_drift",
+        )
+        self.assertEqual(
+            phase["by_role"]["candidate"]["classification"],
+            "unstable_phase_drift",
+        )
+        self.assertEqual(
+            phase["by_role"]["baseline"]["material_run_count"],
+            1,
+        )
+        self.assertEqual(
+            phase["by_role"]["candidate"]["material_run_count"],
+            1,
+        )
+
     def test_same_binary_run_records_and_can_fail_control_analysis(self):
         comparison = {
             "evidence_quality": "healthy",
