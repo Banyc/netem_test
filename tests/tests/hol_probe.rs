@@ -1676,6 +1676,7 @@ async fn run_hol_probe_rtp_mux(
                     ) => sent,
                 };
                 let _ = stream.shutdown().await;
+                let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
                 // Signal the pump to stop and join it before the straggler
                 // grace, so the bulk byte counter snapshot is stable.
                 bulk_stop_tx.send(true).unwrap();
@@ -1686,7 +1687,6 @@ async fn run_hol_probe_rtp_mux(
                     samples.push(latency);
                 }
                 let received = samples.len() as u64;
-                let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
                 let bulk_secs = active_for.as_secs_f64();
                 let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
                 print_hol_summary(label, &summary);

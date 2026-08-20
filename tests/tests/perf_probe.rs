@@ -645,6 +645,11 @@ async fn probe_hostile_goodput_30s() {
                 matches!(
                     link_profile.as_str(),
                     "hostile"
+                        | "hostile-steady"
+                        | "hostile-steady-bottleneck"
+                        | "hostile-steady-bottleneck-20ms"
+                        | "hostile-steady-bottleneck-100ms"
+                        | "hostile-periodic-bottleneck"
                         | "lossy-400kib"
                         | "hostile-fat-pipe"
                         | "controller-fat-pipe"
@@ -656,6 +661,7 @@ async fn probe_hostile_goodput_30s() {
                         | "fec-recoverable-bottleneck"
                         | "fec-gaming-fat-pipe"
                         | "fec-paired-saturated"
+                        | "fec-paired-saturated-bottleneck"
                         | "hostile-periodic-bottleneck-20ms"
                         | "hostile-periodic-bottleneck-100ms"
                         | "hostile-periodic-bottleneck-300ms"
@@ -689,6 +695,14 @@ async fn probe_hostile_goodput_30s() {
             let retransmission_armor = parse_flag_env("RTP_RTX_DUP");
             let make_link = || match link_profile.as_str() {
                 "hostile" => support::presets::hostile_real_link(),
+                "hostile-steady" => support::presets::hostile_steady_link(),
+                "hostile-steady-bottleneck" => support::presets::hostile_steady_bottleneck(),
+                "hostile-steady-bottleneck-20ms" => {
+                    support::presets::hostile_steady_bottleneck_20ms()
+                }
+                "hostile-steady-bottleneck-100ms" => {
+                    support::presets::hostile_steady_bottleneck_100ms()
+                }
                 "lossy-400kib" => support::presets::lossy_400kib_per_sec(),
                 "hostile-fat-pipe" => support::presets::hostile_fat_pipe(),
                 "controller-fat-pipe" => support::presets::controller_fat_pipe(),
@@ -702,7 +716,10 @@ async fn probe_hostile_goodput_30s() {
                 // offset: the FEC-on arm wraps the data packet in the 10-byte
                 // FEC envelope, so the netem key must point past it at the
                 // same logical codec sequence the FEC-off arm keys on.
-                "fec-paired-saturated" => support::presets::fec_paired_saturated_bottleneck(fec),
+                "fec-paired-saturated" | "fec-paired-saturated-bottleneck" => {
+                    support::presets::fec_paired_saturated_bottleneck(fec)
+                }
+                "hostile-periodic-bottleneck" => support::presets::hostile_periodic_bottleneck(),
                 "hostile-periodic-bottleneck-20ms" => {
                     support::presets::hostile_periodic_bottleneck_20ms()
                 }
@@ -920,6 +937,11 @@ async fn probe_hostile_goodput_30s() {
                 if matches!(
                     link_profile.as_str(),
                     "hostile"
+                        | "hostile-steady"
+                        | "hostile-steady-bottleneck"
+                        | "hostile-steady-bottleneck-20ms"
+                        | "hostile-steady-bottleneck-100ms"
+                        | "hostile-periodic-bottleneck"
                         | "lossy-400kib"
                         | "hostile-fat-pipe"
                         | "hostile-bottleneck-20ms"
@@ -928,6 +950,7 @@ async fn probe_hostile_goodput_30s() {
                         | "fec-recoverable-bottleneck"
                         | "fec-gaming-fat-pipe"
                         | "fec-paired-saturated"
+                        | "fec-paired-saturated-bottleneck"
                         | "hostile-periodic-bottleneck-20ms"
                         | "hostile-periodic-bottleneck-100ms"
                         | "hostile-periodic-bottleneck-300ms"
@@ -1189,11 +1212,12 @@ async fn probe_hostile_message_latency() {
             assert!(
                 matches!(
                     link_profile.as_str(),
-                    "hostile-periodic-bottleneck-300ms"
+                    "hostile-periodic-bottleneck"
+                        | "hostile-periodic-bottleneck-300ms"
                         | "hostile-periodic-bottleneck-100ms"
                         | "hostile-periodic-bottleneck-20ms"
                 ),
-                "NETEM_PERF_LINK_PROFILE for the message-latency probe must be exactly 'hostile-periodic-bottleneck-300ms', 'hostile-periodic-bottleneck-100ms', or 'hostile-periodic-bottleneck-20ms', got {link_profile:?}"
+                "NETEM_PERF_LINK_PROFILE for the message-latency probe must be exactly 'hostile-periodic-bottleneck', 'hostile-periodic-bottleneck-300ms', 'hostile-periodic-bottleneck-100ms', or 'hostile-periodic-bottleneck-20ms', got {link_profile:?}"
             );
             let mss_bytes = std::env::var("NETEM_PERF_MSS_BYTES")
                 .map(|value| {
@@ -1220,6 +1244,9 @@ async fn probe_hostile_message_latency() {
             let fec = parse_flag_env("NETEM_PERF_FEC");
             let retransmission_armor = parse_flag_env("RTP_RTX_DUP");
             let make_link = || match link_profile.as_str() {
+                "hostile-periodic-bottleneck" => {
+                    support::presets::hostile_periodic_bottleneck()
+                }
                 "hostile-periodic-bottleneck-300ms" => {
                     support::presets::hostile_periodic_bottleneck_300ms()
                 }

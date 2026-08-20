@@ -42,6 +42,7 @@ pub struct LaneFecEvidence {
 
 /// Captures per-lane FEC evidence through sampled RTP metrics observers.
 /// Evidence is sampled at most every 50 ms so snapshot cost stays bounded.
+#[derive(Clone)]
 pub struct RtpMuxFecCapture {
     interactive: Arc<Mutex<LaneFecEvidence>>,
     bulk: Arc<Mutex<LaneFecEvidence>>,

@@ -37,6 +37,11 @@ PROBE_TESTS = {
 }
 LINK_PROFILES = (
     "hostile",
+    "hostile-steady",
+    "hostile-steady-bottleneck",
+    "hostile-steady-bottleneck-20ms",
+    "hostile-steady-bottleneck-100ms",
+    "hostile-periodic-bottleneck",
     "lossy-400kib",
     "hostile-fat-pipe",
     "controller-fat-pipe",
@@ -48,6 +53,7 @@ LINK_PROFILES = (
     "fec-recoverable-bottleneck",
     "fec-gaming-fat-pipe",
     "fec-paired-saturated",
+    "fec-paired-saturated-bottleneck",
     "hostile-periodic-bottleneck-20ms",
     "hostile-periodic-bottleneck-100ms",
     "hostile-periodic-bottleneck-300ms",
@@ -106,6 +112,8 @@ def parse_component_revision(value):
         raise argparse.ArgumentTypeError(
             "component revision must use COMPONENT=REVISION"
         )
+    if component not in COMPONENTS:
+        raise argparse.ArgumentTypeError(f"unknown suite component: {component}")
     return (component, revision)
 
 
@@ -551,6 +559,7 @@ def run_probe(
     env["NETEM_PERF_MSS_BYTES"] = str(mss_bytes)
     env["NETEM_PERF_FEC"] = "1" if fec else "0"
     env["NETEM_PERF_INSTREAM_GROUP_FEC"] = "1" if instream_group_fec else "0"
+    env["RTP_INSTREAM_GROUP_FEC"] = "1" if instream_group_fec else "0"
     env["NETEM_PERF_SCENARIO"] = scenario
     env["RTP_RTX_DUP"] = "1" if retransmission_armor else "0"
     env["NETEM_PERF_REVISION"] = revision
@@ -1036,7 +1045,11 @@ def role_fec_configuration(args, role):
     only the explicit runtime FEC setting this creates, never the build.
     """
     candidate_fec = {"same": bool(args.fec), "on": True, "off": False}[args.candidate_fec]
-    return candidate_fec if role == "candidate" else bool(args.fec)
+    fec = candidate_fec if role == "candidate" else bool(args.fec)
+    return {
+        "fec": fec,
+        "instream_group_fec": bool(args.instream_group_fec and fec),
+    }
 
 
 def treatment_config_differences(args):
@@ -1045,10 +1058,13 @@ def treatment_config_differences(args):
     Only explicit runtime FEC settings may differ in a same-workspace
     treatment; the allowlist never admits a key whose values match.
     """
-    differences = []
-    if bool(args.fec) != role_fec_configuration(args, "candidate"):
-        differences.append("fec")
-    return tuple(differences)
+    baseline = role_fec_configuration(args, "baseline")
+    candidate = role_fec_configuration(args, "candidate")
+    return tuple(
+        key
+        for key in ("fec", "instream_group_fec")
+        if baseline[key] != candidate[key]
+    )
 
 
 def command_run(args):
@@ -1057,6 +1073,10 @@ def command_run(args):
     baseline = validate_workspace(Path(args.baseline), "baseline")
     candidate = validate_workspace(Path(args.candidate), "candidate")
     treatment = bool(args.same_workspace_treatment)
+    role_configuration = {
+        role: role_fec_configuration(args, role)
+        for role in ("baseline", "candidate")
+    }
     if treatment:
         if args.same_binary_control:
             raise SystemExit(
@@ -1246,10 +1266,10 @@ def command_run(args):
                 target_dir=args.target_dir,
                 link_profile=args.link_profile,
                 mss_bytes=args.mss_bytes,
-                fec=role_fec_configuration(args, role),
+                fec=role_configuration[role]["fec"],
                 retransmission_armor=args.retransmission_armor,
                 scenario=args.scenario,
-                instream_group_fec=args.instream_group_fec,
+                instream_group_fec=role_configuration[role]["instream_group_fec"],
                 candidate_fec=args.candidate_fec,
                 window_seconds=args.window_seconds,
                 warmup_seconds=args.warmup_seconds,
@@ -1324,6 +1344,7 @@ def command_run(args):
         "fec": bool(args.fec),
         "candidate_fec": args.candidate_fec,
         "instream_group_fec": bool(args.instream_group_fec),
+        "role_configuration": role_configuration,
         "retransmission_armor": bool(args.retransmission_armor),
         "scenario": args.scenario,
         "same_workspace_treatment": bool(args.same_workspace_treatment),
@@ -1388,9 +1409,7 @@ def command_run(args):
         "evidence_quality": comparison.get("evidence_quality", "invalid"),
         "compare_exit": compare.returncode,
     }
-    (output_root / "run.json").write_text(
-        json.dumps(run_json, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    write_json_object_atomic(output_root / "run.json", run_json)
     probe_failed = any(row["runner_exit"] != 0 for row in rows)
     evidence_invalid = comparison.get("evidence_quality") == "invalid"
     if probe_failed or evidence_invalid or compare.returncode != 0:

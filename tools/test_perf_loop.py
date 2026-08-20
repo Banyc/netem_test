@@ -444,6 +444,7 @@ class PerfLoopTest(unittest.TestCase):
             self.assertEqual(env["NETEM_PERF_MSS_BYTES"], "1400")
             self.assertEqual(env["NETEM_PERF_FEC"], "1")
             self.assertEqual(env["NETEM_PERF_INSTREAM_GROUP_FEC"], "1")
+            self.assertEqual(env["RTP_INSTREAM_GROUP_FEC"], "1")
             self.assertEqual(env["NETEM_PERF_SCENARIO"], "message-latency")
             self.assertEqual(env["RTP_RTX_DUP"], "1")
             self.assertEqual(env["NETEM_PERF_DIAGNOSTIC_MODE"], "1")
@@ -1231,6 +1232,8 @@ class PerfLoopTest(unittest.TestCase):
         for invalid in ("rtp", "=abc", "rtp=", ""):
             with self.assertRaisesRegex(argparse.ArgumentTypeError, "COMPONENT=REVISION"):
                 LOOP.parse_component_revision(invalid)
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "unknown suite component"):
+            LOOP.parse_component_revision("missing=abc")
         snapshot = parser.parse_args(
             ["snapshot", "--source", "suite/netem_test", "--output", "/safe/snapshot",
              "--component-revision", "rtp=abc", "--component-revision", "mux=def"]
