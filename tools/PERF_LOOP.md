@@ -167,6 +167,14 @@ measurement-window samples as the empirical CDF, so an unchanged median cannot
 hide an upper-tail regression. Quantiles do not establish distribution shape
 nor cause; inspect the RTT histogram, CDF, and timeline when they disagree.
 
+Current comparison schema 38 reports exact ACK-flush claims for both endpoints
+by trigger ('initial', 'age', 'count', 'fin', and 'explicit'), including totals,
+per-GiB rates, and each trigger's share. These are successful transactional
+claims rather than schedule notifications, so notification coalescing
+and superseded deadlines cannot masquerade as flush work. The trigger mix shows
+which policy gate is active; it does not prove that changing that gate improves
+delivery.
+
 ## Clean lane
 
 ```sh
