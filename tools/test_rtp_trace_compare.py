@@ -587,6 +587,38 @@ class TraceCompareTest(unittest.TestCase):
                 )
 
 
+    def test_measurement_state_window_includes_long_warmup_offset(self):
+        manifest = {
+            "rtp_observer": "true",
+            "window_seconds": "30",
+            "measurement_start_trace_elapsed_us": "60000000",
+        }
+        rtp = [{"smoothed_rtt_us": "1000", "trace_elapsed_us": "75000000"}]
+        checks = COMPARE.trace_health(Path("."), manifest, rtp, [], [], [])
+        self.assertTrue(checks["checks"]["measurement_state_present"])
+
+    def test_sparse_message_timebox_accepts_its_missing_sink_outcome_only(self):
+        manifest = {
+            "scenario": "mux_over_rtp_hostile-periodic-bottleneck-300ms_message_latency_window",
+            "measurement_end_reason": "timebox_elapsed",
+            "probe_outcome": "completed",
+            "client_mux_outcome": "running",
+            "server_mux_outcome": "running",
+        }
+        checks = COMPARE.trace_health(Path("."), manifest, [], [], [], [])
+        self.assertTrue(checks["checks"]["endpoint_lifecycle_accounted"])
+
+        manifest["scenario"] = "mux_over_rtp_hostile_goodput_30s"
+        checks = COMPARE.trace_health(Path("."), manifest, [], [], [], [])
+        self.assertFalse(checks["checks"]["endpoint_lifecycle_accounted"])
+
+        manifest["scenario"] = (
+            "mux_over_rtp_hostile-periodic-bottleneck-300ms_message_latency_window"
+        )
+        manifest["client_mux_outcome"] = "error: closed early"
+        checks = COMPARE.trace_health(Path("."), manifest, [], [], [], [])
+        self.assertFalse(checks["checks"]["endpoint_lifecycle_accounted"])
+
     def test_schema_22_and_23_require_counter_baselines_after_warmup(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
             root = Path(directory)

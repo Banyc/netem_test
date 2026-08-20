@@ -465,9 +465,18 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
         and probe_outcome == "completed"
         and all(outcome == "running" for outcome in endpoint_outcomes)
     )
+    scenario = manifest.get("scenario", "")
+    expected_sparse_completion = (
+        scenario.endswith("_message_latency_window")
+        and manifest.get("measurement_end_reason", "") == "timebox_elapsed"
+        and probe_outcome == "completed"
+        and manifest.get("sink_read_outcome", "") in ("", "running")
+        and manifest.get("client_mux_outcome", "") == "running"
+        and manifest.get("server_mux_outcome", "") == "running"
+    )
     checks["endpoint_lifecycle_accounted"] = (
         has_terminal_event(rtp) and has_terminal_event(peer)
-    ) or expected_live_timebox
+    ) or expected_live_timebox or expected_sparse_completion
     checks["endpoint_integrity"] = True
     for key in ("sink_read_outcome", "client_mux_outcome", "server_mux_outcome"):
         outcome = manifest.get(key, "")
@@ -495,6 +504,11 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
         and expected_progress in (None, len(progress))
     )
     window_seconds = metric_number(manifest.get("window_seconds"))
+    measurement_start_seconds = metric_number(
+        manifest.get("measurement_start_trace_elapsed_us")
+    )
+    if measurement_start_seconds is not None:
+        measurement_start_seconds /= 1_000_000.0
     state_times = [
         REPORT.timeline_seconds(row, manifest)
         for row in rtp
@@ -504,7 +518,10 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
         not boolean(manifest.get("rtp_observer", ""))
         or any(
             time is not None
-            and (window_seconds is None or time <= window_seconds)
+            and (
+                window_seconds is None
+                or time <= window_seconds + (measurement_start_seconds or 0.0)
+            )
             for time in state_times
         )
     )
