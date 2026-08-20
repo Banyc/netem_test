@@ -8,16 +8,8 @@ frozen `netem_test` workspace (each with sibling `rtp`, `mux`, `rtp_mux`,
 Freeze the current completed suite without creating additional JJ workspaces:
 
 ```sh
-<<<<<<< conflict 1 of 1
-%%%%%%% diff from: vqwrvwxl 3e638d4c "transport, pair-runner: connect fixed peers once and cache learned routes" (rebase destination)
-\\\\\\\        to: umsumulk 2d0a46f4 "tests/perf-trace, tools: bounded netem trace schema 26 with controller evidence and warmup boundary" (rebase destination)
- ./tools/perf-loop snapshot --source . --revision @- \
----output $TMPDIR/rtp-before
-+--output $TMPDIR/rtp-before
-+++++++ zuuwlpzo 10432820 "tools: reproducible perf suite snapshots, phase-drift rejection, and CPU-weighted diagnostics" (rebased revision)
 ./tools/perf-loop snapshot --source . --source-revision @- \
 --component-revision rtp=<40-char-commit> --output $TMPDIR/rtp-before
->>>>>>> conflict 1 of 1 ends
 ```
 
 The snapshot exports the exact committed tree of every sibling component
@@ -26,8 +18,8 @@ plus `change_id`) into its own directory beneath the output, never the
 mutable working copy. `--source-revision` (default `-`) is resolved
 independently in every component; repeat `--component-revision
 COMPONENT=REVISION` to pin individual components (duplicates and unknown
-component names are rejected), and `--output` is required and must resolve
-beneath `$TMPDIR`. `suite-revisions.json` records the manifest schema
+component names are rejected). When supplied, `--output` must resolve
+beneath `$TMPDIR`; otherwise the tool creates a unique safe-root output directory. `suite-revisions.json` records the manifest schema
 (`PROBE_SOURCE_MANIFEST_SCHEMA`), the source workspace, the requested
 revision, `component_revision_overrides`, and each component's exact
 40-character `commit_id` plus `change_id`. Paired runs read this manifest so
