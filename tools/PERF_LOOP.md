@@ -161,6 +161,12 @@ midpoint only when progress samples bracket it; paired effects are ranked by
 the bounded median across pairs rather than a single outlier, and every
 guidance item retains its `does_not_prove` constraint.
 
+The same schema promotes raw RTT p90 and p99 into paired metrics and the
+run-health table alongside p50. These quantiles use the same
+measurement-window samples as the empirical CDF, so an unchanged median cannot
+hide an upper-tail regression. Quantiles do not establish distribution shape
+nor cause; inspect the RTT histogram, CDF, and timeline when they disagree.
+
 ## Clean lane
 
 ```sh

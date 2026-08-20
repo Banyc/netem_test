@@ -701,6 +701,29 @@ class TraceCompareTest(unittest.TestCase):
         ]
         self.assertEqual(COMPARE.raw_rtt_ms(rows), [125.5, 250.0])
 
+    def test_run_health_reports_peer_upper_tail_quantiles(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            before = root / "before"
+            after = root / "after"
+            self.write_trace(before, "old", "1.0", 11, 12, timeboxed_open=True)
+            self.write_trace(after, "new", "1.1", 11, 12, timeboxed_open=True)
+            output = root / "comparison"
+            COMPARE.render_comparison(
+                [("before-1", before)],
+                [("after-1", after)],
+                output,
+            )
+            document = (output / "comparison.html").read_text(encoding="utf-8")
+            self.assertIn("RTT p50 / p90 / p99 ms", document)
+            comparison = json.loads(
+                (output / "comparison.json").read_text(encoding="utf-8")
+            )
+            summary = {
+                run["label"]: run["summary"] for run in comparison["runs"]
+            }["after-1"]
+            self.assertEqual(summary["peer_rtt_p90_ms"], 100.0)
+            self.assertEqual(summary["peer_rtt_p99_ms"], 100.0)
 
     def test_retransmission_rate_requires_delivered_application_bytes(self):
         self.assertEqual(COMPARE._per_gib(3, 1024 ** 3), 3.0)
@@ -743,6 +766,10 @@ class TraceCompareTest(unittest.TestCase):
             "changed",
         )
 
+    def test_upper_tail_rtt_guidance_uses_lower_is_better_direction(self):
+        for metric in ("rtt_p90_ms", "rtt_p99_ms"):
+            self.assertEqual(COMPARE.metric_direction(metric, -1.0), "better")
+            self.assertEqual(COMPARE.metric_direction(metric, 1.0), "worse")
 
     def test_guidance_preserves_a_change_from_a_zero_baseline(self):
         metric = "low_send_rate_occupancy"

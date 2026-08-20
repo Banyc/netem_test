@@ -964,6 +964,8 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "mean_cc_loss_ratio": statistics.fmean(cc_loss) if cc_loss else math.nan,
         "rtt_p50_ms": REPORT.quantile(rtt, 0.5) if rtt else math.nan,
         "peer_rtt_p50_ms": REPORT.quantile(peer_rtt, 0.5) if peer_rtt else math.nan,
+        "peer_rtt_p90_ms": REPORT.quantile(peer_rtt, 0.9) if peer_rtt else math.nan,
+        "peer_rtt_p99_ms": REPORT.quantile(peer_rtt, 0.99) if peer_rtt else math.nan,
         "terminations": termination_summary(rtp),
         "peer_terminations": termination_summary(peer),
         "send_driver_wakes": sender_wakes,
@@ -2041,7 +2043,9 @@ def render_html(comparison, runs):
             f"<td>{escape(_fmt(summary['goodput_mib_per_second'], '{:.3f}'))}</td>"
             f"<td>{escape(_fmt(summary['goodput_first_half_mib_per_second'], '{:.3f}'))} / "
             f"{escape(_fmt(summary['goodput_second_half_mib_per_second'], '{:.3f}'))}</td>"
-            f"<td>{escape(_fmt(summary['rtt_p50_ms'], '{:.2f}'))}</td>"
+            f"<td>{escape(_fmt(summary['rtt_p50_ms'], '{:.2f}'))} / "
+            f"{escape(_fmt(summary['rtt_p90_ms'], '{:.2f}'))} / "
+            f"{escape(_fmt(summary['rtt_p99_ms'], '{:.2f}'))}</td>"
             f"<td>{escape(_fmt(summary['low_send_rate_occupancy'], '{:.1f}'))}</td>"
             f"<td>{escape(str(summary['terminations']))}</td>"
             f"<td>{escape(str(summary['peer_terminations']))}</td>"
@@ -2188,7 +2192,7 @@ th, td {{ text-align: left; border-bottom: 1px solid #e5e7eb; padding: .4rem .55
 <p class="note">The verdict is a consistency label derived from valid paired seed identities only; it is not statistical confidence and does not prove causality. Every hint below carries a does_not_prove constraint.</p>
 <p class="verdict">verdict: {escape(comparison['verdict'])} - {comparison['valid_pairs']} valid / {comparison['total_pairs']} total pairs</p>
 <section><h2>Comparison readiness</h2>{readiness}</section>
-<section><h2>Run health</h2><table><thead><tr><th>run</th><th>role</th><th>evidence</th><th>c2s/s2c seed</th><th>goodput MiB/s</th><th>first / second half MiB/s</th><th>RTT p50 ms</th><th>low rate %</th><th>terminations</th><th>peer terminations</th><th>send-driver wakes</th><th>peer send-driver wakes</th><th>resume requests</th><th>peer resume requests</th><th>netem counters</th><th>probe/sink</th><th>mux outcomes</th></tr></thead><tbody>{''.join(health_rows)}</tbody></table></section>
+<section><h2>Run health</h2><table><thead><tr><th>run</th><th>role</th><th>evidence</th><th>c2s/s2c seed</th><th>goodput MiB/s</th><th>first / second half MiB/s</th><th>RTT p50 / p90 / p99 ms</th><th>low rate %</th><th>terminations</th><th>peer terminations</th><th>send-driver wakes</th><th>peer send-driver wakes</th><th>resume requests</th><th>peer resume requests</th><th>netem counters</th><th>probe/sink</th><th>mux outcomes</th></tr></thead><tbody>{''.join(health_rows)}</tbody></table></section>
 <section><h2>Paired outcomes</h2><table><thead><tr><th>#</th><th>baseline</th><th>candidate</th><th>valid</th><th>excluded</th>{''.join(f'<th>{escape(metric)}</th>' for metric in METRICS)}</tr></thead><tbody>{''.join(pair_rows)}</tbody></table></section>
 <section><h2>Behavior-conditioned observations (phase/behavior conditioning)</h2><table><thead><tr><th>counter</th><th>condition</th><th>pairs</th><th>support</th><th>attention</th><th>outcomes</th><th>boundary</th></tr></thead><tbody>{''.join(conditioned_rows)}</tbody></table></section>
 <section><h2>Controller activation coverage</h2><table><thead><tr><th>metric</th><th>pair states</th><th>per-pair</th></tr></thead><tbody>{''.join(activation_rows)}</tbody></table></section>
