@@ -175,6 +175,12 @@ and superseded deadlines cannot masquerade as flush work. The trigger mix shows
 which policy gate is active; it does not prove that changing that gate improves
 delivery.
 
+The comparison HTML also renders a baseline/candidate empirical RTT CDF for
+each valid matched seed pair. These panels keep pair-local shoulders,
+plateaus, and tail separation from being hidden by the global overlay.
+Distribution shape guides follow-up timeline inspection; it does not establish
+modality or cause.
+
 ## Clean lane
 
 ```sh
