@@ -2468,6 +2468,47 @@ mod tests {
     }
 
     #[test]
+    fn packet_keyed_loss_zero_offset_is_never_dropped() {
+        // key_offset 0 has no command byte before the key, so every packet is
+        // treated as too short to key and is forwarded (never dropped). This
+        // guards against the old saturating_sub(1) behaviour that silently
+        // reused the key's own first byte as the "command" and computed a
+        // bogus identity.
+        let model = LossModel::PacketKeyed { key_offset: 0 };
+        let mut state = FourStateState::default();
+        let mut cor = CorRng::new(0);
+        let mut rng = RndState::seed(9);
+        let mut seed = 171;
+        let mut keyed = PacketKeyedLossState::default();
+        for key in 0u64..256 {
+            let mut packet = vec![3];
+            packet.extend_from_slice(&key.to_be_bytes());
+            assert!(
+                !model.loss(
+                    &mut state,
+                    &mut cor,
+                    &mut rng,
+                    u32::MAX,
+                    &mut seed,
+                    &packet,
+                    &mut keyed,
+                ),
+                "key_offset 0 must never drop (key {key})"
+            );
+        }
+        // A packet far too short for even the key is likewise forwarded.
+        assert!(!model.loss(
+            &mut state,
+            &mut cor,
+            &mut rng,
+            u32::MAX,
+            &mut seed,
+            &[3],
+            &mut keyed
+        ));
+    }
+
+    #[test]
     fn config_default_is_no_impairment() {
         let c = NetemConfig::default();
         assert!(c.latency.is_zero());

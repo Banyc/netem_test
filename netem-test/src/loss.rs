@@ -50,6 +50,11 @@ pub enum LossModel {
     /// FEC-off / FEC-on protocol treatments lose the same logical RTP
     /// sequence despite the FEC data envelope. Retransmissions and short
     /// packets are forwarded; remembered identities are bounded.
+    ///
+    /// `key_offset` must be at least 1: the keyed identity mixes in the
+    /// command byte that sits one byte before the eight-byte key, so an
+    /// offset of 0 has no such byte and is treated as a packet too short to
+    /// key (always forwarded, never dropped).
     PacketKeyed { key_offset: u16 },
 }
 
@@ -143,11 +148,13 @@ fn packet_keyed_loss_key(packet: &[u8], key_offset: usize, seed: u64, loss: u32)
     if loss == 0 {
         return None;
     }
-    let Some(key) = packet.get(key_offset..key_offset.saturating_add(8)) else {
-        return None;
-    };
+    // The identity mixes the 8-byte key with the command byte immediately
+    // before it. Offset 0 has no preceding byte, so the packet cannot carry
+    // a valid keyed identity and is treated as too short (forwarded).
+    let command_offset = key_offset.checked_sub(1)?;
+    let key = packet.get(key_offset..key_offset.saturating_add(8))?;
     let key = u64::from_be_bytes(key.try_into().unwrap());
-    let command = u64::from(packet[key_offset.saturating_sub(1)]);
+    let command = u64::from(packet[command_offset]);
     let identity = key ^ command.rotate_left(56);
     let mut mixed = identity ^ seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
     mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
