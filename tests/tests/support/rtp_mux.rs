@@ -18,8 +18,8 @@ use crate::support::{
 /// Production interactive-lane FEC policy: maximum-diversity tuning plus
 /// in-stream group FEC, owned by the `rtp_mux` composition with no caller
 /// toggle. The bulk lane stays non-FEC by construction.
-fn interactive_fec_tuning() -> (rtp::FecTuning, bool) {
-    (rtp::FecTuning::max_diversity(), true)
+fn interactive_fec_tuning() -> (rtp_mux::FecTuning, bool) {
+    (rtp_mux::FecTuning::max_diversity(), true)
 }
 
 /// Per-lane typed RTP metrics observers: the interactive lane keeps its own
@@ -27,8 +27,8 @@ fn interactive_fec_tuning() -> (rtp::FecTuning, bool) {
 /// FEC policy.
 #[derive(Clone, Default)]
 pub struct RtpMuxMetricsObservers {
-    pub interactive: Option<rtp::metrics::MetricsObserver>,
-    pub bulk: Option<rtp::metrics::MetricsObserver>,
+    pub interactive: Option<rtp_mux::MetricsObserver>,
+    pub bulk: Option<rtp_mux::MetricsObserver>,
 }
 
 /// Typed FEC evidence for one lane endpoint: whether any RTP metrics were
@@ -37,7 +37,7 @@ pub struct RtpMuxMetricsObservers {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LaneFecEvidence {
     pub observed: bool,
-    pub counters: Option<rtp::metrics::MetricsFecCounters>,
+    pub counters: Option<rtp_mux::MetricsFecCounters>,
 }
 
 /// Captures per-lane FEC evidence through sampled RTP metrics observers.
@@ -77,11 +77,11 @@ impl Default for RtpMuxFecCapture {
 /// An RTP metrics observer that captures a state snapshot at most every
 /// `SAMPLE_INTERVAL_US`, recording the observed flag and the snapshot's
 /// typed FEC counters into `evidence`.
-fn sampled_fec_observer(evidence: Arc<Mutex<LaneFecEvidence>>) -> rtp::metrics::MetricsObserver {
+fn sampled_fec_observer(evidence: Arc<Mutex<LaneFecEvidence>>) -> rtp_mux::MetricsObserver {
     const SAMPLE_INTERVAL_US: u64 = 50_000;
     let last_sample_us = Arc::new(AtomicU64::new(u64::MAX));
     let filter_clock = Arc::clone(&last_sample_us);
-    rtp::metrics::MetricsObserver::filtered(
+    rtp_mux::MetricsObserver::filtered(
         move |_, elapsed| {
             let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
             let previous = filter_clock.load(Ordering::Relaxed);
@@ -154,7 +154,7 @@ async fn spawn_rtp_mux_latency_bulk_server_core(
                         tx.clone(),
                         Arc::clone(&bulk_for_server),
                         base,
-                        source_lane == mux::LaneClass::Interactive,
+                        source_lane == rtp_mux::LaneClass::Interactive,
                     );
                 })
                 .await;
