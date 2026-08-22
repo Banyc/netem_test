@@ -2050,7 +2050,7 @@ impl SharedLinkRunner {
                 break;
             }
             match self.recv.recv_from(buf) {
-                Ok((n, from)) => {
+                Ok((n, _from)) => {
                     let dst = self
                         .learned_dst
                         .refresh_if_changed(&mut cached, &mut observed_generation);

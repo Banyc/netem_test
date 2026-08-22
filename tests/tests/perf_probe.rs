@@ -802,24 +802,23 @@ async fn probe_hostile_goodput_30s() {
             let mut pump_error = None;
             let warmup = tokio::time::sleep(Duration::from_secs_f64(warmup_seconds));
             tokio::pin!(warmup);
-            loop {
-                tokio::select! {
-                    joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
-                        let result = joined.expect("bulk pump exists").unwrap();
-                        pump_error = Some(match result {
-                            Ok(()) => "bulk pump ended before the measurement window".to_owned(),
-                            Err(error) => format!("bulk pump failed: {error:?}: {error}"),
-                        });
-                        break;
-                    }
-                    _ = &mut warmup => break,
+            tokio::select! {
+                joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
+                    let result = joined.expect("bulk pump exists").unwrap();
+                    pump_error = Some(match result {
+                        Ok(()) => "bulk pump ended before the measurement window".to_owned(),
+                        Err(error) => format!("bulk pump failed: {error:?}: {error}"),
+                    });
                 }
+                _ = &mut warmup => {}
             }
             let warmup_delivered = progress.delivered_bytes();
             let start = Instant::now();
             // Anchor the measurement boundary on the shared trace clock so
             // netem/progress samples line up with the RTP endpoint rows.
-            trace.as_mut().map(|trace| trace.mark_measurement_start(start));
+            if let Some(trace) = trace.as_mut() {
+                trace.mark_measurement_start(start);
+            }
             let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
             netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1330,7 +1329,9 @@ async fn probe_hostile_message_latency() {
             let start = Instant::now();
             // Anchor the measurement boundary on the shared trace clock so
             // netem/latency samples line up with the RTP endpoint rows.
-            trace.as_mut().map(|trace| trace.mark_measurement_start(start));
+            if let Some(trace) = trace.as_mut() {
+                trace.mark_measurement_start(start);
+            }
             let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
             netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

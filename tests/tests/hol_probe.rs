@@ -1683,7 +1683,7 @@ async fn run_hol_probe_rtp_mux(
                 // Signal the pump to stop and join it before the straggler
                 // grace, so the bulk byte counter snapshot is stable.
                 bulk_stop_tx.send(true).unwrap();
-                let _ = bulk_pump.await.unwrap();
+                bulk_pump.await.unwrap();
                 tokio::time::sleep(grace).await;
                 let mut samples = Vec::new();
                 while let Ok((_tag, latency)) = latencies.try_recv() {

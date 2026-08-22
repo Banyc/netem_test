@@ -56,6 +56,7 @@ impl PayloadPatternVerifier {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod payload_pattern_tests {
     use super::{PAYLOAD_PATTERN_PERIOD, PayloadPatternVerifier};
 

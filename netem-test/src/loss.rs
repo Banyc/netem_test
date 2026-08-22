@@ -94,6 +94,7 @@ impl LossModel {
     /// `sch_netem.c` for the random and four-state models, and implements
     /// the deterministic periodic and packet-identity-keyed schedules.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn loss(
         &self,
         state: &mut FourStateState,
