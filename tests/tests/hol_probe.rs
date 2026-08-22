@@ -1629,7 +1629,7 @@ async fn run_hol_probe_rtp_mux(
                 let int_proxy_addr = int_pair.client_addr();
                 tokio::spawn(async move {
                     let mut stream = match connector
-                        .connect_stream_with_lane(int_proxy_addr, mux::LaneClass::Bulk)
+                        .connect_stream_with_lane(int_proxy_addr, rtp_mux::LaneClass::Bulk)
                         .await
                     {
                         Ok(stream) => stream,
@@ -1656,7 +1656,10 @@ async fn run_hol_probe_rtp_mux(
             };
             let body = async {
                 let mut stream = connector
-                    .connect_stream_with_lane(int_pair.client_addr(), mux::LaneClass::Interactive)
+                    .connect_stream_with_lane(
+                        int_pair.client_addr(),
+                        rtp_mux::LaneClass::Interactive,
+                    )
                     .await
                     .unwrap();
                 // The bulk pump must stay live until the interactive
