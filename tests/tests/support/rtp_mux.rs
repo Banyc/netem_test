@@ -263,6 +263,7 @@ fn rtp_mux_connector_core(
             interactive_metrics_observer: observers.interactive,
             bulk_metrics_observer: observers.bulk,
             handshake: true,
+            obfuscation_key: None,
             explorer: rtp_mux::ExplorerConfig {
                 enabled: false,
                 ..rtp_mux::ExplorerConfig::default()
