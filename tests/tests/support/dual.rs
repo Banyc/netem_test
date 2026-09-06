@@ -54,7 +54,9 @@ async fn spawn_dual_mux_latency_bulk_server_with_mss_core(
     base: Instant,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
-    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
@@ -374,7 +376,9 @@ async fn spawn_dual_msg_channel_server_core(
     base: Instant,
     mode: mux::DeliveryMode,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
-    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
@@ -624,7 +628,9 @@ async fn spawn_dual_mux_migrating_latency_bulk_server_core(
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
-    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
@@ -905,7 +911,9 @@ async fn spawn_dual_mux_gaming_latency_bulk_server_core(
     fec: bool,
     base: Instant,
 ) -> std::io::Result<(std::net::SocketAddr, mpsc::Receiver<f64>, Arc<AtomicU64>)> {
-    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
@@ -1657,7 +1665,9 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
     mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
 )> {
-    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
     let addr = listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
@@ -1968,8 +1978,12 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
     Arc<AtomicU64>,
     TestTaskSubmitter,
 )> {
-    let int_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
-    let bulk_listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let int_listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
+    let bulk_listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
     let int_addr = int_listener.local_addr();
     let bulk_addr = bulk_listener.local_addr();
     let (tx, rx) = mpsc::channel(LATENCY_SAMPLE_CAPACITY);

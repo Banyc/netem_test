@@ -104,7 +104,8 @@ where
     F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let listener =
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?;
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
     spawn(Box::pin({
@@ -1277,7 +1278,9 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let listener = Arc::new(rtp::udp::Listener::bind("127.0.0.1:0").await?);
+    let listener = Arc::new(
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?,
+    );
     let addr = listener.local_addr();
 
     let fd = FrameMode::enabled();

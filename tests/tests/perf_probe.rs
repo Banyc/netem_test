@@ -1074,7 +1074,8 @@ async fn spawn_message_latency_server_via(
     let (latency_tx, latency_rx) = tokio::sync::mpsc::channel(support::LATENCY_SAMPLE_CAPACITY);
     let delivered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mux_session = std::sync::Arc::new(support::stats::MuxSessionProgress::new());
-    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let listener =
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?;
     let addr = listener.local_addr();
     let listener = std::sync::Arc::new(listener);
     let delivered_for_handlers = std::sync::Arc::clone(&delivered);

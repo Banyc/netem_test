@@ -20,7 +20,8 @@ async fn spawn_rtp_echo_server_core(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
-    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let listener =
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?;
     let addr = listener.local_addr();
     spawn_required(
         "rtp echo server",
@@ -272,7 +273,8 @@ async fn spawn_rtp_byte_sink_server_core(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
-    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let listener =
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?;
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
 
@@ -448,7 +450,8 @@ async fn spawn_rtp_msg_latency_sink_core(
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, tokio::sync::mpsc::Receiver<f64>)> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
-    let listener = rtp::udp::Listener::bind("127.0.0.1:0").await?;
+    let listener =
+        rtp::udp::Listener::bind("127.0.0.1:0", rtp::udp::ListenerConfig::default()).await?;
     let addr = listener.local_addr();
     let listener = Arc::new(listener);
 

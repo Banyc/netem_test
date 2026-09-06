@@ -123,7 +123,7 @@ async fn spawn_rtp_mux_latency_bulk_server_core(
     TestTaskSubmitter,
 )> {
     let (fec_tuning, instream_group_fec) = interactive_fec_tuning();
-    let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0")
+    let server = rtp_mux::RtpMuxServer::bind("127.0.0.1:0", rtp_mux::RtpMuxServerConfig::default())
         .await?
         .with_metrics_observers(observers.interactive, observers.bulk)
         .with_interactive_fec_tuning(fec_tuning, instream_group_fec);

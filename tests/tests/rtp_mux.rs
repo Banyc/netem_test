@@ -3,7 +3,7 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use netem_test::{NetemConfig, NetemPair};
 use rtp_mux::{
     BindSelector, BulkAddrSelector, ExplorerConfig, LaneClass, RtpMuxConnector,
-    RtpMuxConnectorConfig, RtpMuxServer,
+    RtpMuxConnectorConfig, RtpMuxServer, RtpMuxServerConfig,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -22,7 +22,7 @@ async fn spawn_echo_server_via(
     SocketAddr,
     tokio::sync::mpsc::Receiver<LaneClass>,
 )> {
-    let server = RtpMuxServer::bind("127.0.0.1:0").await?;
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default()).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     let (lane_tx, lane_rx) = tokio::sync::mpsc::channel(LANE_EVENT_CAPACITY);
@@ -162,7 +162,7 @@ const CMD_PING: u8 = b'P';
 async fn spawn_cmd_server_via(
     task_tx: &crate::support::TestTaskSubmitter,
 ) -> io::Result<(SocketAddr, SocketAddr)> {
-    let server = RtpMuxServer::bind("127.0.0.1:0").await?;
+    let server = RtpMuxServer::bind("127.0.0.1:0", RtpMuxServerConfig::default()).await?;
     let interactive_addr = server.listener().local_addr();
     let bulk_addr = server.bulk_listener().local_addr();
     // Session futures spawned by the SessionSpawner and the per-stream
