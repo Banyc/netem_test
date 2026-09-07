@@ -7,7 +7,9 @@ license.workspace = true
 [dev-dependencies]
 netem-test = { path = "../netem-test" }
 rtp = { path = "../../rtp" }
-mux = { path = "../../mux" }
+# rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.88" }
+mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.28" }
+# mux = { path = "../../mux" }
 rtp_mux = { path = "../../rtp_mux" }
 tokio = { version = "1", features = ["full", "test-util"] }
 
