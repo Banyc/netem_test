@@ -29,7 +29,7 @@ const KEY: [u8; 32] = [7; 32];
 /// `[1300, 1400]`, dynamic payload-sized (the length prefix rides in the
 /// plaintext).
 const PROFILE: rtp::udp::PaddingSettings =
-    rtp::udp::PaddingSettings::data_channel(rtp::udp::TargetKind::Triangular {
+    rtp::udp::PaddingSettings::dynamic_target(rtp::udp::TargetKind::Triangular {
         mode: 1350,
         spread: 50,
     });
