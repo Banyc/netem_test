@@ -25,10 +25,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod support;
 
 const KEY: [u8; 32] = [7; 32];
-/// The random-mode padding profile under test.
-const PROFILE: rtp::udp::PaddingProfile = rtp::udp::PaddingProfile::Random {
-    mode: 1350,
-    spread: 50,
+/// The random-mode padding settings under test: triangular draw over
+/// `[1300, 1400]`, dynamic payload-sized (the length prefix rides in the
+/// plaintext).
+const PROFILE: rtp::udp::PaddingSettings = rtp::udp::PaddingSettings {
+    target: rtp::udp::TargetKind::Random {
+        kind: rtp::udp::RandomKind::Triangular,
+        mode: 1350,
+        spread: 50,
+    },
+    payload_sized: rtp::udp::PayloadSized::Dynamic,
 };
 
 /// A transport wrapper that records every received datagram's size.
@@ -68,7 +74,7 @@ impl UdpTransport for RecordingTransport {
 /// Spawn an obfuscated rtp echo server with the given padding profile.
 async fn spawn_padded_echo_server(
     tx: &support::TestTaskSubmitter,
-    profile: Option<rtp::udp::PaddingProfile>,
+    profile: Option<rtp::udp::PaddingSettings>,
 ) -> std::io::Result<SocketAddr> {
     let listener = rtp::udp::Listener::bind(
         "127.0.0.1:0",
@@ -130,7 +136,7 @@ async fn spawn_padded_echo_server(
 /// Run one padded/unpadded transfer through a recording NetemPair and return
 /// the wire size histogram and the transfer duration.
 async fn run_transfer(
-    profile: Option<rtp::udp::PaddingProfile>,
+    profile: Option<rtp::udp::PaddingSettings>,
     transfer_bytes: usize,
 ) -> (std::collections::HashMap<usize, usize>, Duration) {
     let mut tasks = support::TestScope::new();
@@ -286,7 +292,7 @@ async fn padding_throughput_overhead() {
 /// Run a transfer through the given preset (both directions) and return the
 /// transfer duration.
 async fn run_transfer_preset(
-    profile: Option<rtp::udp::PaddingProfile>,
+    profile: Option<rtp::udp::PaddingSettings>,
     preset: netem_test::NetemConfig,
     transfer_bytes: usize,
 ) -> Duration {
@@ -337,7 +343,7 @@ async fn run_transfer_preset(
 /// Run `count` small round-trip echoes through the given preset and return
 /// the total time (the small-packet path is where the padding cost shows).
 async fn run_small_echoes(
-    profile: Option<rtp::udp::PaddingProfile>,
+    profile: Option<rtp::udp::PaddingSettings>,
     preset: netem_test::NetemConfig,
     count: usize,
     size: usize,
