@@ -28,13 +28,11 @@ const KEY: [u8; 32] = [7; 32];
 /// The random-mode padding settings under test: triangular draw over
 /// `[1300, 1400]`, dynamic payload-sized (the length prefix rides in the
 /// plaintext).
-const PROFILE: rtp::udp::PaddingSettings = rtp::udp::PaddingSettings {
-    target: rtp::udp::TargetKind::Triangular {
+const PROFILE: rtp::udp::PaddingSettings =
+    rtp::udp::PaddingSettings::data_channel(rtp::udp::TargetKind::Triangular {
         mode: 1350,
         spread: 50,
-    },
-    payload_sized: rtp::udp::PayloadSized::Dynamic,
-};
+    });
 
 /// A transport wrapper that records every received datagram's size.
 struct RecordingTransport {
