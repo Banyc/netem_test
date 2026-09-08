@@ -25,8 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod support;
 
 const KEY: [u8; 32] = [7; 32];
-/// The single-mode padding profile under test.
-const PROFILE: rtp::udp::TargetProfile = rtp::udp::TargetProfile {
+/// The random-mode padding profile under test.
+const PROFILE: rtp::udp::PaddingProfile = rtp::udp::PaddingProfile::Random {
     mode: 1350,
     spread: 50,
 };
@@ -68,7 +68,7 @@ impl UdpTransport for RecordingTransport {
 /// Spawn an obfuscated rtp echo server with the given padding profile.
 async fn spawn_padded_echo_server(
     tx: &support::TestTaskSubmitter,
-    profile: Option<rtp::udp::TargetProfile>,
+    profile: Option<rtp::udp::PaddingProfile>,
 ) -> std::io::Result<SocketAddr> {
     let listener = rtp::udp::Listener::bind(
         "127.0.0.1:0",
@@ -130,7 +130,7 @@ async fn spawn_padded_echo_server(
 /// Run one padded/unpadded transfer through a recording NetemPair and return
 /// the wire size histogram and the transfer duration.
 async fn run_transfer(
-    profile: Option<rtp::udp::TargetProfile>,
+    profile: Option<rtp::udp::PaddingProfile>,
     transfer_bytes: usize,
 ) -> (std::collections::HashMap<usize, usize>, Duration) {
     let mut tasks = support::TestScope::new();
@@ -286,7 +286,7 @@ async fn padding_throughput_overhead() {
 /// Run a transfer through the given preset (both directions) and return the
 /// transfer duration.
 async fn run_transfer_preset(
-    profile: Option<rtp::udp::TargetProfile>,
+    profile: Option<rtp::udp::PaddingProfile>,
     preset: netem_test::NetemConfig,
     transfer_bytes: usize,
 ) -> Duration {
@@ -337,7 +337,7 @@ async fn run_transfer_preset(
 /// Run `count` small round-trip echoes through the given preset and return
 /// the total time (the small-packet path is where the padding cost shows).
 async fn run_small_echoes(
-    profile: Option<rtp::udp::TargetProfile>,
+    profile: Option<rtp::udp::PaddingProfile>,
     preset: netem_test::NetemConfig,
     count: usize,
     size: usize,
