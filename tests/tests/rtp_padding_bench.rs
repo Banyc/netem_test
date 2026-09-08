@@ -1,8 +1,11 @@
-//! Bench: fixed single-mode profile padding on the obfuscation layer.
+//! Bench: fixed single-mode profile padding and fitted ACK padding on the
+//! obfuscation layer.
 //!
 //! Measures (a) the wire size distribution of an obfuscated rtp connection
 //! with and without the padding profile — does the padded distribution
-//! converge to one peak? — and (b) the throughput overhead of the padding
+//! converge to one peak? — together with (b) the same question for the
+//! fitted ACK padding (standalone ACKs zero-filled to the observed
+//! data-packet sizes) and (c) the throughput/latency overhead of both
 //! under netem impairment.
 //!
 //! Run with:
@@ -68,16 +71,19 @@ impl UdpTransport for RecordingTransport {
     }
 }
 
-/// Spawn an obfuscated rtp echo server with the given padding profile.
+/// Spawn an obfuscated rtp echo server with the given padding profile and
+/// fitted ACK-padding toggle.
 async fn spawn_padded_echo_server(
     tx: &support::TestTaskSubmitter,
     profile: Option<rtp::udp::PaddingSettings>,
+    ack_padding: bool,
 ) -> std::io::Result<SocketAddr> {
     let listener = rtp::udp::Listener::bind(
         "127.0.0.1:0",
         rtp::udp::ListenerConfig {
             obfuscation_key: Some(KEY),
             padding_profile: profile,
+            ack_padding,
         },
     )
     .await?;
@@ -92,6 +98,7 @@ async fn spawn_padded_echo_server(
                     accepted = listener.accept_without_handshake_with(rtp::udp::AcceptConfig {
                         obfuscation_key: Some(KEY),
                         padding_profile: profile,
+                        ack_padding,
                         ..rtp::udp::AcceptConfig::default()
                     }) => {
                         let accepted = match accepted {
@@ -130,17 +137,20 @@ async fn spawn_padded_echo_server(
     Ok(addr)
 }
 
-/// Run one padded/unpadded transfer through a recording NetemPair and return
-/// the wire size histogram and the transfer duration.
+/// Run one transfer through a recording NetemPair and return the wire size
+/// histogram and the transfer duration.
 async fn run_transfer(
     profile: Option<rtp::udp::PaddingSettings>,
+    ack_padding: bool,
     transfer_bytes: usize,
 ) -> (std::collections::HashMap<usize, usize>, Duration) {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let server_addr = spawn_padded_echo_server(&task_tx, profile).await.unwrap();
+            let server_addr = spawn_padded_echo_server(&task_tx, profile, ack_padding)
+                .await
+                .unwrap();
 
             // Recording transports on both sides of the proxy capture the
             // wire datagram sizes.
@@ -169,6 +179,7 @@ async fn run_transfer(
                     handshake: false,
                     obfuscation_key: Some(KEY),
                     padding_profile: profile,
+                    ack_padding,
                     ..rtp::udp::ConnectConfig::default()
                 },
             )
@@ -216,7 +227,7 @@ async fn run_transfer(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn padded_wire_sizes_converge_to_one_peak() {
-    let (histogram, _) = run_transfer(Some(PROFILE), 256 * 1024).await;
+    let (histogram, _) = run_transfer(Some(PROFILE), false, 256 * 1024).await;
 
     let total: usize = histogram.values().sum();
     assert!(total > 0, "no wire datagrams captured");
@@ -250,7 +261,7 @@ async fn padded_wire_sizes_converge_to_one_peak() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn unpadded_wire_sizes_stay_multimodal() {
-    let (histogram, _) = run_transfer(None, 256 * 1024).await;
+    let (histogram, _) = run_transfer(None, false, 256 * 1024).await;
 
     let total: usize = histogram.values().sum();
     let small: usize = histogram
@@ -269,14 +280,51 @@ async fn unpadded_wire_sizes_stay_multimodal() {
     );
 }
 
-/// The throughput overhead of the padding: padded vs unpadded transfer time
-/// over a clean link.
+/// Fitted ACK padding hides the ACK packets among the data packets: the
+/// tiny standalone-ACK cluster of the baseline disappears (or shrinks
+/// dramatically) while the large data peak is preserved.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn ack_padding_hides_ack_packets_among_data() {
+    let transfer_bytes = 256 * 1024;
+    let (baseline, _) = run_transfer(None, false, transfer_bytes).await;
+    let (fitted, _) = run_transfer(None, true, transfer_bytes).await;
+
+    let small = |h: &std::collections::HashMap<usize, usize>| -> usize {
+        h.iter().filter(|&(&n, _)| n < 200).map(|(_, &c)| c).sum()
+    };
+    let large = |h: &std::collections::HashMap<usize, usize>| -> usize {
+        h.iter().filter(|&(&n, _)| n >= 200).map(|(_, &c)| c).sum()
+    };
+    let baseline_small = small(&baseline);
+    let fitted_small = small(&fitted);
+    let baseline_large = large(&baseline);
+    let fitted_large = large(&fitted);
+    println!(
+        "ack_padding: baseline_small={baseline_small} fitted_small={fitted_small} baseline_large={baseline_large} fitted_large={fitted_large}"
+    );
+    assert!(
+        baseline_small > 0,
+        "the baseline must keep a distinct small-datagram cluster, got {baseline:?}"
+    );
+    assert!(
+        fitted_small < baseline_small / 2,
+        "the fitted run's small cluster must be dramatically shrunken: baseline={baseline_small} fitted={fitted_small}"
+    );
+    assert!(
+        fitted_large >= baseline_large * 9 / 10,
+        "the large-data peak must be preserved: baseline={baseline_large} fitted={fitted_large}"
+    );
+}
+
+/// The throughput overhead of the fixed profile: padded vs unpadded
+/// transfer time over a clean link.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn padding_throughput_overhead() {
     let transfer_bytes = 512 * 1024;
-    let (_, unpadded) = run_transfer(None, transfer_bytes).await;
-    let (_, padded) = run_transfer(Some(PROFILE), transfer_bytes).await;
+    let (_, unpadded) = run_transfer(None, false, transfer_bytes).await;
+    let (_, padded) = run_transfer(Some(PROFILE), false, transfer_bytes).await;
 
     let unpadded_mbps = transfer_bytes as f64 / unpadded.as_secs_f64() / 1e6;
     let padded_mbps = transfer_bytes as f64 / padded.as_secs_f64() / 1e6;
@@ -290,6 +338,7 @@ async fn padding_throughput_overhead() {
 /// transfer duration.
 async fn run_transfer_preset(
     profile: Option<rtp::udp::PaddingSettings>,
+    ack_padding: bool,
     preset: netem_test::NetemConfig,
     transfer_bytes: usize,
 ) -> Duration {
@@ -297,7 +346,9 @@ async fn run_transfer_preset(
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let server_addr = spawn_padded_echo_server(&task_tx, profile).await.unwrap();
+            let server_addr = spawn_padded_echo_server(&task_tx, profile, ack_padding)
+                .await
+                .unwrap();
             let pair = NetemPair::spawn(server_addr, preset.clone(), preset).unwrap();
             let connected = rtp::udp::connect_with(
                 "0.0.0.0:0",
@@ -306,6 +357,7 @@ async fn run_transfer_preset(
                     handshake: false,
                     obfuscation_key: Some(KEY),
                     padding_profile: profile,
+                    ack_padding,
                     ..rtp::udp::ConnectConfig::default()
                 },
             )
@@ -341,6 +393,7 @@ async fn run_transfer_preset(
 /// the total time (the small-packet path is where the padding cost shows).
 async fn run_small_echoes(
     profile: Option<rtp::udp::PaddingSettings>,
+    ack_padding: bool,
     preset: netem_test::NetemConfig,
     count: usize,
     size: usize,
@@ -349,7 +402,9 @@ async fn run_small_echoes(
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let server_addr = spawn_padded_echo_server(&task_tx, profile).await.unwrap();
+            let server_addr = spawn_padded_echo_server(&task_tx, profile, ack_padding)
+                .await
+                .unwrap();
             let pair = NetemPair::spawn(server_addr, preset.clone(), preset).unwrap();
             let connected = rtp::udp::connect_with(
                 "0.0.0.0:0",
@@ -358,6 +413,7 @@ async fn run_small_echoes(
                     handshake: false,
                     obfuscation_key: Some(KEY),
                     padding_profile: profile,
+                    ack_padding,
                     ..rtp::udp::ConnectConfig::default()
                 },
             )
@@ -398,13 +454,37 @@ async fn ab_bulk_throughput_across_presets() {
     ];
     println!("A/B bulk throughput ({transfer_bytes} bytes):");
     for (name, preset) in presets {
-        let unpadded = run_transfer_preset(None, preset.clone(), transfer_bytes).await;
-        let padded = run_transfer_preset(Some(PROFILE), preset, transfer_bytes).await;
+        let unpadded = run_transfer_preset(None, false, preset.clone(), transfer_bytes).await;
+        let padded = run_transfer_preset(Some(PROFILE), false, preset, transfer_bytes).await;
         let unpadded_mbps = transfer_bytes as f64 / unpadded.as_secs_f64() / 1e6;
         let padded_mbps = transfer_bytes as f64 / padded.as_secs_f64() / 1e6;
         println!(
             "  {name:<14} unpadded={unpadded_mbps:7.2} MB/s ({unpadded:?}) padded={padded_mbps:7.2} MB/s ({padded:?}) delta={:.1}%",
             100.0 * (padded_mbps - unpadded_mbps) / unpadded_mbps
+        );
+    }
+}
+
+/// A/B: bulk throughput, fitted ACK padding off vs on (no profile), under
+/// the same three presets.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn ab_bulk_throughput_ack_padding() {
+    let transfer_bytes = 4 * 1024 * 1024;
+    let presets: Vec<(&str, netem_test::NetemConfig)> = vec![
+        ("clean", clean()),
+        ("latency20ms", support::presets::latency(20)),
+        ("lossy400kibps", support::presets::lossy_400kib_per_sec()),
+    ];
+    println!("A/B bulk throughput ack_padding ({transfer_bytes} bytes):");
+    for (name, preset) in presets {
+        let off = run_transfer_preset(None, false, preset.clone(), transfer_bytes).await;
+        let on = run_transfer_preset(None, true, preset, transfer_bytes).await;
+        let off_mbps = transfer_bytes as f64 / off.as_secs_f64() / 1e6;
+        let on_mbps = transfer_bytes as f64 / on.as_secs_f64() / 1e6;
+        println!(
+            "  {name:<14} ack_padding=off {off_mbps:7.2} MB/s ({off:?}) ack_padding=on {on_mbps:7.2} MB/s ({on:?}) delta={:.1}%",
+            100.0 * (on_mbps - off_mbps) / off_mbps
         );
     }
 }
@@ -416,8 +496,8 @@ async fn ab_bulk_throughput_across_presets() {
 async fn ab_small_echo_latency() {
     let count = 200;
     let size = 64;
-    let unpadded = run_small_echoes(None, clean(), count, size).await;
-    let padded = run_small_echoes(Some(PROFILE), clean(), count, size).await;
+    let unpadded = run_small_echoes(None, false, clean(), count, size).await;
+    let padded = run_small_echoes(Some(PROFILE), false, clean(), count, size).await;
     let unpadded_per = unpadded.as_secs_f64() / count as f64;
     let padded_per = padded.as_secs_f64() / count as f64;
     println!(
@@ -427,6 +507,27 @@ async fn ab_small_echo_latency() {
         padded.as_secs_f64(),
         padded_per * 1000.0,
         padded.as_secs_f64() / unpadded.as_secs_f64()
+    );
+}
+
+/// A/B: small round-trip latency, fitted ACK padding off vs on, on a clean
+/// link.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn ab_small_echo_latency_ack_padding() {
+    let count = 200;
+    let size = 64;
+    let off = run_small_echoes(None, false, clean(), count, size).await;
+    let on = run_small_echoes(None, true, clean(), count, size).await;
+    let off_per = off.as_secs_f64() / count as f64;
+    let on_per = on.as_secs_f64() / count as f64;
+    println!(
+        "A/B small echo ack_padding ({count} x {size}B): off={:.3} s total ({:.3} ms/echo) on={:.3} s total ({:.3} ms/echo) slowdown={:.1}x",
+        off.as_secs_f64(),
+        off_per * 1000.0,
+        on.as_secs_f64(),
+        on_per * 1000.0,
+        on.as_secs_f64() / off.as_secs_f64()
     );
 }
 
@@ -446,8 +547,8 @@ async fn ab_small_echo_latency_across_presets() {
     ];
     println!("A/B small echo ({count} x {size}B) under injected latency:");
     for (name, preset) in presets {
-        let unpadded = run_small_echoes(None, preset.clone(), count, size).await;
-        let padded = run_small_echoes(Some(PROFILE), preset, count, size).await;
+        let unpadded = run_small_echoes(None, false, preset.clone(), count, size).await;
+        let padded = run_small_echoes(Some(PROFILE), false, preset, count, size).await;
         let unpadded_per = unpadded.as_secs_f64() / count as f64;
         let padded_per = padded.as_secs_f64() / count as f64;
         println!(
