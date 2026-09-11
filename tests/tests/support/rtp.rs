@@ -251,6 +251,42 @@ pub async fn rtp_connect_via(
     rtp_connect_with_mss_via(tx, proxy_client_addr, fec, rtp::udp::NO_FEC_MSS).await
 }
 
+/// [`rtp_connect_via`] with FEC forced on and the `max_diversity` tuning preset
+/// (three parities for a single-symbol interactive group).  The default-FEC
+/// scenarios never reach the `data_count == 1 && small_group_parity_count > 1`
+/// interactive path, so a scenario that must cover it connects through here.
+/// The supervisor is a non-required keepalive: the test body owns teardown.
+pub async fn rtp_connect_max_diversity_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+) -> (
+    rtp::socket::AsyncReadAdapter,
+    rtp::socket::AsyncWriteAdapter,
+) {
+    let connected = rtp::udp::connect_with(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec: true,
+            fec_tuning: rtp::FecTuning::max_diversity(),
+            ..rtp::udp::ConnectConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let read = connected.read.into_async_read();
+    let write = connected.write.into_async_write();
+    let supervisor = connected.supervisor;
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let _ = supervisor.await;
+        }),
+    );
+    (read, write)
+}
+
 /// Write `payload` through `write`, shut the writer down, and read the full
 /// echo back from `read` until EOF. Panics on any IO error.
 pub async fn rtp_echo_payload<R, W>(mut read: R, mut write: W, payload: &[u8]) -> Vec<u8>
