@@ -80,6 +80,7 @@ async fn spawn_padded_echo_server(
         rtp::udp::ListenerConfig {
             obfuscation_key: Some(KEY),
             padding: policy,
+            ..rtp::udp::ListenerConfig::default()
         },
     )
     .await?;
