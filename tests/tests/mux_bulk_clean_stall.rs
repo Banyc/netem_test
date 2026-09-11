@@ -2,11 +2,18 @@
 //!
 //! `hol_verify4::v4_clean_muxbulk` writes a bulk stream for a fixed window and
 //! only completes when the writer drains; on a *clean* 50 ms link it sometimes
-//! blocks for tens of seconds (a mux stream `write_all` that neither completes
-//! nor errors).  The stall is non-deterministic, so this scenario does not just
-//! time the whole run: it wraps every `write_all` in a watchdog and, when the
-//! watchdog fires, dumps the rtp connection's transport-state snapshot so the
-//! parked path is visible instead of a bare timeout.
+//! blocked for tens of seconds (a mux stream `write_all` that neither completed
+//! nor errored).
+//!
+//! **The reproduction must NOT attach a metrics observer.** A snapshot-taking
+//! observer's hot-path work changes the interleaving enough to mask the stall
+//! entirely (it is a timing-sensitive lost window: the sender's congestion
+//! window grew to 8x the BDP, the whole window was burst at once, the peer's
+//! bounded receive window overran, and the resulting holes could not be
+//! repaired). A no-op observer does not mask it. So
+//! [`clean_link_mux_bulk_completes_within_timeout`] connects without an
+//! observer, while [`induced_stall_fires_the_watchdog`] attaches one purely to
+//! validate the watchdog and its transport dump.
 //!
 //! The rtp snapshot is captured through the public [`MetricsObserver`] hook:
 //! `stall_reason`, congestion window / in-flight / pending-send bytes, the
@@ -14,14 +21,6 @@
 //! wake.  Together they say whether the sender is blocked by pacing, by the
 //! congestion window, by a full send stage, or by an underlay that stopped
 //! accepting — and whether the peer stopped acknowledging.
-//!
-//! Two scenarios share the write loop:
-//! - [`clean_link_mux_bulk_completes_within_timeout`] — the real reproduction
-//!   (a stall fails the test and prints the dump).
-//! - [`induced_stall_fires_the_watchdog`] — a deterministic validation: the
-//!   server sink stops reading, the mux window fills, and the watchdog must
-//!   fire.  This proves the watchdog and its dump work even when the
-//!   load-dependent real stall does not reproduce.
 //!
 //! Run with:
 //!
@@ -40,7 +39,7 @@ use rtp::metrics::{
 };
 use support::mux::{mux_client_connect_via, spawn_mux_over_rtp_server_with_mss_via};
 use support::payload::cyclic_payload;
-use support::rtp::rtp_connect_with_mss_and_observer_via;
+use support::rtp::{rtp_connect_with_mss_and_observer_via, rtp_connect_with_mss_via};
 use support::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -238,7 +237,8 @@ async fn drive_writes<W: AsyncWrite + Unpin>(
 async fn clean_link_mux_bulk_completes_within_timeout() {
     let mut tasks = TestScope::new();
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
-    let (observer, latest) = diagnostic_observer();
+    // No metrics observer: attaching the snapshot observer masks the stall.
+    let latest = Arc::new(Mutex::new(LatestState::default()));
     let latest_for_run = Arc::clone(&latest);
 
     let delivered = Arc::new(AtomicU64::new(0));
@@ -268,14 +268,9 @@ async fn clean_link_mux_bulk_completes_within_timeout() {
         .unwrap();
 
         let pair = NetemPair::spawn(server_addr, clean_link(11), clean_link(22)).unwrap();
-        let (connected_read, connected_write) = rtp_connect_with_mss_and_observer_via(
-            &task_tx,
-            pair.client_addr(),
-            false,
-            rtp::udp::NO_FEC_MSS,
-            observer,
-        )
-        .await;
+        let (connected_read, connected_write) =
+            rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
+                .await;
         let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
         let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
 
