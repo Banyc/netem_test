@@ -287,6 +287,44 @@ pub async fn rtp_connect_max_diversity_via(
     (read, write)
 }
 
+/// [`rtp_connect_with_mss_via`] with a caller-supplied metrics observer, so a
+/// scenario can capture the connection's transport-state snapshots (used by
+/// the mux bulk stall watchdog).  The supervisor is a non-required keepalive.
+pub async fn rtp_connect_with_mss_and_observer_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+    observer: rtp::metrics::MetricsObserver,
+) -> (
+    rtp::socket::AsyncReadAdapter,
+    rtp::socket::AsyncWriteAdapter,
+) {
+    let connected = rtp::udp::connect_with(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec,
+            mss: rtp::udp::MssConfig::Custom(mss),
+            metrics_observer: Some(observer),
+            ..rtp::udp::ConnectConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let read = connected.read.into_async_read();
+    let write = connected.write.into_async_write();
+    let supervisor = connected.supervisor;
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let _ = supervisor.await;
+        }),
+    );
+    (read, write)
+}
+
 /// Write `payload` through `write`, shut the writer down, and read the full
 /// echo back from `read` until EOF. Panics on any IO error.
 pub async fn rtp_echo_payload<R, W>(mut read: R, mut write: W, payload: &[u8]) -> Vec<u8>
