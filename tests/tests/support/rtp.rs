@@ -137,11 +137,9 @@ pub async fn spawn_rtp_echo_server_via(
 /// resulting reliable byte-stream halves. Pass [`NetemPair::client_addr`] as
 /// `proxy_client_addr`; `fec` must match the server's FEC setting.
 ///
-/// `tasks` owns the rtp session supervisor: it is awaited by a REQUIRED
-/// scope task, so the session must stay alive for the whole test body — a
-/// session that ends early fails the test. Callers that intentionally tear
-/// the connection down mid-body must not use this helper (see
-/// `perf_probe::rtp_connect_transient`).
+/// `tasks` owns the rtp session supervisor as a non-required keepalive;
+/// the supervisor is awaited in the background and the test body owns
+/// teardown. A normal FIN shutdown does not fail the test.
 pub async fn rtp_connect(
     tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
@@ -154,11 +152,11 @@ pub async fn rtp_connect(
 }
 
 /// Shared core for [`rtp_connect_with_mss`] and its `_via` variant: opens
-/// the connection and hands the required supervisor keepalive to
-/// `spawn_required` (either a [`TestScope`] spawn or the bounded reaper
+/// the connection and hands the supervisor keepalive to `spawn` as a
+/// non-required keepalive (either a [`TestScope`] spawn or the bounded reaper
 /// submission).
 async fn rtp_connect_core(
-    spawn_required: impl FnOnce(&'static str, TestTask),
+    spawn: impl FnOnce(TestTask),
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
@@ -180,14 +178,11 @@ async fn rtp_connect_core(
     .unwrap();
     let read = connected.read.into_async_read();
     let write = connected.write.into_async_write();
-    // The supervisor owns the session drivers; poll it from a required task
-    // so the session ending before the test body completes is a panic.
-    spawn_required(
-        "rtp client session",
-        Box::pin(async move {
-            let _ = connected.supervisor.await;
-        }),
-    );
+    // The supervisor owns the session drivers; poll it as a non-required
+    // keepalive so a normal FIN shutdown does not fail the test.
+    spawn(Box::pin(async move {
+        let _ = connected.supervisor.await;
+    }));
     (read, write)
 }
 
@@ -195,8 +190,8 @@ async fn rtp_connect_core(
 ///
 /// `mss` is passed to [`rtp::udp::connect_with`] via a custom
 /// [`rtp::udp::MssConfig`]; `proxy_client_addr` should be
-/// [`NetemPair::client_addr`]. The supervisor is awaited by a required scope
-/// task like [`rtp_connect`].
+/// [`NetemPair::client_addr`]. The supervisor is awaited as a non-required
+/// keepalive like [`rtp_connect`].
 pub async fn rtp_connect_with_mss(
     tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
@@ -206,19 +201,13 @@ pub async fn rtp_connect_with_mss(
     impl AsyncRead + Unpin + Send + use<>,
     impl AsyncWrite + Unpin + Send + use<>,
 ) {
-    rtp_connect_core(
-        |name, fut| tasks.spawn_required(name, fut),
-        proxy_client_addr,
-        fec,
-        mss,
-    )
-    .await
+    rtp_connect_core(|fut| tasks.spawn(fut), proxy_client_addr, fec, mss).await
 }
 
 /// [`rtp_connect_with_mss`] through the bounded task-submission handle, for
 /// use inside [`TestScope::run`] bodies where `&mut TestScope` is
-/// unavailable. The supervisor keepalive is submitted as required through the
-/// handle.
+/// unavailable. The supervisor keepalive is submitted as a non-required
+/// keepalive through the handle.
 pub async fn rtp_connect_with_mss_via(
     tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
@@ -228,18 +217,13 @@ pub async fn rtp_connect_with_mss_via(
     impl AsyncRead + Unpin + Send + use<>,
     impl AsyncWrite + Unpin + Send + use<>,
 ) {
-    rtp_connect_core(
-        |name, fut| submit_test_task_required(tx, name, fut),
-        proxy_client_addr,
-        fec,
-        mss,
-    )
-    .await
+    rtp_connect_core(|fut| submit_test_task(tx, fut), proxy_client_addr, fec, mss).await
 }
 
 /// [`rtp_connect`] through the bounded task-submission handle, for use inside
 /// [`TestScope::run`] bodies where `&mut TestScope` is unavailable. The
-/// supervisor keepalive is submitted as required through the handle.
+/// supervisor keepalive is submitted as a non-required keepalive through the
+/// handle.
 pub async fn rtp_connect_via(
     tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,

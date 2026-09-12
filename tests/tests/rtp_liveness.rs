@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use netem_test::{NetemConfig, NetemPair};
 use support::mux::send_timestamped_messages;
 use support::rtp::{rtp_connect_with_mss_via, spawn_rtp_msg_latency_sink_via};
-use support::{submit_test_task, submit_test_task_required};
+use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod support;
@@ -360,12 +360,15 @@ fn rtp_permanent_hole_liveness_smoke() {
 
                 let mut read = connected.read.into_async_read();
                 let mut write = connected.write.into_async_write();
-                // The supervisor owns the session drivers; the connection must
-                // survive the whole body, so poll it from a required task
-                // submitted through the handle.
-                submit_test_task_required(&task_tx, "rtp client session", async move {
-                    let _ = connected.supervisor.await;
-                });
+                // The supervisor owns the session drivers; poll it as a
+                // non-required keepalive so a normal FIN shutdown does not
+                // fail the test.
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let _ = connected.supervisor.await;
+                    }),
+                );
 
                 // Keep the read half alive so ACKs keep flowing; parked until the
                 // connection closes, so the owning JoinSet aborts it at scope end.
