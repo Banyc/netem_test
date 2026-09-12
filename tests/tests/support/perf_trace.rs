@@ -23,6 +23,13 @@ use rtp::metrics::{
 const TRACE_SCHEMA_VERSION: u16 = 31;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+/// Raw RTT samples are time-decimated to one retained row per interval on
+/// their own clock, finer than [`STATE_SAMPLE_INTERVAL`] so the retained RTT
+/// series stays dense enough for p90/p99 tail evidence. Retention is then a
+/// fixed rows-per-second constant per endpoint regardless of lane speed, so a
+/// fast lane cannot exhaust the bounded storage and long runs degrade
+/// evidence resolution uniformly rather than losing their tail.
+const RTT_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const RTP_TRACE_COLUMNS: usize = 102;
 const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,fec_parity_sent,fec_groups_flushed,fec_flushed_groups_1,fec_flushed_groups_2_to_4,fec_flushed_groups_5_to_7,fec_flushed_groups_8,fec_groups_skipped_no_surplus_tokens,fec_no_surplus_groups_1,fec_no_surplus_groups_2_to_4,fec_no_surplus_groups_5_to_7,fec_no_surplus_groups_8,fec_groups_skipped_burst_end,fec_burst_end_groups_1,fec_burst_end_groups_2_to_4,fec_burst_end_groups_5_to_7,fec_burst_end_groups_8,fec_groups_skipped_loss_gate,fec_loss_gate_groups_1,fec_loss_gate_groups_2_to_4,fec_loss_gate_groups_5_to_7,fec_loss_gate_groups_8,fec_groups_skipped_no_spare_capacity,fec_no_spare_capacity_groups_1,fec_no_spare_capacity_groups_2_to_4,fec_no_spare_capacity_groups_5_to_7,fec_no_spare_capacity_groups_8,fec_recovered_symbols,fec_dropped_malformed_packets,fec_dropped_decoder_panics,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
 
@@ -322,10 +329,17 @@ struct NetemObservation {
 }
 
 /// A bounded, sealable capture of RTP observations for one endpoint. State
-/// samples are throttled to [`STATE_SAMPLE_INTERVAL`] while every raw RTT
-/// sample and termination row is retained; callbacks are synchronous and the
-/// storage is bounded at `capacity`. Rare scheduler/recovery events are
-/// aggregate atomics and never consume bounded state-row capacity.
+/// samples are throttled to [`STATE_SAMPLE_INTERVAL`] and raw RTT samples are
+/// time-decimated to [`RTT_SAMPLE_INTERVAL`] on an independent clock;
+/// termination rows bypass both throttles. Callbacks are synchronous and the
+/// storage is bounded at `capacity`; the retained row rate is a fixed const
+/// per endpoint (state + claimed RTT + terminations), so arbitrarily fast
+/// lanes cannot exhaust capacity and long runs degrade evidence resolution
+/// (fewer samples per second) rather than losing the run tail. First-N
+/// truncation would bias per-unit-time evidence on fast lanes; uniform
+/// time-decimation keeps the retained RTT series an unbiased sample of the
+/// RTT process on the same grid for every lane. Rare scheduler/recovery
+/// events are aggregate atomics and never consume bounded row capacity.
 #[derive(Debug)]
 struct RtpCapture {
     trace_start: Instant,
@@ -333,6 +347,7 @@ struct RtpCapture {
     counter_baseline: Mutex<Option<CumulativeCounters>>,
     measurement_start_micros: AtomicU64,
     last_state_sample_micros: AtomicU64,
+    last_rtt_sample_micros: AtomicU64,
     dropped_capacity: AtomicU64,
     send_driver_resume_signal_wakes: AtomicU64,
     send_driver_ack_schedule_signal_wakes: AtomicU64,
@@ -362,6 +377,7 @@ impl RtpCapture {
             counter_baseline: Mutex::new(None),
             measurement_start_micros: AtomicU64::new(0),
             last_state_sample_micros: AtomicU64::new(u64::MAX),
+            last_rtt_sample_micros: AtomicU64::new(u64::MAX),
             dropped_capacity: AtomicU64::new(0),
             send_driver_resume_signal_wakes: AtomicU64::new(0),
             send_driver_ack_schedule_signal_wakes: AtomicU64::new(0),
@@ -439,6 +455,8 @@ impl RtpCapture {
         drop(observations);
         self.last_state_sample_micros
             .store(u64::MAX, Ordering::Relaxed);
+        self.last_rtt_sample_micros
+            .store(u64::MAX, Ordering::Relaxed);
         self.dropped_capacity.store(0, Ordering::Relaxed);
         self.send_driver_resume_signal_wakes
             .store(0, Ordering::Relaxed);
@@ -469,6 +487,30 @@ impl RtpCapture {
         self.data_send_would_blocks.store(0, Ordering::Relaxed);
         self.gentle_exits.reset();
         self.ack_flushes.reset();
+    }
+
+    /// Claim the next raw RTT sample on the RTT decimation clock: at most one
+    /// sample per [`RTT_SAMPLE_INTERVAL`], with the first sample after the
+    /// measurement boundary always claiming. Independent of the state clock
+    /// so RTT retention never competes with state-row cadence.
+    fn claim_rtt_sample_at(&self, elapsed: Duration) -> bool {
+        let now = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let interval = RTT_SAMPLE_INTERVAL.as_micros() as u64;
+        let mut previous = self.last_rtt_sample_micros.load(Ordering::Relaxed);
+        loop {
+            if previous != u64::MAX && now.saturating_sub(previous) < interval {
+                return false;
+            }
+            match self.last_rtt_sample_micros.compare_exchange_weak(
+                previous,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => previous = actual,
+            }
+        }
     }
 
     fn claim_state_sample_at(&self, elapsed: Duration) -> bool {
@@ -560,7 +602,7 @@ impl RtpCapture {
             || self.claim_state_sample_at(elapsed)
         {
             MetricsInterest::Snapshot
-        } else if event == MetricsEvent::RttSample {
+        } else if event == MetricsEvent::RttSample && self.claim_rtt_sample_at(elapsed) {
             MetricsInterest::EventOnly
         } else {
             MetricsInterest::Skip
@@ -569,9 +611,11 @@ impl RtpCapture {
 }
 
 /// Opt-in capture for performance probes. Set 'NETEM_PERF_TRACE_DIR' to an
-/// empty output directory to enable it. Client and accepted-peer RTP state are
-/// captured independently at 50 ms while every accepted raw RTT sample is
-/// retained. Storage is bounded and callback execution is synchronous; no
+/// empty output directory to enable it. Client and accepted-peer RTP state
+/// are captured independently at 50 ms while raw RTT samples are
+/// time-decimated at a finer 10 ms cadence on an independent clock, so
+/// retention is a fixed rows-per-second constant per endpoint regardless of
+/// lane speed. Storage is bounded and callback execution is synchronous; no
 /// async channel or detached task is involved.
 ///
 /// Set 'NETEM_PERF_TRACE_RTP=0' to retain only netem and application-progress
@@ -712,6 +756,13 @@ impl PerfTrace {
             &[
                 "rtp_state_sample_interval_micros",
                 &STATE_SAMPLE_INTERVAL.as_micros().to_string(),
+            ],
+        )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "rtp_rtt_sample_interval_micros",
+                &RTT_SAMPLE_INTERVAL.as_micros().to_string(),
             ],
         )?;
         write_csv_row(&mut out, &["rtp_capacity", &self.rtp.capacity.to_string()])?;
@@ -1276,13 +1327,16 @@ mod tests {
     }
 
     #[test]
-    fn state_is_throttled_but_all_raw_rtt_samples_are_kept() {
+    fn state_and_rtt_samples_are_each_time_decimated_on_independent_clocks() {
         let capture = capture(Instant::now(), 8);
+        // The first event claims the state clock.
         assert_eq!(
             capture.interest(MetricsEvent::SendDataPacketAttempt, Duration::ZERO),
             MetricsInterest::Snapshot
         );
         capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        // A second state event inside the state interval is throttled even
+        // though the RTT clock is still unclaimed: the clocks are independent.
         assert_eq!(
             capture.interest(
                 MetricsEvent::SendDataPacketAttempt,
@@ -1290,21 +1344,42 @@ mod tests {
             ),
             MetricsInterest::Skip
         );
+        // The first raw RTT sample claims the RTT clock and is retained.
         assert_eq!(
             capture.interest(MetricsEvent::RttSample, Duration::from_millis(2)),
             MetricsInterest::EventOnly
         );
         capture.record(observation(2, 2, MetricsEvent::RttSample));
+        // Raw RTT samples are time-decimated on their own clock, mirroring
+        // the state throttle: a sample inside the RTT interval is not
+        // retained, so arbitrarily fast lanes cannot exhaust storage.
         assert_eq!(
             capture.interest(MetricsEvent::RttSample, Duration::from_millis(3)),
-            MetricsInterest::EventOnly
+            MetricsInterest::Skip,
+            "raw RTT samples inside {RTT_SAMPLE_INTERVAL:?} of the previous \
+             claim must be decimated"
         );
-        capture.record(observation(3, 3, MetricsEvent::RttSample));
+        // The state clock is due again at 50 ms and claims independently of
+        // the RTT clock.
         assert_eq!(
             capture.interest(MetricsEvent::ReceiveAckPacket, Duration::from_millis(50)),
             MetricsInterest::Snapshot
         );
         capture.record(observation(4, 50, MetricsEvent::ReceiveAckPacket));
+        // One RTT interval after its own prior claim the RTT clock is due
+        // again: the sample is retained even though it is inside the state
+        // interval.
+        let rtt_due = Duration::from_millis(2) + RTT_SAMPLE_INTERVAL;
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, rtt_due),
+            MetricsInterest::EventOnly
+        );
+        capture.record(observation(5, 52, MetricsEvent::RttSample));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, rtt_due + Duration::from_millis(1)),
+            MetricsInterest::Skip
+        );
+        // Termination bypasses both throttles.
         assert_eq!(
             capture.interest(
                 MetricsEvent::SessionTermination(MetricsTermination {
@@ -1312,22 +1387,74 @@ mod tests {
                     error_kind: std::io::ErrorKind::BrokenPipe,
                     raw_os_error: None,
                 }),
-                Duration::from_millis(51)
+                Duration::from_millis(60)
             ),
             MetricsInterest::Snapshot,
-            "termination must bypass the periodic state throttle"
+            "termination must bypass the periodic state and RTT throttles"
         );
 
         let observations = capture.observations.lock().unwrap();
         assert_eq!(observations.len(), 4);
         assert_eq!(observations[0].observation.event_index, 0);
         assert_eq!(observations[1].observation.event_index, 2);
-        assert_eq!(observations[2].observation.event_index, 3);
-        assert_eq!(observations[3].observation.event_index, 4);
+        assert_eq!(observations[2].observation.event_index, 4);
+        assert_eq!(observations[3].observation.event_index, 5);
         // Every captured row carries its shared trace-clock position.
         for captured in observations.iter() {
             assert!(!captured.trace_elapsed.is_zero());
         }
+    }
+
+    #[test]
+    fn rtt_decimation_clock_resets_at_the_measurement_boundary() {
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 8);
+        // Warmup: the first event claims the state clock; the next RTT sample
+        // claims the RTT clock; the one after is decimated.
+        assert_eq!(
+            capture.interest(MetricsEvent::SendDataPacketAttempt, Duration::ZERO),
+            MetricsInterest::Snapshot
+        );
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(1)),
+            MetricsInterest::EventOnly
+        );
+        capture.record(observation(1, 1, MetricsEvent::RttSample));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(2)),
+            MetricsInterest::Skip
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        let boundary = trace_start.elapsed();
+        capture.begin_measurement(boundary);
+        // Both decimation clocks reset with the capacity state: warmup rows
+        // are discarded and the first post-boundary event claims the state
+        // clock again ...
+        assert_eq!(
+            capture.interest(
+                MetricsEvent::SendDataPacketAttempt,
+                Duration::from_millis(100)
+            ),
+            MetricsInterest::Snapshot
+        );
+        capture.record(observation(100, 100, MetricsEvent::SendDataPacketAttempt));
+        // ... while the first post-boundary RTT sample claims the RTT clock
+        // again, even though it arrives inside the state interval.
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(101)),
+            MetricsInterest::EventOnly
+        );
+        capture.record(observation(101, 101, MetricsEvent::RttSample));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(102)),
+            MetricsInterest::Skip
+        );
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].observation.event_index, 100);
+        assert_eq!(observations[1].observation.event_index, 101);
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 0);
     }
 
     #[test]
