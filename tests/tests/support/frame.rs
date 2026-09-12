@@ -2,7 +2,7 @@
 // Frame‑delivery adapter
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::support::{TestScope, TestTask, TestTaskSubmitter, submit_test_task_required};
+use crate::support::{TestScope, TestTask, TestTaskSubmitter, submit_test_task};
 
 pub type RtpFrameReader = rtp::socket::FrameByteReader;
 pub type RtpFrameDeliveryWriter = rtp::socket::FrameByteWriter;
@@ -10,8 +10,9 @@ pub type RtpFrameDeliveryWriter = rtp::socket::FrameByteWriter;
 /// Connect an rtp client using frame delivery.  Returns the frame-preserving
 /// reader and writer adapters that guarantee one-mux-frame-per-one-rtp-frame.
 ///
-/// `tasks` owns the rtp session-owner keepalive; the session must stay alive
-/// for the whole test body, so the keepalive is registered as required.
+/// `tasks` owns the rtp session supervisor as a non-required keepalive; the
+/// supervisor is awaited in the background and the test body owns teardown.
+/// A normal FIN shutdown does not fail the test.
 pub async fn rtp_frame_delivery_connect(
     tasks: &mut TestScope,
     proxy_client_addr: std::net::SocketAddr,
@@ -28,15 +29,15 @@ pub async fn rtp_frame_delivery_connect(
 
 /// [`rtp_frame_delivery_connect`] through the bounded task-submission handle,
 /// for use inside [`TestScope::run`] bodies where `&mut TestScope` is
-/// unavailable. The supervisor keepalive is submitted as required through the
-/// handle.
+/// unavailable. The supervisor keepalive is submitted as a non-required
+/// keepalive through the handle.
 pub async fn rtp_frame_delivery_connect_via(
     tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
     rtp_frame_delivery_connect_core(
-        |name, fut| submit_test_task_required(tx, name, fut),
+        |fut| submit_test_task(tx, fut),
         proxy_client_addr,
         fec,
         rtp::udp::MssConfig::Default,
@@ -70,7 +71,7 @@ pub async fn rtp_frame_delivery_connect_with_mss_via(
     mss: usize,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
     rtp_frame_delivery_connect_core(
-        |name, fut| submit_test_task_required(tx, name, fut),
+        |fut| submit_test_task(tx, fut),
         proxy_client_addr,
         fec,
         rtp::udp::MssConfig::Custom(mss),
@@ -84,21 +85,15 @@ async fn rtp_frame_delivery_connect_with_mss_config(
     fec: bool,
     mss: rtp::udp::MssConfig,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
-    rtp_frame_delivery_connect_core(
-        |name, fut| tasks.spawn_required(name, fut),
-        proxy_client_addr,
-        fec,
-        mss,
-    )
-    .await
+    rtp_frame_delivery_connect_core(|fut| tasks.spawn(fut), proxy_client_addr, fec, mss).await
 }
 
 /// Shared core for [`rtp_frame_delivery_connect_with_mss_config`] and the
-/// `_via` variants: opens the connection and hands the required supervisor
-/// keepalive to `spawn_required` (either a [`TestScope`] spawn or the bounded
-/// reaper submission).
+/// `_via` variants: opens the connection and hands the supervisor keepalive to
+/// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission) as
+/// a non-required keepalive.
 async fn rtp_frame_delivery_connect_core(
-    spawn_required: impl FnOnce(&'static str, TestTask),
+    spawn: impl FnOnce(TestTask),
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: rtp::udp::MssConfig,
@@ -115,13 +110,12 @@ async fn rtp_frame_delivery_connect_core(
     )
     .await
     .unwrap();
-    // Hold the rtp session owner for the connection's lifetime; the session
-    // must survive the whole test body, so the keepalive is required.
-    spawn_required(
-        "rtp client session",
-        Box::pin(async move {
-            let _ = connected.supervisor.await;
-        }),
-    );
+    // Hold the rtp session owner for the connection's lifetime; the supervisor
+    // is polled as a non-required keepalive so a normal FIN shutdown does not
+    // fail the test. An early session end still surfaces through the
+    // higher-level supervision (mux session / pump write errors).
+    spawn(Box::pin(async move {
+        let _ = connected.supervisor.await;
+    }));
     (connected.read, connected.write)
 }

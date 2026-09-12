@@ -66,7 +66,7 @@ use support::rtp_mux::{
     spawn_rtp_mux_latency_bulk_server_observed_via,
 };
 use support::stats::{HolSummary, combined_stats, summarize};
-use support::{submit_test_task, submit_test_task_required};
+use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod support;
@@ -1468,16 +1468,22 @@ async fn run_hol_probe_frame_delivery_shared(
             let mut spawner = tokio::task::JoinSet::new();
             let (opener, _accepter) =
                 mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
-            // The mux supervision is drained by a required task submitted
-            // through the handle: the session must survive the whole body, a
-            // panicked supervision task surfaces immediately, and the
-            // session ending before the body completes is a panic.
-            submit_test_task_required(&task_tx, "mux client session", async move {
-                if let Some(result) = spawner.join_next().await {
-                    let err = result.unwrap();
-                    panic!("mux client session ended before the test body: {err:?}");
-                }
-            });
+            // The mux supervision is drained by a non-required background
+            // task: these echo lanes let the session tear down normally (FIN
+            // exchanged) before the measurement body finishes, so a required
+            // task would panic on that normal early completion. A panicked
+            // supervision task still surfaces at scope end, and the JoinSet
+            // is dropped when the task completes, aborting any stragglers.
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    if let Some(result) = spawner.join_next().await {
+                        if let Err(err) = result {
+                            panic!("mux client session supervision failed: {err:?}");
+                        }
+                    }
+                }),
+            );
             let (mut rr_read, mut rr_write) = opener.open().await.unwrap();
             // Parked until the stream closes; the owning JoinSet aborts it at scope end.
             submit_test_task(
@@ -1776,6 +1782,10 @@ async fn run_hol_probe_dual_lane(
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let active_for = run_for - BULK_RAMP;
             let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            // `pump_failed_tx` records that the pump ended on its own (open or
+            // write failure) rather than on the watch stop signal; only an
+            // own-end while the measurement is running is a premature pump end.
+            let (pump_failed_tx, pump_failed_rx) = tokio::sync::watch::channel(false);
             let bulk_opener = opener.clone();
             let mut bulk_tasks = tokio::task::JoinSet::new();
             {
@@ -1783,7 +1793,10 @@ async fn run_hol_probe_dual_lane(
                 bulk_tasks.spawn(async move {
                     let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                         Ok(v) => v,
-                        Err(_) => return,
+                        Err(_) => {
+                            let _ = pump_failed_tx.send(true);
+                            return;
+                        }
                     };
                     // The pump runs until the watch signals shutdown at the end of
                     // the interactive measurement (or a write failure ends it).
@@ -1799,7 +1812,12 @@ async fn run_hol_probe_dual_lane(
                             Duration::from_secs(3600),
                             &BULK_NO_STOP,
                             BulkLoad::Saturating,
-                        ) => {}
+                        ) => {
+                            // The writer returned short of its 3600s backstop and
+                            // before the stop signal: the pump ended on a write
+                            // failure while the measurement may still be running.
+                            let _ = pump_failed_tx.send(true);
+                        }
                     }
                     let _ = w.shutdown();
                 });
@@ -1845,17 +1863,14 @@ async fn run_hol_probe_dual_lane(
                 bulk_pair.stop();
                 summary
             };
-            tokio::pin!(body);
-            let summary = tokio::select! {
-                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
-                    // The bulk pump ended before the interactive measurement
-                    // completed: fail the test instead of measuring without
-                    // contention.
-                    joined.expect("bulk pump exists").unwrap();
-                    panic!("bulk pump ended before the interactive measurement completed");
-                }
-                summary = &mut body => summary,
-            };
+            // The bulk pump must stay live (contending) for the whole
+            // interactive measurement: run it to completion, then fail if the
+            // pump ended on its own (open or write failure) instead of on the
+            // watch stop signal.
+            let summary = body.await;
+            if *pump_failed_rx.borrow() {
+                panic!("bulk pump ended before the interactive measurement completed");
+            }
             // Epilog: join the pump so any panic surfaces.
             while let Some(result) = bulk_tasks.join_next().await {
                 result.unwrap();
@@ -1920,6 +1935,10 @@ async fn run_hol_probe_dual_lane_two_interactive(
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let active_for = run_for - BULK_RAMP;
             let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            // `pump_failed_tx` records that the pump ended on its own (open or
+            // write failure) rather than on the watch stop signal; only an
+            // own-end while the measurement is running is a premature pump end.
+            let (pump_failed_tx, pump_failed_rx) = tokio::sync::watch::channel(false);
             let bulk_opener = opener.clone();
             let mut bulk_tasks = tokio::task::JoinSet::new();
             {
@@ -1927,7 +1946,10 @@ async fn run_hol_probe_dual_lane_two_interactive(
                 bulk_tasks.spawn(async move {
                     let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                         Ok(v) => v,
-                        Err(_) => return,
+                        Err(_) => {
+                            let _ = pump_failed_tx.send(true);
+                            return;
+                        }
                     };
                     // The pump runs until the watch signals shutdown at the end of
                     // the interactive measurement (or a write failure ends it).
@@ -1943,7 +1965,12 @@ async fn run_hol_probe_dual_lane_two_interactive(
                             Duration::from_secs(3600),
                             &BULK_NO_STOP,
                             BulkLoad::Saturating,
-                        ) => {}
+                        ) => {
+                            // The writer returned short of its 3600s backstop and
+                            // before the stop signal: the pump ended on a write
+                            // failure while the measurement may still be running.
+                            let _ = pump_failed_tx.send(true);
+                        }
                     }
                     let _ = w.shutdown();
                 });
@@ -2058,17 +2085,14 @@ async fn run_hol_probe_dual_lane_two_interactive(
                 bulk_pair.stop();
                 (summary_a, summary_b, combined, bulk_mibps)
             };
-            tokio::pin!(body);
-            let result = tokio::select! {
-                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
-                    // The bulk pump ended before the interactive measurement
-                    // completed: fail the test instead of measuring without
-                    // contention.
-                    joined.expect("bulk pump exists").unwrap();
-                    panic!("bulk pump ended before the interactive measurement completed");
-                }
-                result = &mut body => result,
-            };
+            // The bulk pump must stay live (contending) for the whole
+            // interactive measurement: run it to completion, then fail if the
+            // pump ended on its own (open or write failure) instead of on the
+            // watch stop signal.
+            let result = body.await;
+            if *pump_failed_rx.borrow() {
+                panic!("bulk pump ended before the interactive measurement completed");
+            }
             // Epilog: join the pump so any panic surfaces.
             while let Some(result) = bulk_tasks.join_next().await {
                 result.unwrap();
@@ -2116,16 +2140,22 @@ async fn run_frame_delivery_two_interactive(
             let mut spawner = tokio::task::JoinSet::new();
             let (opener, _accepter) =
                 mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
-            // The mux supervision is drained by a required task submitted
-            // through the handle: the session must survive the whole body, a
-            // panicked supervision task surfaces immediately, and the
-            // session ending before the body completes is a panic.
-            submit_test_task_required(&task_tx, "mux client session", async move {
-                if let Some(result) = spawner.join_next().await {
-                    let err = result.unwrap();
-                    panic!("mux client session ended before the test body: {err:?}");
-                }
-            });
+            // The mux supervision is drained by a non-required background
+            // task: these echo lanes let the session tear down normally (FIN
+            // exchanged) before the measurement body finishes, so a required
+            // task would panic on that normal early completion. A panicked
+            // supervision task still surfaces at scope end, and the JoinSet
+            // is dropped when the task completes, aborting any stragglers.
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    if let Some(result) = spawner.join_next().await {
+                        if let Err(err) = result {
+                            panic!("mux client session supervision failed: {err:?}");
+                        }
+                    }
+                }),
+            );
             let (mut read_a, mut write_a) = opener.open().await.unwrap();
             let (mut read_b, mut write_b) = opener.open().await.unwrap();
             // Parked until the streams close; the owning JoinSet aborts them at scope end.
@@ -2631,6 +2661,10 @@ async fn run_hol_probe_dual_lane_separate_listeners(
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let active_for = run_for - BULK_RAMP;
             let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
+            // `pump_failed_tx` records that the pump ended on its own (open or
+            // write failure) rather than on the watch stop signal; only an
+            // own-end while the measurement is running is a premature pump end.
+            let (pump_failed_tx, pump_failed_rx) = tokio::sync::watch::channel(false);
             let bulk_opener = opener.clone();
             let mut bulk_tasks = tokio::task::JoinSet::new();
             {
@@ -2638,7 +2672,10 @@ async fn run_hol_probe_dual_lane_separate_listeners(
                 bulk_tasks.spawn(async move {
                     let (_, mut w) = match bulk_opener.open(mux::LaneClass::Bulk).await {
                         Ok(v) => v,
-                        Err(_) => return,
+                        Err(_) => {
+                            let _ = pump_failed_tx.send(true);
+                            return;
+                        }
                     };
                     // The pump runs until the watch signals shutdown at the end of
                     // the interactive measurement (or a write failure ends it).
@@ -2654,7 +2691,12 @@ async fn run_hol_probe_dual_lane_separate_listeners(
                             Duration::from_secs(3600),
                             &BULK_NO_STOP,
                             BulkLoad::Saturating,
-                        ) => {}
+                        ) => {
+                            // The writer returned short of its 3600s backstop and
+                            // before the stop signal: the pump ended on a write
+                            // failure while the measurement may still be running.
+                            let _ = pump_failed_tx.send(true);
+                        }
                     }
                     let _ = w.shutdown();
                 });
@@ -2705,17 +2747,14 @@ async fn run_hol_probe_dual_lane_separate_listeners(
                 bulk_pair.stop();
                 summary
             };
-            tokio::pin!(body);
-            let summary = tokio::select! {
-                joined = bulk_tasks.join_next(), if !bulk_tasks.is_empty() => {
-                    // The bulk pump ended before the interactive measurement
-                    // completed: fail the test instead of measuring without
-                    // contention.
-                    joined.expect("bulk pump exists").unwrap();
-                    panic!("bulk pump ended before the interactive measurement completed");
-                }
-                summary = &mut body => summary,
-            };
+            // The bulk pump must stay live (contending) for the whole
+            // interactive measurement: run it to completion, then fail if the
+            // pump ended on its own (open or write failure) instead of on the
+            // watch stop signal.
+            let summary = body.await;
+            if *pump_failed_rx.borrow() {
+                panic!("bulk pump ended before the interactive measurement completed");
+            }
             // Epilog: join the pump so any panic surfaces.
             while let Some(result) = bulk_tasks.join_next().await {
                 result.unwrap();
