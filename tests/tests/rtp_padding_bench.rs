@@ -143,9 +143,7 @@ async fn run_transfer(
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let server_addr = spawn_padded_echo_server(&task_tx, policy)
-                .await
-                .unwrap();
+            let server_addr = spawn_padded_echo_server(&task_tx, policy).await.unwrap();
 
             // Recording transports on both sides of the proxy capture the
             // wire datagram sizes.
@@ -282,7 +280,11 @@ async fn unpadded_wire_sizes_stay_multimodal() {
 async fn ack_padding_hides_ack_packets_among_data() {
     let transfer_bytes = 256 * 1024;
     let (baseline, _) = run_transfer(rtp::udp::HarmfulPaddingPolicy::None, transfer_bytes).await;
-    let (fitted, _) = run_transfer(rtp::udp::HarmfulPaddingPolicy::AckMimicsData, transfer_bytes).await;
+    let (fitted, _) = run_transfer(
+        rtp::udp::HarmfulPaddingPolicy::AckMimicsData,
+        transfer_bytes,
+    )
+    .await;
 
     let small = |h: &std::collections::HashMap<usize, usize>| -> usize {
         h.iter().filter(|&(&n, _)| n < 200).map(|(_, &c)| c).sum()
@@ -339,9 +341,7 @@ async fn run_transfer_preset(
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let server_addr = spawn_padded_echo_server(&task_tx, policy)
-                .await
-                .unwrap();
+            let server_addr = spawn_padded_echo_server(&task_tx, policy).await.unwrap();
             let pair = NetemPair::spawn(server_addr, preset.clone(), preset).unwrap();
             let connected = rtp::udp::connect_with(
                 "0.0.0.0:0",
@@ -393,9 +393,7 @@ async fn run_small_echoes(
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let server_addr = spawn_padded_echo_server(&task_tx, policy)
-                .await
-                .unwrap();
+            let server_addr = spawn_padded_echo_server(&task_tx, policy).await.unwrap();
             let pair = NetemPair::spawn(server_addr, preset.clone(), preset).unwrap();
             let connected = rtp::udp::connect_with(
                 "0.0.0.0:0",
@@ -444,7 +442,12 @@ async fn ab_bulk_throughput_across_presets() {
     ];
     println!("A/B bulk throughput ({transfer_bytes} bytes):");
     for (name, preset) in presets {
-        let unpadded = run_transfer_preset(rtp::udp::HarmfulPaddingPolicy::None, preset.clone(), transfer_bytes).await;
+        let unpadded = run_transfer_preset(
+            rtp::udp::HarmfulPaddingPolicy::None,
+            preset.clone(),
+            transfer_bytes,
+        )
+        .await;
         let padded = run_transfer_preset(PROFILE, preset, transfer_bytes).await;
         let unpadded_mbps = transfer_bytes as f64 / unpadded.as_secs_f64() / 1e6;
         let padded_mbps = transfer_bytes as f64 / padded.as_secs_f64() / 1e6;
@@ -468,8 +471,18 @@ async fn ab_bulk_throughput_ack_padding() {
     ];
     println!("A/B bulk throughput ack_padding ({transfer_bytes} bytes):");
     for (name, preset) in presets {
-        let off = run_transfer_preset(rtp::udp::HarmfulPaddingPolicy::None, preset.clone(), transfer_bytes).await;
-        let on = run_transfer_preset(rtp::udp::HarmfulPaddingPolicy::AckMimicsData, preset, transfer_bytes).await;
+        let off = run_transfer_preset(
+            rtp::udp::HarmfulPaddingPolicy::None,
+            preset.clone(),
+            transfer_bytes,
+        )
+        .await;
+        let on = run_transfer_preset(
+            rtp::udp::HarmfulPaddingPolicy::AckMimicsData,
+            preset,
+            transfer_bytes,
+        )
+        .await;
         let off_mbps = transfer_bytes as f64 / off.as_secs_f64() / 1e6;
         let on_mbps = transfer_bytes as f64 / on.as_secs_f64() / 1e6;
         println!(
@@ -486,7 +499,8 @@ async fn ab_bulk_throughput_ack_padding() {
 async fn ab_small_echo_latency() {
     let count = 200;
     let size = 64;
-    let unpadded = run_small_echoes(rtp::udp::HarmfulPaddingPolicy::None, clean(), count, size).await;
+    let unpadded =
+        run_small_echoes(rtp::udp::HarmfulPaddingPolicy::None, clean(), count, size).await;
     let padded = run_small_echoes(PROFILE, clean(), count, size).await;
     let unpadded_per = unpadded.as_secs_f64() / count as f64;
     let padded_per = padded.as_secs_f64() / count as f64;
@@ -508,7 +522,13 @@ async fn ab_small_echo_latency_ack_padding() {
     let count = 200;
     let size = 64;
     let off = run_small_echoes(rtp::udp::HarmfulPaddingPolicy::None, clean(), count, size).await;
-    let on = run_small_echoes(rtp::udp::HarmfulPaddingPolicy::AckMimicsData, clean(), count, size).await;
+    let on = run_small_echoes(
+        rtp::udp::HarmfulPaddingPolicy::AckMimicsData,
+        clean(),
+        count,
+        size,
+    )
+    .await;
     let off_per = off.as_secs_f64() / count as f64;
     let on_per = on.as_secs_f64() / count as f64;
     println!(
@@ -537,7 +557,13 @@ async fn ab_small_echo_latency_across_presets() {
     ];
     println!("A/B small echo ({count} x {size}B) under injected latency:");
     for (name, preset) in presets {
-        let unpadded = run_small_echoes(rtp::udp::HarmfulPaddingPolicy::None, preset.clone(), count, size).await;
+        let unpadded = run_small_echoes(
+            rtp::udp::HarmfulPaddingPolicy::None,
+            preset.clone(),
+            count,
+            size,
+        )
+        .await;
         let padded = run_small_echoes(PROFILE, preset, count, size).await;
         let unpadded_per = unpadded.as_secs_f64() / count as f64;
         let padded_per = padded.as_secs_f64() / count as f64;
