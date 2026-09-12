@@ -98,7 +98,7 @@ fn diagnostic_observer() -> (MetricsObserver, Arc<Mutex<LatestState>>) {
             let attempts = Arc::clone(&attempts);
             move |event, _elapsed| match event {
                 MetricsEvent::SendDataPacketAttempt => {
-                    if attempts.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+                    if attempts.fetch_add(1, Ordering::Relaxed).is_multiple_of(256) {
                         MetricsInterest::Snapshot
                     } else {
                         MetricsInterest::EventOnly
