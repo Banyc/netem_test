@@ -95,6 +95,7 @@ mod payload_pattern_tests {
 async fn spawn_mux_over_rtp_server_core<F, Fut>(
     spawn: impl FnOnce(TestTask),
     fec: bool,
+    fec_tuning: Option<rtp::FecTuning>,
     mss: usize,
     metrics_observer: Option<rtp::metrics::MetricsObserver>,
     mux_session: Option<Arc<MuxSessionProgress>>,
@@ -111,16 +112,24 @@ where
     spawn(Box::pin({
         let listener = Arc::clone(&listener);
         async move {
+            // Apply the caller's explicit per-connection tuning when given;
+            // `None` preserves the process-env default from `AcceptConfig`.
+            let with_tuning = |mut config: rtp::udp::AcceptConfig| {
+                if let Some(tuning) = fec_tuning {
+                    config.fec_tuning = tuning;
+                }
+                config
+            };
             // First (and only) rtp connection.
             // An accept failure is a scenario failure; panic so the root
             // JoinError unwrap crashes the test.
             let accepted = listener
-                .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                .accept_without_handshake_with(with_tuning(rtp::udp::AcceptConfig {
                     fec,
                     mss: rtp::udp::MssConfig::Custom(mss),
                     metrics_observer,
                     ..rtp::udp::AcceptConfig::default()
-                })
+                }))
                 .await
                 .unwrap();
             // The extra-accept drainer loop keeps driving `udp_listener`'s
@@ -133,16 +142,17 @@ where
             // handlers below and only ends by panicking on an accept error.
             let drainer = {
                 let listener = Arc::clone(&listener);
+                let drainer_config = with_tuning(rtp::udp::AcceptConfig {
+                    fec,
+                    mss: rtp::udp::MssConfig::Custom(mss),
+                    // The drainer rejects extra logical sessions;
+                    // only the first accepted peer is observed.
+                    ..rtp::udp::AcceptConfig::default()
+                });
                 async move {
                     loop {
                         listener
-                            .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                                fec,
-                                mss: rtp::udp::MssConfig::Custom(mss),
-                                // The drainer rejects extra logical sessions;
-                                // only the first accepted peer is observed.
-                                ..rtp::udp::AcceptConfig::default()
-                            })
+                            .accept_without_handshake_with(drainer_config.clone())
                             .await
                             .unwrap();
                     }
@@ -248,8 +258,16 @@ where
     F: Fn(mux::StreamReader, mux::StreamWriter) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    spawn_mux_over_rtp_server_core(|fut| tasks.spawn(fut), fec, mss, None, None, handle_stream)
-        .await
+    spawn_mux_over_rtp_server_core(
+        |fut| tasks.spawn(fut),
+        fec,
+        None,
+        mss,
+        None,
+        None,
+        handle_stream,
+    )
+    .await
 }
 
 /// [`spawn_mux_over_rtp_server_with_mss`] through the bounded
@@ -268,6 +286,7 @@ where
     spawn_mux_over_rtp_server_core(
         |fut| submit_test_task(tx, fut),
         fec,
+        None,
         mss,
         None,
         None,
@@ -287,6 +306,7 @@ async fn spawn_mux_over_rtp_echo_server_core(
     spawn_mux_over_rtp_server_core(
         spawn,
         fec,
+        None,
         mss,
         None,
         None,
@@ -361,6 +381,7 @@ async fn spawn_mux_over_rtp_sink_server_core(
     let addr = spawn_mux_over_rtp_server_core(
         spawn,
         fec,
+        None,
         mss,
         None,
         None,
@@ -469,6 +490,7 @@ async fn spawn_mux_msg_latency_sink_core(
     let addr = spawn_mux_over_rtp_server_core(
         spawn,
         fec,
+        None,
         mss,
         None,
         None,
@@ -767,6 +789,7 @@ async fn spawn_mux_over_rtp_counting_sink_server_core(
     let addr = spawn_mux_over_rtp_server_core(
         spawn,
         fec,
+        None,
         mss,
         metrics_observer,
         Some(progress.mux_session()),
@@ -881,87 +904,105 @@ async fn spawn_mux_latency_bulk_server_core(
     tokio::sync::mpsc::Receiver<f64>,
     Arc<AtomicU64>,
 )> {
+    spawn_mux_latency_bulk_server_core_with_fec_tuning(spawn, fec, None, base).await
+}
+
+/// [`spawn_mux_latency_bulk_server_core`] with an explicit per-connection
+/// [`rtp::FecTuning`] threaded to the accept side (`None` keeps the
+/// process-env default), so a scenario can A/B the stock vs prompt-parity
+/// tuning on both peers.
+async fn spawn_mux_latency_bulk_server_core_with_fec_tuning(
+    spawn: impl FnOnce(TestTask),
+    fec: bool,
+    fec_tuning: Option<rtp::FecTuning>,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, None, {
-        let tx = tx.clone();
-        let bulk_delivered = Arc::clone(&bulk_delivered);
-        move |mut stream_read, mut stream_write| {
+    let addr =
+        spawn_mux_over_rtp_server_core(spawn, fec, fec_tuning, rtp::udp::NO_FEC_MSS, None, None, {
             let tx = tx.clone();
             let bulk_delivered = Arc::clone(&bulk_delivered);
-            async move {
-                let mut tag = [0u8; 1];
-                let n = match stream_read.read(&mut tag).await {
-                    Ok(n) => n,
-                    Err(_) => {
+            move |mut stream_read, mut stream_write| {
+                let tx = tx.clone();
+                let bulk_delivered = Arc::clone(&bulk_delivered);
+                async move {
+                    let mut tag = [0u8; 1];
+                    let n = match stream_read.read(&mut tag).await {
+                        Ok(n) => n,
+                        Err(_) => {
+                            let _ = stream_write.shutdown();
+                            return;
+                        }
+                    };
+                    if n == 0 {
                         let _ = stream_write.shutdown();
                         return;
                     }
-                };
-                if n == 0 {
+                    // Timestamped latency frame parser.
+                    if tag[0] == b'L' {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut offset = 0usize;
+                        while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
+                            if n == 0 {
+                                break;
+                            }
+                            offset += n;
+                            loop {
+                                if offset < 4 {
+                                    break;
+                                }
+                                let frame_len =
+                                    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                                if frame_len < 12 {
+                                    break;
+                                }
+                                if offset < frame_len {
+                                    break;
+                                }
+                                let payload_end = frame_len - 8;
+                                let sent_us = u64::from_le_bytes([
+                                    buf[payload_end],
+                                    buf[payload_end + 1],
+                                    buf[payload_end + 2],
+                                    buf[payload_end + 3],
+                                    buf[payload_end + 4],
+                                    buf[payload_end + 5],
+                                    buf[payload_end + 6],
+                                    buf[payload_end + 7],
+                                ]);
+                                let now_us = base.elapsed().as_micros() as u64;
+                                let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                if !try_send_observation(&tx, latency_ms, "Latency sample") {
+                                    break;
+                                }
+                                buf.copy_within(frame_len..offset, 0);
+                                offset -= frame_len;
+                            }
+                        }
+                    } else {
+                        // Bulk byte sink: verify the deterministic pattern and
+                        // count verified bytes. The tag byte itself is excluded.
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut verifier = PayloadPatternVerifier::default();
+                        while let Ok(n) = stream_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            if verifier.verify(&buf[..n]) {
+                                bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     let _ = stream_write.shutdown();
-                    return;
                 }
-                // Timestamped latency frame parser.
-                if tag[0] == b'L' {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let mut offset = 0usize;
-                    while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
-                        if n == 0 {
-                            break;
-                        }
-                        offset += n;
-                        loop {
-                            if offset < 4 {
-                                break;
-                            }
-                            let frame_len =
-                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                            if frame_len < 12 {
-                                break;
-                            }
-                            if offset < frame_len {
-                                break;
-                            }
-                            let payload_end = frame_len - 8;
-                            let sent_us = u64::from_le_bytes([
-                                buf[payload_end],
-                                buf[payload_end + 1],
-                                buf[payload_end + 2],
-                                buf[payload_end + 3],
-                                buf[payload_end + 4],
-                                buf[payload_end + 5],
-                                buf[payload_end + 6],
-                                buf[payload_end + 7],
-                            ]);
-                            let now_us = base.elapsed().as_micros() as u64;
-                            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            if !try_send_observation(&tx, latency_ms, "Latency sample") {
-                                break;
-                            }
-                            buf.copy_within(frame_len..offset, 0);
-                            offset -= frame_len;
-                        }
-                    }
-                } else {
-                    // Bulk byte sink: verify the deterministic pattern and
-                    // count verified bytes. The tag byte itself is excluded.
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let mut verifier = PayloadPatternVerifier::default();
-                    while let Ok(n) = stream_read.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        }
-                        if verifier.verify(&buf[..n]) {
-                            bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let _ = stream_write.shutdown();
             }
-        }
-    })
-    .await?;
+        })
+        .await?;
     Ok((addr, rx, bulk_delivered))
 }
 
@@ -1005,6 +1046,29 @@ pub async fn spawn_mux_latency_bulk_server_via(
     spawn_mux_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base).await
 }
 
+/// [`spawn_mux_latency_bulk_server_via`] with an explicit per-connection
+/// [`rtp::FecTuning`] applied on the accept side. The connecting peer must use
+/// the same `fec` flag and tuning (no in-band negotiation), so this pairs with
+/// `rtp_connect_with_mss_and_fec_tuning_via`.
+pub async fn spawn_mux_latency_bulk_server_with_fec_tuning_via(
+    tx: &TestTaskSubmitter,
+    fec: bool,
+    base: Instant,
+    fec_tuning: rtp::FecTuning,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<f64>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_latency_bulk_server_core_with_fec_tuning(
+        |fut| submit_test_task(tx, fut),
+        fec,
+        Some(fec_tuning),
+        base,
+    )
+    .await
+}
+
 /// Shared core for [spawn_mux_sized_latency_bulk_server] and its _via
 /// variant: spawns the mux-over-RTP server with a tag-classifying
 /// handler via spawn (either a [TestScope] spawn or the bounded reaper submission).
@@ -1020,7 +1084,7 @@ async fn spawn_mux_sized_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, mss, None, None, {
+    let addr = spawn_mux_over_rtp_server_core(spawn, fec, None, mss, None, None, {
         let tx = tx.clone();
         let bulk_delivered = Arc::clone(&bulk_delivered);
         move |mut stream_read, mut stream_write| {
@@ -1147,90 +1211,91 @@ async fn spawn_mux_gaming_latency_bulk_server_core(
 )> {
     let (tx, rx) = tokio::sync::mpsc::channel(LATENCY_SAMPLE_CAPACITY);
     let bulk_delivered = Arc::new(AtomicU64::new(0));
-    let addr = spawn_mux_over_rtp_server_core(spawn, fec, rtp::udp::NO_FEC_MSS, None, None, {
-        let tx = tx.clone();
-        let bulk_delivered = Arc::clone(&bulk_delivered);
-        move |mut stream_read, mut stream_write| {
+    let addr =
+        spawn_mux_over_rtp_server_core(spawn, fec, None, rtp::udp::NO_FEC_MSS, None, None, {
             let tx = tx.clone();
             let bulk_delivered = Arc::clone(&bulk_delivered);
-            async move {
-                let mut tag = [0u8; 1];
-                let n = match stream_read.read(&mut tag).await {
-                    Ok(n) => n,
-                    Err(_) => {
+            move |mut stream_read, mut stream_write| {
+                let tx = tx.clone();
+                let bulk_delivered = Arc::clone(&bulk_delivered);
+                async move {
+                    let mut tag = [0u8; 1];
+                    let n = match stream_read.read(&mut tag).await {
+                        Ok(n) => n,
+                        Err(_) => {
+                            let _ = stream_write.shutdown();
+                            return;
+                        }
+                    };
+                    if n == 0 {
                         let _ = stream_write.shutdown();
                         return;
                     }
-                };
-                if n == 0 {
+                    if tag[0] == b'G' {
+                        const SYNC_BYTES: usize = 8 * 1024;
+                        let mut remaining = SYNC_BYTES;
+                        let mut buf = vec![0u8; 64 * 1024];
+                        while remaining > 0 {
+                            let to_read = remaining.min(buf.len());
+                            match stream_read.read(&mut buf[..to_read]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => remaining -= n,
+                            }
+                        }
+                        let mut offset = 0usize;
+                        while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
+                            if n == 0 {
+                                break;
+                            }
+                            offset += n;
+                            loop {
+                                if offset < 4 {
+                                    break;
+                                }
+                                let frame_len =
+                                    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                                if frame_len < 12 || offset < frame_len {
+                                    break;
+                                }
+                                let payload_end = frame_len - 8;
+                                let sent_us = u64::from_le_bytes([
+                                    buf[payload_end],
+                                    buf[payload_end + 1],
+                                    buf[payload_end + 2],
+                                    buf[payload_end + 3],
+                                    buf[payload_end + 4],
+                                    buf[payload_end + 5],
+                                    buf[payload_end + 6],
+                                    buf[payload_end + 7],
+                                ]);
+                                let now_us = base.elapsed().as_micros() as u64;
+                                let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
+                                if !try_send_observation(&tx, latency_ms, "Latency sample") {
+                                    break;
+                                }
+                                buf.copy_within(frame_len..offset, 0);
+                                offset -= frame_len;
+                            }
+                        }
+                    } else {
+                        // Bulk byte sink: verify the deterministic pattern and
+                        // count verified bytes. The tag byte itself is excluded.
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut verifier = PayloadPatternVerifier::default();
+                        while let Ok(n) = stream_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            if verifier.verify(&buf[..n]) {
+                                bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     let _ = stream_write.shutdown();
-                    return;
                 }
-                if tag[0] == b'G' {
-                    const SYNC_BYTES: usize = 8 * 1024;
-                    let mut remaining = SYNC_BYTES;
-                    let mut buf = vec![0u8; 64 * 1024];
-                    while remaining > 0 {
-                        let to_read = remaining.min(buf.len());
-                        match stream_read.read(&mut buf[..to_read]).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => remaining -= n,
-                        }
-                    }
-                    let mut offset = 0usize;
-                    while let Ok(n) = stream_read.read(&mut buf[offset..]).await {
-                        if n == 0 {
-                            break;
-                        }
-                        offset += n;
-                        loop {
-                            if offset < 4 {
-                                break;
-                            }
-                            let frame_len =
-                                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                            if frame_len < 12 || offset < frame_len {
-                                break;
-                            }
-                            let payload_end = frame_len - 8;
-                            let sent_us = u64::from_le_bytes([
-                                buf[payload_end],
-                                buf[payload_end + 1],
-                                buf[payload_end + 2],
-                                buf[payload_end + 3],
-                                buf[payload_end + 4],
-                                buf[payload_end + 5],
-                                buf[payload_end + 6],
-                                buf[payload_end + 7],
-                            ]);
-                            let now_us = base.elapsed().as_micros() as u64;
-                            let latency_ms = now_us.saturating_sub(sent_us) as f64 / 1000.0;
-                            if !try_send_observation(&tx, latency_ms, "Latency sample") {
-                                break;
-                            }
-                            buf.copy_within(frame_len..offset, 0);
-                            offset -= frame_len;
-                        }
-                    }
-                } else {
-                    // Bulk byte sink: verify the deterministic pattern and
-                    // count verified bytes. The tag byte itself is excluded.
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let mut verifier = PayloadPatternVerifier::default();
-                    while let Ok(n) = stream_read.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        }
-                        if verifier.verify(&buf[..n]) {
-                            bulk_delivered.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let _ = stream_write.shutdown();
             }
-        }
-    })
-    .await?;
+        })
+        .await?;
     Ok((addr, rx, bulk_delivered))
 }
 

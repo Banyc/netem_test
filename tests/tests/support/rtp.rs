@@ -160,22 +160,27 @@ async fn rtp_connect_core(
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
+    fec_tuning: Option<rtp::FecTuning>,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
 ) -> (
     rtp::socket::AsyncReadAdapter,
     rtp::socket::AsyncWriteAdapter,
 ) {
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &proxy_client_addr.to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            fec,
-            mss: rtp::udp::MssConfig::Custom(mss),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
+    // `None` preserves the process-env default tuning (`ConnectConfig::default`),
+    // while `Some` pins the per-connection tuning both peers must agree on.
+    let mut config = rtp::udp::ConnectConfig {
+        handshake: false,
+        fec,
+        mss: rtp::udp::MssConfig::Custom(mss),
+        metrics_observer,
+        ..rtp::udp::ConnectConfig::default()
+    };
+    if let Some(tuning) = fec_tuning {
+        config.fec_tuning = tuning;
+    }
+    let connected = rtp::udp::connect_with("0.0.0.0:0", &proxy_client_addr.to_string(), config)
+        .await
+        .unwrap();
     let read = connected.read.into_async_read();
     let write = connected.write.into_async_write();
     // The supervisor owns the session drivers; poll it as a non-required
@@ -201,7 +206,15 @@ pub async fn rtp_connect_with_mss(
     impl AsyncRead + Unpin + Send + use<>,
     impl AsyncWrite + Unpin + Send + use<>,
 ) {
-    rtp_connect_core(|fut| tasks.spawn(fut), proxy_client_addr, fec, mss).await
+    rtp_connect_core(
+        |fut| tasks.spawn(fut),
+        proxy_client_addr,
+        fec,
+        mss,
+        None,
+        None,
+    )
+    .await
 }
 
 /// [`rtp_connect_with_mss`] through the bounded task-submission handle, for
@@ -217,7 +230,67 @@ pub async fn rtp_connect_with_mss_via(
     impl AsyncRead + Unpin + Send + use<>,
     impl AsyncWrite + Unpin + Send + use<>,
 ) {
-    rtp_connect_core(|fut| submit_test_task(tx, fut), proxy_client_addr, fec, mss).await
+    rtp_connect_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        mss,
+        None,
+        None,
+    )
+    .await
+}
+
+/// [`rtp_connect_with_mss_via`] with an explicit per-connection
+/// [`rtp::FecTuning`], so a scenario can A/B the stock tuning against the
+/// prompt-parity preset. `fec` must still be `true` for the tuning to matter;
+/// the peer's accept side must set the same `fec` and tuning (there is no
+/// in-band negotiation).
+pub async fn rtp_connect_with_mss_and_fec_tuning_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+    fec_tuning: rtp::FecTuning,
+) -> (
+    impl AsyncRead + Unpin + Send + use<>,
+    impl AsyncWrite + Unpin + Send + use<>,
+) {
+    rtp_connect_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        mss,
+        Some(fec_tuning),
+        None,
+    )
+    .await
+}
+
+/// [`rtp_connect_with_mss_and_fec_tuning_via`] with a caller-supplied metrics
+/// observer, so a scenario can capture the connection's FEC counters (parity
+/// sent, loss-gate skips) alongside its latency samples. The supervisor is a
+/// non-required keepalive: the test body owns teardown.
+pub async fn rtp_connect_with_mss_fec_tuning_and_observer_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    mss: usize,
+    fec_tuning: rtp::FecTuning,
+    observer: rtp::metrics::MetricsObserver,
+) -> (
+    rtp::socket::AsyncReadAdapter,
+    rtp::socket::AsyncWriteAdapter,
+) {
+    rtp_connect_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        mss,
+        Some(fec_tuning),
+        Some(observer),
+    )
+    .await
 }
 
 /// [`rtp_connect`] through the bounded task-submission handle, for use inside
