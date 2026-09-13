@@ -927,31 +927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtp"
-version = "0.1.0"
-source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.89#900b0a3f82ea7b5e853777ed84174db559b0896a"
-dependencies = [
- "async-trait",
- "async_async_io",
- "byteorder",
- "csv",
- "dre",
- "fec",
- "mpudp",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
- "rand 0.10.2",
- "self_assign",
- "serde",
- "tap",
- "thiserror",
- "tokio",
- "tokio-util",
- "tokio_chacha20",
- "tokio_udp",
- "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.17)",
-]
-
-[[package]]
 name = "rtp_mux"
 version = "0.1.0"
 dependencies = [
@@ -959,7 +934,7 @@ dependencies = [
  "metrics",
  "mux",
  "rand 0.10.2",
- "rtp 0.1.0 (git+https://github.com/Banyc/rtp.git?tag=v0.0.89)",
+ "rtp",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1109,7 +1084,7 @@ version = "0.1.0"
 dependencies = [
  "mux",
  "netem-test",
- "rtp 0.1.0",
+ "rtp",
  "rtp_mux",
  "tokio",
 ]
