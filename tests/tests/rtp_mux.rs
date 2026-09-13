@@ -80,7 +80,10 @@ fn connector_via(
         },
         ..RtpMuxConnectorConfig::standard(bind)
     });
-    support::submit_test_task_required(task_tx, "rtp_mux connector driver", driver);
+    // The driver is a non-required background keepalive: it exits when the
+    // connector's last handle is dropped (normal teardown at body end); a
+    // panicked driver still surfaces through the scope's reaper unwrap.
+    support::submit_test_task(task_tx, Box::pin(driver));
     connector
 }
 
@@ -785,7 +788,11 @@ async fn run_explorer_arm() -> ExplorerArm {
                     },
                     ..RtpMuxConnectorConfig::standard(bind)
                 });
-                support::submit_test_task_required(&task_tx, "rtp_mux connector driver", driver);
+                // The driver is a non-required background keepalive: it exits
+                // when the connector's last handle is dropped (normal teardown
+                // at body end); a panicked driver still surfaces through the
+                // scope's reaper unwrap.
+                support::submit_test_task(&task_tx, Box::pin(driver));
                 connector
             };
             let addr = interactive_fan.client_addr();

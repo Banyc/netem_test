@@ -241,10 +241,10 @@ pub async fn spawn_rtp_mux_latency_bulk_server_observed_via(
 }
 
 /// Shared core for [`rtp_mux_connector`] and its `_via` variant: builds the
-/// connector and hands the required driver future to `spawn_required` (either
-/// a [`TestScope`] spawn or the bounded reaper submission).
+/// connector and hands the driver future to `spawn` (either a [`TestScope`]
+/// spawn or the bounded reaper submission).
 fn rtp_mux_connector_core(
-    spawn_required: impl FnOnce(&'static str, TestTask),
+    spawn: impl FnOnce(TestTask),
     bulk_proxy_addr: std::net::SocketAddr,
     observers: RtpMuxMetricsObservers,
 ) -> rtp_mux::RtpMuxConnector {
@@ -269,9 +269,16 @@ fn rtp_mux_connector_core(
                 ..rtp_mux::ExplorerConfig::default()
             },
         });
-    // The connector driver must stay alive for the whole test body; an early
-    // exit would silently stall every connect/redial through the connector.
-    spawn_required("rtp_mux connector driver", Box::pin(driver));
+    // The connector driver is a non-required background keepalive: like the
+    // mux/rtp client session supervisors (e5efa1f6), it may finish at any
+    // point because the driver exits once the connector's last handle is
+    // dropped — i.e. at normal teardown when the body ends, which the body
+    // completing concurrently with the driver's exit would otherwise misread
+    // as a premature end. A driver that genuinely fails (a panicked
+    // supervisor join inside `run_connector`) still fails the test: the scope
+    // or reaper unwraps the completed future and re-raises the panic, and a
+    // dead connector surfaces as connect/write errors on the streams.
+    spawn(Box::pin(driver));
     connector
 }
 
@@ -280,7 +287,7 @@ pub fn rtp_mux_connector(
     bulk_proxy_addr: std::net::SocketAddr,
 ) -> rtp_mux::RtpMuxConnector {
     rtp_mux_connector_core(
-        |name, fut| tasks.spawn_required(name, fut),
+        |fut| tasks.spawn(fut),
         bulk_proxy_addr,
         RtpMuxMetricsObservers::default(),
     )
@@ -288,31 +295,28 @@ pub fn rtp_mux_connector(
 
 /// [`rtp_mux_connector`] through the bounded task-submission handle, for use
 /// inside [`TestScope::run`] bodies where `&mut TestScope` is unavailable.
-/// The connector driver is submitted as required through the handle.
+/// The connector driver is submitted as a non-required background keepalive
+/// through the handle.
 pub fn rtp_mux_connector_via(
     tx: &TestTaskSubmitter,
     bulk_proxy_addr: std::net::SocketAddr,
 ) -> rtp_mux::RtpMuxConnector {
     rtp_mux_connector_core(
-        |name, fut| submit_test_task_required(tx, name, fut),
+        |fut| submit_test_task(tx, fut),
         bulk_proxy_addr,
         RtpMuxMetricsObservers::default(),
     )
 }
 
 /// [`rtp_mux_connector_via`] with per-lane RTP metrics observers attached to
-/// the interactive and bulk lanes. The connector driver is submitted as
-/// required through the handle.
+/// the interactive and bulk lanes. The connector driver is submitted as a
+/// non-required background keepalive through the handle.
 pub fn rtp_mux_connector_observed_via(
     tx: &TestTaskSubmitter,
     bulk_proxy_addr: std::net::SocketAddr,
     observers: RtpMuxMetricsObservers,
 ) -> rtp_mux::RtpMuxConnector {
-    rtp_mux_connector_core(
-        |name, fut| submit_test_task_required(tx, name, fut),
-        bulk_proxy_addr,
-        observers,
-    )
+    rtp_mux_connector_core(|fut| submit_test_task(tx, fut), bulk_proxy_addr, observers)
 }
 
 pub fn spawn_tagged_stream_sink(
