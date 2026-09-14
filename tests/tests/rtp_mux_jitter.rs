@@ -45,6 +45,15 @@
 //!
 //! The remaining single-scenario tests keep the original arms for continuity.
 //!
+//! * [`jitter_duallane_arms`] — the deployment topology at MATCHED bulk load:
+//!   the interactive lane (frame mode + FEC, prompt tuning) and the bulk lane
+//!   (a second, independent, strict byte-stream, FEC-free RTP connection) run
+//!   on separate `NetemPair` links. The `both` arm prints the interactive
+//!   decomposition plus the bulk lane's wire goodput, so receiver-side
+//!   fast-forward (`bulk_and_loss_duallane_reorder_fec`) can be compared with
+//!   strict frame delivery (`bulk_and_loss_duallane_strict_fec`) at the SAME
+//!   bulk load instead of the confounded single-connection arms.
+//!
 //! These tests are `#[ignore]`-d by default so they do not slow normal builds.
 //! Run them with (release is expected; multi-threaded scenarios):
 //!
@@ -58,6 +67,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netem_test::{Counters, NetemConfig, NetemPair};
+use support::dual::{
+    LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
+    spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
+};
 use support::frame::{
     rtp_frame_delivery_connect_reorder_with_fec_tuning_via,
     rtp_frame_delivery_connect_with_fec_tuning_via,
@@ -1301,4 +1314,371 @@ async fn jitter_interactive_bulk_and_loss() {
     )
     .await;
     assert_sane(label, &run.summary);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dual-lane interactive latency: the deployment topology at matched bulk load
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Which impairments a dual-lane arm applies. Each lane rides its own
+/// [`NetemPair`], so the interactive and bulk impairments are independent: the
+/// bulk lane's rate cap and loss never touch the interactive lane's RTP
+/// connection.
+#[derive(Clone, Copy, Debug)]
+enum DualImpairment {
+    /// No loss, no bulk: the interactive-lane floor.
+    Solo,
+    /// 2% loss on both lanes, no bulk.
+    Loss,
+    /// No loss, bulk burst contesting only the bulk lane.
+    Bulk,
+    /// 2% loss plus the bulk burst: the deployment case.
+    Both,
+}
+
+impl DualImpairment {
+    fn has_loss(self) -> bool {
+        matches!(self, Self::Loss | Self::Both)
+    }
+
+    fn has_bulk(self) -> bool {
+        matches!(self, Self::Bulk | Self::Both)
+    }
+}
+
+/// One measured dual-lane arm: the interactive-lane [`JitterRun`] (latency +
+/// FEC evidence) plus the bulk lane's wire load and sink goodput.
+struct DualRun {
+    run: JitterRun,
+    /// Bulk-lane client->server wire bytes forwarded by the impairment proxy:
+    /// the offered bulk load, i.e. the matched-load check across the two
+    /// interactive frame modes.
+    bulk_wire_bytes: u64,
+    /// Bulk-lane sink-delivered payload bytes (independent of wire load).
+    bulk_sink_bytes: u64,
+    /// Combined bulk-pair counters (both directions).
+    bulk_counters: Counters,
+}
+
+/// Run one dual-lane arm: the interactive lane on its own RTP connection
+/// (frame mode + FEC per `interactive_reorder`) and the bulk lane on a second,
+/// independent, strict byte-stream FEC-free RTP connection. The two lanes ride
+/// two separate [`NetemPair`]s so the bulk burst cannot head-of-line block the
+/// interactive RTP connection, and the bulk lane is byte-for-byte identical in
+/// the fast-forward and strict arms.
+async fn run_duallane(
+    label: &str,
+    interactive_reorder: bool,
+    impairment: DualImpairment,
+) -> DualRun {
+    let interactive_loss = if impairment.has_loss() { LOSS_2 } else { 0 };
+    let bulk_loss = if impairment.has_loss() { LOSS_2 } else { 0 };
+    let bulk_rate = if impairment.has_bulk() {
+        BULK_RATE_BPS
+    } else {
+        0
+    };
+    // The interactive lane never takes the rate cap (the cap is the bulk
+    // lane's own connection); its loss is the interactive `2%`.
+    let int_c2s = link(41, interactive_loss, 0);
+    let int_s2c = link(42, interactive_loss, 0);
+    // The bulk lane is byte-for-byte identical in the fast-forward and strict
+    // arms (same seeds, same loss, same rate cap), so the wire bulk goodput is
+    // the matched-load evidence.
+    let bulk_c2s = link(43, bulk_loss, bulk_rate);
+    let bulk_s2c = link(44, bulk_loss, bulk_rate);
+
+    let prompt = prompt_tuning();
+    let int_rtp = if interactive_reorder {
+        LaneRtpConfig::frame_reordering(true, prompt)
+    } else {
+        LaneRtpConfig::frame_strict_tuned(true, prompt)
+    };
+    let bulk_rtp = LaneRtpConfig::byte_stream();
+
+    let base = Instant::now();
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TASK_QUEUE_BOUND);
+    tasks
+        .run(async {
+            let (int_addr, bulk_addr, mut latencies, bulk_counter, _sink_streams) =
+                spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via(
+                    &task_tx, base, int_rtp, bulk_rtp,
+                )
+                .await
+                .unwrap();
+            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
+            let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+
+            let (observer, fec_cell) = fec_observer();
+            let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via(
+                &task_tx,
+                int_pair.client_addr(),
+                bulk_pair.client_addr(),
+                int_rtp,
+                bulk_rtp,
+                Some(observer),
+                None,
+            )
+            .await
+            .unwrap();
+
+            // Interactive latency stream (`b'L'`) on the interactive lane.
+            let (mut lat_read, mut lat_write) =
+                opener.open(mux::LaneClass::Interactive).await.unwrap();
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = lat_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }),
+            );
+
+            // Bulk stream (`b'B'`) on the separate bulk lane, only when offered.
+            let bulk_write = if impairment.has_bulk() {
+                let (mut bulk_read, bulk_write) = opener.open(mux::LaneClass::Bulk).await.unwrap();
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        while let Ok(n) = bulk_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
+                Some(bulk_write)
+            } else {
+                None
+            };
+
+            let interactive = async {
+                if lat_write.write_all(b"L").await.is_err() {
+                    return 0;
+                }
+                send_timestamped_messages(&mut lat_write, base, MSG_BYTES, CADENCE, RUN_FOR).await
+            };
+            let bulk_fut = async {
+                let Some(mut write) = bulk_write else {
+                    return 0;
+                };
+                if write.write_all(b"B").await.is_err() {
+                    return 0;
+                }
+                let payload = cyclic_payload(BULK_BURST_BYTES);
+                periodic_burst(
+                    &mut write,
+                    &payload,
+                    BULK_BURST_BYTES,
+                    BULK_PERIOD,
+                    BULK_RAMP,
+                    RUN_FOR,
+                )
+                .await
+            };
+            let (sent, _bulk_written) = tokio::join!(interactive, bulk_fut);
+
+            tokio::time::sleep(GRACE).await;
+            let int_counters = int_pair.stats();
+            let bulk_counters = bulk_pair.stats();
+            let bulk_wire_bytes = bulk_pair.stats_c2s().forwarded_bytes;
+            let mut samples = Vec::new();
+            while let Ok((tag, lat)) = latencies.try_recv() {
+                if tag == b'L' {
+                    samples.push(lat);
+                }
+            }
+            let received = samples.len() as u64;
+            let bulk_active_secs = (RUN_FOR - BULK_RAMP).as_secs_f64();
+            let summary = summarize(samples, sent, received, bulk_wire_bytes, bulk_active_secs);
+            let fec = *fec_cell.lock().unwrap();
+            let bulk_sink_bytes = bulk_counter.load(Ordering::Relaxed);
+
+            print_summary(label, &summary);
+            eprintln!(
+                "[duallane {label}] interactive={} bulk wire c2s forwarded = {bulk_wire_bytes} \
+                 bytes / {} pkts; sink delivered = {bulk_sink_bytes} bytes",
+                if interactive_reorder {
+                    "fast-forward"
+                } else {
+                    "strict"
+                },
+                bulk_counters.forwarded,
+            );
+            eprintln!("[duallane {label}] interactive pair = {int_counters:?}");
+            eprintln!("[duallane {label}] bulk pair = {bulk_counters:?}");
+            if let Some(fec) = fec {
+                eprintln!(
+                    "[duallane {label}] fec parity_sent={} groups_flushed={} \
+                     loss_gate_skips={} no_spare_capacity_skips={} burst_end_skips={} \
+                     recovered={}",
+                    fec.parity_sent,
+                    fec.groups_flushed,
+                    fec.groups_skipped_loss_gate,
+                    fec.groups_skipped_no_spare_capacity,
+                    fec.groups_skipped_burst_end,
+                    fec.recovered_symbols,
+                );
+            }
+
+            int_pair.stop();
+            bulk_pair.stop();
+            DualRun {
+                run: JitterRun {
+                    summary,
+                    counters: int_counters,
+                    fec,
+                },
+                bulk_wire_bytes,
+                bulk_sink_bytes,
+                bulk_counters,
+            }
+        })
+        .await
+}
+
+/// Print the dual-lane headline table: the interactive-lane latency
+/// percentiles plus the bulk lane's wire goodput (the matched-load check) and
+/// the interactive lane's RTP FEC counters.
+fn print_duallane_table(runs: &[(&str, &DualRun)]) {
+    eprintln!(
+        "[duallane] interactive lane at 2% per-packet loss, prompt FEC tuning; bulk lane is a \
+         separate strict byte-stream FEC-free RTP connection"
+    );
+    eprintln!(
+        "[duallane] arm                       p50     p90     p99     max  over250  ep  run  \
+         bulk_wire_MiB/s  sink_MiB  parity  recovered"
+    );
+    for (name, r) in runs {
+        let s = &r.run.summary;
+        let f = r.run.fec.unwrap_or_default();
+        let sink_mib = r.bulk_sink_bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[duallane] {name:<27} {p50:7.1} {p90:7.1} {p99:7.1} {max:7.1} {o25:7.3} {ep:3} {mr:3} \
+             {bulk:>15.3} {sink:>9.3} {parity:>7} {recovered:>9}",
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            max = s.max,
+            o25 = s.over250_pct,
+            ep = s.episodes,
+            mr = s.max_run,
+            bulk = s.bulk_mibps,
+            sink = sink_mib,
+            parity = f.parity_sent,
+            recovered = f.recovered_symbols,
+        );
+    }
+    let find = |name: &str| runs.iter().find(|(n, _)| *n == name).map(|(_, r)| *r);
+    let (Some(reorder), Some(strict)) = (find("both_reorder"), find("both_strict")) else {
+        return;
+    };
+    let (a, b) = (&reorder.run.summary, &strict.run.summary);
+    eprintln!(
+        "[duallane] both_reorder - both_strict: p50={:+.1} p90={:+.1} p99={:+.1} max={:+.1} \
+         over250={:+.3} episodes={:+} bulk_wire_MiB/s={:+.3}",
+        a.p50 - b.p50,
+        a.p90 - b.p90,
+        a.p99 - b.p99,
+        a.max - b.max,
+        a.over250_pct - b.over250_pct,
+        a.episodes as i64 - b.episodes as i64,
+        a.bulk_mibps - b.bulk_mibps,
+    );
+}
+
+/// Print the bulk lane's wire load and sink goodput for each arm of one
+/// interactive frame mode — the matched-load evidence for the headline
+/// comparison.
+fn print_duallane_loads(mode: &str, runs: &[(&str, &DualRun)]) {
+    eprintln!("[duallane {mode}] bulk-lane load (matched-load evidence):");
+    for (name, r) in runs {
+        eprintln!(
+            "[duallane {mode}] {name:<6} wire_c2s={:>10} bytes ({:.3} MiB/s over {:?}) \
+             pkts={:>7} sink={:>10} bytes",
+            r.bulk_wire_bytes,
+            r.run.summary.bulk_mibps,
+            RUN_FOR - BULK_RAMP,
+            r.bulk_counters.forwarded,
+            r.bulk_sink_bytes,
+        );
+    }
+}
+
+/// Dual-lane interactive-latency decomposition. The deployment's topology is
+/// reproduced at MATCHED bulk load: the interactive lane runs frame mode + FEC
+/// on its own RTP connection (receiver-side fast-forward in the `reorder` arm,
+/// strict in the `strict` arm) and the bulk lane is a SECOND, independent,
+/// strict, FEC-free byte-stream RTP connection. Because the lanes are separate
+/// connections the bulk burst cannot head-of-line block the interactive lane,
+/// and because the two arms share the identical bulk lane the fast-forward win
+/// — if any — is read at the same offered bulk load.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; eight ~35 s dual-lane arms (fast-forward + strict); run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_duallane_arms() {
+    let impairments = [
+        ("solo", DualImpairment::Solo),
+        ("loss", DualImpairment::Loss),
+        ("bulk", DualImpairment::Bulk),
+        ("both", DualImpairment::Both),
+    ];
+
+    let mut reorder: Vec<(&str, DualRun)> = Vec::new();
+    for (name, impairment) in impairments {
+        let label = format!("duallane_reorder_fec/{name}");
+        let run = with_timeout(
+            Duration::from_secs(120),
+            &label,
+            run_duallane(&label, true, impairment),
+        )
+        .await;
+        assert_sane(&label, &run.run.summary);
+        reorder.push((name, run));
+    }
+    let mut strict: Vec<(&str, DualRun)> = Vec::new();
+    for (name, impairment) in impairments {
+        let label = format!("duallane_strict_fec/{name}");
+        let run = with_timeout(
+            Duration::from_secs(120),
+            &label,
+            run_duallane(&label, false, impairment),
+        )
+        .await;
+        assert_sane(&label, &run.run.summary);
+        strict.push((name, run));
+    }
+
+    // The requested arms, named for the headline comparison.
+    eprintln!("[duallane] bulk_and_loss_duallane_reorder_fec = duallane_reorder_fec/both");
+    eprintln!("[duallane] bulk_and_loss_duallane_strict_fec = duallane_strict_fec/both");
+
+    let reorder_view: Vec<(&str, &DualRun)> = reorder.iter().map(|(n, r)| (*n, r)).collect();
+    let strict_view: Vec<(&str, &DualRun)> = strict.iter().map(|(n, r)| (*n, r)).collect();
+    let headline: Vec<(&str, &DualRun)> = vec![
+        ("both_reorder", &reorder[3].1),
+        ("both_strict", &strict[3].1),
+    ];
+    print_duallane_table(&headline);
+
+    print_decomposition(
+        "duallane-reorder-fec",
+        &reorder[0].1.run,
+        &reorder[1].1.run,
+        &reorder[2].1.run,
+        &reorder[3].1.run,
+    );
+    print_duallane_loads("duallane-reorder-fec", &reorder_view);
+    print_decomposition(
+        "duallane-strict-fec",
+        &strict[0].1.run,
+        &strict[1].1.run,
+        &strict[2].1.run,
+        &strict[3].1.run,
+    );
+    print_duallane_loads("duallane-strict-fec", &strict_view);
 }

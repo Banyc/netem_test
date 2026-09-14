@@ -7,19 +7,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use rtp::FecTuning;
 use rtp::FrameMode;
 
-use super::frame::{rtp_frame_delivery_connect, rtp_frame_delivery_connect_via};
-use super::rtp::{rtp_connect, rtp_connect_via};
+use super::frame::{
+    rtp_frame_delivery_connect, rtp_frame_delivery_connect_reorder_with_fec_tuning_via,
+    rtp_frame_delivery_connect_via, rtp_frame_delivery_connect_with_fec_tuning_via,
+};
+use super::rtp::{rtp_connect, rtp_connect_via, rtp_connect_with_mss_and_fec_tuning_via};
 use super::rtp_mux::spawn_tagged_stream_sink;
 use crate::support::{
     LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, TEST_TASK_QUEUE_BOUND, TestScope, TestTask,
-    TestTaskSubmitter, submit_test_task_required, try_send_observation,
+    TestTaskSubmitter, submit_test_task, submit_test_task_required, try_send_observation,
 };
 
 /// Server that accepts two RTP connections (lane‑hello paired) and handles
@@ -1569,6 +1572,133 @@ pub async fn dual_mux_client_connect_with_lane_modes_via(
     Ok((opener, accepter))
 }
 
+/// [`dual_mux_client_connect_with_lane_modes_via`] with independent per-lane
+/// RTP transport configuration and an optional per-lane metrics observer. The
+/// interactive lane may run strict frame delivery or receiver-side
+/// fast-forward (with an explicit FEC tuning), while the bulk lane is an
+/// independent connection that can stay byte-stream and FEC-free — the
+/// deployment's dual-lane topology.
+pub async fn dual_mux_client_connect_lane_rtp_via(
+    tx: &TestTaskSubmitter,
+    int_proxy_addr: std::net::SocketAddr,
+    bulk_proxy_addr: std::net::SocketAddr,
+    int_rtp: LaneRtpConfig,
+    bulk_rtp: LaneRtpConfig,
+    int_observer: Option<rtp::metrics::MetricsObserver>,
+    bulk_observer: Option<rtp::metrics::MetricsObserver>,
+) -> Result<(mux::DualStreamOpener, mux::DualStreamAccepter), mux::DualMuxError> {
+    let int_config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: int_rtp.frame_mode.enabled,
+    };
+    let bulk_config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: bulk_rtp.frame_mode.enabled,
+    };
+    type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+    type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+    async fn connect_lane(
+        tx: &TestTaskSubmitter,
+        addr: std::net::SocketAddr,
+        lane: LaneRtpConfig,
+        observer: Option<rtp::metrics::MetricsObserver>,
+    ) -> (BoxedRead, BoxedWrite) {
+        if lane.frame_mode.enabled {
+            if lane.frame_mode.allow_reorder {
+                let (r, w) = rtp_frame_delivery_connect_reorder_with_fec_tuning_via(
+                    tx,
+                    addr,
+                    lane.fec,
+                    lane.fec_tuning,
+                    observer,
+                )
+                .await;
+                (Box::new(r), Box::new(w))
+            } else {
+                let (r, w) = rtp_frame_delivery_connect_with_fec_tuning_via(
+                    tx,
+                    addr,
+                    lane.fec,
+                    lane.fec_tuning,
+                    observer,
+                )
+                .await;
+                (Box::new(r), Box::new(w))
+            }
+        } else {
+            let (r, w) = rtp_connect_with_mss_and_fec_tuning_via(
+                tx,
+                addr,
+                lane.fec,
+                rtp::udp::NO_FEC_MSS,
+                lane.fec_tuning,
+            )
+            .await;
+            (Box::new(r), Box::new(w))
+        }
+    }
+    let mut super_spawner = JoinSet::new();
+    let nonce = mux::PairingNonce::generate();
+    let group = mux::GroupToken::generate();
+    let (int_reader, mut int_writer) =
+        connect_lane(tx, int_proxy_addr, int_rtp, int_observer).await;
+    mux::write_lane_hello(&mut int_writer, mux::LaneClass::Interactive, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+    int_writer
+        .flush()
+        .await
+        .map_err(|e| mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(e.kind())))?;
+    let (bulk_reader, mut bulk_writer) =
+        connect_lane(tx, bulk_proxy_addr, bulk_rtp, bulk_observer).await;
+    mux::write_lane_hello(&mut bulk_writer, mux::LaneClass::Bulk, nonce, group)
+        .await
+        .map_err(mux::DualMuxError::LaneHello)?;
+    bulk_writer
+        .flush()
+        .await
+        .map_err(|e| mux::DualMuxError::LaneHello(mux::LaneHelloError::Io(e.kind())))?;
+    // Give each lane's reliable layer time to deliver the lane hello before the
+    // mux sessions start writing frames. The lane hello is the first frame on a
+    // handshake-less connection, and under receiver-side fast-forward a later
+    // mux frame is delivered past an unrepaired hello hole, so the hello must
+    // be in flight first; the reliable layer's 1 s minimum RTO retransmit lands
+    // well inside the server's 3 s hello deadline.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut int_spawner = JoinSet::new();
+    let (int_opener, int_accepter) =
+        mux::spawn_mux_no_reconnection(int_reader, int_writer, int_config, &mut int_spawner);
+    let mut bulk_spawner = JoinSet::new();
+    let (bulk_opener, bulk_accepter) =
+        mux::spawn_mux_no_reconnection(bulk_reader, bulk_writer, bulk_config, &mut bulk_spawner);
+    let (opener, accepter) = mux::spawn_dual_mux_paired_supervised(
+        int_opener,
+        int_accepter,
+        int_spawner,
+        bulk_opener,
+        bulk_accepter,
+        bulk_spawner,
+        &mut super_spawner,
+    );
+    // Drain the supervision as a non-required keepalive, mirroring the
+    // single-connection frame-delivery session drain: a normal session end at
+    // teardown is expected and ignored, while a panicked lane (a `JoinError`)
+    // still surfaces immediately.
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            if let Some(result) = super_spawner.join_next().await
+                && let Err(err) = result
+            {
+                panic!("dual-mux client lane-rtp session supervision failed: {err:?}");
+            }
+        }),
+    );
+    Ok((opener, accepter))
+}
+
 // ─────────────── dual‑lane frame‑delivery server helpers ───────────────
 
 /// Dual‑mux latency‑bulk server with frame‑reassembly enabled.
@@ -1890,6 +2020,59 @@ async fn spawn_dual_mux_latency_bulk_server_with_per_lane_configs(
     Ok((addr, rx, bulk_delivered))
 }
 
+/// Per-lane RTP transport configuration for the dual-lane two-listener
+/// server/client helpers: the lane's FEC setting, its receiver-side frame
+/// mode (disabled = byte-stream, `enabled()` = strict frame delivery,
+/// `enabled_reordering()` = fast-forward), and its FEC tuning. Both peers of
+/// a lane must agree on all three (there is no in-band negotiation).
+#[derive(Clone, Copy, Debug)]
+pub struct LaneRtpConfig {
+    pub fec: bool,
+    pub frame_mode: rtp::FrameMode,
+    pub fec_tuning: rtp::FecTuning,
+}
+
+impl LaneRtpConfig {
+    /// A byte-stream lane (frame delivery disabled), FEC off, stock tuning.
+    pub fn byte_stream() -> Self {
+        Self {
+            fec: false,
+            frame_mode: FrameMode::default(),
+            fec_tuning: FecTuning::default(),
+        }
+    }
+
+    /// A strict frame-delivery lane (fast-forward off) with the given FEC
+    /// setting and stock tuning.
+    pub fn frame_strict(fec: bool) -> Self {
+        Self {
+            fec,
+            frame_mode: FrameMode::enabled(),
+            fec_tuning: FecTuning::default(),
+        }
+    }
+
+    /// A frame-delivery lane with receiver-side fast-forward and an explicit
+    /// per-connection FEC tuning: the deployment's interactive-lane config.
+    pub fn frame_reordering(fec: bool, fec_tuning: FecTuning) -> Self {
+        Self {
+            fec,
+            frame_mode: FrameMode::enabled_reordering(),
+            fec_tuning,
+        }
+    }
+
+    /// A strict frame-delivery lane with an explicit per-connection FEC
+    /// tuning (the matched strict counterpart of [`Self::frame_reordering`]).
+    pub fn frame_strict_tuned(fec: bool, fec_tuning: FecTuning) -> Self {
+        Self {
+            fec,
+            frame_mode: FrameMode::enabled(),
+            fec_tuning,
+        }
+    }
+}
+
 /// Dual-lane latency-bulk server with two listeners. Continuously pumps each
 /// listener's accept loop and applies per-lane frame delivery at accept time,
 /// then spawns the mux handshake in the pairing loop.
@@ -1917,13 +2100,30 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners(
     // `tasks`), which selects between submissions and join_next() completions
     // and unwraps every completion so panics surface immediately.
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+    let int_rtp = if interactive_frame {
+        LaneRtpConfig::frame_strict(fec)
+    } else {
+        LaneRtpConfig {
+            fec,
+            frame_mode: FrameMode::default(),
+            fec_tuning: FecTuning::default(),
+        }
+    };
+    let bulk_rtp = if bulk_frame {
+        LaneRtpConfig::frame_strict(fec)
+    } else {
+        LaneRtpConfig {
+            fec,
+            frame_mode: FrameMode::default(),
+            fec_tuning: FecTuning::default(),
+        }
+    };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
         |name, fut| tasks.spawn_required(name, fut),
         task_tx.clone(),
-        fec,
         base,
-        interactive_frame,
-        bulk_frame,
+        int_rtp,
+        bulk_rtp,
     )
     .await
 }
@@ -1947,13 +2147,56 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
     Arc<AtomicU64>,
     TestTaskSubmitter,
 )> {
+    let int_rtp = if interactive_frame {
+        LaneRtpConfig::frame_strict(fec)
+    } else {
+        LaneRtpConfig {
+            fec,
+            frame_mode: FrameMode::default(),
+            fec_tuning: FecTuning::default(),
+        }
+    };
+    let bulk_rtp = if bulk_frame {
+        LaneRtpConfig::frame_strict(fec)
+    } else {
+        LaneRtpConfig {
+            fec,
+            frame_mode: FrameMode::default(),
+            fec_tuning: FecTuning::default(),
+        }
+    };
     spawn_dual_mux_latency_bulk_server_two_listeners_core(
         |name, fut| submit_test_task_required(tx, name, fut),
         tx.clone(),
-        fec,
         base,
-        interactive_frame,
-        bulk_frame,
+        int_rtp,
+        bulk_rtp,
+    )
+    .await
+}
+
+/// [`spawn_dual_mux_latency_bulk_server_two_listeners`] with independent
+/// per-lane RTP transport configuration, so a dual-lane scenario can mirror
+/// the deployment exactly: interactive lane frame fast-forward + FEC, bulk
+/// lane a separate strict (byte-stream) FEC-free RTP connection.
+pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via(
+    tx: &TestTaskSubmitter,
+    base: Instant,
+    int_rtp: LaneRtpConfig,
+    bulk_rtp: LaneRtpConfig,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+    TestTaskSubmitter,
+)> {
+    spawn_dual_mux_latency_bulk_server_two_listeners_core(
+        |name, fut| submit_test_task_required(tx, name, fut),
+        tx.clone(),
+        base,
+        int_rtp,
+        bulk_rtp,
     )
     .await
 }
@@ -1967,10 +2210,9 @@ pub async fn spawn_dual_mux_latency_bulk_server_two_listeners_via(
 async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
     mut spawn_required: impl FnMut(&'static str, TestTask),
     task_tx: TestTaskSubmitter,
-    fec: bool,
     base: Instant,
-    interactive_frame: bool,
-    bulk_frame: bool,
+    int_rtp: LaneRtpConfig,
+    bulk_rtp: LaneRtpConfig,
 ) -> std::io::Result<(
     std::net::SocketAddr,
     std::net::SocketAddr,
@@ -1991,41 +2233,28 @@ async fn spawn_dual_mux_latency_bulk_server_two_listeners_core(
     let (accept_tx, mut accept_rx) = mpsc::channel(TEST_ACCEPT_CAPACITY);
 
     // Parked accept loops (aborted when `tasks` drops at scope end).
-    for (listener, lane_frame) in [
-        (int_listener, interactive_frame),
-        (bulk_listener, bulk_frame),
-    ] {
+    for (listener, lane_rtp) in [(int_listener, int_rtp), (bulk_listener, bulk_rtp)] {
         let accept_tx = accept_tx.clone();
         let config = mux::MuxConfig {
             initiation: mux::Initiation::Server,
             heartbeat_interval: Duration::from_secs(5),
-            frame_reassembly: lane_frame,
+            frame_reassembly: lane_rtp.frame_mode.enabled,
         };
         spawn_required(
             "dual-mux server task",
             Box::pin(async move {
-                loop {
-                    let fd = if lane_frame {
-                        FrameMode::enabled()
-                    } else {
-                        FrameMode::default()
-                    };
-                    match listener
-                        .accept_without_handshake_with(rtp::udp::AcceptConfig {
-                            fec,
-                            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-                            fec_tuning: FecTuning::default(),
-                            frame_delivery: fd,
-                            ..rtp::udp::AcceptConfig::default()
-                        })
-                        .await
-                    {
-                        Ok(accepted) => {
-                            if accept_tx.send((accepted, config.clone())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(accepted) = listener
+                    .accept_without_handshake_with(rtp::udp::AcceptConfig {
+                        fec: lane_rtp.fec,
+                        mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+                        fec_tuning: lane_rtp.fec_tuning,
+                        frame_delivery: lane_rtp.frame_mode,
+                        ..rtp::udp::AcceptConfig::default()
+                    })
+                    .await
+                {
+                    if accept_tx.send((accepted, config.clone())).await.is_err() {
+                        break;
                     }
                 }
             }),
