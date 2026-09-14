@@ -24,7 +24,9 @@
 //!   decomposition (`loss_delta`, `queue_delta`, `combined_delta`, and whether
 //!   combined is additive or super-additive) for p50/p90/p99/max and for the
 //!   episode/spike counts. This is the separation of the loss tail from the
-//!   queue tail.
+//!   queue tail. The same four arms are then repeated in RTP frame-delivery
+//!   mode (`solo_frame`, `loss_frame`, `bulk_frame`, `bulk_and_loss_frame`) to
+//!   measure the deployment's `frame_reassembly` path alongside byte-stream.
 //! * [`jitter_fec_arms_2pct`] / [`jitter_fec_arms_6pct`] — the interactive
 //!   lane with FEC `off` / stock (`default`) / prompt parity
 //!   (`instream_flush=true, small_group_parity_count=1`) at 2% and 6% loss,
@@ -46,8 +48,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netem_test::{Counters, NetemConfig, NetemPair};
+use support::frame::rtp_frame_delivery_connect_via;
 use support::mux::{
-    mux_client_connect_via, send_timestamped_messages,
+    mux_client_connect_frame_delivery_via, mux_client_connect_via, send_timestamped_messages,
+    spawn_mux_frame_delivery_latency_bulk_server_via,
     spawn_mux_latency_bulk_server_with_fec_tuning_via,
 };
 use support::payload::{cyclic_payload, with_timeout};
@@ -352,6 +356,143 @@ async fn run_one(
     .await
 }
 
+/// Run one interactive-vs-bulk/loss jitter scenario in RTP frame-delivery mode.
+/// Mirrors [`run_jitter`] but connects through the frame-delivery accept/connect
+/// helpers and a `frame_reassembly` mux client, matching the deployment path
+/// (`rtp_mux` sets `frame_reassembly: true`). FEC is off because the
+/// frame-delivery server helper takes no tuning; the frame arms therefore use
+/// the no-FEC [`scen`] defaults.
+async fn run_jitter_frame(scenario: JitterScenario) -> JitterRun {
+    let JitterScenario {
+        label,
+        c2s,
+        s2c,
+        bulk,
+        ..
+    } = scenario;
+    let base = Instant::now();
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TASK_QUEUE_BOUND);
+    tasks
+        .run(async {
+            let (server_addr, mut latencies, bulk_counter) =
+                spawn_mux_frame_delivery_latency_bulk_server_via(&task_tx, false, base)
+                    .await
+                    .unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+
+            let (reader, writer) =
+                rtp_frame_delivery_connect_via(&task_tx, pair.client_addr(), false).await;
+            let opener = mux_client_connect_frame_delivery_via(&task_tx, reader, writer);
+
+            // Interactive latency stream (`b'L'`). Its read half stays parked
+            // until the stream closes; the owning scope aborts it at teardown.
+            let (mut lat_read, mut lat_write) = opener.open().await.unwrap();
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 8 * 1024];
+                    while let Ok(n) = lat_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }),
+            );
+
+            // Optional bulk stream (`b'B'`) on the same mux connection.
+            let bulk_write = if bulk.is_some() {
+                let (mut bulk_read, bulk_write) = opener.open().await.unwrap();
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        while let Ok(n) = bulk_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
+                Some(bulk_write)
+            } else {
+                None
+            };
+
+            let interactive = async {
+                if lat_write.write_all(b"L").await.is_err() {
+                    return 0;
+                }
+                send_timestamped_messages(&mut lat_write, base, MSG_BYTES, CADENCE, RUN_FOR).await
+            };
+            let bulk_fut = async {
+                let Some(mut write) = bulk_write else {
+                    return 0;
+                };
+                if write.write_all(b"B").await.is_err() {
+                    return 0;
+                }
+                let spec = bulk.expect("bulk_write is Some iff bulk is Some");
+                let payload = cyclic_payload(spec.burst_bytes);
+                periodic_burst(
+                    &mut write,
+                    &payload,
+                    spec.burst_bytes,
+                    spec.period,
+                    BULK_RAMP,
+                    RUN_FOR,
+                )
+                .await
+            };
+            let (sent, _bulk_written) = tokio::join!(interactive, bulk_fut);
+
+            // Let stragglers arrive before draining the latency channel.
+            tokio::time::sleep(GRACE).await;
+            let counters = combined_stats(&pair);
+            let mut samples = Vec::new();
+            while let Ok((tag, lat)) = latencies.try_recv() {
+                if tag == b'L' {
+                    samples.push(lat);
+                }
+            }
+            let received = samples.len() as u64;
+            let summary = summarize(
+                samples,
+                sent,
+                received,
+                bulk_counter.load(Ordering::Relaxed),
+                RUN_FOR.as_secs_f64(),
+            );
+
+            print_summary(&label, &summary);
+            eprintln!("[jitter {label}] pair stats = {counters:?}");
+
+            pair.stop();
+            JitterRun {
+                summary,
+                counters,
+                fec: None,
+            }
+        })
+        .await
+}
+
+/// Wrap a single-decision frame-delivery [`JitterScenario`] in the standard
+/// timeout and run it through [`run_jitter_frame`].
+async fn run_one_frame(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    bulk: Option<BulkSpec>,
+) -> JitterRun {
+    with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_jitter_frame(scen(label, c2s, s2c, bulk)),
+    )
+    .await
+}
+
 /// Offer `burst_bytes` every `period` through `write`, as fast as the transport
 /// accepts, starting after `ramp` and stopping at `run_for`. Returns the number
 /// of payload bytes written.
@@ -450,16 +591,29 @@ fn classify_ratio(ratio: f64) -> &'static str {
     }
 }
 
+/// A `HolSummary` latency extractor used by the decomposition table rows.
+type SummaryMetric = fn(&HolSummary) -> f64;
+
 /// Print the loss-vs-queueing decomposition table (the deliverable for
 /// [`jitter_decomposition`]): the four absolute arms and the derived deltas,
-/// for both the latency percentiles and the spike/episode counts.
-fn print_decomposition(solo: &JitterRun, loss: &JitterRun, bulk: &JitterRun, both: &JitterRun) {
-    eprintln!("[decomp] interactive latency decomposition (2% loss, 1 MiB/s rate, 2 MiB/3 s bulk)");
+/// for both the latency percentiles and the spike/episode counts. `mode`
+/// labels the RTP delivery path (`byte-stream` or `frame-delivery`) so the two
+/// tables are directly comparable.
+fn print_decomposition(
+    mode: &str,
+    solo: &JitterRun,
+    loss: &JitterRun,
+    bulk: &JitterRun,
+    both: &JitterRun,
+) {
     eprintln!(
-        "[decomp] metric       solo     loss     bulk     both   loss_d  queue_d   comb_d  comb/(loss+q)"
+        "[decomp {mode}] interactive latency decomposition (2% loss, 1 MiB/s rate, 2 MiB/3 s bulk)"
+    );
+    eprintln!(
+        "[decomp {mode}] metric       solo     loss     bulk     both   loss_d  queue_d   comb_d  comb/(loss+q)"
     );
     let mut p99_ratio = f64::NAN;
-    let percentile_rows: [(&str, fn(&HolSummary) -> f64); 4] = [
+    let percentile_rows: [(&str, SummaryMetric); 4] = [
         ("p50", |s| s.p50),
         ("p90", |s| s.p90),
         ("p99", |s| s.p99),
@@ -483,7 +637,7 @@ fn print_decomposition(solo: &JitterRun, loss: &JitterRun, bulk: &JitterRun, bot
             p99_ratio = ratio;
         }
         eprintln!(
-            "[decomp] {name:<8} {s:8.1} {l:8.1} {b:8.1} {c:8.1} \
+            "[decomp {mode}] {name:<8} {s:8.1} {l:8.1} {b:8.1} {c:8.1} \
              {loss_delta:8.1} {queue_delta:8.1} {combined_delta:8.1}     {ratio:6.2}"
         );
     }
@@ -497,7 +651,9 @@ fn print_decomposition(solo: &JitterRun, loss: &JitterRun, bulk: &JitterRun, bot
         ("episodes", Spike::Count(|s| s.episodes)),
         ("max_run", Spike::Count(|s| s.max_run)),
     ];
-    eprintln!("[decomp] spikes       solo     loss     bulk     both   loss_d  queue_d   comb_d");
+    eprintln!(
+        "[decomp {mode}] spikes       solo     loss     bulk     both   loss_d  queue_d   comb_d"
+    );
     for (name, kind) in spike_rows {
         let (s, l, b, c) = match kind {
             Spike::Pct(get) => (
@@ -514,7 +670,7 @@ fn print_decomposition(solo: &JitterRun, loss: &JitterRun, bulk: &JitterRun, bot
             ),
         };
         eprintln!(
-            "[decomp] {name:<8} {s:8.3} {l:8.3} {b:8.3} {c:8.3} \
+            "[decomp {mode}] {name:<8} {s:8.3} {l:8.3} {b:8.3} {c:8.3} \
              {:8.3} {:8.3} {:8.3}",
             l - s,
             b - s,
@@ -522,11 +678,11 @@ fn print_decomposition(solo: &JitterRun, loss: &JitterRun, bulk: &JitterRun, bot
         );
     }
     eprintln!(
-        "[decomp] p99 combined/(loss_delta+queue_delta) = {p99_ratio:.2} => {}",
+        "[decomp {mode}] p99 combined/(loss_delta+queue_delta) = {p99_ratio:.2} => {}",
         classify_ratio(p99_ratio)
     );
     eprintln!(
-        "[decomp] p99 loss_only_delta={:.1} bqueue_only_delta={:.1} sum={:.1} combined={:.1}",
+        "[decomp {mode}] p99 loss_only_delta={:.1} bqueue_only_delta={:.1} sum={:.1} combined={:.1}",
         loss.summary.p99 - solo.summary.p99,
         bulk.summary.p99 - solo.summary.p99,
         (loss.summary.p99 - solo.summary.p99) + (bulk.summary.p99 - solo.summary.p99),
@@ -634,7 +790,7 @@ async fn run_fec_level(level: &str, loss: u32, c2s_seed: u64, s2c_seed: u64) {
 /// Deliverable 1: the loss-vs-queueing decomposition on the same seeded link,
 /// printed as the table that separates the loss tail from the queue tail.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "spawns threads and binds ephemeral ports; four ~35 s arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+#[ignore = "spawns threads and binds ephemeral ports; eight ~35 s arms (byte-stream + frame-delivery); run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn jitter_decomposition() {
     let solo = run_one("solo", link(11, 0, 0), link(12, 0, 0), None).await;
     let loss_only = run_one("loss-only", link(21, LOSS_2, 0), link(22, LOSS_2, 0), None).await;
@@ -661,7 +817,42 @@ async fn jitter_decomposition() {
     ] {
         assert_sane(label, &run.summary);
     }
-    print_decomposition(&solo, &loss_only, &bulk_only, &bulk_and_loss);
+    print_decomposition("byte-stream", &solo, &loss_only, &bulk_only, &bulk_and_loss);
+
+    // The same four arms in the deployment's frame-delivery path.
+    let solo_frame = run_one_frame("solo_frame", link(11, 0, 0), link(12, 0, 0), None).await;
+    let loss_frame =
+        run_one_frame("loss_frame", link(21, LOSS_2, 0), link(22, LOSS_2, 0), None).await;
+    let bulk_frame = run_one_frame(
+        "bulk_frame",
+        link(31, 0, BULK_RATE_BPS),
+        link(32, 0, BULK_RATE_BPS),
+        Some(BULK),
+    )
+    .await;
+    let bulk_and_loss_frame = run_one_frame(
+        "bulk_and_loss_frame",
+        link(41, LOSS_2, BULK_RATE_BPS),
+        link(42, LOSS_2, BULK_RATE_BPS),
+        Some(BULK),
+    )
+    .await;
+
+    for (label, run) in [
+        ("solo_frame", &solo_frame),
+        ("loss_frame", &loss_frame),
+        ("bulk_frame", &bulk_frame),
+        ("bulk_and_loss_frame", &bulk_and_loss_frame),
+    ] {
+        assert_sane(label, &run.summary);
+    }
+    print_decomposition(
+        "frame-delivery",
+        &solo_frame,
+        &loss_frame,
+        &bulk_frame,
+        &bulk_and_loss_frame,
+    );
 }
 
 /// Deliverable 2: FEC arms at 2% loss (below FEC's 5% enable gate).

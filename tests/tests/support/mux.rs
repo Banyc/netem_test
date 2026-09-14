@@ -672,6 +672,45 @@ where
     )
 }
 
+/// Wrap a frame-preserving reliable stream pair (from
+/// [`crate::support::frame::rtp_frame_delivery_connect`]) in a `mux` client
+/// configured for `frame_reassembly`, matching the deployment's frame-delivery
+/// path, and return the stream opener.
+///
+/// Unlike [`mux_client_connect_via`], the supervision drain is submitted as a
+/// non-required background task: a frame-delivery lane exchanges a normal FIN
+/// at teardown before the measurement body finishes, so the session can
+/// complete normally and a required drain would panic on that early end. A
+/// panicked supervision task still surfaces at scope end.
+pub fn mux_client_connect_frame_delivery_via<R, W>(
+    tx: &TestTaskSubmitter,
+    read: R,
+    write: W,
+) -> mux::StreamOpener
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let config = mux::MuxConfig {
+        initiation: mux::Initiation::Client,
+        heartbeat_interval: Duration::from_secs(5),
+        frame_reassembly: true,
+    };
+    let mut spawner = JoinSet::new();
+    let (opener, _accepter) = mux::spawn_mux_no_reconnection(read, write, config, &mut spawner);
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            if let Some(result) = spawner.join_next().await
+                && let Err(err) = result
+            {
+                panic!("mux client frame-delivery session supervision failed: {err:?}");
+            }
+        }),
+    );
+    opener
+}
+
 /// Open a mux stream, write `payload`, shut the stream down, and read the
 /// full echo back until EOF.
 ///
