@@ -136,6 +136,34 @@ fn link(seed: u64, loss: u32, rate_bps: u64) -> NetemConfig {
     }
 }
 
+/// Build one impairment direction with every non-loss knob exposed: fixed
+/// delay, jitter, iid loss, duplication, and sch_netem reordering (once
+/// `reorder_gap_pkts` packets have accumulated, a packet that draws under the
+/// reorder threshold jumps ahead of the delayed queue).
+#[allow(clippy::too_many_arguments)]
+fn link_custom(
+    seed: u64,
+    latency: Duration,
+    jitter: Duration,
+    loss: u32,
+    duplicate: u32,
+    reorder: u32,
+    reorder_gap_pkts: u32,
+    rate_bps: u64,
+) -> NetemConfig {
+    NetemConfig {
+        latency,
+        jitter,
+        rate: rate_bps,
+        loss,
+        duplicate,
+        reorder,
+        reorder_gap_pkts,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
 /// A periodic bulk burst: `burst_bytes` offered every `period`, as fast as the
 /// transport accepts, for the duration of the run.
 #[derive(Clone, Copy, Debug)]
@@ -209,18 +237,28 @@ struct JitterRun {
     summary: HolSummary,
     counters: Counters,
     fec: Option<rtp::metrics::MetricsFecCounters>,
+    rtx: Option<rtp::metrics::MetricsRetransmissionCounters>,
 }
 
-/// A lightweight metrics observer that retains the latest FEC counter snapshot
-/// at a coarse 250 ms cadence, so the observer never perturbs the measured
-/// traffic while still letting the arm report whether parity was emitted and
-/// whether the loss gate skipped it.
-fn fec_observer() -> (
+/// The metrics observer plus the FEC-counter and full-snapshot cells it
+/// fills, so a run can read the FEC counters, the retransmission counters, and
+/// the congestion state after it completes.
+type ObserverBundle = (
     rtp::metrics::MetricsObserver,
     Arc<Mutex<Option<rtp::metrics::MetricsFecCounters>>>,
-) {
+    Arc<Mutex<Option<rtp::metrics::MetricsSnapshot>>>,
+);
+
+/// A lightweight metrics observer that retains the latest FEC and
+/// retransmission counter snapshots at a coarse 250 ms cadence, so the
+/// observer never perturbs the measured traffic while still letting the arm
+/// report whether parity was emitted and whether reorder/duplicate caused a
+/// spurious repair.
+fn fec_observer() -> ObserverBundle {
     let cell = Arc::new(Mutex::new(None));
     let sink = Arc::clone(&cell);
+    let snapshot_cell = Arc::new(Mutex::new(None));
+    let snapshot_sink = Arc::clone(&snapshot_cell);
     let last_ms = Arc::new(AtomicU64::new(0));
     let observer = rtp::metrics::MetricsObserver::filtered(
         move |_event, elapsed| {
@@ -234,12 +272,15 @@ fn fec_observer() -> (
             }
         },
         move |observation| {
-            if let Some(fec) = observation.snapshot.and_then(|s| s.fec_counters) {
-                *sink.lock().unwrap() = Some(fec);
+            if let Some(snapshot) = observation.snapshot {
+                if let Some(fec) = snapshot.fec_counters {
+                    *sink.lock().unwrap() = Some(fec);
+                }
+                *snapshot_sink.lock().unwrap() = Some(snapshot);
             }
         },
     );
-    (observer, cell)
+    (observer, cell, snapshot_cell)
 }
 
 /// Run one interactive-vs-bulk/loss jitter scenario and return its measurements.
@@ -270,7 +311,7 @@ async fn run_jitter(scenario: JitterScenario) -> JitterRun {
                     .unwrap();
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-            let (observer, fec_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell) = fec_observer();
             let (connected_read, connected_write) =
                 rtp_connect_with_mss_fec_tuning_and_observer_via(
                     &task_tx,
@@ -360,6 +401,8 @@ async fn run_jitter(scenario: JitterScenario) -> JitterRun {
                 RUN_FOR.as_secs_f64(),
             );
             let fec = *fec_cell.lock().unwrap();
+            let snapshot = *snapshot_cell.lock().unwrap();
+            let rtx = snapshot.map(|s| s.retransmission_counters);
 
             print_summary(&label, &summary);
             eprintln!("[jitter {label}] pair stats = {counters:?}");
@@ -382,6 +425,7 @@ async fn run_jitter(scenario: JitterScenario) -> JitterRun {
                 summary,
                 counters,
                 fec,
+                rtx,
             }
         })
         .await
@@ -453,7 +497,7 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
             };
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-            let (observer, fec_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell) = fec_observer();
             let (reader, writer) = if reorder {
                 rtp_frame_delivery_connect_reorder_with_fec_tuning_via(
                     &task_tx,
@@ -571,6 +615,21 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
             );
             eprintln!("[jitter {label}] pair stats = {counters:?}");
             let fec = *fec_cell.lock().unwrap();
+            let snapshot = *snapshot_cell.lock().unwrap();
+            let rtx = snapshot.map(|s| s.retransmission_counters);
+            if let Some(rtx) = rtx {
+                eprintln!(
+                    "[jitter {label}] rtx attempts={} first={} repeat={} rto={} reorder={} fast_loss={} pre_outage={} tail_probes={}",
+                    rtx.attempts,
+                    rtx.first_attempts,
+                    rtx.repeat_attempts,
+                    rtx.rto_reason,
+                    rtx.reorder_reason,
+                    rtx.fast_loss_reason,
+                    rtx.pre_outage_reason,
+                    rtx.tail_probes,
+                );
+            }
             if let Some(fec) = fec {
                 eprintln!(
                     "[jitter {label}] fec parity_sent={} groups_flushed={} \
@@ -590,6 +649,7 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
                 summary,
                 counters,
                 fec,
+                rtx,
             }
         })
         .await
@@ -1243,6 +1303,180 @@ async fn jitter_fec_arms_6pct() {
     run_fec_level("6pct", LOSS_6, 61, 62).await;
 }
 
+/// A 10% per-packet reorder/duplication threshold (`u32` fraction).
+const IMPAIR_10: u32 = u32::MAX / 10;
+
+/// Print one non-loss arm's latency percentiles, wire load, and RTP
+/// retransmission counters so a repair/reorder artifact is separable from
+/// expected propagation jitter.
+fn print_nonloss_table(runs: &[(&str, JitterRun)]) {
+    eprintln!(
+        "[nonloss] deployment interactive lane: frame fast-forward + prompt FEC, no loss, no bulk"
+    );
+    eprintln!(
+        "[nonloss] arm                     p50     p90     p99     max  over250  del  recv  \
+         wire_pkts  wire_bytes  rtx_first  rtx_rto  rtx_reord  rtx_fast  rtx_repeat  parity"
+    );
+    for (name, run) in runs {
+        let s = &run.summary;
+        let r = run.rtx.unwrap_or_default();
+        let parity = run.fec.map(|f| f.parity_sent).unwrap_or(0);
+        eprintln!(
+            "[nonloss] {name:<24} {p50:7.1} {p90:7.1} {p99:7.1} {max:7.1} {o25:7.3} {del:5.3} \
+             {recv:5} {wpkts:>10} {wbytes:>11} {first:>10} {rto:8} {reord:10} {fast:9} \
+             {repeat:11} {parity:7}",
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            max = s.max,
+            o25 = s.over250_pct,
+            del = s.delivery_pct,
+            recv = s.received,
+            wpkts = run.counters.forwarded,
+            wbytes = run.counters.forwarded_bytes,
+            first = r.first_attempts,
+            rto = r.rto_reason,
+            reord = r.reorder_reason,
+            fast = r.fast_loss_reason,
+            repeat = r.repeat_attempts,
+        );
+    }
+}
+
+/// Non-loss impairment arm sweep on the deployment's interactive lane: the
+/// clean no-jitter floor, jitter alone, a one-slot reorder window, datagram
+/// duplication, and reorder+duplication, each with the RTP retransmission
+/// counters so a spurious repair is visible. A strict-frame reorder arm is
+/// printed beside the fast-forward arms to show whether the already-deployed
+/// fast-forward is what keeps the reorder window from costing latency.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; six ~35 s non-loss arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_nonloss_impairments() {
+    let prompt = prompt_tuning();
+    let clean_a = link_custom(71, OWD, Duration::ZERO, 0, 0, 0, 0, 0);
+    let clean_b = link_custom(72, OWD, Duration::ZERO, 0, 0, 0, 0, 0);
+    let jitter_a = link_custom(73, OWD, JITTER, 0, 0, 0, 0, 0);
+    let jitter_b = link_custom(74, OWD, JITTER, 0, 0, 0, 0, 0);
+    let reorder_a = link_custom(75, OWD, Duration::ZERO, 0, 0, IMPAIR_10, 2, 0);
+    let reorder_b = link_custom(76, OWD, Duration::ZERO, 0, 0, IMPAIR_10, 2, 0);
+    let dup_a = link_custom(77, OWD, Duration::ZERO, 0, IMPAIR_10, 0, 0, 0);
+    let dup_b = link_custom(78, OWD, Duration::ZERO, 0, IMPAIR_10, 0, 0, 0);
+    let reorder_dup_a = link_custom(79, OWD, Duration::ZERO, 0, IMPAIR_10, IMPAIR_10, 2, 0);
+    let reorder_dup_b = link_custom(80, OWD, Duration::ZERO, 0, IMPAIR_10, IMPAIR_10, 2, 0);
+    let strict_reorder_a = link_custom(81, OWD, Duration::ZERO, 0, 0, IMPAIR_10, 2, 0);
+    let strict_reorder_b = link_custom(82, OWD, Duration::ZERO, 0, 0, IMPAIR_10, 2, 0);
+
+    let mut runs: Vec<(&str, JitterRun)> = Vec::new();
+    runs.push((
+        "ff_clean_nojitter",
+        run_one_frame_reorder_fec("ff_clean_nojitter", clean_a, clean_b, None, prompt).await,
+    ));
+    runs.push((
+        "ff_jitter_only",
+        run_one_frame_reorder_fec("ff_jitter_only", jitter_a, jitter_b, None, prompt).await,
+    ));
+    runs.push((
+        "ff_reorder_only",
+        run_one_frame_reorder_fec("ff_reorder_only", reorder_a, reorder_b, None, prompt).await,
+    ));
+    runs.push((
+        "ff_dup_only",
+        run_one_frame_reorder_fec("ff_dup_only", dup_a, dup_b, None, prompt).await,
+    ));
+    runs.push((
+        "ff_reorder_dup",
+        run_one_frame_reorder_fec("ff_reorder_dup", reorder_dup_a, reorder_dup_b, None, prompt)
+            .await,
+    ));
+    runs.push((
+        "strict_reorder_only",
+        run_one_frame_fec(
+            "strict_reorder_only",
+            strict_reorder_a,
+            strict_reorder_b,
+            None,
+            prompt,
+        )
+        .await,
+    ));
+    for (label, run) in &runs {
+        assert_sane(label, &run.summary);
+    }
+    print_nonloss_table(&runs);
+}
+
+/// Reorder-rate curve on the deployment's interactive lane: the fast-forward
+/// path at 1%, 3%, and 10% per-packet reorder (gap 2) beside the strict path
+/// at 10%, so the p99 cost can be attributed to the reorder depth and to the
+/// fast-forward choice.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; four ~35 s reorder arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_reorder_rate_curve() {
+    let prompt = prompt_tuning();
+    let mut runs: Vec<(&str, JitterRun)> = Vec::new();
+    for (label, pct) in [
+        ("ff_reorder_1pct", 1u32),
+        ("ff_reorder_3pct", 3),
+        ("ff_reorder_10pct", 10),
+    ] {
+        let a = link_custom(
+            90 + pct as u64,
+            OWD,
+            Duration::ZERO,
+            0,
+            0,
+            loss_pct(pct),
+            2,
+            0,
+        );
+        let b = link_custom(
+            190 + pct as u64,
+            OWD,
+            Duration::ZERO,
+            0,
+            0,
+            loss_pct(pct),
+            2,
+            0,
+        );
+        runs.push((
+            label,
+            run_one_frame_reorder_fec(label, a, b, None, prompt).await,
+        ));
+    }
+    let a = link_custom(81, OWD, Duration::ZERO, 0, 0, loss_pct(10), 2, 0);
+    let b = link_custom(82, OWD, Duration::ZERO, 0, 0, loss_pct(10), 2, 0);
+    runs.push((
+        "strict_reorder_10pct",
+        run_one_frame_fec("strict_reorder_10pct", a, b, None, prompt).await,
+    ));
+    for (label, run) in &runs {
+        assert_sane(label, &run.summary);
+    }
+    print_nonloss_table(&runs);
+}
+
+/// Direction split of the 3% reorder collapse: c2s-only reorder (a data hole)
+/// versus s2c-only reorder (an acknowledgement-path reorder), both on the
+/// fast-forward interactive lane, so the stall can be attributed to the data
+/// or the ACK path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; two ~35 s reorder arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_reorder_direction() {
+    let prompt = prompt_tuning();
+    let clean = |seed: u64| link_custom(seed, OWD, Duration::ZERO, 0, 0, 0, 0, 0);
+    let reord = |seed: u64| link_custom(seed, OWD, Duration::ZERO, 0, 0, loss_pct(3), 2, 0);
+    let c2s =
+        run_one_frame_reorder_fec("ff_reorder_c2s_3pct", reord(101), clean(102), None, prompt)
+            .await;
+    let s2c =
+        run_one_frame_reorder_fec("ff_reorder_s2c_3pct", clean(103), reord(104), None, prompt)
+            .await;
+    assert_sane("ff_reorder_c2s_3pct", &c2s.summary);
+    assert_sane("ff_reorder_s2c_3pct", &s2c.summary);
+    print_nonloss_table(&[("ff_reorder_c2s_3pct", c2s), ("ff_reorder_s2c_3pct", s2c)]);
+}
+
 /// The floor: interactive pings on a delay+jitter link, no loss, no bulk.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads and binds ephemeral ports; ~35 s measurement; run with --ignored --nocapture --test-threads=1 (see module header)"]
@@ -1410,7 +1644,7 @@ async fn run_duallane(
             let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
             let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
 
-            let (observer, fec_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell) = fec_observer();
             let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -1497,6 +1731,8 @@ async fn run_duallane(
             let bulk_active_secs = (RUN_FOR - BULK_RAMP).as_secs_f64();
             let summary = summarize(samples, sent, received, bulk_wire_bytes, bulk_active_secs);
             let fec = *fec_cell.lock().unwrap();
+            let snapshot = *snapshot_cell.lock().unwrap();
+            let rtx = snapshot.map(|s| s.retransmission_counters);
             let bulk_sink_bytes = bulk_counter.load(Ordering::Relaxed);
 
             print_summary(label, &summary);
@@ -1533,6 +1769,7 @@ async fn run_duallane(
                     summary,
                     counters: int_counters,
                     fec,
+                    rtx,
                 },
                 bulk_wire_bytes,
                 bulk_sink_bytes,
