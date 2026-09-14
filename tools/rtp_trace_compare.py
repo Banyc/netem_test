@@ -47,7 +47,7 @@ def ack_flush_metric_keys():
 
 ACK_FLUSH_METRICS = ack_flush_metric_keys() + ACK_FLUSH_COMPAT_METRICS
 
-# Trace schema 31 snapshot columns: the 29 typed FEC work/recovery counters
+# Trace schema 32 snapshot columns: the 30 typed FEC work/recovery counters
 # recorded on state rows. They stay None when the trace predates them or the
 # lane never enabled FEC; a present zero is a real zero.
 FEC_COUNTER_FIELDS = (
@@ -80,6 +80,7 @@ FEC_COUNTER_FIELDS = (
     "fec_recovered_symbols",
     "fec_dropped_malformed_packets",
     "fec_dropped_decoder_panics",
+    "fec_rejected_recovered_symbols",
 )
 
 
@@ -413,6 +414,7 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     schema = manifest.get("trace_schema_version", "")
     row_schema = REPORT.field(rtp[0], "schema_version") if rtp else ""
     supported_schemas = (
+        "32",
         "31",
         "30",
         "29",
@@ -1072,6 +1074,9 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
                 "fec_dropped_malformed_packets"
             ],
             "dropped_decoder_panics": final_fec["fec_dropped_decoder_panics"],
+            "rejected_recovered_symbols": final_fec[
+                "fec_rejected_recovered_symbols"
+            ],
         },
         "fec_parity_sent_per_gib_delivered": _per_gib(
             final_fec["fec_parity_sent"], delivered_bytes
@@ -1084,6 +1089,9 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         ),
         "fec_dropped_decoder_panics_per_gib_delivered": _per_gib(
             final_fec["fec_dropped_decoder_panics"], delivered_bytes
+        ),
+        "fec_rejected_recovered_symbols_per_gib_delivered": _per_gib(
+            final_fec["fec_rejected_recovered_symbols"], delivered_bytes
         ),
         "message_latency_p50_ms": metric_number(
             manifest.get("message_latency_p50_ms")
@@ -1273,6 +1281,7 @@ METRICS = (
     "fec_recovered_symbols_per_gib_delivered",
     "fec_dropped_malformed_packets_per_gib_delivered",
     "fec_dropped_decoder_panics_per_gib_delivered",
+    "fec_rejected_recovered_symbols_per_gib_delivered",
     *ACK_FLUSH_METRICS,
 )
 
@@ -1333,6 +1342,7 @@ LOWER_IS_BETTER_METRICS = {
     "fec_parity_sent_per_gib_delivered",
     "fec_dropped_malformed_packets_per_gib_delivered",
     "fec_dropped_decoder_panics_per_gib_delivered",
+    "fec_rejected_recovered_symbols_per_gib_delivered",
 }
 
 CONDITIONING_METRICS = tuple(

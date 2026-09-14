@@ -13,14 +13,14 @@ use rtp::metrics::{
     MetricsSnapshot,
 };
 
-/// Trace schema 31: RTP rows carry the complete congestion-controller and
-/// retransmission-scheduler snapshot (73 columns) plus the 29 typed FEC
+/// Trace schema 32: RTP rows carry the complete congestion-controller and
+/// retransmission-scheduler snapshot (73 columns) plus the 30 typed FEC
 /// work/recovery columns and `trace_elapsed_us` so endpoint, netem, and
 /// progress samples share one clock (`PerfTrace::trace_start`). Event-only
 /// rows leave every snapshot column empty; the retransmission-active/ready,
 /// RTO timing, controller-decision, and FEC evidence is present only on
 /// snapshot rows.
-const TRACE_SCHEMA_VERSION: u16 = 31;
+const TRACE_SCHEMA_VERSION: u16 = 32;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 /// Raw RTT samples are time-decimated to one retained row per interval on
@@ -30,8 +30,8 @@ const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 /// fast lane cannot exhaust the bounded storage and long runs degrade
 /// evidence resolution uniformly rather than losing their tail.
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
-const RTP_TRACE_COLUMNS: usize = 102;
-const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,fec_parity_sent,fec_groups_flushed,fec_flushed_groups_1,fec_flushed_groups_2_to_4,fec_flushed_groups_5_to_7,fec_flushed_groups_8,fec_groups_skipped_no_surplus_tokens,fec_no_surplus_groups_1,fec_no_surplus_groups_2_to_4,fec_no_surplus_groups_5_to_7,fec_no_surplus_groups_8,fec_groups_skipped_burst_end,fec_burst_end_groups_1,fec_burst_end_groups_2_to_4,fec_burst_end_groups_5_to_7,fec_burst_end_groups_8,fec_groups_skipped_loss_gate,fec_loss_gate_groups_1,fec_loss_gate_groups_2_to_4,fec_loss_gate_groups_5_to_7,fec_loss_gate_groups_8,fec_groups_skipped_no_spare_capacity,fec_no_spare_capacity_groups_1,fec_no_spare_capacity_groups_2_to_4,fec_no_spare_capacity_groups_5_to_7,fec_no_spare_capacity_groups_8,fec_recovered_symbols,fec_dropped_malformed_packets,fec_dropped_decoder_panics,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
+const RTP_TRACE_COLUMNS: usize = 103;
+const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,fec_parity_sent,fec_groups_flushed,fec_flushed_groups_1,fec_flushed_groups_2_to_4,fec_flushed_groups_5_to_7,fec_flushed_groups_8,fec_groups_skipped_no_surplus_tokens,fec_no_surplus_groups_1,fec_no_surplus_groups_2_to_4,fec_no_surplus_groups_5_to_7,fec_no_surplus_groups_8,fec_groups_skipped_burst_end,fec_burst_end_groups_1,fec_burst_end_groups_2_to_4,fec_burst_end_groups_5_to_7,fec_burst_end_groups_8,fec_groups_skipped_loss_gate,fec_loss_gate_groups_1,fec_loss_gate_groups_2_to_4,fec_loss_gate_groups_5_to_7,fec_loss_gate_groups_8,fec_groups_skipped_no_spare_capacity,fec_no_spare_capacity_groups_1,fec_no_spare_capacity_groups_2_to_4,fec_no_spare_capacity_groups_5_to_7,fec_no_spare_capacity_groups_8,fec_recovered_symbols,fec_dropped_malformed_packets,fec_dropped_decoder_panics,fec_rejected_recovered_symbols,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
 
 /// Exact per-cause gentle-mode exit counters. Rare transitions are aggregated
 /// atomically and never consume bounded state-row capacity.
@@ -223,6 +223,10 @@ impl CumulativeCounters {
                 dropped_decoder_panics: since(
                     current.dropped_decoder_panics,
                     previous.dropped_decoder_panics,
+                ),
+                rejected_recovered_symbols: since(
+                    current.rejected_recovered_symbols,
+                    previous.rejected_recovered_symbols,
                 ),
             }
         });
@@ -1089,9 +1093,10 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
                 fec.recovered_symbols.to_string(),
                 fec.dropped_malformed_packets.to_string(),
                 fec.dropped_decoder_panics.to_string(),
+                fec.rejected_recovered_symbols.to_string(),
             ]);
         } else {
-            fields.extend(std::iter::repeat_with(String::new).take(29));
+            fields.extend(std::iter::repeat_with(String::new).take(30));
         }
         fields.extend([
             snapshot.next_send_sequence.to_string(),
@@ -1459,7 +1464,7 @@ mod tests {
 
     #[test]
     fn event_only_and_snapshot_rows_match_the_schema_width() {
-        assert_eq!(RTP_TRACE_HEADER.split(',').count(), 102);
+        assert_eq!(RTP_TRACE_HEADER.split(',').count(), RTP_TRACE_COLUMNS);
         let mut snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
         snapshot.snapshot.as_mut().unwrap().fec_counters = Some(MetricsFecCounters {
             parity_sent: 1,
@@ -1501,14 +1506,15 @@ mod tests {
             recovered_symbols: 27,
             dropped_malformed_packets: 28,
             dropped_decoder_panics: 29,
+            rejected_recovered_symbols: 30,
         });
         let mut event_only = observation(1, 1, MetricsEvent::RttSample);
         event_only.snapshot = None;
         let trace_elapsed = Duration::from_micros(123);
         let snapshot_fields = rtp_fields(snapshot, trace_elapsed);
-        assert_eq!(snapshot_fields.len(), 102);
+        assert_eq!(snapshot_fields.len(), RTP_TRACE_COLUMNS);
         let event_only_fields = rtp_fields(event_only, trace_elapsed);
-        assert_eq!(event_only_fields.len(), 102);
+        assert_eq!(event_only_fields.len(), RTP_TRACE_COLUMNS);
         assert_eq!(event_only_fields[7], "20000");
         assert!(
             event_only_fields[8..RTP_TRACE_COLUMNS - 1]
@@ -1517,7 +1523,7 @@ mod tests {
         );
         assert_eq!(event_only_fields[RTP_TRACE_COLUMNS - 1], "123");
 
-        // The 29 typed FEC columns sit immediately after `tail_probe_attempts`.
+        // The 30 typed FEC columns sit immediately after `tail_probe_attempts`.
         let columns: Vec<&str> = RTP_TRACE_HEADER.split(',').collect();
         let fec_start = columns
             .iter()
@@ -1528,7 +1534,7 @@ mod tests {
             .iter()
             .position(|column| *column == "next_send_sequence")
             .unwrap();
-        assert_eq!(fec_end - fec_start, 29);
+        assert_eq!(fec_end - fec_start, 30);
         for (index, column) in columns[fec_start..fec_end].iter().enumerate() {
             assert!(
                 column.starts_with("fec_"),
@@ -1539,7 +1545,7 @@ mod tests {
         // Snapshot rows serialize every FEC member in header order ...
         let expected_fec: Vec<&str> = vec![
             "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
-            "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
+            "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30",
         ];
         assert_eq!(&snapshot_fields[fec_start..fec_end], &expected_fec);
         // ... while event-only rows leave them empty, preserving the width.
@@ -1690,6 +1696,7 @@ mod tests {
                 recovered_symbols: base,
                 dropped_malformed_packets: malformed,
                 dropped_decoder_panics: base,
+                rejected_recovered_symbols: base,
             }
         }
         // Stamp every cumulative retransmission and FEC member onto a

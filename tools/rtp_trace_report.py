@@ -34,7 +34,7 @@ CONGESTION_ACTION_LANES = {
 }
 
 
-# Trace schema 31 typed FEC work/recovery snapshot columns. They render only
+# Trace schema 32 typed FEC work/recovery snapshot columns. They render only
 # when present; absent FEC stays absent rather than being drawn as zero work.
 FEC_COUNTER_FIELDS = (
     "fec_parity_sent",
@@ -66,6 +66,7 @@ FEC_COUNTER_FIELDS = (
     "fec_recovered_symbols",
     "fec_dropped_malformed_packets",
     "fec_dropped_decoder_panics",
+    "fec_rejected_recovered_symbols",
 )
 
 WIDTH = 960
@@ -549,10 +550,8 @@ def render_report(trace_dir, output, rtp_filename="rtp.csv"):
     )
     fec_final = {}
     for field_name in FEC_COUNTER_FIELDS:
-        value = next(
-            (row[field_name] for row in reversed(rtp) if row[field_name] is not None),
-            None,
-        )
+        cells = (field(row, field_name) for row in reversed(rtp))
+        value = next((cell for cell in cells if cell not in (None, "")), None)
         if value is not None:
             fec_final[field_name] = value
     fec_table_rows = "".join(
