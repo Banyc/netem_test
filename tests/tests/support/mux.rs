@@ -1375,6 +1375,7 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
     spawn: impl FnOnce(TestTask),
     fec: bool,
     base: Instant,
+    frame_mode: FrameMode,
 ) -> std::io::Result<(
     std::net::SocketAddr,
     tokio::sync::mpsc::Receiver<(u8, f64)>,
@@ -1387,7 +1388,7 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
     );
     let addr = listener.local_addr();
 
-    let fd = FrameMode::enabled();
+    let fd = frame_mode;
     let listener_accept = Arc::clone(&listener);
     let bulk_delivered_for_server = Arc::clone(&bulk_delivered);
     spawn(Box::pin(async move {
@@ -1574,7 +1575,13 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
     tokio::sync::mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
 )> {
-    spawn_mux_frame_delivery_latency_bulk_server_core(|fut| tasks.spawn(fut), fec, base).await
+    spawn_mux_frame_delivery_latency_bulk_server_core(
+        |fut| tasks.spawn(fut),
+        fec,
+        base,
+        FrameMode::enabled(),
+    )
+    .await
 }
 
 /// [`spawn_mux_frame_delivery_latency_bulk_server`] through the bounded
@@ -1589,6 +1596,34 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server_via(
     tokio::sync::mpsc::Receiver<(u8, f64)>,
     Arc<AtomicU64>,
 )> {
-    spawn_mux_frame_delivery_latency_bulk_server_core(|fut| submit_test_task(tx, fut), fec, base)
-        .await
+    spawn_mux_frame_delivery_latency_bulk_server_core(
+        |fut| submit_test_task(tx, fut),
+        fec,
+        base,
+        FrameMode::enabled(),
+    )
+    .await
+}
+
+/// [`spawn_mux_frame_delivery_latency_bulk_server_via`] with receiver-side
+/// fast-forward enabled: every accepted RTP connection uses
+/// [`FrameMode::enabled_reordering`], matching the client's
+/// [`crate::support::frame::rtp_frame_delivery_connect_reorder_via`]. This is
+/// the deployment's interactive-lane frame mode; both peers must select it.
+pub async fn spawn_mux_frame_delivery_latency_bulk_server_reorder_via(
+    tx: &TestTaskSubmitter,
+    fec: bool,
+    base: Instant,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_frame_delivery_latency_bulk_server_core(
+        |fut| submit_test_task(tx, fut),
+        fec,
+        base,
+        FrameMode::enabled_reordering(),
+    )
+    .await
 }

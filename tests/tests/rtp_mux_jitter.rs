@@ -26,7 +26,12 @@
 //!   episode/spike counts. This is the separation of the loss tail from the
 //!   queue tail. The same four arms are then repeated in RTP frame-delivery
 //!   mode (`solo_frame`, `loss_frame`, `bulk_frame`, `bulk_and_loss_frame`) to
-//!   measure the deployment's `frame_reassembly` path alongside byte-stream.
+//!   measure the deployment's `frame_reassembly` path alongside byte-stream,
+//!   and once more with receiver-side fast-forward
+//!   ([`jitter_frame_reorder_decomposition`]: `solo_frame_reorder`,
+//!   `loss_frame_reorder`, `bulk_frame_reorder`, `bulk_and_loss_frame_reorder`)
+//!   to measure the deployment's interactive-lane `allow_reorder` mode against
+//!   the strict frame-delivery table.
 //! * [`jitter_fec_arms_2pct`] / [`jitter_fec_arms_6pct`] — the interactive
 //!   lane with FEC `off` / stock (`default`) / prompt parity
 //!   (`instream_flush=true, small_group_parity_count=1`) at 2% and 6% loss,
@@ -48,9 +53,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netem_test::{Counters, NetemConfig, NetemPair};
-use support::frame::rtp_frame_delivery_connect_via;
+use support::frame::{rtp_frame_delivery_connect_reorder_via, rtp_frame_delivery_connect_via};
 use support::mux::{
     mux_client_connect_frame_delivery_via, mux_client_connect_via, send_timestamped_messages,
+    spawn_mux_frame_delivery_latency_bulk_server_reorder_via,
     spawn_mux_frame_delivery_latency_bulk_server_via,
     spawn_mux_latency_bulk_server_with_fec_tuning_via,
 };
@@ -363,6 +369,22 @@ async fn run_one(
 /// frame-delivery server helper takes no tuning; the frame arms therefore use
 /// the no-FEC [`scen`] defaults.
 async fn run_jitter_frame(scenario: JitterScenario) -> JitterRun {
+    run_jitter_frame_mode(scenario, false).await
+}
+
+/// [`run_jitter_frame`] with receiver-side fast-forward: both the frame-delivery
+/// server and the frame-delivery client use
+/// [`rtp::FrameMode::enabled_reordering`](rtp::FrameMode::enabled_reordering),
+/// so a complete frame starting past an unrepaired in-order hole is delivered
+/// immediately. Mirrors [`run_jitter_frame`] in every other respect.
+async fn run_jitter_frame_reorder(scenario: JitterScenario) -> JitterRun {
+    run_jitter_frame_mode(scenario, true).await
+}
+
+/// Shared body for [`run_jitter_frame`] (strict) and [`run_jitter_frame_reorder`]
+/// (fast-forward): `reorder` selects the matching server/client frame-mode
+/// helpers; both peers flip together because the mode is not negotiated.
+async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> JitterRun {
     let JitterScenario {
         label,
         c2s,
@@ -375,14 +397,22 @@ async fn run_jitter_frame(scenario: JitterScenario) -> JitterRun {
     let task_tx = tasks.submitter(TASK_QUEUE_BOUND);
     tasks
         .run(async {
-            let (server_addr, mut latencies, bulk_counter) =
+            let (server_addr, mut latencies, bulk_counter) = if reorder {
+                spawn_mux_frame_delivery_latency_bulk_server_reorder_via(&task_tx, false, base)
+                    .await
+                    .unwrap()
+            } else {
                 spawn_mux_frame_delivery_latency_bulk_server_via(&task_tx, false, base)
                     .await
-                    .unwrap();
+                    .unwrap()
+            };
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-            let (reader, writer) =
-                rtp_frame_delivery_connect_via(&task_tx, pair.client_addr(), false).await;
+            let (reader, writer) = if reorder {
+                rtp_frame_delivery_connect_reorder_via(&task_tx, pair.client_addr(), false).await
+            } else {
+                rtp_frame_delivery_connect_via(&task_tx, pair.client_addr(), false).await
+            };
             let opener = mux_client_connect_frame_delivery_via(&task_tx, reader, writer);
 
             // Interactive latency stream (`b'L'`). Its read half stays parked
@@ -489,6 +519,22 @@ async fn run_one_frame(
         Duration::from_secs(120),
         label,
         run_jitter_frame(scen(label, c2s, s2c, bulk)),
+    )
+    .await
+}
+
+/// Wrap a single-decision fast-forward frame-delivery [`JitterScenario`] in the
+/// standard timeout and run it through [`run_jitter_frame_reorder`].
+async fn run_one_frame_reorder(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    bulk: Option<BulkSpec>,
+) -> JitterRun {
+    with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_jitter_frame_reorder(scen(label, c2s, s2c, bulk)),
     )
     .await
 }
@@ -852,6 +898,58 @@ async fn jitter_decomposition() {
         &loss_frame,
         &bulk_frame,
         &bulk_and_loss_frame,
+    );
+}
+
+/// Deliverable 1b: the same four frame-delivery arms with receiver-side
+/// fast-forward (`FrameMode::enabled_reordering`), the deployment's
+/// interactive-lane mode. Both the accept side (`*_reorder_via`) and the
+/// connect side (`rtp_frame_delivery_connect_reorder_via`) select
+/// `allow_reorder`, so a complete interactive frame is delivered as soon as
+/// it arrives instead of waiting behind a bulk hole. The table is printed with
+/// the `frame-reorder` label and is directly comparable to the strict
+/// `frame-delivery` table from [`jitter_decomposition`].
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; four ~35 s fast-forward frame arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_frame_reorder_decomposition() {
+    let solo_frame_reorder =
+        run_one_frame_reorder("solo_frame_reorder", link(11, 0, 0), link(12, 0, 0), None).await;
+    let loss_frame_reorder = run_one_frame_reorder(
+        "loss_frame_reorder",
+        link(21, LOSS_2, 0),
+        link(22, LOSS_2, 0),
+        None,
+    )
+    .await;
+    let bulk_frame_reorder = run_one_frame_reorder(
+        "bulk_frame_reorder",
+        link(31, 0, BULK_RATE_BPS),
+        link(32, 0, BULK_RATE_BPS),
+        Some(BULK),
+    )
+    .await;
+    let bulk_and_loss_frame_reorder = run_one_frame_reorder(
+        "bulk_and_loss_frame_reorder",
+        link(41, LOSS_2, BULK_RATE_BPS),
+        link(42, LOSS_2, BULK_RATE_BPS),
+        Some(BULK),
+    )
+    .await;
+
+    for (label, run) in [
+        ("solo_frame_reorder", &solo_frame_reorder),
+        ("loss_frame_reorder", &loss_frame_reorder),
+        ("bulk_frame_reorder", &bulk_frame_reorder),
+        ("bulk_and_loss_frame_reorder", &bulk_and_loss_frame_reorder),
+    ] {
+        assert_sane(label, &run.summary);
+    }
+    print_decomposition(
+        "frame-reorder",
+        &solo_frame_reorder,
+        &loss_frame_reorder,
+        &bulk_frame_reorder,
+        &bulk_and_loss_frame_reorder,
     );
 }
 

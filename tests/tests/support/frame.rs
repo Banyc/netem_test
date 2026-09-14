@@ -41,6 +41,28 @@ pub async fn rtp_frame_delivery_connect_via(
         proxy_client_addr,
         fec,
         rtp::udp::MssConfig::Default,
+        rtp::FrameMode::enabled(),
+    )
+    .await
+}
+
+/// [`rtp_frame_delivery_connect_via`] with receiver-side fast-forward
+/// enabled: the connection uses [`rtp::FrameMode::enabled_reordering`], so a
+/// complete frame starting past an unrepaired in-order hole is delivered
+/// immediately instead of being withheld behind the hole. Both peers must use
+/// the reordering mode; the frame-mode `*_reorder` server helper is the
+/// matching accept side.
+pub async fn rtp_frame_delivery_connect_reorder_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    rtp_frame_delivery_connect_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        rtp::udp::MssConfig::Default,
+        rtp::FrameMode::enabled_reordering(),
     )
     .await
 }
@@ -75,6 +97,7 @@ pub async fn rtp_frame_delivery_connect_with_mss_via(
         proxy_client_addr,
         fec,
         rtp::udp::MssConfig::Custom(mss),
+        rtp::FrameMode::enabled(),
     )
     .await
 }
@@ -85,7 +108,14 @@ async fn rtp_frame_delivery_connect_with_mss_config(
     fec: bool,
     mss: rtp::udp::MssConfig,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
-    rtp_frame_delivery_connect_core(|fut| tasks.spawn(fut), proxy_client_addr, fec, mss).await
+    rtp_frame_delivery_connect_core(
+        |fut| tasks.spawn(fut),
+        proxy_client_addr,
+        fec,
+        mss,
+        rtp::FrameMode::enabled(),
+    )
+    .await
 }
 
 /// Shared core for [`rtp_frame_delivery_connect_with_mss_config`] and the
@@ -97,6 +127,7 @@ async fn rtp_frame_delivery_connect_core(
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: rtp::udp::MssConfig,
+    frame_mode: rtp::FrameMode,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
     let connected = rtp::udp::FrameDeliveryIo::connect(
         "0.0.0.0:0",
@@ -105,6 +136,7 @@ async fn rtp_frame_delivery_connect_core(
             handshake: false,
             fec,
             mss,
+            frame_delivery: frame_mode,
             ..rtp::udp::ConnectConfig::default()
         },
     )
