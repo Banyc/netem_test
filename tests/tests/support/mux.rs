@@ -1376,6 +1376,7 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
     fec: bool,
     base: Instant,
     frame_mode: FrameMode,
+    fec_tuning: FecTuning,
 ) -> std::io::Result<(
     std::net::SocketAddr,
     tokio::sync::mpsc::Receiver<(u8, f64)>,
@@ -1398,7 +1399,7 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
             .accept_without_handshake_with(rtp::udp::AcceptConfig {
                 fec,
                 mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-                fec_tuning: FecTuning::default(),
+                fec_tuning,
                 frame_delivery: fd,
                 ..rtp::udp::AcceptConfig::default()
             })
@@ -1420,7 +1421,7 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
                         .accept_without_handshake_with(rtp::udp::AcceptConfig {
                             fec,
                             mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-                            fec_tuning: FecTuning::default(),
+                            fec_tuning,
                             frame_delivery: fd,
                             ..rtp::udp::AcceptConfig::default()
                         })
@@ -1517,15 +1518,21 @@ async fn spawn_mux_frame_delivery_latency_bulk_server_core(
                                         }
                                     }
                                 } else {
+                                    // Bulk sink: count every delivered byte.
+                                    // The byte-order-strict
+                                    // `PayloadPatternVerifier` desyncs once RTP
+                                    // frame-reorder fast-forwards a bulk frame
+                                    // past a hole, which made the frame-reorder
+                                    // arms look artificially light. The
+                                    // delivered-byte total is order-independent
+                                    // and keeps the offered load matched across
+                                    // the strict and reorder arms.
                                     let mut buf = vec![0u8; 64 * 1024];
-                                    let mut verifier = PayloadPatternVerifier::default();
                                     loop {
                                         match reader.read(&mut buf).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(n) => {
-                                                if verifier.verify(&buf[..n]) {
-                                                    bulk.fetch_add(n as u64, Ordering::Relaxed);
-                                                }
+                                                bulk.fetch_add(n as u64, Ordering::Relaxed);
                                             }
                                         }
                                     }
@@ -1580,6 +1587,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server(
         fec,
         base,
         FrameMode::enabled(),
+        FecTuning::default(),
     )
     .await
 }
@@ -1601,6 +1609,7 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server_via(
         fec,
         base,
         FrameMode::enabled(),
+        FecTuning::default(),
     )
     .await
 }
@@ -1624,6 +1633,54 @@ pub async fn spawn_mux_frame_delivery_latency_bulk_server_reorder_via(
         fec,
         base,
         FrameMode::enabled_reordering(),
+        FecTuning::default(),
+    )
+    .await
+}
+
+/// [`spawn_mux_frame_delivery_latency_bulk_server_via`] with an explicit
+/// per-connection [`rtp::FecTuning`], so a frame-delivery scenario can run the
+/// deployment's frame-mode-plus-FEC path (both peers must set the same
+/// tuning; there is no in-band negotiation).
+pub async fn spawn_mux_frame_delivery_latency_bulk_server_with_fec_tuning_via(
+    tx: &TestTaskSubmitter,
+    fec: bool,
+    base: Instant,
+    fec_tuning: rtp::FecTuning,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_frame_delivery_latency_bulk_server_core(
+        |fut| submit_test_task(tx, fut),
+        fec,
+        base,
+        FrameMode::enabled(),
+        fec_tuning,
+    )
+    .await
+}
+
+/// [`spawn_mux_frame_delivery_latency_bulk_server_reorder_via`] with an
+/// explicit per-connection [`rtp::FecTuning`]: the deployment's interactive
+/// lane (frame fast-forward **and** FEC) with both peers on the same tuning.
+pub async fn spawn_mux_frame_delivery_latency_bulk_server_reorder_with_fec_tuning_via(
+    tx: &TestTaskSubmitter,
+    fec: bool,
+    base: Instant,
+    fec_tuning: rtp::FecTuning,
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Receiver<(u8, f64)>,
+    Arc<AtomicU64>,
+)> {
+    spawn_mux_frame_delivery_latency_bulk_server_core(
+        |fut| submit_test_task(tx, fut),
+        fec,
+        base,
+        FrameMode::enabled_reordering(),
+        fec_tuning,
     )
     .await
 }

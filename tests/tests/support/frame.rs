@@ -42,6 +42,8 @@ pub async fn rtp_frame_delivery_connect_via(
         fec,
         rtp::udp::MssConfig::Default,
         rtp::FrameMode::enabled(),
+        rtp::FecTuning::default(),
+        None,
     )
     .await
 }
@@ -63,6 +65,55 @@ pub async fn rtp_frame_delivery_connect_reorder_via(
         fec,
         rtp::udp::MssConfig::Default,
         rtp::FrameMode::enabled_reordering(),
+        rtp::FecTuning::default(),
+        None,
+    )
+    .await
+}
+
+/// [`rtp_frame_delivery_connect_via`] with an explicit per-connection
+/// [`rtp::FecTuning`] and an optional metrics observer, so a frame-delivery
+/// scenario can run the deployment's frame-mode-plus-FEC path and capture its
+/// FEC counters. Both peers must set the same `fec` and tuning (there is no
+/// in-band negotiation).
+pub async fn rtp_frame_delivery_connect_with_fec_tuning_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    fec_tuning: rtp::FecTuning,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    rtp_frame_delivery_connect_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        rtp::udp::MssConfig::Default,
+        rtp::FrameMode::enabled(),
+        fec_tuning,
+        metrics_observer,
+    )
+    .await
+}
+
+/// [`rtp_frame_delivery_connect_reorder_via`] with an explicit
+/// per-connection [`rtp::FecTuning`] and an optional metrics observer: the
+/// deployment's interactive lane (frame fast-forward **and** FEC) with both
+/// peers on the same tuning.
+pub async fn rtp_frame_delivery_connect_reorder_with_fec_tuning_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    fec_tuning: rtp::FecTuning,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
+) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
+    rtp_frame_delivery_connect_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        rtp::udp::MssConfig::Default,
+        rtp::FrameMode::enabled_reordering(),
+        fec_tuning,
+        metrics_observer,
     )
     .await
 }
@@ -98,6 +149,8 @@ pub async fn rtp_frame_delivery_connect_with_mss_via(
         fec,
         rtp::udp::MssConfig::Custom(mss),
         rtp::FrameMode::enabled(),
+        rtp::FecTuning::default(),
+        None,
     )
     .await
 }
@@ -114,6 +167,8 @@ async fn rtp_frame_delivery_connect_with_mss_config(
         fec,
         mss,
         rtp::FrameMode::enabled(),
+        rtp::FecTuning::default(),
+        None,
     )
     .await
 }
@@ -128,6 +183,8 @@ async fn rtp_frame_delivery_connect_core(
     fec: bool,
     mss: rtp::udp::MssConfig,
     frame_mode: rtp::FrameMode,
+    fec_tuning: rtp::FecTuning,
+    metrics_observer: Option<rtp::metrics::MetricsObserver>,
 ) -> (RtpFrameReader, RtpFrameDeliveryWriter) {
     let connected = rtp::udp::FrameDeliveryIo::connect(
         "0.0.0.0:0",
@@ -137,6 +194,8 @@ async fn rtp_frame_delivery_connect_core(
             fec,
             mss,
             frame_delivery: frame_mode,
+            fec_tuning,
+            metrics_observer,
             ..rtp::udp::ConnectConfig::default()
         },
     )

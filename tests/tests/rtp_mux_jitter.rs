@@ -32,6 +32,11 @@
 //!   `loss_frame_reorder`, `bulk_frame_reorder`, `bulk_and_loss_frame_reorder`)
 //!   to measure the deployment's interactive-lane `allow_reorder` mode against
 //!   the strict frame-delivery table.
+//! * [`jitter_frame_reorder_fec_arms`] — the deployment's real interactive-lane
+//!   configuration: frame fast-forward **and** FEC (prompt tuning, permissive
+//!   loss gate) at 2% loss, printed beside the strict-frame + FEC and the
+//!   reorder FEC-off arms, with the FEC counters and the c2s wire bulk load so
+//!   the offered load can be checked matched across all three.
 //! * [`jitter_fec_arms_2pct`] / [`jitter_fec_arms_6pct`] — the interactive
 //!   lane with FEC `off` / stock (`default`) / prompt parity
 //!   (`instream_flush=true, small_group_parity_count=1`) at 2% and 6% loss,
@@ -53,11 +58,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netem_test::{Counters, NetemConfig, NetemPair};
-use support::frame::{rtp_frame_delivery_connect_reorder_via, rtp_frame_delivery_connect_via};
+use support::frame::{
+    rtp_frame_delivery_connect_reorder_with_fec_tuning_via,
+    rtp_frame_delivery_connect_with_fec_tuning_via,
+};
 use support::mux::{
     mux_client_connect_frame_delivery_via, mux_client_connect_via, send_timestamped_messages,
-    spawn_mux_frame_delivery_latency_bulk_server_reorder_via,
-    spawn_mux_frame_delivery_latency_bulk_server_via,
+    spawn_mux_frame_delivery_latency_bulk_server_reorder_with_fec_tuning_via,
+    spawn_mux_frame_delivery_latency_bulk_server_with_fec_tuning_via,
     spawn_mux_latency_bulk_server_with_fec_tuning_via,
 };
 use support::payload::{cyclic_payload, with_timeout};
@@ -160,6 +168,25 @@ fn prompt_tuning() -> rtp::FecTuning {
     rtp::FecTuning {
         instream_flush: true,
         small_group_parity_count: 1,
+    }
+}
+
+/// Build a scenario with FEC enabled on both ends and the given per-connection
+/// tuning (the deployment's interactive-lane configuration).
+fn scen_fec(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    bulk: Option<BulkSpec>,
+    fec_tuning: rtp::FecTuning,
+) -> JitterScenario {
+    JitterScenario {
+        label: label.to_owned(),
+        c2s,
+        s2c,
+        bulk,
+        fec: true,
+        fec_tuning,
     }
 }
 
@@ -365,9 +392,9 @@ async fn run_one(
 /// Run one interactive-vs-bulk/loss jitter scenario in RTP frame-delivery mode.
 /// Mirrors [`run_jitter`] but connects through the frame-delivery accept/connect
 /// helpers and a `frame_reassembly` mux client, matching the deployment path
-/// (`rtp_mux` sets `frame_reassembly: true`). FEC is off because the
-/// frame-delivery server helper takes no tuning; the frame arms therefore use
-/// the no-FEC [`scen`] defaults.
+/// (`rtp_mux` sets `frame_reassembly: true`). The scenario's `fec`/`fec_tuning`
+/// are threaded to both peers (the FEC-off [`scen`] defaults leave them off), so
+/// the deployment's frame-mode-plus-FEC path is measurable.
 async fn run_jitter_frame(scenario: JitterScenario) -> JitterRun {
     run_jitter_frame_mode(scenario, false).await
 }
@@ -390,7 +417,8 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
         c2s,
         s2c,
         bulk,
-        ..
+        fec,
+        fec_tuning,
     } = scenario;
     let base = Instant::now();
     let mut tasks = TestScope::new();
@@ -398,20 +426,39 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
     tasks
         .run(async {
             let (server_addr, mut latencies, bulk_counter) = if reorder {
-                spawn_mux_frame_delivery_latency_bulk_server_reorder_via(&task_tx, false, base)
-                    .await
-                    .unwrap()
+                spawn_mux_frame_delivery_latency_bulk_server_reorder_with_fec_tuning_via(
+                    &task_tx, fec, base, fec_tuning,
+                )
+                .await
+                .unwrap()
             } else {
-                spawn_mux_frame_delivery_latency_bulk_server_via(&task_tx, false, base)
-                    .await
-                    .unwrap()
+                spawn_mux_frame_delivery_latency_bulk_server_with_fec_tuning_via(
+                    &task_tx, fec, base, fec_tuning,
+                )
+                .await
+                .unwrap()
             };
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
+            let (observer, fec_cell) = fec_observer();
             let (reader, writer) = if reorder {
-                rtp_frame_delivery_connect_reorder_via(&task_tx, pair.client_addr(), false).await
+                rtp_frame_delivery_connect_reorder_with_fec_tuning_via(
+                    &task_tx,
+                    pair.client_addr(),
+                    fec,
+                    fec_tuning,
+                    Some(observer),
+                )
+                .await
             } else {
-                rtp_frame_delivery_connect_via(&task_tx, pair.client_addr(), false).await
+                rtp_frame_delivery_connect_with_fec_tuning_via(
+                    &task_tx,
+                    pair.client_addr(),
+                    fec,
+                    fec_tuning,
+                    Some(observer),
+                )
+                .await
             };
             let opener = mux_client_connect_frame_delivery_via(&task_tx, reader, writer);
 
@@ -479,6 +526,7 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
             // Let stragglers arrive before draining the latency channel.
             tokio::time::sleep(GRACE).await;
             let counters = combined_stats(&pair);
+            let c2s = pair.stats_c2s();
             let mut samples = Vec::new();
             while let Ok((tag, lat)) = latencies.try_recv() {
                 if tag == b'L' {
@@ -486,22 +534,49 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
                 }
             }
             let received = samples.len() as u64;
+            // The bulk sink's byte stream stalls at its first unrepaired hole
+            // under frame fast-forward (the mux per-stream reader is in-order),
+            // so the sink count collapses in the reorder arms even while the
+            // wire carries the full offered load. Report the client->server
+            // wire bytes as the load measure so strict and reorder arms are
+            // compared at matched offered load; keep the sink count (now an
+            // order-independent raw read total) as a goodput diagnostic.
+            let sink_delivered = bulk_counter.load(Ordering::Relaxed);
             let summary = summarize(
                 samples,
                 sent,
                 received,
-                bulk_counter.load(Ordering::Relaxed),
+                c2s.forwarded_bytes,
                 RUN_FOR.as_secs_f64(),
             );
 
             print_summary(&label, &summary);
+            eprintln!(
+                "[jitter {label}] bulk sink delivered = {sink_delivered} bytes; \
+                 wire c2s forwarded = {} bytes / {} pkts",
+                c2s.forwarded_bytes, c2s.forwarded
+            );
             eprintln!("[jitter {label}] pair stats = {counters:?}");
+            let fec = *fec_cell.lock().unwrap();
+            if let Some(fec) = fec {
+                eprintln!(
+                    "[jitter {label}] fec parity_sent={} groups_flushed={} \
+                     loss_gate_skips={} no_spare_capacity_skips={} burst_end_skips={} \
+                     recovered={}",
+                    fec.parity_sent,
+                    fec.groups_flushed,
+                    fec.groups_skipped_loss_gate,
+                    fec.groups_skipped_no_spare_capacity,
+                    fec.groups_skipped_burst_end,
+                    fec.recovered_symbols,
+                );
+            }
 
             pair.stop();
             JitterRun {
                 summary,
                 counters,
-                fec: None,
+                fec,
             }
         })
         .await
@@ -535,6 +610,42 @@ async fn run_one_frame_reorder(
         Duration::from_secs(120),
         label,
         run_jitter_frame_reorder(scen(label, c2s, s2c, bulk)),
+    )
+    .await
+}
+
+/// Wrap a single-decision strict frame-delivery [`JitterScenario`] with FEC on
+/// and the given tuning in the standard timeout, running it through
+/// [`run_jitter_frame`].
+async fn run_one_frame_fec(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    bulk: Option<BulkSpec>,
+    fec_tuning: rtp::FecTuning,
+) -> JitterRun {
+    with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_jitter_frame(scen_fec(label, c2s, s2c, bulk, fec_tuning)),
+    )
+    .await
+}
+
+/// Wrap a single-decision fast-forward frame-delivery [`JitterScenario`] with
+/// FEC on and the given tuning in the standard timeout, running it through
+/// [`run_jitter_frame_reorder`].
+async fn run_one_frame_reorder_fec(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    bulk: Option<BulkSpec>,
+    fec_tuning: rtp::FecTuning,
+) -> JitterRun {
+    with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_jitter_frame_reorder(scen_fec(label, c2s, s2c, bulk, fec_tuning)),
     )
     .await
 }
@@ -796,6 +907,74 @@ fn print_fec_table(level: &str, loss: u32, runs: &[(&str, JitterRun)]) {
     }
 }
 
+/// Print the frame-delivery + FEC arm table: latency percentiles, the RTP FEC
+/// counters (so it is visible whether parity was actually emitted), and the
+/// client->server wire bulk load. The `_fec_off` reorder rows are the FEC-off
+/// baselines and the `_fec` rows are the deployment's frame-mode-plus-FEC
+/// path; the bulk column is the load-match check. It is the c2s wire bytes
+/// (not the sink's delivered bytes): the frame fast-forward leaves the bulk
+/// sink's byte stream stalled at its first hole, so the sink count collapses
+/// in the reorder arms even though the wire carries the full offered load.
+fn print_frame_fec_table(runs: &[(&str, JitterRun)]) {
+    eprintln!(
+        "[framefec] frame-delivery interactive lane, 2% per-packet loss; *_fec rows use prompt \
+         tuning (instream_flush, small_group_parity_count=1)"
+    );
+    eprintln!(
+        "[framefec] arm                              p50     p90     p99     max  over250  ep  run  \
+         parity  flushed   gate  recovered     bulk"
+    );
+    for (name, run) in runs {
+        let s = &run.summary;
+        let f = run.fec.unwrap_or_default();
+        eprintln!(
+            "[framefec] {name:<32} {p50:7.1} {p90:7.1} {p99:7.1} {max:7.1} {o25:7.3} {ep:3} {mr:3} \
+             {parity:7} {flushed:8} {gate:6} {recovered:9} {bulk:8.3}",
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            max = s.max,
+            o25 = s.over250_pct,
+            ep = s.episodes,
+            mr = s.max_run,
+            parity = f.parity_sent,
+            flushed = f.groups_flushed,
+            gate = f.groups_skipped_loss_gate,
+            recovered = f.recovered_symbols,
+            bulk = s.bulk_mibps,
+        );
+    }
+    let find = |name: &str| -> Option<&JitterRun> {
+        runs.iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, run)| run)
+    };
+    for (fec_arm, off_arm) in [
+        ("loss_frame_reorder_fec", "loss_frame_reorder_fec_off"),
+        (
+            "bulk_and_loss_frame_reorder_fec",
+            "bulk_and_loss_frame_reorder_fec_off",
+        ),
+    ] {
+        let (Some(on), Some(off)) = (find(fec_arm), find(off_arm)) else {
+            continue;
+        };
+        let s = &on.summary;
+        let o = &off.summary;
+        eprintln!(
+            "[framefec] {fec_arm} - {off_arm}: p50={:+.1} p90={:+.1} p99={:+.1} max={:+.1} \
+             over250={:+.3} episodes={:+} bulk={:+.3}",
+            s.p50 - o.p50,
+            s.p90 - o.p90,
+            s.p99 - o.p99,
+            s.max - o.max,
+            s.over250_pct - o.over250_pct,
+            s.episodes as i64 - o.episodes as i64,
+            s.bulk_mibps - o.bulk_mibps,
+        );
+    }
+}
+
 /// Run the four FEC treatments (plus a loss-free `solo` reference on the same
 /// seeds) at one loss level and print the table.
 async fn run_fec_level(level: &str, loss: u32, c2s_seed: u64, s2c_seed: u64) {
@@ -951,6 +1130,90 @@ async fn jitter_frame_reorder_decomposition() {
         &bulk_frame_reorder,
         &bulk_and_loss_frame_reorder,
     );
+}
+
+/// Deliverable 1c: the deployment's real interactive-lane configuration — RTP
+/// frame-delivery with receiver-side fast-forward **and** FEC. Runs the strict
+/// frame + FEC and reorder frame + FEC arms beside the reorder FEC-off
+/// baselines on the same seeded 2% link, so the three configurations can be
+/// read off one table. The `_fec` arms use the interactive prompt tuning
+/// (`instream_flush`, `small_group_parity_count = 1`), which selects FEC's
+/// permissive loss gate so parity actually opens at 2%.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; six ~35 s frame+FEC arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_frame_reorder_fec_arms() {
+    let prompt = prompt_tuning();
+
+    // Strict frame delivery + FEC.
+    let loss_frame_fec = run_one_frame_fec(
+        "loss_frame_fec",
+        link(21, LOSS_2, 0),
+        link(22, LOSS_2, 0),
+        None,
+        prompt,
+    )
+    .await;
+    let bulk_and_loss_frame_fec = run_one_frame_fec(
+        "bulk_and_loss_frame_fec",
+        link(41, LOSS_2, BULK_RATE_BPS),
+        link(42, LOSS_2, BULK_RATE_BPS),
+        Some(BULK),
+        prompt,
+    )
+    .await;
+
+    // Frame fast-forward, FEC off (the measured baselines).
+    let loss_frame_reorder_fec_off = run_one_frame_reorder(
+        "loss_frame_reorder_fec_off",
+        link(21, LOSS_2, 0),
+        link(22, LOSS_2, 0),
+        None,
+    )
+    .await;
+    let bulk_and_loss_frame_reorder_fec_off = run_one_frame_reorder(
+        "bulk_and_loss_frame_reorder_fec_off",
+        link(41, LOSS_2, BULK_RATE_BPS),
+        link(42, LOSS_2, BULK_RATE_BPS),
+        Some(BULK),
+    )
+    .await;
+
+    // Frame fast-forward + FEC (the deployment's real path).
+    let loss_frame_reorder_fec = run_one_frame_reorder_fec(
+        "loss_frame_reorder_fec",
+        link(21, LOSS_2, 0),
+        link(22, LOSS_2, 0),
+        None,
+        prompt,
+    )
+    .await;
+    let bulk_and_loss_frame_reorder_fec = run_one_frame_reorder_fec(
+        "bulk_and_loss_frame_reorder_fec",
+        link(41, LOSS_2, BULK_RATE_BPS),
+        link(42, LOSS_2, BULK_RATE_BPS),
+        Some(BULK),
+        prompt,
+    )
+    .await;
+
+    let runs = [
+        ("loss_frame_fec", loss_frame_fec),
+        ("bulk_and_loss_frame_fec", bulk_and_loss_frame_fec),
+        ("loss_frame_reorder_fec_off", loss_frame_reorder_fec_off),
+        ("loss_frame_reorder_fec", loss_frame_reorder_fec),
+        (
+            "bulk_and_loss_frame_reorder_fec_off",
+            bulk_and_loss_frame_reorder_fec_off,
+        ),
+        (
+            "bulk_and_loss_frame_reorder_fec",
+            bulk_and_loss_frame_reorder_fec,
+        ),
+    ];
+    for (label, run) in &runs {
+        assert_sane(label, &run.summary);
+    }
+    print_frame_fec_table(&runs);
 }
 
 /// Deliverable 2: FEC arms at 2% loss (below FEC's 5% enable gate).
