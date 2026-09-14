@@ -47,6 +47,25 @@ re-read every iteration:
 `/Users/charliesmith/code/tmp/rtp-loop/loop-report.sh` prints (1)(2)(4) and
 renders (5); `render-graph.sh` rasterises the SVGs via headless Chrome.
 
+## The rtp-side in-process oracle
+
+The `rtp` crate carries its own deterministic in-process oracles for the
+per-packet interactive repair path (faster and lower-noise than the netem
+harness, and they read the sender/receiver FEC counters directly):
+
+- `src/socket/stream.rs::probe_single_symbol_interactive_fec_repair` — the
+  single-symbol interactive repair path for the depth-1 `interactive_prompt`
+  preset vs depth-3 `max_diversity`.
+- `src/socket/stream.rs::probe_fresh_tail_armor_latency` — the fresh-tail armor
+  duplicate's repair latency vs the ARQ fallback.
+
+```sh
+cargo test --lib probe_ -- --ignored --nocapture   # from crates/rtp
+```
+
+Use these to attribute a repair-latency change before/after a fix; use the
+netem harness above for the end-to-end dual-lane latency + throughput gate.
+
 ## Notes
 
 - The oracle is stock byte-stream by default; the deployment runs frame mode +
