@@ -293,6 +293,10 @@ pub struct HolSummary {
     pub p90: f64,
     /// 99th percentile one-way latency in ms.
     pub p99: f64,
+    /// 99.9th percentile one-way latency in ms, so a tail arm's rare repair
+    /// spikes are visible above the p99 even when most samples sit at the
+    /// floor.
+    pub p999: f64,
     /// Maximum one-way latency in ms.
     pub max: f64,
     /// Fraction of samples > 250 ms.
@@ -359,6 +363,11 @@ pub fn summarize(
     } else {
         0.0
     };
+    let p999 = if n > 0 {
+        percentile(&samples, 0.999)
+    } else {
+        0.0
+    };
     let max = samples.last().copied().unwrap_or(0.0);
     let over250 = if n > 0 {
         samples.iter().filter(|&&x| x > 250.0).count() as f64 / n as f64
@@ -383,6 +392,7 @@ pub fn summarize(
         p50,
         p90,
         p99,
+        p999,
         max,
         over250_pct: over250,
         over1000_pct: over1000,

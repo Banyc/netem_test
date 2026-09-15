@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use netem_test::{Counters, NetemConfig, NetemPair};
+use netem_test::{Counters, LossModel, NetemConfig, NetemPair};
 use support::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
@@ -82,6 +82,7 @@ use support::mux::{
     spawn_mux_latency_bulk_server_with_fec_tuning_via,
 };
 use support::payload::{cyclic_payload, with_timeout};
+use support::presets::gilbert_elliott_loss;
 use support::rtp::rtp_connect_with_mss_fec_tuning_and_observer_via;
 use support::stats::{HolSummary, combined_stats, summarize};
 use support::{TestScope, submit_test_task};
@@ -1841,7 +1842,30 @@ async fn run_duallane(
     // the matched-load evidence.
     let bulk_c2s = link(43, bulk_loss, bulk_rate);
     let bulk_s2c = link(44, bulk_loss, bulk_rate);
+    run_duallane_links(
+        label,
+        interactive_reorder,
+        int_c2s,
+        int_s2c,
+        bulk_c2s,
+        bulk_s2c,
+        impairment.has_bulk(),
+    )
+    .await
+}
 
+/// [`run_duallane`] with explicit per-lane impairment configs, so a report arm
+/// can place a bursty loss model on the interactive lane while keeping the
+/// bulk lane byte-for-byte identical to the production `both` arm.
+async fn run_duallane_links(
+    label: &str,
+    interactive_reorder: bool,
+    int_c2s: NetemConfig,
+    int_s2c: NetemConfig,
+    bulk_c2s: NetemConfig,
+    bulk_s2c: NetemConfig,
+    has_bulk: bool,
+) -> DualRun {
     let prompt = prompt_tuning();
     let int_rtp = if interactive_reorder {
         LaneRtpConfig::frame_reordering(true, prompt)
@@ -1893,7 +1917,7 @@ async fn run_duallane(
             );
 
             // Bulk stream (`b'B'`) on the separate bulk lane, only when offered.
-            let bulk_write = if impairment.has_bulk() {
+            let bulk_write = if has_bulk {
                 let (mut bulk_read, bulk_write) = opener.open(mux::LaneClass::Bulk).await.unwrap();
                 submit_test_task(
                     &task_tx,
@@ -2140,4 +2164,116 @@ async fn jitter_duallane_arms() {
         &strict[3].1.run,
     );
     print_duallane_loads("duallane-strict-fec", &strict_view);
+}
+
+/// Print one burst-loss arm's interactive-latency percentiles (p99.9 beside
+/// p99 so a rare repair spike is not hidden by the floor), delivery, offered
+/// interactive wire, and the RTP repair counters.
+fn print_burst_table(runs: &[(&str, &DualRun)]) {
+    eprintln!(
+        "[burst] deployment interactive lane (fast-forward + prompt FEC, own RTP connection); \
+         interactive loss model as named; bulk lane = production 2 MiB / 3 s at 2% loss"
+    );
+    eprintln!(
+        "[burst] arm                     p50     p90     p99    p999     max  over250  del  recv  \
+         wire_bytes  rtx_first  rtx_rto  rtx_reord  rtx_fast  rtx_tail  rtx_repeat  parity  recovered"
+    );
+    for (name, r) in runs {
+        let s = &r.run.summary;
+        let rtx = r.run.rtx.unwrap_or_default();
+        let fec = r.run.fec.unwrap_or_default();
+        eprintln!(
+            "[burst] {name:<22} {p50:7.1} {p90:7.1} {p99:7.1} {p999:7.1} {max:7.1} {o25:7.3} \
+             {del:5.3} {recv:5} {wbytes:>11} {first:>11} {rto:8} {reord:10} {fast:9} {tail:9} \
+             {repeat:11} {parity:7} {recovered:9}",
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            p999 = s.p999,
+            max = s.max,
+            o25 = s.over250_pct,
+            del = s.delivery_pct,
+            recv = s.received,
+            wbytes = r.run.counters.forwarded_bytes,
+            first = rtx.first_attempts,
+            rto = rtx.rto_reason,
+            reord = rtx.reorder_reason,
+            fast = rtx.fast_loss_reason,
+            tail = rtx.tail_probes,
+            repeat = rtx.repeat_attempts,
+            parity = fec.parity_sent,
+            recovered = fec.recovered_symbols,
+        );
+    }
+    for (name, r) in runs {
+        print_congestion_timeline(name, &r.run.timeline);
+    }
+}
+
+/// Burst-loss / high-loss sweep on the deployment's interactive lane: the
+/// production dual-lane arms only exercise independent 2% loss, so this arm
+/// adds the two field dimensions the harness was missing — a higher iid rate
+/// (6%) and a bursty Gilbert-Elliot model (5% long-term, mean burst 8) — each
+/// on the interactive lane with its own RTP connection and the production
+/// fast-forward + prompt FEC tuning, once without bulk and once at the
+/// production bulk load. p99.9 is printed beside p99 so a rare repair spike
+/// stays visible above the floor. Report-only: the table is the deliverable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; six ~35 s burst-loss dual-lane arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_burst_loss_arms() {
+    let int_link = |seed: u64, loss_model: LossModel| NetemConfig {
+        latency: OWD,
+        jitter: JITTER,
+        loss_model,
+        seed,
+        ..NetemConfig::default()
+    };
+    let iid_2 = |seed: u64| NetemConfig {
+        loss: LOSS_2,
+        ..int_link(seed, LossModel::Random)
+    };
+    let bulk_c2s = link(43, LOSS_2, BULK_RATE_BPS);
+    let bulk_s2c = link(44, LOSS_2, BULK_RATE_BPS);
+    // iid 6% needs the explicit `loss` threshold on `Random`.
+    let iid_6 = |seed: u64| NetemConfig {
+        loss: LOSS_6,
+        ..int_link(seed, LossModel::Random)
+    };
+    let burst = |seed: u64| int_link(seed, gilbert_elliott_loss(5.0, 8.0));
+
+    let arms: Vec<(&str, NetemConfig, NetemConfig, bool)> = vec![
+        ("iid_2pct", iid_2(41), iid_2(42), false),
+        ("iid_6pct", iid_6(41), iid_6(42), false),
+        ("iid_6pct_bulk", iid_6(41), iid_6(42), true),
+        ("burst_5pct_mean8", burst(41), burst(42), false),
+        ("burst_5pct_mean8_bulk", burst(41), burst(42), true),
+        (
+            "burst_10pct_mean4",
+            int_link(41, gilbert_elliott_loss(10.0, 4.0)),
+            int_link(42, gilbert_elliott_loss(10.0, 4.0)),
+            false,
+        ),
+    ];
+
+    let mut runs: Vec<(&str, DualRun)> = Vec::new();
+    for (name, int_c2s, int_s2c, with_bulk) in arms {
+        let label = format!("burst/{name}");
+        let (bulk_c2s, bulk_s2c) = if with_bulk {
+            (bulk_c2s.clone(), bulk_s2c.clone())
+        } else {
+            (NetemConfig::default(), NetemConfig::default())
+        };
+        let run = with_timeout(
+            Duration::from_secs(120),
+            &label,
+            run_duallane_links(
+                &label, true, int_c2s, int_s2c, bulk_c2s, bulk_s2c, with_bulk,
+            ),
+        )
+        .await;
+        assert_sane(&label, &run.run.summary);
+        runs.push((name, run));
+    }
+    let views: Vec<(&str, &DualRun)> = runs.iter().map(|(n, r)| (*n, r)).collect();
+    print_burst_table(&views);
 }
