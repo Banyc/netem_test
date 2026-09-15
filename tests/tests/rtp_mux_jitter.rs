@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use netem_test::{Counters, LossModel, NetemConfig, NetemPair};
+use netem_test::{BottleneckShaper, Counters, LossModel, NetemConfig, NetemPair};
 use support::dual::{
     LaneRtpConfig, dual_mux_client_connect_lane_rtp_via,
     spawn_dual_mux_latency_bulk_server_two_listeners_lane_rtp_via,
@@ -1866,6 +1866,51 @@ async fn run_duallane_links(
     bulk_s2c: NetemConfig,
     has_bulk: bool,
 ) -> DualRun {
+    run_duallane_links_shaped(
+        label,
+        interactive_reorder,
+        DualLaneLinks {
+            int_c2s,
+            int_s2c,
+            bulk_c2s,
+            bulk_s2c,
+        },
+        has_bulk,
+        None,
+    )
+    .await
+}
+
+/// One dual-lane arm's four per-direction impairment configs, bundled so the
+/// shaped runner stays within the argument budget.
+struct DualLaneLinks {
+    int_c2s: NetemConfig,
+    int_s2c: NetemConfig,
+    bulk_c2s: NetemConfig,
+    bulk_s2c: NetemConfig,
+}
+
+/// [`run_duallane_links`] with an optional shared client->server
+/// [`BottleneckShaper`]. When `Some`, both lanes' c2s traffic contends for one
+/// serialization clock — the shared low-capacity link — instead of each lane
+/// getting its own per-flow `rate` cap; the s2c direction is never shared. The
+/// per-lane `c2s` configs must carry `rate = 0` (the shaper owns the rate); a
+/// non-zero rate with a shaper would double-shape. Every other detail matches
+/// [`run_duallane_links`] so an arm's interactive latency is comparable to the
+/// production dual-lane table.
+async fn run_duallane_links_shaped(
+    label: &str,
+    interactive_reorder: bool,
+    links: DualLaneLinks,
+    has_bulk: bool,
+    shared_c2s: Option<BottleneckShaper>,
+) -> DualRun {
+    let DualLaneLinks {
+        int_c2s,
+        int_s2c,
+        bulk_c2s,
+        bulk_s2c,
+    } = links;
     let prompt = prompt_tuning();
     let int_rtp = if interactive_reorder {
         LaneRtpConfig::frame_reordering(true, prompt)
@@ -1885,8 +1930,19 @@ async fn run_duallane_links(
                 )
                 .await
                 .unwrap();
-            let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
-            let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
+            let int_pair = match shared_c2s.clone() {
+                Some(shaper) => {
+                    NetemPair::spawn_shared(int_addr, int_c2s, int_s2c, Some(shaper), None).unwrap()
+                }
+                None => NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap(),
+            };
+            let bulk_pair = match shared_c2s {
+                Some(shaper) => {
+                    NetemPair::spawn_shared(bulk_addr, bulk_c2s, bulk_s2c, Some(shaper), None)
+                        .unwrap()
+                }
+                None => NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap(),
+            };
 
             let (observer, fec_cell, snapshot_cell, timeline_cell) = fec_observer();
             let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via(
@@ -2276,4 +2332,239 @@ async fn jitter_burst_loss_arms() {
     }
     let views: Vec<(&str, &DualRun)> = runs.iter().map(|(n, r)| (*n, r)).collect();
     print_burst_table(&views);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Unexercised dimensions: low-capacity shared link, bufferbloat / droptail,
+// ACK-path (reverse-path) impairment, and cellular-like jitter
+// ══════════════════════════════════════════════════════════════════════
+
+/// One reverse-path (ACK-path) impairment config: the interactive-lane
+/// server->client direction only. The client->server direction is left clean,
+/// so any interactive-latency change is attributable to the ACK path that
+/// carries the SACK evidence.
+fn ack_path(
+    seed: u64,
+    extra_delay: Duration,
+    loss_points: u32,
+    reorder: u32,
+    reorder_gap_pkts: u32,
+) -> NetemConfig {
+    NetemConfig {
+        latency: OWD + extra_delay,
+        jitter: JITTER,
+        loss: if loss_points == 0 {
+            0
+        } else {
+            loss_pct(loss_points)
+        },
+        reorder,
+        reorder_gap_pkts,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
+/// Print one unexercised-dimension arm's interactive-latency percentiles
+/// (p99.9 beside p99 so a rare spike stays visible), delivery, offered
+/// interactive wire, the RTP repair counters, and the bulk lane's wire
+/// goodput, so the bulk-throughput contract is checkable in the same table.
+fn print_newdim_table(runs: &[(&str, &DualRun)]) {
+    eprintln!(
+        "[newdim] deployment interactive lane (fast-forward + prompt FEC, own RTP connection); \
+         dimensions: shared low-capacity link, bufferbloat/droptail, ACK-path impairment, \
+         cellular jitter"
+    );
+    eprintln!(
+        "[newdim] arm                     p50     p90     p99    p999     max  over250  del  recv  \
+         wire_bytes  rtx_first  rtx_rto  rtx_reord  rtx_fast  rtx_tail  parity  recovered  bulk_MiB/s"
+    );
+    for (name, r) in runs {
+        let s = &r.run.summary;
+        let rtx = r.run.rtx.unwrap_or_default();
+        let fec = r.run.fec.unwrap_or_default();
+        eprintln!(
+            "[newdim] {name:<22} {p50:7.1} {p90:7.1} {p99:7.1} {p999:7.1} {max:7.1} {o25:7.3} \
+             {del:5.3} {recv:5} {wbytes:>11} {first:>11} {rto:8} {reord:10} {fast:9} {tail:9} \
+             {parity:7} {recovered:9} {bulk:>10.3}",
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            p999 = s.p999,
+            max = s.max,
+            o25 = s.over250_pct,
+            del = s.delivery_pct,
+            recv = s.received,
+            wbytes = r.run.counters.forwarded_bytes,
+            first = rtx.first_attempts,
+            rto = rtx.rto_reason,
+            reord = rtx.reorder_reason,
+            fast = rtx.fast_loss_reason,
+            tail = rtx.tail_probes,
+            parity = fec.parity_sent,
+            recovered = fec.recovered_symbols,
+            bulk = s.bulk_mibps,
+        );
+    }
+}
+
+/// Sweep the interactive-latency dimensions the existing arms do not
+/// exercise: (a) a low-capacity client->server link shared by the interactive
+/// and bulk lanes, at several shared queue depths (bufferbloat onset/offset
+/// and a small droptail buffer); (b) reverse-path (ACK-path) delay, thinning,
+/// and reordering, which is where the SACK evidence rides; (c) cellular-like
+/// high, time-varying jitter. Report-only and seeded: the table is the
+/// deliverable, the assertions are liveness guards.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; eleven ~35 s dimension arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_latency_dimension_arms() {
+    /// 400 KiB/s = 3.2768 Mbps shared client->server bottleneck.
+    const SHARED_400KIB_BPS: u64 = 400 * 1024 * 8;
+    /// 200 KiB/s shared client->server bottleneck.
+    const SHARED_200KIB_BPS: u64 = 200 * 1024 * 8;
+
+    let clean = |seed: u64| link_custom(seed, OWD, JITTER, 0, 0, 0, 0, 0);
+    // The bulk lane's per-flow config carries no rate when a shared shaper
+    // supplies the bottleneck; only the shaper rate shapes it.
+    let bulk_c2s = link(43, LOSS_2, 0);
+    let bulk_s2c = link(44, LOSS_2, 0);
+
+    let mut runs: Vec<(&str, DualRun)> = Vec::new();
+
+    // (b) Reverse-path impairment on the interactive lane; no bulk, so any
+    // latency change is attributable to the ACK path alone.
+    let ack_arms: Vec<(&str, NetemConfig)> = vec![
+        ("ack_baseline", clean(42)),
+        (
+            "ack_delay_100ms",
+            ack_path(42, Duration::from_millis(100), 0, 0, 0),
+        ),
+        ("ack_thin_10pct", ack_path(42, Duration::ZERO, 10, 0, 0)),
+        (
+            "ack_reorder_10pct",
+            ack_path(42, Duration::ZERO, 0, IMPAIR_10, 2),
+        ),
+        (
+            "ack_thin10_delay100",
+            ack_path(42, Duration::from_millis(100), 10, 0, 0),
+        ),
+    ];
+    for (name, s2c) in ack_arms {
+        let label = format!("newdim/{name}");
+        let run = with_timeout(
+            Duration::from_secs(120),
+            &label,
+            run_duallane_links(
+                &label,
+                true,
+                clean(41),
+                s2c,
+                NetemConfig::default(),
+                NetemConfig::default(),
+                false,
+            ),
+        )
+        .await;
+        assert_reportable(&label, &run.run.summary);
+        runs.push((name, run));
+    }
+
+    // (a) Shared low-capacity link: both lanes contend for one serialization
+    // clock. The shared tail-drop buffer is the router queue, so its depth is
+    // the bufferbloat / droptail dimension. The interactive lane's offered
+    // rate (~10 KiB/s) is far below 400 KiB/s, so the bulk lane is the queue
+    // builder and the interactive packets queue behind it.
+    let shared_arms: Vec<(&str, u64, u64)> = vec![
+        ("shared400k_128kib", SHARED_400KIB_BPS, 128 * 1024),
+        ("shared400k_32kib", SHARED_400KIB_BPS, 32 * 1024),
+        ("shared200k_64kib", SHARED_200KIB_BPS, 64 * 1024),
+        ("shared400k_4kib", SHARED_400KIB_BPS, 4 * 1024),
+    ];
+    for (name, rate, limit_bytes) in shared_arms {
+        let label = format!("newdim/{name}");
+        let shaper = BottleneckShaper::new(rate, limit_bytes);
+        let run = with_timeout(
+            Duration::from_secs(180),
+            &label,
+            run_duallane_links_shaped(
+                &label,
+                true,
+                DualLaneLinks {
+                    int_c2s: clean(41),
+                    int_s2c: clean(42),
+                    bulk_c2s: bulk_c2s.clone(),
+                    bulk_s2c: bulk_s2c.clone(),
+                },
+                true,
+                Some(shaper),
+            ),
+        )
+        .await;
+        assert_reportable(&label, &run.run.summary);
+        runs.push((name, run));
+    }
+
+    // (c) Cellular-like jitter: a high uniform jitter with no loss, which the
+    // low-jitter non-loss arms do not reach. Note the report artifact: the
+    // server timestamps a message when it *reads* it, so under jitter-driven
+    // reordering fast-forward delivers buffered later messages together with
+    // the delayed head, and their `now - sent` can collapse toward zero. The
+    // p50/p90 therefore understate the true one-way latency here; p99.9/max
+    // (the delayed head's own latency) are the meaningful columns.
+    let cell_arms: Vec<(&str, u64)> = vec![("cell_jitter_100ms", 100), ("cell_jitter_200ms", 200)];
+    for (name, jitter_ms) in cell_arms {
+        let label = format!("newdim/{name}");
+        let cfg = |seed: u64| NetemConfig {
+            latency: OWD,
+            jitter: Duration::from_millis(jitter_ms),
+            seed,
+            ..NetemConfig::default()
+        };
+        let run = with_timeout(
+            Duration::from_secs(120),
+            &label,
+            run_duallane_links(
+                &label,
+                true,
+                cfg(41),
+                cfg(42),
+                NetemConfig::default(),
+                NetemConfig::default(),
+                false,
+            ),
+        )
+        .await;
+        assert_reportable(&label, &run.run.summary);
+        runs.push((name, run));
+    }
+
+    let views: Vec<(&str, &DualRun)> = runs.iter().map(|(n, r)| (*n, r)).collect();
+    print_newdim_table(&views);
+    if let Some((worst, run)) = runs
+        .iter()
+        .max_by(|a, b| a.1.run.summary.p999.total_cmp(&b.1.run.summary.p999))
+    {
+        eprintln!(
+            "[newdim] worst p99.9 arm = {worst} ({:.1} ms)",
+            run.run.summary.p999
+        );
+        print_congestion_timeline(worst, &run.run.timeline);
+    }
+    if let Some((worst, run)) = runs
+        .iter()
+        .max_by(|a, b| a.1.run.summary.max.total_cmp(&b.1.run.summary.max))
+    {
+        eprintln!(
+            "[newdim] worst max arm = {worst} ({:.1} ms)",
+            run.run.summary.max
+        );
+    }
+}
+
+/// A looser sanity guard than [`assert_sane`] for the report-only dimension
+/// arms: the interactive stream must actually have run, but a deep shared
+/// queue may leave samples in flight, so the received floor is low.
+fn assert_reportable(label: &str, s: &HolSummary) {
+    assert!(s.sent >= 100, "[{label}] only {} sent", s.sent);
+    assert!(s.received >= 5, "[{label}] only {} received", s.received);
 }
