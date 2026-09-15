@@ -238,33 +238,65 @@ struct JitterRun {
     counters: Counters,
     fec: Option<rtp::metrics::MetricsFecCounters>,
     rtx: Option<rtp::metrics::MetricsRetransmissionCounters>,
+    /// Congestion-controller timeline captured at 50 ms cadence: the action,
+    /// send rate, RTT floor/tolerance, and the drain/backoff counters. Empty
+    /// for the legacy arms whose observer did not record it.
+    timeline: Vec<CongestionRow>,
 }
 
-/// The metrics observer plus the FEC-counter and full-snapshot cells it
-/// fills, so a run can read the FEC counters, the retransmission counters, and
-/// the congestion state after it completes.
+/// One sampled congestion-controller state row.
+#[derive(Clone, Debug)]
+struct CongestionRow {
+    at: Duration,
+    action: Option<rtp::metrics::MetricsCongestionAction>,
+    send_rate: f64,
+    cwnd: usize,
+    in_flight: usize,
+    smooth_rtt: Duration,
+    floor: Option<Duration>,
+    tolerance: Option<Duration>,
+    persistent_for: Option<Duration>,
+    delivery_peak: Option<f64>,
+    delivery_rate: Option<f64>,
+    drain_target: Option<f64>,
+    loss_backoff_target: Option<f64>,
+    delay_drains: u64,
+    loss_backoffs: u64,
+    bandwidth_probes: u64,
+    write_waiters: usize,
+    queue_building: bool,
+    gentle_mode: bool,
+}
+
+/// The metrics observer plus the FEC-counter, full-snapshot, and congestion-
+/// timeline cells it fills, so a run can read the FEC counters, the
+/// retransmission counters, and the congestion state after it completes.
 type ObserverBundle = (
     rtp::metrics::MetricsObserver,
     Arc<Mutex<Option<rtp::metrics::MetricsFecCounters>>>,
     Arc<Mutex<Option<rtp::metrics::MetricsSnapshot>>>,
+    Arc<Mutex<Vec<CongestionRow>>>,
 );
 
 /// A lightweight metrics observer that retains the latest FEC and
-/// retransmission counter snapshots at a coarse 250 ms cadence, so the
-/// observer never perturbs the measured traffic while still letting the arm
-/// report whether parity was emitted and whether reorder/duplicate caused a
-/// spurious repair.
+/// retransmission counter snapshots and appends a congestion-controller
+/// timeline row at a 50 ms cadence. The cadence is coarse enough that the
+/// observer does not perturb the measured traffic, while the timeline makes
+/// the controller action / send-rate / drain-floor evolution visible during a
+/// multi-second interactive stall.
 fn fec_observer() -> ObserverBundle {
     let cell = Arc::new(Mutex::new(None));
     let sink = Arc::clone(&cell);
     let snapshot_cell = Arc::new(Mutex::new(None));
     let snapshot_sink = Arc::clone(&snapshot_cell);
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let timeline_sink = Arc::clone(&timeline);
     let last_ms = Arc::new(AtomicU64::new(0));
     let observer = rtp::metrics::MetricsObserver::filtered(
         move |_event, elapsed| {
             let now = elapsed.as_millis() as u64;
             let previous = last_ms.load(Ordering::Relaxed);
-            if now >= previous.saturating_add(250) {
+            if now >= previous.saturating_add(50) {
                 last_ms.store(now, Ordering::Relaxed);
                 true
             } else {
@@ -277,10 +309,79 @@ fn fec_observer() -> ObserverBundle {
                     *sink.lock().unwrap() = Some(fec);
                 }
                 *snapshot_sink.lock().unwrap() = Some(snapshot);
+                timeline_sink.lock().unwrap().push(CongestionRow {
+                    at: observation.elapsed,
+                    action: snapshot.congestion_action,
+                    send_rate: snapshot.send_rate_packets_per_second,
+                    cwnd: snapshot.congestion_window_packets,
+                    in_flight: snapshot.in_flight_packets,
+                    smooth_rtt: snapshot.smoothed_rtt,
+                    floor: snapshot.congestion_rtt_floor,
+                    tolerance: snapshot.congestion_queue_tolerance,
+                    persistent_for: snapshot.congestion_persistent_queue_for,
+                    delivery_peak: snapshot.congestion_delivery_peak_packets_per_second,
+                    delivery_rate: snapshot.delivery_rate_packets_per_second,
+                    drain_target: snapshot.congestion_drain_target_packets_per_second,
+                    loss_backoff_target: snapshot.congestion_loss_backoff_target_packets_per_second,
+                    delay_drains: snapshot.congestion_delay_drains,
+                    loss_backoffs: snapshot.congestion_loss_backoffs,
+                    bandwidth_probes: snapshot.congestion_bandwidth_probe_increases,
+                    write_waiters: snapshot.application_write_waiters,
+                    queue_building: snapshot.queue_building,
+                    gentle_mode: snapshot.gentle_mode,
+                });
             }
         },
     );
-    (observer, cell, snapshot_cell)
+    (observer, cell, snapshot_cell, timeline)
+}
+
+/// Print the congestion-controller timeline for one arm, one line per action
+/// transition (plus the first and last sample) so a multi-second stall's
+/// controller evolution is readable without dumping every 50 ms row.
+fn print_congestion_timeline(label: &str, rows: &[CongestionRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    eprintln!("[ctrl {label}] congestion timeline (action transitions + first/last):");
+    let mut previous: Option<CongestionRow> = None;
+    for (index, row) in rows.iter().enumerate() {
+        let last = index + 1 == rows.len();
+        let changed = previous
+            .as_ref()
+            .is_none_or(|p| p.action != row.action || p.queue_building != row.queue_building);
+        if changed || last {
+            let marker = if last { " last" } else { "" };
+            let action = row.action.map(|a| a.as_str()).unwrap_or("none");
+            eprintln!(
+                "[ctrl {label}]{marker} t={:>7.1}ms action={action:<14} rate={:>8.1} cwnd={:>4} \
+                 inflight={:>4} srtt={:>7.1}ms floor={:>7.1}ms tol={:>7.1}ms queue={} gentle={} \
+                 q_for={:?} peak={:?} d={:?} drains={} backoffs={} probes={} waiters={} drain_tgt={:?} \
+                 bkoff_tgt={:?}",
+                row.at.as_secs_f64() * 1000.0,
+                row.send_rate,
+                row.cwnd,
+                row.in_flight,
+                row.smooth_rtt.as_secs_f64() * 1000.0,
+                row.floor.map(|f| f.as_secs_f64() * 1000.0).unwrap_or(0.0),
+                row.tolerance
+                    .map(|t| t.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0),
+                row.queue_building,
+                row.gentle_mode,
+                row.persistent_for,
+                row.delivery_peak,
+                row.delivery_rate,
+                row.delay_drains,
+                row.loss_backoffs,
+                row.bandwidth_probes,
+                row.write_waiters,
+                row.drain_target,
+                row.loss_backoff_target,
+            );
+        }
+        previous = Some(row.clone());
+    }
 }
 
 /// Run one interactive-vs-bulk/loss jitter scenario and return its measurements.
@@ -311,7 +412,7 @@ async fn run_jitter(scenario: JitterScenario) -> JitterRun {
                     .unwrap();
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-            let (observer, fec_cell, snapshot_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell, timeline_cell) = fec_observer();
             let (connected_read, connected_write) =
                 rtp_connect_with_mss_fec_tuning_and_observer_via(
                     &task_tx,
@@ -403,6 +504,7 @@ async fn run_jitter(scenario: JitterScenario) -> JitterRun {
             let fec = *fec_cell.lock().unwrap();
             let snapshot = *snapshot_cell.lock().unwrap();
             let rtx = snapshot.map(|s| s.retransmission_counters);
+            let timeline = std::mem::take(&mut *timeline_cell.lock().unwrap());
 
             print_summary(&label, &summary);
             eprintln!("[jitter {label}] pair stats = {counters:?}");
@@ -426,6 +528,7 @@ async fn run_jitter(scenario: JitterScenario) -> JitterRun {
                 counters,
                 fec,
                 rtx,
+                timeline,
             }
         })
         .await
@@ -497,7 +600,7 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
             };
             let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
 
-            let (observer, fec_cell, snapshot_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell, timeline_cell) = fec_observer();
             let (reader, writer) = if reorder {
                 rtp_frame_delivery_connect_reorder_with_fec_tuning_via(
                     &task_tx,
@@ -617,6 +720,7 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
             let fec = *fec_cell.lock().unwrap();
             let snapshot = *snapshot_cell.lock().unwrap();
             let rtx = snapshot.map(|s| s.retransmission_counters);
+            let timeline = std::mem::take(&mut *timeline_cell.lock().unwrap());
             if let Some(rtx) = rtx {
                 eprintln!(
                     "[jitter {label}] rtx attempts={} first={} repeat={} rto={} reorder={} fast_loss={} pre_outage={} tail_probes={}",
@@ -650,6 +754,7 @@ async fn run_jitter_frame_mode(scenario: JitterScenario, reorder: bool) -> Jitte
                 counters,
                 fec,
                 rtx,
+                timeline,
             }
         })
         .await
@@ -1289,6 +1394,121 @@ async fn jitter_frame_reorder_fec_arms() {
     print_frame_fec_table(&runs);
 }
 
+/// Print the per-arm interactive-latency percentiles, delivery, client->server
+/// wire load, and the RTP retransmission counters for the bulk+loss+reorder
+/// decomposition. Unlike [`print_nonloss_table`] this includes the bulk load
+/// and the loss column, so the isolated reorder arm can be compared with the
+/// combined one at matched offered load.
+fn print_blr_table(runs: &[(&str, JitterRun)]) {
+    eprintln!(
+        "[blr] interactive lane: frame fast-forward + prompt FEC, 2% loss, 10% reorder (gap 2); \
+         bulk = 2 MiB / 3 s on the same connection except where noted"
+    );
+    eprintln!(
+        "[blr] arm                      p50     p90     p99     max  over250  del  recv  \
+         wire_bytes   rtx_first  rtx_rto  rtx_reord  rtx_fast  rtx_pre  rtx_tail  rtx_repeat"
+    );
+    for (name, run) in runs {
+        let s = &run.summary;
+        let r = run.rtx.unwrap_or_default();
+        eprintln!(
+            "[blr] {name:<22} {p50:7.1} {p90:7.1} {p99:7.1} {max:7.1} {o25:7.3} {del:5.3} \
+             {recv:5} {wbytes:>11} {first:>11} {rto:8} {reord:10} {fast:9} {pre:8} {tail:9} \
+             {repeat:10}",
+            p50 = s.p50,
+            p90 = s.p90,
+            p99 = s.p99,
+            max = s.max,
+            o25 = s.over250_pct,
+            del = s.delivery_pct,
+            recv = s.received,
+            wbytes = run.counters.forwarded_bytes,
+            first = r.first_attempts,
+            rto = r.rto_reason,
+            reord = r.reorder_reason,
+            fast = r.fast_loss_reason,
+            pre = r.pre_outage_reason,
+            tail = r.tail_probes,
+            repeat = r.repeat_attempts,
+        );
+    }
+    for (name, run) in runs {
+        print_congestion_timeline(name, &run.timeline);
+    }
+}
+
+/// Deliverable 1d: the missing combination — the deployment's interactive lane
+/// (frame fast-forward + prompt FEC) with a bulk burst on the SAME connection
+/// plus 2% loss AND 10% reorder. The prior audit saw a p99 stall (1.4-2 s)
+/// here while bulk-off / loss-only / reorder-only arms sat at the floor. This
+/// is a report-only arm: the printed table is the deliverable, with the RTP
+/// retransmission counters (fast_loss, reorder, rto, pre_outage, tail_probes)
+/// so the stall's repair mechanism is visible.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; four ~35 s arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_frame_reorder_fec_bulk_loss_reorder() {
+    let prompt = prompt_tuning();
+    // 10% per-packet reorder with a two-packet gap, matching the non-loss
+    // reorder arms, combined with the 2% loss and the bulk rate cap.
+    let reorder_link = |seed: u64, loss: u32, bulk: bool| {
+        link_custom(
+            seed,
+            OWD,
+            JITTER,
+            loss,
+            0,
+            IMPAIR_10,
+            2,
+            if bulk { BULK_RATE_BPS } else { 0 },
+        )
+    };
+
+    let bulk_loss = run_one_frame_reorder_fec(
+        "bulk+loss",
+        link(41, LOSS_2, BULK_RATE_BPS),
+        link(42, LOSS_2, BULK_RATE_BPS),
+        Some(BULK),
+        prompt,
+    )
+    .await;
+    let loss_reorder = run_one_frame_reorder_fec(
+        "loss+reorder",
+        reorder_link(51, LOSS_2, false),
+        reorder_link(52, LOSS_2, false),
+        None,
+        prompt,
+    )
+    .await;
+    let bulk_reorder = run_one_frame_reorder_fec(
+        "bulk+reorder",
+        reorder_link(61, 0, true),
+        reorder_link(62, 0, true),
+        Some(BULK),
+        prompt,
+    )
+    .await;
+    let bulk_loss_reorder = run_one_frame_reorder_fec(
+        "bulk+loss+reorder",
+        reorder_link(71, LOSS_2, true),
+        reorder_link(72, LOSS_2, true),
+        Some(BULK),
+        prompt,
+    )
+    .await;
+
+    let runs = [
+        ("bulk+loss", bulk_loss),
+        ("loss+reorder", loss_reorder),
+        ("bulk+reorder", bulk_reorder),
+        ("bulk+loss+reorder", bulk_loss_reorder),
+    ];
+    for (label, run) in &runs {
+        assert_sane(label, &run.summary);
+    }
+    let views: Vec<(&str, JitterRun)> = runs.into_iter().collect();
+    print_blr_table(&views);
+}
+
 /// Deliverable 2: FEC arms at 2% loss (below FEC's 5% enable gate).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns threads and binds ephemeral ports; five ~35 s arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
@@ -1644,7 +1864,7 @@ async fn run_duallane(
             let int_pair = NetemPair::spawn(int_addr, int_c2s, int_s2c).unwrap();
             let bulk_pair = NetemPair::spawn(bulk_addr, bulk_c2s, bulk_s2c).unwrap();
 
-            let (observer, fec_cell, snapshot_cell) = fec_observer();
+            let (observer, fec_cell, snapshot_cell, timeline_cell) = fec_observer();
             let (opener, _accepter) = dual_mux_client_connect_lane_rtp_via(
                 &task_tx,
                 int_pair.client_addr(),
@@ -1733,6 +1953,7 @@ async fn run_duallane(
             let fec = *fec_cell.lock().unwrap();
             let snapshot = *snapshot_cell.lock().unwrap();
             let rtx = snapshot.map(|s| s.retransmission_counters);
+            let timeline = std::mem::take(&mut *timeline_cell.lock().unwrap());
             let bulk_sink_bytes = bulk_counter.load(Ordering::Relaxed);
 
             print_summary(label, &summary);
@@ -1770,6 +1991,7 @@ async fn run_duallane(
                     counters: int_counters,
                     fec,
                     rtx,
+                    timeline,
                 },
                 bulk_wire_bytes,
                 bulk_sink_bytes,
