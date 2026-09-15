@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::payload::cyclic_payload;
 use support::rtp::{
-    spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via, spawn_rtp_echo_server_via,
+    spawn_rtp_bulk_upload_with_lane_via, spawn_rtp_byte_sink_server_via, spawn_rtp_echo_server_via,
 };
 use support::stats::{combined_stats, percentile, print_perf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -139,11 +139,18 @@ where
         interval.tick().await;
         let record = start.elapsed() >= warmup;
         let t0 = Instant::now();
-        if write.write_all(&payload).await.is_err() {
-            break;
-        }
-        if read.read_exact(&mut buf).await.is_err() {
-            break;
+        // Bound each round trip so a starved sample (the bulk flow can hold the
+        // shared bottleneck long enough that a read never completes) ends the
+        // arm with the samples collected so far instead of hanging the whole
+        // scenario until the outer timeout erases every report line.
+        let round_trip = async {
+            write.write_all(&payload).await?;
+            read.read_exact(&mut buf).await?;
+            Ok::<(), std::io::Error>(())
+        };
+        match tokio::time::timeout(Duration::from_secs(2), round_trip).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => break,
         }
         if record {
             samples.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -163,8 +170,11 @@ async fn spawn_bulk_flow(
     payload: Arc<Vec<u8>>,
     run_for: Duration,
     stop: Arc<AtomicBool>,
+    congestion_lane: rtp::CongestionLane,
 ) {
-    let Ok(mut writer) = spawn_rtp_bulk_upload_via(tx, proxy_client_addr, false).await else {
+    let Ok(mut writer) =
+        spawn_rtp_bulk_upload_with_lane_via(tx, proxy_client_addr, false, congestion_lane).await
+    else {
         return;
     };
     submit_test_task(
@@ -198,6 +208,7 @@ async fn rr_under_bulk_ab(
     limit_bytes: u64,
     contested_run_s: u64,
     contested_p99_ceiling_ms: f64,
+    bulk_lane: rtp::CongestionLane,
 ) {
     let owd = Duration::from_millis(OWD_MS);
     let msg_bytes = 2048usize;
@@ -275,6 +286,7 @@ async fn rr_under_bulk_ab(
                 bulk_payload,
                 contested_run,
                 Arc::clone(&bulk_stop),
+                bulk_lane,
             )
             .await;
 
@@ -360,7 +372,37 @@ async fn rr_under_bulk_ab(
 async fn shared_bneck_rr_under_bulk_10mbps() {
     let _ = tokio::time::timeout(
         Duration::from_secs(180),
-        rr_under_bulk_ab("10mbps", 10_000_000, 128 * 1024, 20, 8000.0),
+        rr_under_bulk_ab(
+            "10mbps",
+            10_000_000,
+            128 * 1024,
+            20,
+            8000.0,
+            rtp::CongestionLane::default(),
+        ),
+    )
+    .await;
+}
+
+/// 10 Mbps / 128 KiB shared bottleneck: the interactive rr echo is `Shared` (as
+/// always) while the competing bulk upload declares the dedicated-pipe intent.
+/// The companion [`shared_bneck_rr_under_bulk_10mbps`] runs the same scenario
+/// with a `Shared` bulk upload.  Comparing the two printed p99/goodput pairs is
+/// what decides whether the dedicated tuning is safe when the two lanes share a
+/// link; the assertions are the same structural bounds.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "probes contested latency and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_rr_under_dedicated_bulk_10mbps() {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(180),
+        rr_under_bulk_ab(
+            "10mbps-dedicated-bulk",
+            10_000_000,
+            128 * 1024,
+            20,
+            8000.0,
+            rtp::CongestionLane::Dedicated,
+        ),
     )
     .await;
 }
@@ -371,7 +413,14 @@ async fn shared_bneck_rr_under_bulk_10mbps() {
 async fn shared_bneck_rr_under_bulk_2mbps() {
     let _ = tokio::time::timeout(
         Duration::from_secs(180),
-        rr_under_bulk_ab("2mbps", 2_000_000, 64 * 1024, 20, 12000.0),
+        rr_under_bulk_ab(
+            "2mbps",
+            2_000_000,
+            64 * 1024,
+            20,
+            12000.0,
+            rtp::CongestionLane::default(),
+        ),
     )
     .await;
 }
@@ -440,6 +489,7 @@ async fn shared_bneck_late_joiner_fairness() {
                 Arc::clone(&payload),
                 total_run,
                 Arc::clone(&bulk_stop),
+                rtp::CongestionLane::default(),
             )
             .await;
             tokio::time::sleep(b_join).await;
@@ -449,6 +499,7 @@ async fn shared_bneck_late_joiner_fairness() {
                 Arc::clone(&payload),
                 total_run - b_join,
                 Arc::clone(&bulk_stop),
+                rtp::CongestionLane::default(),
             )
             .await;
 

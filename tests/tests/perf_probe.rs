@@ -135,6 +135,10 @@ async fn rtp_connect_transient_observed(
             metrics_observer,
             fec,
             mss: rtp::udp::MssConfig::Custom(mss),
+            // The probe measures the proxy's bulk data path, which runs over a
+            // dedicated pipe with no competing traffic.  Declare that intent
+            // explicitly instead of relying on the delivery-mode bit.
+            congestion_lane: rtp::CongestionLane::Dedicated,
             ..rtp::udp::ConnectConfig::default()
         },
     )

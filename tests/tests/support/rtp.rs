@@ -717,6 +717,7 @@ async fn spawn_rtp_bulk_upload_core(
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     mss: usize,
+    congestion_lane: rtp::CongestionLane,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
     let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
@@ -725,6 +726,7 @@ async fn spawn_rtp_bulk_upload_core(
             handshake: false,
             fec,
             mss: rtp::udp::MssConfig::Custom(mss),
+            congestion_lane,
             ..rtp::udp::ConnectConfig::default()
         },
     )
@@ -759,7 +761,14 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
-    spawn_rtp_bulk_upload_core(|fut| tasks.spawn(fut), proxy_client_addr, fec, mss).await
+    spawn_rtp_bulk_upload_core(
+        |fut| tasks.spawn(fut),
+        proxy_client_addr,
+        fec,
+        mss,
+        rtp::CongestionLane::default(),
+    )
+    .await
 }
 
 /// [`spawn_rtp_bulk_upload_with_mss`] through the bounded task-submission
@@ -771,7 +780,32 @@ pub async fn spawn_rtp_bulk_upload_with_mss_via(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
-    spawn_rtp_bulk_upload_core(|fut| submit_test_task(tx, fut), proxy_client_addr, fec, mss).await
+    spawn_rtp_bulk_upload_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        mss,
+        rtp::CongestionLane::default(),
+    )
+    .await
+}
+
+/// [`spawn_rtp_bulk_upload_via`] with an explicit congestion-lane intent, so a
+/// scenario can A/B the shared link against a dedicated bulk pipe.
+pub async fn spawn_rtp_bulk_upload_with_lane_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    congestion_lane: rtp::CongestionLane,
+) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
+    spawn_rtp_bulk_upload_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        rtp::udp::NO_FEC_MSS,
+        congestion_lane,
+    )
+    .await
 }
 
 /// Open a fresh `rtp` connection through the proxy and return the async write
