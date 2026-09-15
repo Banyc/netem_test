@@ -23,7 +23,7 @@ use support::payload::cyclic_payload;
 use support::rtp::{
     spawn_rtp_bulk_upload_with_lane_via, spawn_rtp_byte_sink_server_via, spawn_rtp_echo_server_via,
 };
-use support::stats::{combined_stats, percentile, print_perf};
+use support::stats::{HolSummary, combined_stats, print_perf, summarize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::support::payload::with_timeout;
@@ -36,10 +36,21 @@ mod support;
 /// delay is applied *after* the shared bottleneck.
 const OWD_MS: u64 = 50;
 
-/// Connect an `rtp` client whose session is intentionally torn down
-/// mid-body (`solo_pair.stop()` cuts the link before the contested phase), so
-/// the supervisor keepalive must be transient (ordinary submission, ending
-/// when the connection closes) rather than required.
+/// Per-round-trip bound for the interactive echo. A round trip that exceeds
+/// this ends the phase with the samples collected so far instead of hanging the
+/// scenario until an outer timeout erases every report line; with the shared
+/// bottleneck held by the bulk flow the read can otherwise never complete.
+const ROUND_TRIP_BOUND: Duration = Duration::from_secs(4);
+
+/// Connect an `rtp` client for the interactive echo, on an explicit `Shared`
+/// lane: it shares the bottleneck with the competing bulk upload.
+///
+/// The supervisor keepalive is submitted as an ordinary (transient) task. The
+/// body owns the connection read/write halves for exactly the measured window
+/// and closes the session when `rr_echo_samples` consumes them; a REQUIRED
+/// submission would treat that deliberate close as an early session death and
+/// race the body's own completion. A session that dies during the window still
+/// shows up as a short sample count and a delivery shortfall.
 async fn rtp_connect_transient(
     tx: &crate::support::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
@@ -54,6 +65,9 @@ async fn rtp_connect_transient(
             handshake: false,
             fec: false,
             mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            // The interactive echo is a `Shared` lane by definition: it shares
+            // the bottleneck with the competing bulk upload.
+            congestion_lane: rtp::CongestionLane::Shared,
             ..rtp::udp::ConnectConfig::default()
         },
     )
@@ -62,46 +76,13 @@ async fn rtp_connect_transient(
     let read = connected.read.into_async_read();
     let write = connected.write.into_async_write();
     // The supervisor owns the session drivers; a transient submission keeps it
-    // alive only until the session ends (the expected teardown here).
+    // alive until the session ends (the expected teardown after the phase).
     submit_test_task(
         tx,
         Box::pin(async move {
             let _ = connected.supervisor.await;
         }),
     );
-    (read, write)
-}
-
-/// Connect an `rtp` client whose session must survive the whole run body
-/// (`rr_pair` is only stopped at the very end of the contested phase), so the
-/// supervisor keepalive is submitted as REQUIRED: a session that ends early
-/// fails the test via the reaper.
-async fn rtp_connect_required(
-    tx: &crate::support::TestTaskSubmitter,
-    proxy_client_addr: std::net::SocketAddr,
-) -> (
-    impl AsyncRead + Unpin + Send + use<>,
-    impl AsyncWrite + Unpin + Send + use<>,
-) {
-    let connected = rtp::udp::connect_with(
-        "0.0.0.0:0",
-        &proxy_client_addr.to_string(),
-        rtp::udp::ConnectConfig {
-            handshake: false,
-            fec: false,
-            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
-            ..rtp::udp::ConnectConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let read = connected.read.into_async_read();
-    let write = connected.write.into_async_write();
-    // The supervisor owns the session drivers; submit it as REQUIRED so the
-    // contested rr session ending before the body completes fails the test.
-    crate::support::submit_test_task_required(tx, "rtp client session", async move {
-        let _ = connected.supervisor.await;
-    });
     (read, write)
 }
 
@@ -116,7 +97,10 @@ fn flow_config(owd: Duration, seed: u64) -> NetemConfig {
 }
 
 /// Round-robin echo flow: send a `msg_bytes` message every `gap` and measure
-/// the echo RTT in milliseconds. Samples recorded before `warmup` are discarded.
+/// the echo RTT in milliseconds. Samples recorded before `warmup` are
+/// discarded. Returns the measured samples and the number of post-warmup
+/// round trips attempted; the last attempt may have timed out, so
+/// `samples.len()` is the delivered count.
 async fn rr_echo_samples<R, W>(
     mut read: R,
     mut write: W,
@@ -124,31 +108,38 @@ async fn rr_echo_samples<R, W>(
     gap: Duration,
     run_for: Duration,
     warmup: Duration,
-) -> Vec<f64>
+) -> (Vec<f64>, u64)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let payload = cyclic_payload(msg_bytes);
+    // `cyclic_payload` trims the buffer to a whole number of 251-byte periods
+    // (a 2048-byte request yields 2008 bytes), so the read buffer must match
+    // the *payload* length. Reading `msg_bytes` instead stalls every round trip
+    // forever waiting for the 40 trailing bytes that never arrive.
+    let msg_len = payload.len();
     let mut samples = Vec::new();
+    let mut sent = 0u64;
     let mut interval = tokio::time::interval(gap);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut buf = vec![0u8; msg_bytes];
+    let mut buf = vec![0u8; msg_len];
     let start = Instant::now();
     while start.elapsed() < run_for {
         interval.tick().await;
         let record = start.elapsed() >= warmup;
+        if record {
+            sent += 1;
+        }
         let t0 = Instant::now();
-        // Bound each round trip so a starved sample (the bulk flow can hold the
-        // shared bottleneck long enough that a read never completes) ends the
-        // arm with the samples collected so far instead of hanging the whole
-        // scenario until the outer timeout erases every report line.
+        // Bound each round trip so a starved sample ends the phase with the
+        // samples collected so far instead of hanging the whole scenario.
         let round_trip = async {
             write.write_all(&payload).await?;
             read.read_exact(&mut buf).await?;
             Ok::<(), std::io::Error>(())
         };
-        match tokio::time::timeout(Duration::from_secs(2), round_trip).await {
+        match tokio::time::timeout(ROUND_TRIP_BOUND, round_trip).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => break,
         }
@@ -156,7 +147,26 @@ where
             samples.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
     }
-    samples
+    (samples, sent)
+}
+
+/// Print the p50/p90/p99/max latency summary plus a per-sample CSV line.
+fn print_latency(label: &str, summary: &HolSummary, samples: &[f64]) {
+    eprintln!(
+        "[shared_bneck {label}] n={} p50={:.1} p90={:.1} p99={:.1} max={:.1} ms | delivery={:.1}%",
+        summary.received,
+        summary.p50,
+        summary.p90,
+        summary.p99,
+        summary.max,
+        summary.delivery_pct * 100.0,
+    );
+    let csv = samples
+        .iter()
+        .map(|x| format!("{x:.1}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!("[shared_bneck {label} samples_ms] {csv}");
 }
 
 /// Run a bulk upload through one shared-shaper [`NetemPair`] for `run_for`.
@@ -197,11 +207,13 @@ async fn spawn_bulk_flow(
 /// both through a shared bottleneck.
 ///
 /// `rate_bps`/`limit_bytes` define the shared shaper. `contested_run_s` is
-/// the duration of the contested phase. The solo phase always runs 10 s.
+/// the duration of the contested phase. The solo baseline phase runs 8 s; both
+/// phases discard a 2 s warmup.
 ///
-/// Prints the contested/solo p99 inflation. Asserts structural bounds only;
-/// the exact latency numbers are intentionally report-only until the in-flight
-/// `rtp` congestion-control work lands.
+/// Prints the solo and contested p50/p90/p99/max latency, the per-sample
+/// latency CSV, the bulk delivery/goodput, and the wire counters for both
+/// pairs, so a `Shared` bulk upload can be compared against a `Dedicated` one
+/// on the same echo. Asserts structural bounds only.
 async fn rr_under_bulk_ab(
     label: &str,
     rate_bps: u64,
@@ -213,20 +225,29 @@ async fn rr_under_bulk_ab(
     let owd = Duration::from_millis(OWD_MS);
     let msg_bytes = 2048usize;
     let gap = Duration::from_millis(100);
-    let solo_run = Duration::from_secs(10);
+    let solo_run = Duration::from_secs(8);
     let contested_run = Duration::from_secs(contested_run_s);
-    let warmup = Duration::from_secs(3);
+    let warmup = Duration::from_secs(2);
 
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
 
-    // The whole flow — solo setup + 10 s measurement + teardown, then
+    // The whole flow — solo setup + 8 s baseline + teardown, then
     // contested setup + measurement + teardown — runs inside one actively
     // driven scope. Every dynamic child (echo/sink servers, session
     // supervisors, the bulk pump) is submitted through the bounded `task_tx`
     // handle, so the reaper actively drives them (and surfaces panics)
     // throughout, including during the long solo measurement.
-    let (solo_samples, contested_samples, delivered_bytes, rr_pair) = tasks
+    let (
+        solo_samples,
+        solo_sent,
+        contested_samples,
+        contested_sent,
+        delivered_bytes,
+        rr_pair,
+        bulk_pair,
+        shaper,
+    ) = tasks
         .run(async {
             // solo phase
             let echo_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
@@ -244,7 +265,7 @@ async fn rr_under_bulk_ab(
                 rtp_connect_transient(&task_tx, solo_pair.client_addr()),
             )
             .await;
-            let solo_samples =
+            let (solo_samples, solo_sent) =
                 rr_echo_samples(solo_rr.0, solo_rr.1, msg_bytes, gap, solo_run, warmup).await;
             solo_pair.stop();
 
@@ -274,7 +295,7 @@ async fn rr_under_bulk_ab(
             let rr_conn = with_timeout(
                 Duration::from_secs(15),
                 "contested rr setup",
-                rtp_connect_required(&task_tx, rr_pair.client_addr()),
+                rtp_connect_transient(&task_tx, rr_pair.client_addr()),
             )
             .await;
 
@@ -290,63 +311,100 @@ async fn rr_under_bulk_ab(
             )
             .await;
 
-            let contested_samples =
+            let (contested_samples, contested_sent) =
                 rr_echo_samples(rr_conn.0, rr_conn.1, msg_bytes, gap, contested_run, warmup).await;
 
             // Signal the bulk flow to stop and let final bytes drain.
             bulk_stop.store(true, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(2)).await;
             let delivered_bytes = delivered.load(Ordering::Relaxed);
-            bulk_pair.stop();
-            rr_pair.stop();
-            (solo_samples, contested_samples, delivered_bytes, rr_pair)
+            (
+                solo_samples,
+                solo_sent,
+                contested_samples,
+                contested_sent,
+                delivered_bytes,
+                rr_pair,
+                bulk_pair,
+                shaper,
+            )
         })
         .await;
+    // Stop the contested pairs after the scope has reaped its task children.
+    // The echo session is a transient child, so the epilog cancels its
+    // supervisor first and the pair threads are joined here; stopping a pair
+    // from inside the body would tear the session down while the reaper is
+    // still polling it.
+    rr_pair.stop();
+    bulk_pair.stop();
     // ── analysis ──────────────────────────────────────────────────────────
-    let mut solo = solo_samples;
-    solo.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mut contested = contested_samples;
-    contested.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let solo_summary = summarize(
+        solo_samples.clone(),
+        solo_sent,
+        solo_samples.len() as u64,
+        0,
+        0.0,
+    );
+    let contested_summary = summarize(
+        contested_samples.clone(),
+        contested_sent,
+        contested_samples.len() as u64,
+        delivered_bytes,
+        contested_run.as_secs_f64(),
+    );
 
-    let solo_p99 = percentile(&solo, 0.99);
-    let contested_p99 = percentile(&contested, 0.99);
+    print_latency(&format!("{label} solo"), &solo_summary, &solo_samples);
+    print_latency(
+        &format!("{label} contested"),
+        &contested_summary,
+        &contested_samples,
+    );
+    let inflation = contested_summary.p99 / solo_summary.p99.max(f64::EPSILON);
+    eprintln!("[shared_bneck {label}] contested/solo p99 inflation = {inflation:.2}x");
 
+    let cap_bytes_per_sec = rate_bps as f64 / 8.0;
+    let goodput_bytes_per_sec = delivered_bytes as f64 / contested_run.as_secs_f64();
     eprintln!(
-        "[shared_bneck {label}] solo p99={solo_p99:.1} ms n={solo_n} | contested p99={contested_p99:.1} ms n={contested_n}",
-        solo_n = solo.len(),
-        contested_n = contested.len()
+        "[shared_bneck {label}] bulk delivery={delivered_bytes} bytes goodput={goodput_bytes_per_sec:.0} B/s cap={cap_bytes_per_sec:.0} B/s ({pct:.0}%)",
+        pct = goodput_bytes_per_sec / cap_bytes_per_sec * 100.0,
     );
-    if solo_p99 > 0.0 {
-        eprintln!(
-            "[shared_bneck {label}] contested/solo p99 inflation = {ratio:.2}x",
-            ratio = contested_p99 / solo_p99
-        );
-    }
+    eprintln!(
+        "[shared_bneck {label}] rr wire = {:?}",
+        combined_stats(&rr_pair)
+    );
+    eprintln!(
+        "[shared_bneck {label}] bulk wire = {:?}",
+        combined_stats(&bulk_pair)
+    );
+    eprintln!(
+        "[shared_bneck {label}] shaper rate={} bps dropped={} backlog_now={} bytes",
+        shaper.rate_bps(),
+        shaper.dropped(),
+        shaper.backlog_bytes(Instant::now()),
+    );
 
     assert!(
-        solo_p99 <= 1500.0,
-        "solo rr p99 {solo_p99:.1} ms exceeds 1500 ms slack ceiling"
+        solo_summary.p99 <= 1500.0,
+        "solo rr p99 {:.1} ms exceeds 1500 ms slack ceiling",
+        solo_summary.p99
     );
     assert!(
-        contested_p99 <= contested_p99_ceiling_ms,
-        "contested rr p99 {contested_p99:.1} ms exceeds {ceiling:.0} ms ceiling",
-        ceiling = contested_p99_ceiling_ms
+        contested_summary.p99 <= contested_p99_ceiling_ms,
+        "contested rr p99 {:.1} ms exceeds {contested_p99_ceiling_ms:.0} ms ceiling",
+        contested_summary.p99
     );
     assert!(
-        solo.len() >= 15,
+        solo_summary.received >= 15,
         "solo phase should record at least 15 post-warmup samples, got {}",
-        solo.len()
+        solo_summary.received
     );
     assert!(
-        contested.len() >= 5,
-        "contested phase should record at least 5 post-warmup samples, got {}",
-        contested.len()
+        contested_summary.received >= 15,
+        "contested phase should record at least 15 post-warmup samples, got {}",
+        contested_summary.received
     );
 
     // Bulk goodput must stay inside (0, 1.15× link capacity].
-    let cap_bps = rate_bps as f64;
-    let cap_bytes_per_sec = cap_bps / 8.0;
-    let goodput_bytes_per_sec = delivered_bytes as f64 / contested_run.as_secs_f64();
     assert!(
         goodput_bytes_per_sec > 0.0,
         "bulk flow should deliver a non-zero amount of data"
@@ -360,23 +418,20 @@ async fn rr_under_bulk_ab(
         delivered_bytes as usize,
         contested_run,
     );
-    eprintln!(
-        "[shared_bneck {label}] pair stats = {:?}",
-        combined_stats(&rr_pair)
-    );
 }
 
 /// 10 Mbps / 128 KiB shared bottleneck: rr echo under a competing bulk flow.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probes contested latency and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_rr_under_bulk_10mbps() {
-    let _ = tokio::time::timeout(
-        Duration::from_secs(180),
+    with_timeout(
+        Duration::from_secs(90),
+        "shared_bneck 10mbps",
         rr_under_bulk_ab(
             "10mbps",
             10_000_000,
             128 * 1024,
-            20,
+            15,
             8000.0,
             rtp::CongestionLane::default(),
         ),
@@ -393,13 +448,14 @@ async fn shared_bneck_rr_under_bulk_10mbps() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probes contested latency and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_rr_under_dedicated_bulk_10mbps() {
-    let _ = tokio::time::timeout(
-        Duration::from_secs(180),
+    with_timeout(
+        Duration::from_secs(90),
+        "shared_bneck 10mbps-dedicated-bulk",
         rr_under_bulk_ab(
             "10mbps-dedicated-bulk",
             10_000_000,
             128 * 1024,
-            20,
+            15,
             8000.0,
             rtp::CongestionLane::Dedicated,
         ),
@@ -411,13 +467,14 @@ async fn shared_bneck_rr_under_dedicated_bulk_10mbps() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probes contested latency and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_rr_under_bulk_2mbps() {
-    let _ = tokio::time::timeout(
-        Duration::from_secs(180),
+    with_timeout(
+        Duration::from_secs(90),
+        "shared_bneck 2mbps",
         rr_under_bulk_ab(
             "2mbps",
             2_000_000,
             64 * 1024,
-            20,
+            15,
             12000.0,
             rtp::CongestionLane::default(),
         ),
