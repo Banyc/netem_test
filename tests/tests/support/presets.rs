@@ -84,6 +84,24 @@ pub fn controller_fat_pipe() -> NetemConfig {
     }
 }
 
+/// A deterministic, fixed-seed iid-loss fat pipe: the same bandwidth-delay
+/// product and queue limit as [`controller_fat_pipe`] plus a fixed ~1 %
+/// independent per-packet loss. The Tausworthe PRNG is seeded, so the exact
+/// drop pattern is reproducible across runs (unlike the stochastic
+/// Gilbert-Elliott [`hostile_fat_pipe`]); this isolates loss-recovery
+/// behaviour from burst-state divergence.
+pub fn deterministic_iid_loss_fat_pipe() -> NetemConfig {
+    NetemConfig {
+        rate: 100 * 1000 * 1000,
+        latency: Duration::from_millis(150),
+        loss: u32::MAX / 100, // ~1% independent per-packet loss
+        loss_model: LossModel::Random,
+        queue_limit_pkts: 16 * 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
 /// Two-state Gilbert-Elliott loss model on top of the four-state `sch_netem`
 /// representation.
 ///

@@ -183,6 +183,27 @@ plateaus, and tail separation from being hidden by the global overlay.
 Distribution shape guides follow-up timeline inspection; it does not establish
 modality or cause.
 
+## Deterministic iid-loss fat-pipe lane
+
+Use the fixed 100 Mbit/s, 150 ms shaped fat pipe with a fixed-seed ~1 %
+independent per-packet loss when loss-recovery behaviour must be compared
+without the stochastic Gilbert-Elliott state stream of `hostile-fat-pipe`:
+
+```sh
+./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
+--link-profile deterministic-iid-loss-fat-pipe --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30
+```
+
+Like the `controller-fat-pipe` lane this keeps the bandwidth-delay product and
+the 16k-packet queue limit, and adds only a seeded iid loss: the exact drop
+pattern is reproducible from the seed, so a paired run no longer amplifies
+small timing differences through an evolving loss state. It still exercises
+the recovery path (retransmit reasons, app/wire ratio, and recovery idle
+time), but it is a deterministic lane rather than a retention gate; follow a
+retained recovery change with the stochastic `hostile-fat-pipe` and
+adversarial `hostile` lanes.
+
 ## Clean lane
 
 ```sh

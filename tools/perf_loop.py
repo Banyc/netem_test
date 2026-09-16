@@ -45,6 +45,7 @@ LINK_PROFILES = (
     "lossy-400kib",
     "hostile-fat-pipe",
     "controller-fat-pipe",
+    "deterministic-iid-loss-fat-pipe",
     "clean",
     "direct",
     "hostile-bottleneck-20ms",

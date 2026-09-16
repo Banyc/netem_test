@@ -50,6 +50,32 @@ fn controller_fat_pipe_has_only_fixed_shaping() {
     );
 }
 
+/// The deterministic iid-loss lane must be a fixed-seed independent
+/// per-packet loss on the same shaped fat pipe as the controller-retention
+/// lane, so its results are reproducible from the seed alone.
+#[test]
+fn deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss() {
+    let config = support::presets::deterministic_iid_loss_fat_pipe();
+    assert_eq!(config.rate, 100 * 1000 * 1000);
+    assert_eq!(config.latency, Duration::from_millis(150));
+    assert_eq!(config.queue_limit_pkts, 16 * 1024);
+    assert!(config.loss > 0, "the lane must include fixed iid loss");
+    assert_eq!(config.loss_corr, 0, "iid loss must not be correlated");
+    assert_eq!(
+        config.jitter,
+        Duration::ZERO,
+        "iid loss must not include jitter"
+    );
+    assert!(
+        matches!(config.loss_model, netem_test::LossModel::Random),
+        "the lane must use the independent random loss model"
+    );
+    assert_eq!(
+        config.seed, 4,
+        "the lane must be reproducible from a fixed seed"
+    );
+}
+
 /// Connect a `mux` client whose session is intentionally torn down
 /// mid-body: each one-shot probe stops its pair (cutting the link) right
 /// after measuring, so the supervision drain must be transient rather
@@ -657,6 +683,7 @@ async fn probe_hostile_goodput_30s() {
                         | "lossy-400kib"
                         | "hostile-fat-pipe"
                         | "controller-fat-pipe"
+                        | "deterministic-iid-loss-fat-pipe"
                         | "clean"
                         | "direct"
                         | "hostile-bottleneck-20ms"
@@ -710,6 +737,9 @@ async fn probe_hostile_goodput_30s() {
                 "lossy-400kib" => support::presets::lossy_400kib_per_sec(),
                 "hostile-fat-pipe" => support::presets::hostile_fat_pipe(),
                 "controller-fat-pipe" => support::presets::controller_fat_pipe(),
+                "deterministic-iid-loss-fat-pipe" => {
+                    support::presets::deterministic_iid_loss_fat_pipe()
+                }
                 "clean" | "direct" => support::presets::clean(),
                 "hostile-bottleneck-20ms" => support::presets::hostile_steady_bottleneck_20ms(),
                 "hostile-bottleneck-100ms" => support::presets::hostile_steady_bottleneck_100ms(),
@@ -947,6 +977,7 @@ async fn probe_hostile_goodput_30s() {
                         | "hostile-periodic-bottleneck"
                         | "lossy-400kib"
                         | "hostile-fat-pipe"
+                        | "deterministic-iid-loss-fat-pipe"
                         | "hostile-bottleneck-20ms"
                         | "hostile-bottleneck-100ms"
                         | "hostile-bottleneck-300ms"
