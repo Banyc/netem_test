@@ -261,6 +261,12 @@ struct CongestionRow {
     persistent_for: Option<Duration>,
     delivery_peak: Option<f64>,
     delivery_rate: Option<f64>,
+    /// Whether the latest rate sample was application-limited.  A shared lane
+    /// that is app-limited has less queued than the pipe can carry, so it must
+    /// not attribute cross-traffic delay or loss to its own send rate; the
+    /// burst-loss arm uses this column to show the loss-backoff collapse that
+    /// serializes the interactive repair.
+    app_limited: Option<bool>,
     drain_target: Option<f64>,
     loss_backoff_target: Option<f64>,
     delay_drains: u64,
@@ -324,6 +330,7 @@ fn fec_observer() -> ObserverBundle {
                     persistent_for: snapshot.congestion_persistent_queue_for,
                     delivery_peak: snapshot.congestion_delivery_peak_packets_per_second,
                     delivery_rate: snapshot.delivery_rate_packets_per_second,
+                    app_limited: snapshot.delivery_sample_app_limited,
                     drain_target: snapshot.congestion_drain_target_packets_per_second,
                     loss_backoff_target: snapshot.congestion_loss_backoff_target_packets_per_second,
                     delay_drains: snapshot.congestion_delay_drains,
@@ -359,8 +366,8 @@ fn print_congestion_timeline(label: &str, rows: &[CongestionRow]) {
             eprintln!(
                 "[ctrl {label}]{marker} t={:>7.1}ms action={action:<14} rate={:>8.1} cwnd={:>4} \
                  inflight={:>4} srtt={:>7.1}ms floor={:>7.1}ms tol={:>7.1}ms queue={} gentle={} \
-                 q_for={:?} peak={:?} d={:?} drains={} backoffs={} probes={} waiters={} drain_tgt={:?} \
-                 bkoff_tgt={:?}",
+                 app_lim={:?} q_for={:?} peak={:?} d={:?} drains={} backoffs={} probes={} waiters={} \
+                 drain_tgt={:?} bkoff_tgt={:?}",
                 row.at.as_secs_f64() * 1000.0,
                 row.send_rate,
                 row.cwnd,
@@ -372,6 +379,7 @@ fn print_congestion_timeline(label: &str, rows: &[CongestionRow]) {
                     .unwrap_or(0.0),
                 row.queue_building,
                 row.gentle_mode,
+                row.app_limited,
                 row.persistent_for,
                 row.delivery_peak,
                 row.delivery_rate,
