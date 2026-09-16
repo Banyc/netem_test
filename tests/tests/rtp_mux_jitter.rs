@@ -2568,3 +2568,109 @@ fn assert_reportable(label: &str, s: &HolSummary) {
     assert!(s.sent >= 100, "[{label}] only {} sent", s.sent);
     assert!(s.received >= 5, "[{label}] only {} received", s.received);
 }
+
+/// Focused shared-bottleneck sweep: runs only the four shared-link queue-depth
+/// arms (`shared400k_128kib`, `shared400k_32kib`, `shared200k_64kib`,
+/// `shared400k_4kib`), so the queue-depth-versus-interactive-latency trade and
+/// the bulk-lane goodput can be reproduced in isolation. Report-only besides
+/// liveness guards: the table is the deliverable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "shared-bottleneck latency sweep; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_shared_bottleneck_arms() {
+    /// 400 KiB/s = 3.2768 Mbps shared client->server bottleneck.
+    const SHARED_400KIB_BPS: u64 = 400 * 1024 * 8;
+    /// 200 KiB/s shared client->server bottleneck.
+    const SHARED_200KIB_BPS: u64 = 200 * 1024 * 8;
+
+    let clean = |seed: u64| link_custom(seed, OWD, JITTER, 0, 0, 0, 0, 0);
+    // The bulk lane's per-flow config carries no rate when a shared shaper
+    // supplies the bottleneck; only the shaper rate shapes it.
+    let bulk_c2s = link(43, LOSS_2, 0);
+    let bulk_s2c = link(44, LOSS_2, 0);
+
+    let shared_arms: Vec<(&str, u64, u64)> = vec![
+        ("shared400k_128kib", SHARED_400KIB_BPS, 128 * 1024),
+        ("shared400k_32kib", SHARED_400KIB_BPS, 32 * 1024),
+        ("shared200k_64kib", SHARED_200KIB_BPS, 64 * 1024),
+        ("shared400k_4kib", SHARED_400KIB_BPS, 4 * 1024),
+    ];
+    let mut runs: Vec<(&str, DualRun)> = Vec::new();
+    for (name, rate, limit_bytes) in shared_arms {
+        let label = format!("shared/{name}");
+        let shaper = BottleneckShaper::new(rate, limit_bytes);
+        // Sample the shared shaper's serialization backlog every 10 ms for the
+        // whole bulk-active window. This is the low-noise mechanism signal:
+        // the interactive latency is the queue depth divided by the link rate.
+        let backlog = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let backlog_sink = Arc::clone(&backlog);
+        let backlog_shaper = shaper.clone();
+        let sampler = tokio::spawn(async move {
+            let start = Instant::now();
+            tokio::time::sleep(BULK_RAMP).await;
+            while start.elapsed() < RUN_FOR {
+                backlog_sink
+                    .lock()
+                    .unwrap()
+                    .push(backlog_shaper.backlog_bytes(Instant::now()));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let run = with_timeout(
+            Duration::from_secs(180),
+            &label,
+            run_duallane_links_shaped(
+                &label,
+                true,
+                DualLaneLinks {
+                    int_c2s: clean(41),
+                    int_s2c: clean(42),
+                    bulk_c2s: bulk_c2s.clone(),
+                    bulk_s2c: bulk_s2c.clone(),
+                },
+                true,
+                Some(shaper),
+            ),
+        )
+        .await;
+        sampler.abort();
+        assert_reportable(&label, &run.run.summary);
+        runs.push((name, run));
+        let mut samples = backlog.lock().unwrap().clone();
+        samples.sort_unstable();
+        let percentile = |p: f64| -> u64 {
+            if samples.is_empty() {
+                return 0;
+            }
+            let idx = ((samples.len() - 1) as f64 * p).round() as usize;
+            samples[idx]
+        };
+        eprintln!(
+            "[backlog] {name}: n={} p50={} p90={} p99={} max={} bytes (link={} B/s)",
+            samples.len(),
+            percentile(0.50),
+            percentile(0.90),
+            percentile(0.99),
+            samples.last().copied().unwrap_or(0),
+            rate / 8,
+        );
+    }
+    let views: Vec<(&str, &DualRun)> = runs.iter().map(|(n, r)| (*n, r)).collect();
+    print_newdim_table(&views);
+    for (name, run) in &runs {
+        let goodput = run.bulk_sink_bytes as f64 / (RUN_FOR - BULK_RAMP).as_secs_f64();
+        eprintln!(
+            "[shared] {name}: p50={:.1} p99={:.1} p999={:.1} max={:.1} ms | bulk_wire={} \
+             sink={} goodput={:.0} B/s | int_pair={:?} | bulk_pair={:?}",
+            run.run.summary.p50,
+            run.run.summary.p99,
+            run.run.summary.p999,
+            run.run.summary.max,
+            run.bulk_wire_bytes,
+            run.bulk_sink_bytes,
+            goodput,
+            run.run.counters,
+            run.bulk_counters,
+        );
+        print_congestion_timeline(name, &run.run.timeline);
+    }
+}
