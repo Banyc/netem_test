@@ -83,7 +83,9 @@ use support::mux::{
 };
 use support::payload::{cyclic_payload, with_timeout};
 use support::presets::gilbert_elliott_loss;
-use support::rtp::rtp_connect_with_mss_fec_tuning_and_observer_via;
+use support::rtp::{
+    rtp_connect_with_mss_fec_tuning_and_observer_via, spawn_rtp_byte_sink_server_via,
+};
 use support::stats::{HolSummary, combined_stats, summarize};
 use support::{TestScope, submit_test_task};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -2559,6 +2561,57 @@ async fn jitter_latency_dimension_arms() {
             run.run.summary.max
         );
     }
+    // Report-only: the cellular-jitter arms are where the interactive lane is
+    // most likely to show a controller reaction hidden by the jitter floor, so
+    // print their controller timelines even when they are not the worst arm.
+    for (name, run) in &runs {
+        if name.starts_with("cell_jitter") {
+            print_congestion_timeline(name, &run.run.timeline);
+        }
+    }
+}
+
+/// Report-only: the two cellular-like jitter arms run in isolation with their
+/// controller timelines printed, so a controller over-reaction hidden beneath
+/// the jitter envelope is visible instead of only the worst p99.9 arm's.  The
+/// link is the same 25 ms one-way delay with 100/200 ms uniform jitter used by
+/// [`jitter_latency_dimension_arms`]; seeded and report-only besides liveness.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; two ~35 s cellular-jitter arms; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_cellular_timeline_arms() {
+    let cfg = |seed: u64, jitter_ms: u64| NetemConfig {
+        latency: OWD,
+        jitter: Duration::from_millis(jitter_ms),
+        seed,
+        ..NetemConfig::default()
+    };
+    for (name, jitter_ms) in [("cell_jitter_100ms", 100u64), ("cell_jitter_200ms", 200u64)] {
+        let label = format!("cell/{name}");
+        let run = with_timeout(
+            Duration::from_secs(120),
+            &label,
+            run_duallane_links(
+                &label,
+                true,
+                cfg(41, jitter_ms),
+                cfg(42, jitter_ms),
+                NetemConfig::default(),
+                NetemConfig::default(),
+                false,
+            ),
+        )
+        .await;
+        assert_reportable(&label, &run.run.summary);
+        eprintln!(
+            "[cell] {name}: p50={:.1} p90={:.1} p99={:.1} p999={:.1} max={:.1} ms",
+            run.run.summary.p50,
+            run.run.summary.p90,
+            run.run.summary.p99,
+            run.run.summary.p999,
+            run.run.summary.max,
+        );
+        print_congestion_timeline(name, &run.run.timeline);
+    }
 }
 
 /// A looser sanity guard than [`assert_sane`] for the report-only dimension
@@ -2567,6 +2620,112 @@ async fn jitter_latency_dimension_arms() {
 fn assert_reportable(label: &str, s: &HolSummary) {
     assert!(s.sent >= 100, "[{label}] only {} sent", s.sent);
     assert!(s.received >= 5, "[{label}] only {} received", s.received);
+}
+
+/// Report-only: one RTP bulk lane that bursts and then goes fully idle, so the
+/// delay controller's persistent-queue timer either survives the idle gap (a
+/// stale drain/hold state that punishes the first burst after idle) or
+/// restarts fresh.  Each ~2 s burst is offered through a rate-shaped link and
+/// followed by a 4 s silence -- several times the one-second gentle-entry
+/// stretch -- before the next burst.  The congestion timeline is printed so
+/// the post-idle action is visible, and the delivered bytes make a throughput
+/// cost visible.  Seeded and report-only besides liveness.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; one ~35 s idle-restart arm; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_bulk_idle_restart_arm() {
+    /// 2 Mbit/s: a 512 KiB burst drains in ~2 s.
+    const RATE_BPS: u64 = 2_000_000;
+    const BURST_BYTES: usize = 512 * 1024;
+    const IDLE: Duration = Duration::from_secs(4);
+    const RUN_FOR: Duration = Duration::from_secs(34);
+
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TASK_QUEUE_BOUND);
+    let (timeline, delivered, bursts, send_time) = tasks
+        .run(async {
+            let (sink_addr, delivered) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+            let pair = NetemPair::spawn(
+                sink_addr,
+                NetemConfig {
+                    latency: OWD,
+                    jitter: JITTER,
+                    rate: RATE_BPS,
+                    seed: 41,
+                    ..NetemConfig::default()
+                },
+                NetemConfig {
+                    latency: OWD,
+                    jitter: JITTER,
+                    seed: 42,
+                    ..NetemConfig::default()
+                },
+            )
+            .unwrap();
+            let (observer, _fec_cell, _snapshot_cell, timeline_cell) = fec_observer();
+            let (mut read, mut write) = with_timeout(
+                Duration::from_secs(15),
+                "idle-restart connect",
+                rtp_connect_with_mss_fec_tuning_and_observer_via(
+                    &task_tx,
+                    pair.client_addr(),
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                    rtp::FecTuning::default(),
+                    observer,
+                ),
+            )
+            .await;
+            // Keep the read half alive so ACKs are processed while sending.
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n) = read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }),
+            );
+            let payload = cyclic_payload(BURST_BYTES);
+            let start = Instant::now();
+            let mut first = true;
+            let mut send_time = Duration::ZERO;
+            let mut bursts = 0u32;
+            while start.elapsed() < RUN_FOR {
+                if !first {
+                    tokio::time::sleep(IDLE).await;
+                }
+                first = false;
+                // One burst; blocks until the staging buffer accepts it, so the
+                // writer paces the offered load instead of dumping it.  The
+                // accepted-burst time is the controller's throughput cost
+                // without the fixed idle gaps.
+                let burst_start = Instant::now();
+                if write.write_all(&payload).await.is_err() {
+                    break;
+                }
+                send_time += burst_start.elapsed();
+                bursts += 1;
+            }
+            tokio::time::sleep(GRACE).await;
+            let timeline = std::mem::take(&mut *timeline_cell.lock().unwrap());
+            let delivered = delivered.load(Ordering::Relaxed);
+            pair.stop();
+            (timeline, delivered, bursts, send_time)
+        })
+        .await;
+    eprintln!(
+        "[idlerestart] delivered={delivered} bytes over {} s ({:.0} KiB/s); bursts={bursts} \
+         accepted_send_time={:.2} s ({:.0} ms/burst)",
+        RUN_FOR.as_secs(),
+        delivered as f64 / RUN_FOR.as_secs_f64() / 1024.0,
+        send_time.as_secs_f64(),
+        send_time.as_secs_f64() * 1000.0 / f64::from(bursts.max(1)),
+    );
+    print_congestion_timeline("bulk_idle_restart", &timeline);
 }
 
 /// Focused shared-bottleneck sweep: runs only the four shared-link queue-depth
