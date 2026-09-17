@@ -37,10 +37,36 @@ mod support;
 const OWD_MS: u64 = 50;
 
 /// Per-round-trip bound for the interactive echo. A round trip that exceeds
-/// this ends the phase with the samples collected so far instead of hanging the
-/// scenario until an outer timeout erases every report line; with the shared
-/// bottleneck held by the bulk flow the read can otherwise never complete.
+/// this is not counted as a sample, but it no longer ends the phase: the
+/// committed request echo is drained and the phase continues, so one slow reply
+/// under host or bottleneck pressure cannot discard the rest of the window. The
+/// bound still guarantees the scenario terminates when the session is dead
+/// instead of hanging until an outer timeout erases every report line.
 const ROUND_TRIP_BOUND: Duration = Duration::from_secs(4);
+
+/// Time allowed to resynchronize the byte stream after a bounded round trip
+/// exceeded [`ROUND_TRIP_BOUND`]: the committed-but-unread echo bytes must be
+/// drained before the next attempt, otherwise every later read would consume a
+/// stale prefix and report a falsely low latency. A stream that cannot be
+/// resynchronized within this budget is treated as dead.
+const DRAIN_BOUND: Duration = Duration::from_secs(4);
+
+/// Timing budget for the bounded echo: how long one round trip may take before
+/// it is treated as a slow, unsampled attempt, and how long resynchronization
+/// after such an attempt may take.
+#[derive(Clone, Copy, Debug)]
+struct EchoBounds {
+    round_trip: Duration,
+    drain: Duration,
+}
+
+impl EchoBounds {
+    /// Production timing; tests shorten it to exercise slow replies quickly.
+    const PRODUCTION: Self = Self {
+        round_trip: ROUND_TRIP_BOUND,
+        drain: DRAIN_BOUND,
+    };
+}
 
 /// Connect an `rtp` client for the interactive echo, on an explicit `Shared`
 /// lane: it shares the bottleneck with the competing bulk upload.
@@ -96,18 +122,137 @@ fn flow_config(owd: Duration, seed: u64) -> NetemConfig {
     }
 }
 
+/// Outcome of one bounded stop-and-wait echo attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EchoAttempt {
+    /// The full echo arrived within the bound; the duration is the round trip.
+    Complete(Duration),
+    /// The attempt exceeded its bound and the committed request echo was
+    /// drained, so the byte stream is aligned for the next attempt. The phase
+    /// continues instead of ending on one slow reply.
+    Slow,
+    /// The stream ended or errored; the phase cannot continue.
+    Failed,
+}
+
+/// Send `payload` and read its echo, bounding the whole attempt.
+///
+/// The write is tracked byte by byte because `AsyncWrite::write` commits
+/// exactly the bytes it returns and commits nothing while it is still pending;
+/// a timeout therefore never hides how much of the request reached the peer.
+/// When the bound fires, the committed request echo is drained under
+/// `drain_bound` so the next attempt starts on a message boundary, and
+/// [`EchoAttempt::Slow`] is returned rather than ending the phase. A stream
+/// that cannot be resynchronized is [`EchoAttempt::Failed`].
+async fn bounded_echo<R, W>(
+    read: &mut R,
+    write: &mut W,
+    payload: &[u8],
+    buf: &mut [u8],
+    bound: Duration,
+    drain_bound: Duration,
+) -> EchoAttempt
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    assert!(
+        buf.len() >= payload.len(),
+        "echo buffer {} bytes is smaller than the {} byte payload",
+        buf.len(),
+        payload.len(),
+    );
+    let started = Instant::now();
+    let deadline = started + bound;
+
+    // Commit the request, tracking exactly the bytes the writer accepted.
+    let mut committed = 0usize;
+    while committed < payload.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, write.write(&payload[committed..])).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return EchoAttempt::Failed,
+            Ok(Ok(n)) => committed += n,
+            Err(_) => break,
+        }
+    }
+
+    // Read the echo of exactly the committed bytes.
+    let mut consumed = 0usize;
+    while consumed < committed {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, read.read(&mut buf[consumed..committed])).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return EchoAttempt::Failed,
+            Ok(Ok(n)) => consumed += n,
+            Err(_) => break,
+        }
+    }
+
+    if committed == payload.len() && consumed == committed {
+        return EchoAttempt::Complete(started.elapsed());
+    }
+
+    // Slow or short: drain the remaining committed echo so the stream stays
+    // aligned before the next attempt.
+    let drain_deadline = Instant::now() + drain_bound;
+    while consumed < committed {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return EchoAttempt::Failed;
+        }
+        match tokio::time::timeout(remaining, read.read(&mut buf[consumed..committed])).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return EchoAttempt::Failed,
+            Ok(Ok(n)) => consumed += n,
+            Err(_) => return EchoAttempt::Failed,
+        }
+    }
+    EchoAttempt::Slow
+}
+
 /// Round-robin echo flow: send a `msg_bytes` message every `gap` and measure
 /// the echo RTT in milliseconds. Samples recorded before `warmup` are
 /// discarded. Returns the measured samples and the number of post-warmup
 /// round trips attempted; the last attempt may have timed out, so
 /// `samples.len()` is the delivered count.
 async fn rr_echo_samples<R, W>(
+    read: R,
+    write: W,
+    msg_bytes: usize,
+    gap: Duration,
+    run_for: Duration,
+    warmup: Duration,
+) -> (Vec<f64>, u64)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    rr_echo_samples_with_bounds(
+        read,
+        write,
+        msg_bytes,
+        gap,
+        run_for,
+        warmup,
+        EchoBounds::PRODUCTION,
+    )
+    .await
+}
+
+/// [`rr_echo_samples`] with explicit round-trip and drain bounds, so a test can
+/// exercise the slow-reply resynchronization without waiting seconds.
+async fn rr_echo_samples_with_bounds<R, W>(
     mut read: R,
     mut write: W,
     msg_bytes: usize,
     gap: Duration,
     run_for: Duration,
     warmup: Duration,
+    bounds: EchoBounds,
 ) -> (Vec<f64>, u64)
 where
     R: AsyncRead + Unpin,
@@ -131,20 +276,25 @@ where
         if record {
             sent += 1;
         }
-        let t0 = Instant::now();
-        // Bound each round trip so a starved sample ends the phase with the
-        // samples collected so far instead of hanging the whole scenario.
-        let round_trip = async {
-            write.write_all(&payload).await?;
-            read.read_exact(&mut buf).await?;
-            Ok::<(), std::io::Error>(())
-        };
-        match tokio::time::timeout(ROUND_TRIP_BOUND, round_trip).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => break,
-        }
-        if record {
-            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        match bounded_echo(
+            &mut read,
+            &mut write,
+            &payload,
+            &mut buf,
+            bounds.round_trip,
+            bounds.drain,
+        )
+        .await
+        {
+            EchoAttempt::Complete(rtt) => {
+                if record {
+                    samples.push(rtt.as_secs_f64() * 1000.0);
+                }
+            }
+            // The attempt was slow but resynchronized: keep the phase alive
+            // instead of ending it on one slow reply.
+            EchoAttempt::Slow => {}
+            EchoAttempt::Failed => break,
         }
     }
     (samples, sent)
@@ -658,4 +808,64 @@ async fn shared_bneck_late_joiner_fairness() {
     );
     let stats = combined_stats(&pair_a).forwarded + combined_stats(&pair_b).forwarded;
     eprintln!("[shared_bneck late_joiner] combined forwarded={stats}");
+}
+
+/// Regression: one reply slower than the round-trip bound must not end the
+/// phase. Before the resynchronizing round trip, the first slow reply broke the
+/// echo loop and the phase reported zero post-warmup samples; with it, the
+/// phase drains the committed echo and keeps measuring the later prompt
+/// replies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_reply_resynchronizes_instead_of_ending_the_phase() {
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (client_read, client_write) = tokio::io::split(client);
+    let (mut server_read, mut server_write) = tokio::io::split(server);
+
+    // Echo server: delay the first reply past the round-trip bound, echo every
+    // later read promptly. Mirrors the RTP echo server, which echoes each
+    // partial read rather than waiting for a whole message.
+    let echo = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8 * 1024];
+        let mut first = true;
+        loop {
+            match server_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if first {
+                        first = false;
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    if server_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let (samples, sent) = rr_echo_samples_with_bounds(
+        client_read,
+        client_write,
+        1024,
+        Duration::from_millis(20),
+        Duration::from_millis(700),
+        Duration::ZERO,
+        EchoBounds {
+            round_trip: Duration::from_millis(150),
+            drain: Duration::from_secs(2),
+        },
+    )
+    .await;
+    echo.abort();
+
+    assert!(
+        sent > 1,
+        "the phase must attempt more than one round trip, got {sent}"
+    );
+    assert!(
+        samples.len() >= 5,
+        "a reply slower than the bound must resynchronize and keep sampling, \
+         got {} of {sent} attempts delivered",
+        samples.len()
+    );
 }
