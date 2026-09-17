@@ -1477,10 +1477,8 @@ async fn run_hol_probe_frame_delivery_shared(
             submit_test_task(
                 &task_tx,
                 Box::pin(async move {
-                    if let Some(result) = spawner.join_next().await {
-                        if let Err(err) = result {
-                            panic!("mux client session supervision failed: {err:?}");
-                        }
+                    if let Some(Err(err)) = spawner.join_next().await {
+                        panic!("mux client session supervision failed: {err:?}");
                     }
                 }),
             );
@@ -2149,10 +2147,8 @@ async fn run_frame_delivery_two_interactive(
             submit_test_task(
                 &task_tx,
                 Box::pin(async move {
-                    if let Some(result) = spawner.join_next().await {
-                        if let Err(err) = result {
-                            panic!("mux client session supervision failed: {err:?}");
-                        }
+                    if let Some(Err(err)) = spawner.join_next().await {
+                        panic!("mux client session supervision failed: {err:?}");
                     }
                 }),
             );
