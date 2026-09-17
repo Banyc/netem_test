@@ -810,6 +810,172 @@ async fn shared_bneck_late_joiner_fairness() {
     eprintln!("[shared_bneck late_joiner] combined forwarded={stats}");
 }
 
+/// Jain fairness index for two flow rates: `(a + b)^2 / (2 (a^2 + b^2))`.
+fn jain_index(a: f64, b: f64) -> f64 {
+    let sum = a + b;
+    let sq = a * a + b * b;
+    if sum <= 0.0 || sq <= 0.0 {
+        return 0.0;
+    }
+    sum * sum / (2.0 * sq)
+}
+
+/// Two-bulk-flow fairness sweep across seeds and RTT/arrival symmetry.
+///
+/// Both flows are `Shared` lanes over one 10 Mbps / 128 KiB serialization
+/// shaper. The sweep varies arrival time (simultaneous vs late joiner) and
+/// path RTT (symmetric 20/20 ms vs asymmetric 10/60 ms) so the report can
+/// separate late-joiner bias from RTT bias. Per-flow goodput is sampled in
+/// 250 ms bins; the Jain index is computed over the steady overlap window
+/// (from `join + 3 s` to `total_run - 1 s`). The shared lane's additive probe
+/// step lands here: every arm's Jain floor is set above the pre-fix baseline
+/// (symmetric ~0.89-0.93, asymmetric ~0.62) so a return to non-convergent
+/// multiplicative-only probing fails this test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "probes contested fairness and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_fairness_sweep() {
+    let configs: &[(&str, u64, u64, u64, f64)] = &[
+        ("sym_same_start", 20, 20, 0, 0.92),
+        ("sym_late_join", 20, 20, 2, 0.92),
+        ("asym_same_start", 10, 60, 0, 0.66),
+        ("asym_late_join", 10, 60, 2, 0.66),
+    ];
+    for &(label, owd_a_ms, owd_b_ms, join_s, jain_floor) in configs {
+        let mut jains = Vec::new();
+        for rep in 0..3u64 {
+            let (ga, gb) = two_flow_goodput(
+                owd_a_ms,
+                owd_b_ms,
+                Duration::from_secs(join_s),
+                Duration::from_secs(10),
+                rep,
+            )
+            .await;
+            assert!(
+                ga > 0.0 && gb > 0.0,
+                "{label} rep={rep}: both flows must deliver, got a={ga:.0} b={gb:.0} B/s"
+            );
+            let jain = jain_index(ga, gb);
+            eprintln!(
+                "[fairness] {label} rep={rep} a={ga:.0} B/s b={gb:.0} B/s ratio={ratio:.2} jain={jain:.3}",
+                ratio = ga / gb,
+            );
+            jains.push(jain);
+        }
+        let mean = jains.iter().sum::<f64>() / jains.len() as f64;
+        let min = jains.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = jains.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        eprintln!("[fairness] {label} jain_mean={mean:.3} jain_min={min:.3} jain_max={max:.3}");
+        for (rep, jain) in jains.iter().enumerate() {
+            assert!(
+                *jain >= jain_floor,
+                "{label} rep={rep}: Jain {jain:.3} below the {jain_floor:.2} fairness floor"
+            );
+        }
+    }
+}
+
+/// Spawn two bulk flows through one shared shaper, sampling per-flow delivered
+/// bytes every 250 ms. Returns each flow's goodput over the steady window.
+async fn two_flow_goodput(
+    owd_a_ms: u64,
+    owd_b_ms: u64,
+    join: Duration,
+    total_run: Duration,
+    rep: u64,
+) -> (f64, f64) {
+    let rate_bps = 10_000_000u64;
+    let limit_bytes = 128 * 1024u64;
+    let bin_width = Duration::from_millis(250);
+
+    let mut tasks = support::TestScope::new();
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let (bins_a, bins_b, pair_a, pair_b) = tasks
+        .run(async {
+            let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+            let (sink_b_addr, delivered_b) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
+            let shaper = BottleneckShaper::new(rate_bps, limit_bytes);
+            let cfg = |owd_ms: u64, seed: u64| NetemConfig {
+                latency: Duration::from_millis(owd_ms),
+                seed,
+                ..NetemConfig::default()
+            };
+            let pair_a = NetemPair::spawn_shared(
+                sink_a_addr,
+                cfg(owd_a_ms, 100 + rep * 7),
+                cfg(owd_a_ms, 101 + rep * 7),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+            let pair_b = NetemPair::spawn_shared(
+                sink_b_addr,
+                cfg(owd_b_ms, 200 + rep * 7),
+                cfg(owd_b_ms, 201 + rep * 7),
+                Some(shaper.clone()),
+                None,
+            )
+            .unwrap();
+
+            let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
+            let stop = Arc::new(AtomicBool::new(false));
+            let run_start = Instant::now();
+            spawn_bulk_flow(
+                &task_tx,
+                pair_a.client_addr(),
+                Arc::clone(&payload),
+                total_run,
+                Arc::clone(&stop),
+                rtp::CongestionLane::default(),
+            )
+            .await;
+            if !join.is_zero() {
+                tokio::time::sleep(join).await;
+            }
+            spawn_bulk_flow(
+                &task_tx,
+                pair_b.client_addr(),
+                Arc::clone(&payload),
+                total_run.saturating_sub(join),
+                Arc::clone(&stop),
+                rtp::CongestionLane::default(),
+            )
+            .await;
+
+            let mut bins_a = Vec::new();
+            let mut bins_b = Vec::new();
+            let (mut last_a, mut last_b) = (0u64, 0u64);
+            while run_start.elapsed() < total_run {
+                tokio::time::sleep(bin_width).await;
+                let now_a = delivered_a.load(Ordering::Relaxed);
+                let now_b = delivered_b.load(Ordering::Relaxed);
+                bins_a.push(now_a - last_a);
+                bins_b.push(now_b - last_b);
+                last_a = now_a;
+                last_b = now_b;
+            }
+            stop.store(true, Ordering::Relaxed);
+            (bins_a, bins_b, pair_a, pair_b)
+        })
+        .await;
+    pair_a.stop();
+    pair_b.stop();
+
+    // Steady window: from join+3 s to total_run-1 s.
+    let steady_start = join + Duration::from_secs(3);
+    let steady_end = total_run.saturating_sub(Duration::from_secs(1));
+    let last = ((steady_end.as_millis() / bin_width.as_millis()) as usize).min(bins_a.len());
+    let first = ((steady_start.as_millis() / bin_width.as_millis()) as usize).min(last);
+    let window = (last - first) as f64 * bin_width.as_secs_f64();
+    let a_bytes: u64 = bins_a[first..last].iter().sum();
+    let b_bytes: u64 = bins_b[first..last].iter().sum();
+    (a_bytes as f64 / window, b_bytes as f64 / window)
+}
+
 /// Regression: one reply slower than the round-trip bound must not end the
 /// phase. Before the resynchronizing round trip, the first slow reply broke the
 /// echo loop and the phase reported zero post-warmup samples; with it, the
