@@ -192,6 +192,7 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
             // matching by equality. Panic on any unexpected payload.
             let mut got_bulk = false;
             let mut got_small = false;
+            let mut bulk_arrived_at: Option<Instant> = None;
             let mut small_arrived_at: Option<Instant> = None;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
             while !got_bulk || !got_small {
@@ -201,6 +202,7 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
                     .expect("sink channel closed");
                 if recv == bulk_for_compare {
                     got_bulk = true;
+                    bulk_arrived_at = Some(Instant::now());
                 } else if recv == small {
                     got_small = true;
                     small_arrived_at = Some(Instant::now());
@@ -211,12 +213,29 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
 
             assert!(got_bulk, "bulk stream must deliver all 400KiB intact");
             assert!(got_small, "small stream must deliver intact");
-            let small_arrived_after = small_arrived_at
-                .expect("small payload arrived")
-                .duration_since(start);
+            let small_at = small_arrived_at.expect("small payload arrived");
+            let bulk_at = bulk_arrived_at.expect("bulk payload arrived");
+            // Starvation is a *relative* property: the small interactive
+            // stream must overtake the 400 KiB bulk it shares the connection
+            // with, not merely finish inside some absolute wall-clock budget.
+            // Comparing the two arrivals stays valid under host load (both
+            // streams slow down together) while still failing if the bulk
+            // drains before the small payload — i.e. if the multiplexer
+            // starves the small stream behind the bulk.
             assert!(
-                small_arrived_after < Duration::from_secs(5),
-                "small stream should arrive < 5 s after start, took {small_arrived_after:?}"
+                small_at < bulk_at,
+                "small interactive stream must be delivered before the bulk stream \
+                 completes (small at {:?}, bulk at {:?} after start)",
+                small_at.duration_since(start),
+                bulk_at.duration_since(start),
+            );
+            // Absolute liveness guard only, derived from the scenario's own
+            // 120 s budget rather than a tight scheduling bound; the ordering
+            // assertion above is the starvation detector.
+            let small_arrived_after = small_at.duration_since(start);
+            assert!(
+                small_arrived_after < Duration::from_secs(30),
+                "small stream took {small_arrived_after:?}, far past the scenario budget"
             );
             let _ = small_elapsed;
             print_perf(

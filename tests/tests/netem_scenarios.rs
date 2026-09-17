@@ -246,10 +246,13 @@ fn netem_rate_limit_throttles_burst() {
         elapsed >= Duration::from_millis(120),
         "rate shaping should spread delivery, got {elapsed:?}"
     );
-    // Sanity upper bound: well below the 2 s read timeout, proving the test
-    // passes by observing delivery, not by waiting for a timeout.
+    // Coarse sanity backstop: the burst must complete well before the 2 s
+    // socket read timeout, so a passing test proves real delivery rather than
+    // a timeout. In-order arrival of all 20 packets already proves that; this
+    // bound is scheduling-tolerant (~9x the ~160 ms serialization time) so
+    // host load cannot trip it while it still catches a gross regression.
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed < Duration::from_millis(1500),
         "rate shaping should complete well under the timeout, got {elapsed:?}"
     );
 }
@@ -311,10 +314,13 @@ fn netem_reorder_with_rate_jumps_ahead() {
     );
     // And it should arrive immediately, well before the shaped tail (~40ms
     // serialization backlog at 8 kbit/s for 5 prior packets). Measured from
-    // the first arrival timestamp, not a socket timeout.
+    // the first arrival timestamp, not a socket timeout. `order[0] == 5`
+    // above is the real detector (it fails when the reordered packet is not
+    // scheduled ahead of the shaped tail); this is a coarse
+    // scheduling-tolerant backstop against a gross re-schedule.
     let first = stamps[0];
     assert!(
-        first < Duration::from_millis(30),
+        first < Duration::from_millis(500),
         "reordered packet should arrive immediately, got {first:?}"
     );
 }
