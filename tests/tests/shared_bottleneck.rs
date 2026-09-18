@@ -878,6 +878,14 @@ impl TwoFlowRun {
 /// (symmetric ~0.89-0.93, asymmetric ~0.62-0.71) so a return to
 /// non-convergent multiplicative-only probing fails this test.
 ///
+/// The extreme-RTT arms (`extra_*`) are floored at 0.95 too.  Their long-run
+/// convergence was blocked not by the additive probe but by the delay gate's
+/// per-flow propagation-floor-scaled queue tolerance, which let the high-RTT
+/// flow keep probing while the low-RTT flow drained; `extra_20_100` held every
+/// long-run window below 0.90 until the shared lane's drain margin became
+/// common-mode.  A floor at 0.95 fails that pre-fix state (measured 0.80-0.89)
+/// and passes the converged one (long-run windows at or above 0.976).
+///
 /// The Jain index alone can hide the failure that matters most here: a flow
 /// can be starved below any usable rate while the two-flow Jain stays above
 /// its floor only because the winner is merely large.  Each arm additionally
@@ -898,9 +906,9 @@ async fn shared_bneck_fairness_sweep() {
         ("sym_late_join", 20, 20, 2, 0.92),
         ("asym_same_start", 10, 60, 0, 0.80),
         ("asym_late_join", 10, 60, 2, 0.80),
-        ("extra_10_40", 10, 40, 0, 0.0),
-        ("extra_20_100", 20, 100, 0, 0.0),
-        ("extra_60_10", 60, 10, 0, 0.0),
+        ("extra_10_40", 10, 40, 0, 0.95),
+        ("extra_20_100", 20, 100, 0, 0.95),
+        ("extra_60_10", 60, 10, 0, 0.95),
     ];
     for &(label, owd_a_ms, owd_b_ms, join_s, jain_floor) in configs {
         let mut jains = Vec::new();
@@ -1060,6 +1068,9 @@ async fn shared_bneck_fairness_longrun() {
         ("sym_same_start", 20, 20, 0),
         ("asym_same_start", 10, 60, 0),
         ("asym_late_join", 10, 60, 2),
+        ("extra_10_40", 10, 40, 0),
+        ("extra_20_100", 20, 100, 0),
+        ("extra_60_10", 60, 10, 0),
     ];
     let filter = std::env::var("RTP_FAIR_CONFIGS").ok();
     let configs: Vec<&(&str, u64, u64, u64)> = all_configs
@@ -1089,6 +1100,14 @@ async fn shared_bneck_fairness_longrun() {
             let mut worst_at_s = 0.0f64;
             let mut below_90 = 0u32;
             let mut n_windows = 0u32;
+            // Tail window set: the last quarter of the sampled bins. A change
+            // that converges slowly shows its residual bias here; a run that is
+            // merely noisy shows a healthy tail even when one early window is
+            // bad.
+            let tail_start_bin = run.bins_a.len() * 3 / 4;
+            let mut tail_worst = f64::INFINITY;
+            let mut tail_below_90 = 0u32;
+            let mut tail_windows = 0u32;
             let mut idx = start_bin;
             while idx + window_bins <= run.bins_a.len() {
                 let a: u64 = run.bins_a[idx..idx + window_bins].iter().sum();
@@ -1111,6 +1130,13 @@ async fn shared_bneck_fairness_longrun() {
                 if wj < 0.90 {
                     below_90 += 1;
                 }
+                if idx >= tail_start_bin {
+                    tail_worst = tail_worst.min(wj);
+                    tail_windows += 1;
+                    if wj < 0.90 {
+                        tail_below_90 += 1;
+                    }
+                }
                 n_windows += 1;
                 idx += window_bins;
             }
@@ -1118,6 +1144,7 @@ async fn shared_bneck_fairness_longrun() {
             eprintln!(
                 "[fair-longrun-summary] {label} rep={rep} windows={n_windows} \
                  worst_jain={worst:.4} worst_at={worst_at_s:.1}s below_0.90={below_90} \
+                 tail_worst_jain={tail_worst:.4} tail_below_0.90={tail_below_90}/{tail_windows} \
                  goodput_a={ga:.0} goodput_b={gb:.0} B/s"
             );
             assert!(
