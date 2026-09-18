@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use support::payload::cyclic_payload;
 use support::rtp::{
-    spawn_rtp_bulk_upload_with_lane_via, spawn_rtp_byte_sink_server_via, spawn_rtp_echo_server_via,
+    spawn_rtp_bulk_upload_with_lane_and_frame_via, spawn_rtp_byte_sink_server_via,
+    spawn_rtp_echo_server_via,
 };
 use support::stats::{HolSummary, combined_stats, print_perf, summarize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -331,9 +332,16 @@ async fn spawn_bulk_flow(
     run_for: Duration,
     stop: Arc<AtomicBool>,
     congestion_lane: rtp::CongestionLane,
+    frame_delivery: rtp::FrameMode,
 ) {
-    let Ok(mut writer) =
-        spawn_rtp_bulk_upload_with_lane_via(tx, proxy_client_addr, false, congestion_lane).await
+    let Ok(mut writer) = spawn_rtp_bulk_upload_with_lane_and_frame_via(
+        tx,
+        proxy_client_addr,
+        false,
+        congestion_lane,
+        frame_delivery,
+    )
+    .await
     else {
         return;
     };
@@ -458,6 +466,7 @@ async fn rr_under_bulk_ab(
                 contested_run,
                 Arc::clone(&bulk_stop),
                 bulk_lane,
+                rtp::FrameMode::default(),
             )
             .await;
 
@@ -697,6 +706,7 @@ async fn shared_bneck_late_joiner_fairness() {
                 total_run,
                 Arc::clone(&bulk_stop),
                 rtp::CongestionLane::default(),
+                rtp::FrameMode::default(),
             )
             .await;
             tokio::time::sleep(b_join).await;
@@ -707,6 +717,7 @@ async fn shared_bneck_late_joiner_fairness() {
                 total_run - b_join,
                 Arc::clone(&bulk_stop),
                 rtp::CongestionLane::default(),
+                rtp::FrameMode::default(),
             )
             .await;
 
@@ -901,6 +912,7 @@ async fn shared_bneck_fairness_sweep() {
                 Duration::from_secs(join_s),
                 Duration::from_secs(10),
                 rep,
+                rtp::FrameMode::default(),
             )
             .await;
             let (ga, gb) = run.steady_goodput();
@@ -935,6 +947,89 @@ async fn shared_bneck_fairness_sweep() {
         // A starved flow can still clear every Jain floor when the winner is
         // merely large; the mean minimum share is the independent starvation
         // guard, so a change that pins either flow near zero cannot pass.
+        assert!(
+            mean_share >= MIN_MEAN_STEADY_SHARE,
+            "{label}: the slower flow holds only {mean_share:.3} of the steady window on \
+             average, below the {MIN_MEAN_STEADY_SHARE:.2} starvation floor (reps: {shares:?})"
+        );
+    }
+}
+
+/// Reorder-tolerant `Shared` fairness: the same two-flow convergence as
+/// [`shared_bneck_fairness_sweep`], but every client declares the
+/// reorder-tolerant interactive intent (`allow_reorder`, so
+/// `CongestionResponse::reorder_tolerant()` is true). This is the congestion
+/// mode of the production `rtp_mux` interactive lane, and the lane the reorder
+/// probe cap guards. The reorder cap must bound only the delivery-scaled part
+/// of a probe and let the lane's absolute additive step through, so the
+/// symmetric arm converges. The deterministic wire-rate proof for this lane
+/// lives in `rtp`'s
+/// `reorder_tolerant_shared_lane_applies_the_additive_step_to_the_send_rate`.
+///
+/// The asymmetric arm is report-only: it still carries a high-RTT bias
+/// (measured Jain 0.78-0.81, slower-flow steady share ~0.24, at the starvation
+/// floor), which is a reorder-lane gate/floor property separate from the probe
+/// cap this scenario exercises. Pinning it here as a passing floor would
+/// encode that bias; the deterministic `rtp` layer test is the regression gate
+/// for the cap itself.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "probes contested fairness and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_reorder_tolerant_fairness() {
+    // `allow_reorder` alone is the congestion lane's reorder flag (the same
+    // shape `ReliableLayer` tests use); keeping `enabled = false` leaves the
+    // stock byte-stream send path so the arm isolates the cap, not framing.
+    let reorder = rtp::FrameMode {
+        enabled: false,
+        allow_reorder: true,
+    };
+    let configs: &[(&str, u64, u64, u64, Option<f64>)] = &[
+        ("reorder_sym_same_start", 20, 20, 0, Some(0.95)),
+        ("reorder_asym_same_start", 10, 60, 0, None),
+    ];
+    for &(label, owd_a_ms, owd_b_ms, join_s, jain_floor) in configs {
+        let mut jains = Vec::new();
+        let mut shares = Vec::new();
+        for rep in 0..3u64 {
+            let run = two_flow_goodput(
+                owd_a_ms,
+                owd_b_ms,
+                Duration::from_secs(join_s),
+                Duration::from_secs(10),
+                rep,
+                reorder,
+            )
+            .await;
+            let (ga, gb) = run.steady_goodput();
+            assert!(
+                ga > 0.0 && gb > 0.0,
+                "{label} rep={rep}: both flows must deliver, got a={ga:.0} b={gb:.0} B/s"
+            );
+            let jain = jain_index(ga, gb);
+            let steady_share = ga.min(gb) / (ga + gb);
+            eprintln!(
+                "[reorder-fairness] {label} rep={rep} a={ga:.0} B/s b={gb:.0} B/s ratio={ratio:.2} \
+                 share_min={steady_share:.3} jain={jain:.3}",
+                ratio = ga / gb,
+            );
+            jains.push(jain);
+            shares.push(steady_share);
+        }
+        let mean = jains.iter().sum::<f64>() / jains.len() as f64;
+        let min = jains.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mean_share = shares.iter().sum::<f64>() / shares.len() as f64;
+        eprintln!(
+            "[reorder-fairness] {label} jain_mean={mean:.3} jain_min={min:.3} share_mean={mean_share:.3}"
+        );
+        let Some(jain_floor) = jain_floor else {
+            continue;
+        };
+        for (rep, jain) in jains.iter().enumerate() {
+            assert!(
+                *jain >= jain_floor,
+                "{label} rep={rep}: Jain {jain:.3} below the {jain_floor:.2} reorder-lane \
+                 fairness floor (the additive step must survive the reorder cap on the wire)"
+            );
+        }
         assert!(
             mean_share >= MIN_MEAN_STEADY_SHARE,
             "{label}: the slower flow holds only {mean_share:.3} of the steady window on \
@@ -981,6 +1076,7 @@ async fn shared_bneck_fairness_longrun() {
                 Duration::from_secs(join_s),
                 total_run,
                 rep,
+                rtp::FrameMode::default(),
             )
             .await;
             let bin_ms = run.bin_width.as_millis() as usize;
@@ -1039,6 +1135,7 @@ async fn two_flow_goodput(
     join: Duration,
     total_run: Duration,
     rep: u64,
+    frame_delivery: rtp::FrameMode,
 ) -> TwoFlowRun {
     let rate_bps = 10_000_000u64;
     let limit_bytes = 128 * 1024u64;
@@ -1087,6 +1184,7 @@ async fn two_flow_goodput(
                 total_run,
                 Arc::clone(&stop),
                 rtp::CongestionLane::default(),
+                frame_delivery,
             )
             .await;
             if !join.is_zero() {
@@ -1099,6 +1197,7 @@ async fn two_flow_goodput(
                 total_run.saturating_sub(join),
                 Arc::clone(&stop),
                 rtp::CongestionLane::default(),
+                frame_delivery,
             )
             .await;
 

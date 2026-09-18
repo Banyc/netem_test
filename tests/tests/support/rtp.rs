@@ -718,6 +718,7 @@ async fn spawn_rtp_bulk_upload_core(
     fec: bool,
     mss: usize,
     congestion_lane: rtp::CongestionLane,
+    frame_delivery: rtp::FrameMode,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
     let connected = rtp::udp::connect_with(
         "0.0.0.0:0",
@@ -727,6 +728,7 @@ async fn spawn_rtp_bulk_upload_core(
             fec,
             mss: rtp::udp::MssConfig::Custom(mss),
             congestion_lane,
+            frame_delivery,
             ..rtp::udp::ConnectConfig::default()
         },
     )
@@ -767,6 +769,7 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
         fec,
         mss,
         rtp::CongestionLane::default(),
+        rtp::FrameMode::default(),
     )
     .await
 }
@@ -786,6 +789,7 @@ pub async fn spawn_rtp_bulk_upload_with_mss_via(
         fec,
         mss,
         rtp::CongestionLane::default(),
+        rtp::FrameMode::default(),
     )
     .await
 }
@@ -798,12 +802,34 @@ pub async fn spawn_rtp_bulk_upload_with_lane_via(
     fec: bool,
     congestion_lane: rtp::CongestionLane,
 ) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
+    spawn_rtp_bulk_upload_with_lane_and_frame_via(
+        tx,
+        proxy_client_addr,
+        fec,
+        congestion_lane,
+        rtp::FrameMode::default(),
+    )
+    .await
+}
+
+/// [`spawn_rtp_bulk_upload_with_lane_via`] with an explicit frame-delivery
+/// mode, so a scenario can declare the reorder-tolerant interactive intent
+/// (`FrameMode::enabled_reordering`, or `allow_reorder` without framing) and
+/// exercise the reorder lane's cap and additive probe on the wire.
+pub async fn spawn_rtp_bulk_upload_with_lane_and_frame_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    congestion_lane: rtp::CongestionLane,
+    frame_delivery: rtp::FrameMode,
+) -> std::io::Result<rtp::socket::AsyncWriteAdapter> {
     spawn_rtp_bulk_upload_core(
         |fut| submit_test_task(tx, fut),
         proxy_client_addr,
         fec,
         rtp::udp::NO_FEC_MSS,
         congestion_lane,
+        frame_delivery,
     )
     .await
 }
