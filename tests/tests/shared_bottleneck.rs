@@ -820,6 +820,41 @@ fn jain_index(a: f64, b: f64) -> f64 {
     sum * sum / (2.0 * sq)
 }
 
+/// Read an environment knob, defaulting when unset or unparseable.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Per-bin sample series of one two-flow run. Keeping the raw 250 ms bins lets
+/// a caller recompute fairness over arbitrary windows instead of collapsing a
+/// multi-minute run into a single number.
+struct TwoFlowRun {
+    bins_a: Vec<u64>,
+    bins_b: Vec<u64>,
+    bin_width: Duration,
+    join: Duration,
+    total_run: Duration,
+}
+
+impl TwoFlowRun {
+    /// Goodput (B/s) of each flow over the steady window (`join+3 s` to
+    /// `total_run-1 s`), the same window the short sweep reports.
+    fn steady_goodput(&self) -> (f64, f64) {
+        let steady_start = self.join + Duration::from_secs(3);
+        let steady_end = self.total_run.saturating_sub(Duration::from_secs(1));
+        let last =
+            ((steady_end.as_millis() / self.bin_width.as_millis()) as usize).min(self.bins_a.len());
+        let first = ((steady_start.as_millis() / self.bin_width.as_millis()) as usize).min(last);
+        let window = (last - first) as f64 * self.bin_width.as_secs_f64();
+        let a: u64 = self.bins_a[first..last].iter().sum();
+        let b: u64 = self.bins_b[first..last].iter().sum();
+        (a as f64 / window, b as f64 / window)
+    }
+}
+
 /// Two-bulk-flow fairness sweep across seeds, arrival time, and RTT symmetry.
 ///
 /// Both flows are `Shared` lanes over one 10 Mbps / 128 KiB serialization
@@ -860,7 +895,7 @@ async fn shared_bneck_fairness_sweep() {
         let mut jains = Vec::new();
         let mut shares = Vec::new();
         for rep in 0..3u64 {
-            let (ga, gb) = two_flow_goodput(
+            let run = two_flow_goodput(
                 owd_a_ms,
                 owd_b_ms,
                 Duration::from_secs(join_s),
@@ -868,6 +903,7 @@ async fn shared_bneck_fairness_sweep() {
                 rep,
             )
             .await;
+            let (ga, gb) = run.steady_goodput();
             assert!(
                 ga > 0.0 && gb > 0.0,
                 "{label} rep={rep}: both flows must deliver, got a={ga:.0} b={gb:.0} B/s"
@@ -907,15 +943,103 @@ async fn shared_bneck_fairness_sweep() {
     }
 }
 
+/// Long-run two-flow fairness: the shared-bottleneck substrate for a
+/// multi-minute window, reporting the Jain index over successive windows so
+/// convergence, drift, and slow starvation are visible rather than collapsed
+/// into one aggregate. Report-only: the short sweep owns the fairness floors.
+///
+/// Knobs: `RTP_FAIR_LONGRUN_SECS` (default 300), `RTP_FAIR_LONGRUN_REPS`
+/// (default 3), `RTP_FAIR_WINDOW_SECS` (default 20).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "long-run fairness measurement (multi-minute, real time); run with --ignored --nocapture --test-threads=1"]
+async fn shared_bneck_fairness_longrun() {
+    let total_run = Duration::from_secs(env_u64("RTP_FAIR_LONGRUN_SECS", 300));
+    let reps = env_u64("RTP_FAIR_LONGRUN_REPS", 3);
+    let window = Duration::from_secs(env_u64("RTP_FAIR_WINDOW_SECS", 20).max(1));
+    let skip = Duration::from_secs(env_u64("RTP_FAIR_SKIP_SECS", 10));
+    // The asymmetry the additive-probe fix targets, plus the symmetric control
+    // and the late-join variant. `RTP_FAIR_CONFIGS` filters by name prefix.
+    let all_configs: &[(&str, u64, u64, u64)] = &[
+        ("sym_same_start", 20, 20, 0),
+        ("asym_same_start", 10, 60, 0),
+        ("asym_late_join", 10, 60, 2),
+    ];
+    let filter = std::env::var("RTP_FAIR_CONFIGS").ok();
+    let configs: Vec<&(&str, u64, u64, u64)> = all_configs
+        .iter()
+        .filter(|(label, ..)| {
+            filter
+                .as_deref()
+                .is_none_or(|f| f.split(',').any(|name| name.trim() == *label))
+        })
+        .collect();
+    for &(label, owd_a_ms, owd_b_ms, join_s) in configs.iter().copied() {
+        for rep in 0..reps {
+            let run = two_flow_goodput(
+                owd_a_ms,
+                owd_b_ms,
+                Duration::from_secs(join_s),
+                total_run,
+                rep,
+            )
+            .await;
+            let bin_ms = run.bin_width.as_millis() as usize;
+            let window_bins = (window.as_millis() as usize / bin_ms).max(1);
+            // Skip the post-join ramp before judging convergence.
+            let start_bin = ((run.join + skip).as_millis() as usize) / bin_ms;
+            let mut worst = f64::INFINITY;
+            let mut worst_at_s = 0.0f64;
+            let mut below_90 = 0u32;
+            let mut n_windows = 0u32;
+            let mut idx = start_bin;
+            while idx + window_bins <= run.bins_a.len() {
+                let a: u64 = run.bins_a[idx..idx + window_bins].iter().sum();
+                let b: u64 = run.bins_b[idx..idx + window_bins].iter().sum();
+                let wj = jain_index(a as f64, b as f64);
+                let share = if a + b > 0 {
+                    a.min(b) as f64 / (a + b) as f64
+                } else {
+                    0.0
+                };
+                let t_s = (idx * bin_ms) as f64 / 1000.0;
+                eprintln!(
+                    "[fair-longrun] {label} rep={rep} window={n_windows} t={t_s:.1}s \
+                     a={a} b={b} jain={wj:.4} share_min={share:.4}"
+                );
+                if wj < worst {
+                    worst = wj;
+                    worst_at_s = t_s;
+                }
+                if wj < 0.90 {
+                    below_90 += 1;
+                }
+                n_windows += 1;
+                idx += window_bins;
+            }
+            let (ga, gb) = run.steady_goodput();
+            eprintln!(
+                "[fair-longrun-summary] {label} rep={rep} windows={n_windows} \
+                 worst_jain={worst:.4} worst_at={worst_at_s:.1}s below_0.90={below_90} \
+                 goodput_a={ga:.0} goodput_b={gb:.0} B/s"
+            );
+            assert!(
+                run.bins_a.iter().sum::<u64>() > 0 && run.bins_b.iter().sum::<u64>() > 0,
+                "{label} rep={rep}: both flows must deliver over the long run"
+            );
+        }
+    }
+}
+
 /// Spawn two bulk flows through one shared shaper, sampling per-flow delivered
-/// bytes every 250 ms. Returns each flow's goodput over the steady window.
+/// bytes every 250 ms. Returns the raw per-bin series so callers can compute
+/// fairness over any window.
 async fn two_flow_goodput(
     owd_a_ms: u64,
     owd_b_ms: u64,
     join: Duration,
     total_run: Duration,
     rep: u64,
-) -> (f64, f64) {
+) -> TwoFlowRun {
     let rate_bps = 10_000_000u64;
     let limit_bytes = 128 * 1024u64;
     let bin_width = Duration::from_millis(250);
@@ -997,15 +1121,13 @@ async fn two_flow_goodput(
     pair_a.stop();
     pair_b.stop();
 
-    // Steady window: from join+3 s to total_run-1 s.
-    let steady_start = join + Duration::from_secs(3);
-    let steady_end = total_run.saturating_sub(Duration::from_secs(1));
-    let last = ((steady_end.as_millis() / bin_width.as_millis()) as usize).min(bins_a.len());
-    let first = ((steady_start.as_millis() / bin_width.as_millis()) as usize).min(last);
-    let window = (last - first) as f64 * bin_width.as_secs_f64();
-    let a_bytes: u64 = bins_a[first..last].iter().sum();
-    let b_bytes: u64 = bins_b[first..last].iter().sum();
-    (a_bytes as f64 / window, b_bytes as f64 / window)
+    TwoFlowRun {
+        bins_a,
+        bins_b,
+        bin_width,
+        join,
+        total_run,
+    }
 }
 
 /// Regression: one reply slower than the round-trip bound must not end the

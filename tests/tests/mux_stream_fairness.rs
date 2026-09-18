@@ -39,6 +39,14 @@ const LINK_LATENCY_MS: u64 = 20;
 const WARMUP: Duration = Duration::from_secs(4);
 const STEADY: Duration = Duration::from_secs(8);
 
+/// Read an environment knob, defaulting when unset or unparseable.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// What a measured arm must satisfy.
 #[derive(Clone, Copy)]
 enum Floor {
@@ -90,13 +98,34 @@ fn jain(values: &[u64]) -> f64 {
 /// Run one arm once and return the per-stream delivered bytes over the steady
 /// window, indexed by the tag each client stream writes first.
 async fn measure_arm(arm: &Arm, seed: u64) -> Vec<u64> {
+    let (windows, _) = measure_arm_windows(arm, seed, WARMUP, STEADY, STEADY).await;
+    let mut totals = vec![0u64; arm.chunks.len()];
+    for window in &windows {
+        for (slot, &delta) in totals.iter_mut().zip(window.iter()) {
+            *slot += delta;
+        }
+    }
+    totals
+}
+
+/// Run one arm and return per-stream delivered bytes for each sampling window
+/// across the steady phase, so a caller can report fairness over time instead
+/// of one aggregate. The client streams identify themselves with an 8-byte
+/// little-endian tag before their payload.
+async fn measure_arm_windows(
+    arm: &Arm,
+    seed: u64,
+    warmup: Duration,
+    steady: Duration,
+    window_len: Duration,
+) -> (Vec<Vec<u64>>, Duration) {
     let n = arm.chunks.len();
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     let slots: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
     let server_slots = Arc::clone(&slots);
 
-    tasks
+    let windows = tasks
         .run(async move {
             let server_addr = spawn_mux_over_rtp_server_with_mss_via(
                 &task_tx,
@@ -172,18 +201,27 @@ async fn measure_arm(arm: &Arm, seed: u64) -> Vec<u64> {
                 }
             }
 
-            tokio::time::sleep(WARMUP).await;
-            let warm: Vec<u64> = slots.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-            tokio::time::sleep(STEADY).await;
-            let hot: Vec<u64> = slots.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+            tokio::time::sleep(warmup).await;
+            let mut last: Vec<u64> = slots.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+            let start = tokio::time::Instant::now();
+            let mut windows = Vec::new();
+            while start.elapsed() < steady {
+                tokio::time::sleep(window_len).await;
+                let now: Vec<u64> = slots.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+                let delta: Vec<u64> = now
+                    .iter()
+                    .zip(last.iter())
+                    .map(|(h, w)| h.saturating_sub(*w))
+                    .collect();
+                last = now;
+                windows.push(delta);
+            }
             stop.store(true, Ordering::Relaxed);
             pair.stop();
-            hot.iter()
-                .zip(warm.iter())
-                .map(|(h, w)| h.saturating_sub(*w))
-                .collect::<Vec<u64>>()
+            windows
         })
-        .await
+        .await;
+    (windows, window_len)
 }
 
 fn arms() -> Vec<Arm> {
@@ -284,4 +322,116 @@ async fn mux_stream_fairness_sweep() {
             }
         }
     }
+}
+
+/// Long-run, many-stream byte-fairness: runs the mixed-chunk substrate over a
+/// multi-minute window with a per-window byte-share series, so a long-tail
+/// starvation or a slow scheduler drift is visible even when the whole-run
+/// Jain looks healthy. Report-only: the short sweep owns the floors.
+///
+/// Knobs: `MUX_FAIR_STREAMS` (default 8), `MUX_FAIR_CHUNKS` (comma list),
+/// `MUX_FAIR_STEADY_SECS` (default 240), `MUX_FAIR_WARMUP_SECS` (default 10),
+/// `MUX_FAIR_WINDOW_SECS` (default 10), `MUX_FAIR_REPS` (default 1).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "long-run fairness measurement (multi-minute, real time); run with --ignored --nocapture --test-threads=1"]
+async fn mux_stream_fairness_longrun() {
+    let warmup = Duration::from_secs(env_u64("MUX_FAIR_WARMUP_SECS", 10));
+    let steady = Duration::from_secs(env_u64("MUX_FAIR_STEADY_SECS", 240));
+    let window = Duration::from_secs(env_u64("MUX_FAIR_WINDOW_SECS", 10).max(1));
+    for arm in longrun_arms() {
+        for rep in 0..env_u64("MUX_FAIR_REPS", 1) {
+            let seed = 500 + rep * 7;
+            let (windows, _) = measure_arm_windows(&arm, seed, warmup, steady, window).await;
+            let n = arm.chunks.len();
+            let mut worst_jain = f64::INFINITY;
+            let mut worst_jain_at = 0usize;
+            let mut worst_min_share = f64::INFINITY;
+            for (wi, w) in windows.iter().enumerate() {
+                let j = jain(w);
+                let total: u64 = w.iter().sum();
+                let shares: Vec<f64> = w
+                    .iter()
+                    .map(|&v| {
+                        if total > 0 {
+                            v as f64 / total as f64
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let min_share = shares.iter().cloned().fold(f64::INFINITY, f64::min);
+                eprintln!(
+                    "[mux-fair-longrun] {} rep={rep} window={wi} bytes={w:?} \
+                     shares={shares:?} jain={j:.4} min_share={min_share:.4}",
+                    arm.label,
+                );
+                if j < worst_jain {
+                    worst_jain = j;
+                    worst_jain_at = wi;
+                }
+                worst_min_share = worst_min_share.min(min_share);
+            }
+            let mut totals = vec![0u64; n];
+            for w in &windows {
+                for (i, &v) in w.iter().enumerate() {
+                    totals[i] += v;
+                }
+            }
+            let total: u64 = totals.iter().sum();
+            let shares: Vec<f64> = totals
+                .iter()
+                .map(|&v| {
+                    if total > 0 {
+                        v as f64 / total as f64
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            eprintln!(
+                "[mux-fair-longrun-summary] {} rep={rep} streams={n} windows={} totals={totals:?} \
+                 shares={shares:?} jain={:.4} worst_window_jain={worst_jain:.4} \
+                 worst_window={worst_jain_at} worst_min_share={worst_min_share:.4}",
+                arm.label,
+                windows.len(),
+                jain(&totals),
+            );
+            assert!(
+                totals.iter().all(|&v| v > 0),
+                "{} rep={rep}: a stream was starved to zero over the long run: {totals:?}",
+                arm.label,
+            );
+        }
+    }
+}
+
+/// The long-run arms: a homogeneous N-stream arm and a mixed-chunk N-stream
+/// arm. `MUX_FAIR_STREAMS` sets the count (default 8); `MUX_FAIR_CHUNKS`
+/// overrides the mixed arm's per-stream chunk sizes.
+fn longrun_arms() -> Vec<Arm> {
+    let streams = env_u64("MUX_FAIR_STREAMS", 8).clamp(1, 16) as usize;
+    let mixed: Vec<usize> = match std::env::var("MUX_FAIR_CHUNKS") {
+        Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+        Err(_) => {
+            const SIZES: [usize; 8] =
+                [512, 1024, 1500, 4096, 8192, 16 * 1024, 32 * 1024, 64 * 1024];
+            (0..streams).map(|i| SIZES[i % SIZES.len()]).collect()
+        }
+    };
+    vec![
+        Arm {
+            label: "longrun_bulk",
+            chunks: vec![64 * 1024; streams],
+            skew: Duration::ZERO,
+            throttled_bps: None,
+            floor: Floor::ReportOnly,
+        },
+        Arm {
+            label: "longrun_mixed",
+            chunks: mixed,
+            skew: Duration::ZERO,
+            throttled_bps: None,
+            floor: Floor::ReportOnly,
+        },
+    ]
 }
