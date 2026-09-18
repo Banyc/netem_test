@@ -820,28 +820,45 @@ fn jain_index(a: f64, b: f64) -> f64 {
     sum * sum / (2.0 * sq)
 }
 
-/// Two-bulk-flow fairness sweep across seeds and RTT/arrival symmetry.
+/// Two-bulk-flow fairness sweep across seeds, arrival time, and RTT symmetry.
 ///
 /// Both flows are `Shared` lanes over one 10 Mbps / 128 KiB serialization
 /// shaper. The sweep varies arrival time (simultaneous vs late joiner) and
-/// path RTT (symmetric 20/20 ms vs asymmetric 10/60 ms) so the report can
+/// path RTT (symmetric 20/20 ms vs asymmetric pairs) so the report can
 /// separate late-joiner bias from RTT bias. Per-flow goodput is sampled in
 /// 250 ms bins; the Jain index is computed over the steady overlap window
 /// (from `join + 3 s` to `total_run - 1 s`). The shared lane's additive probe
-/// step lands here: every arm's Jain floor is set above the pre-fix baseline
-/// (symmetric ~0.89-0.93, asymmetric ~0.62) so a return to non-convergent
-/// multiplicative-only probing fails this test.
+/// step lands here: every arm's Jain floor sits above the pre-fix baseline
+/// (symmetric ~0.89-0.93, asymmetric ~0.62-0.71) so a return to
+/// non-convergent multiplicative-only probing fails this test.
+///
+/// The Jain index alone can hide the failure that matters most here: a flow
+/// can be starved below any usable rate while the two-flow Jain stays above
+/// its floor only because the winner is merely large.  Each arm additionally
+/// asserts a minimum share of the steady window averaged across its reps, so
+/// an arm in which either flow is consistently pinned near zero fails
+/// regardless of the Jain value.  The share is averaged rather than asserted
+/// per rep because the late-join arms carry a pre-existing, host-scheduling
+/// dependent incumbent-starvation race (observed on the unmodified controller
+/// too) that a single unlucky rep can trip without the controller converging
+/// badly.
+const MIN_MEAN_STEADY_SHARE: f64 = 0.25;
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probes contested fairness and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_fairness_sweep() {
     let configs: &[(&str, u64, u64, u64, f64)] = &[
         ("sym_same_start", 20, 20, 0, 0.92),
         ("sym_late_join", 20, 20, 2, 0.92),
-        ("asym_same_start", 10, 60, 0, 0.66),
-        ("asym_late_join", 10, 60, 2, 0.66),
+        ("asym_same_start", 10, 60, 0, 0.80),
+        ("asym_late_join", 10, 60, 2, 0.80),
+        ("extra_10_40", 10, 40, 0, 0.0),
+        ("extra_20_100", 20, 100, 0, 0.0),
+        ("extra_60_10", 60, 10, 0, 0.0),
     ];
     for &(label, owd_a_ms, owd_b_ms, join_s, jain_floor) in configs {
         let mut jains = Vec::new();
+        let mut shares = Vec::new();
         for rep in 0..3u64 {
             let (ga, gb) = two_flow_goodput(
                 owd_a_ms,
@@ -856,22 +873,37 @@ async fn shared_bneck_fairness_sweep() {
                 "{label} rep={rep}: both flows must deliver, got a={ga:.0} b={gb:.0} B/s"
             );
             let jain = jain_index(ga, gb);
+            let steady_share = ga.min(gb) / (ga + gb);
             eprintln!(
-                "[fairness] {label} rep={rep} a={ga:.0} B/s b={gb:.0} B/s ratio={ratio:.2} jain={jain:.3}",
+                "[fairness] {label} rep={rep} a={ga:.0} B/s b={gb:.0} B/s ratio={ratio:.2} \
+                 share_min={steady_share:.3} jain={jain:.3}",
                 ratio = ga / gb,
             );
             jains.push(jain);
+            shares.push(steady_share);
         }
         let mean = jains.iter().sum::<f64>() / jains.len() as f64;
         let min = jains.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = jains.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        eprintln!("[fairness] {label} jain_mean={mean:.3} jain_min={min:.3} jain_max={max:.3}");
+        let mean_share = shares.iter().sum::<f64>() / shares.len() as f64;
+        eprintln!(
+            "[fairness] {label} jain_mean={mean:.3} jain_min={min:.3} jain_max={max:.3} \
+             share_mean={mean_share:.3}"
+        );
         for (rep, jain) in jains.iter().enumerate() {
             assert!(
                 *jain >= jain_floor,
                 "{label} rep={rep}: Jain {jain:.3} below the {jain_floor:.2} fairness floor"
             );
         }
+        // A starved flow can still clear every Jain floor when the winner is
+        // merely large; the mean minimum share is the independent starvation
+        // guard, so a change that pins either flow near zero cannot pass.
+        assert!(
+            mean_share >= MIN_MEAN_STEADY_SHARE,
+            "{label}: the slower flow holds only {mean_share:.3} of the steady window on \
+             average, below the {MIN_MEAN_STEADY_SHARE:.2} starvation floor (reps: {shares:?})"
+        );
     }
 }
 
