@@ -44,8 +44,10 @@ const STEADY: Duration = Duration::from_secs(8);
 enum Floor {
     /// Equal-size chunks must split the link evenly and stably.
     HomogeneousJain,
-    /// Different-size chunks that are all bulk must at least not starve.
-    NoStarve,
+    /// Different-size bulk chunks must split the link by bytes too, not by
+    /// messages: byte-fair deficit round robin keeps a small-message stream's
+    /// share near its peers', so the Jain index stays high.
+    ByteFairJain,
     /// Report-only: a genuinely latency-sensitive small-message stream is
     /// allowed to dominate, and a throttled stream is expected to see an
     /// unequal (offered-rate-limited) share.
@@ -67,8 +69,11 @@ struct Arm {
 
 /// Jain floor for equal-size arms.
 const HOMOGENEOUS_JAIN_FLOOR: f64 = 0.98;
-/// A bulk arm whose smaller message used to pin the larger ones at zero bytes
-/// must at least keep every stream making real progress.
+/// Jain floor for heterogeneous arms once the round is byte-fair. The
+/// pre-byte-fair scheduler measured ~0.75 on `hetero_4k_64k_64k`, so this
+/// floor is a real regression guard, not a tautology.
+const BYTE_FAIR_JAIN_FLOOR: f64 = 0.98;
+/// Starvation floor: every arm must keep every stream above this share.
 const HETERO_MIN_SHARE: f64 = 0.02;
 
 /// Jain fairness index over per-stream delivered bytes.
@@ -212,14 +217,14 @@ fn arms() -> Vec<Arm> {
             chunks: vec![1024, 64 * 1024, 64 * 1024],
             skew: Duration::ZERO,
             throttled_bps: None,
-            floor: Floor::ReportOnly,
+            floor: Floor::ByteFairJain,
         },
         Arm {
             label: "hetero_4k_64k_64k",
             chunks: vec![4096, 64 * 1024, 64 * 1024],
             skew: Duration::ZERO,
             throttled_bps: None,
-            floor: Floor::NoStarve,
+            floor: Floor::ByteFairJain,
         },
     ]
 }
@@ -248,6 +253,18 @@ async fn mux_stream_fairness_sweep() {
                 arm.label,
             );
             let min_share = shares.iter().cloned().fold(f64::INFINITY, f64::min);
+            // The starvation guard applies to every arm: no stream may be
+            // pinned near zero, whatever its message size or offered rate.
+            assert!(
+                deltas.iter().all(|&v| v > 0),
+                "{} seed={seed}: a stream was starved to zero: {deltas:?}",
+                arm.label,
+            );
+            assert!(
+                min_share >= HETERO_MIN_SHARE,
+                "{} seed={seed}: smallest share {min_share:.4} below {HETERO_MIN_SHARE}",
+                arm.label,
+            );
             match arm.floor {
                 Floor::HomogeneousJain => {
                     assert!(
@@ -256,15 +273,10 @@ async fn mux_stream_fairness_sweep() {
                         arm.label,
                     );
                 }
-                Floor::NoStarve => {
+                Floor::ByteFairJain => {
                     assert!(
-                        deltas.iter().all(|&v| v > 0),
-                        "{} seed={seed}: a stream was starved to zero: {deltas:?}",
-                        arm.label,
-                    );
-                    assert!(
-                        min_share >= HETERO_MIN_SHARE,
-                        "{} seed={seed}: smallest share {min_share:.4} below {HETERO_MIN_SHARE}",
+                        j >= BYTE_FAIR_JAIN_FLOOR,
+                        "{} seed={seed}: byte-fair Jain {j:.3} below {BYTE_FAIR_JAIN_FLOOR}",
                         arm.label,
                     );
                 }
