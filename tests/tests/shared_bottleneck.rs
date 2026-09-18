@@ -961,30 +961,34 @@ async fn shared_bneck_fairness_sweep() {
 /// `CongestionResponse::reorder_tolerant()` is true). This is the congestion
 /// mode of the production `rtp_mux` interactive lane, and the lane the reorder
 /// probe cap guards. The reorder cap must bound only the delivery-scaled part
-/// of a probe and let the lane's absolute additive step through, so the
-/// symmetric arm converges. The deterministic wire-rate proof for this lane
-/// lives in `rtp`'s
+/// of a probe and let the lane's absolute additive step through; the
+/// deterministic wire-rate proof for that cap lives in `rtp`'s
 /// `reorder_tolerant_shared_lane_applies_the_additive_step_to_the_send_rate`.
 ///
-/// The asymmetric arm is report-only: it still carries a high-RTT bias
-/// (measured Jain 0.78-0.81, slower-flow steady share ~0.24, at the starvation
-/// floor), which is a reorder-lane gate/floor property separate from the probe
-/// cap this scenario exercises. Pinning it here as a passing floor would
-/// encode that bias; the deterministic `rtp` layer test is the regression gate
-/// for the cap itself.
+/// Both arms converge. The asymmetric arm was non-convergent (measured Jain
+/// 0.79-0.81, slower-flow steady share ~0.25) while the reorder lane's
+/// persistent-queue drain timer used the per-flow windowed steady jitter
+/// margin: across flows sharing one bottleneck that margin is not a
+/// common-mode estimate, so the low-RTT contending flow armed the drain timer
+/// and drained instead of probing up. Feeding the timer the trending margin
+/// (common-mode across the queue) converges it to Jain 0.99+ with the slower
+/// flow holding ~0.47. Both arms now assert a Jain floor and the mean-share
+/// starvation guard; the floors sit below the post-fix measurements but above
+/// the pre-fix bias, so a regression to a per-flow drain margin fails them.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probes contested fairness and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_reorder_tolerant_fairness() {
     // `allow_reorder` alone is the congestion lane's reorder flag (the same
     // shape `ReliableLayer` tests use); keeping `enabled = false` leaves the
-    // stock byte-stream send path so the arm isolates the cap, not framing.
+    // stock byte-stream send path so the arm isolates the lane's congestion
+    // tuning, not framing.
     let reorder = rtp::FrameMode {
         enabled: false,
         allow_reorder: true,
     };
-    let configs: &[(&str, u64, u64, u64, Option<f64>)] = &[
-        ("reorder_sym_same_start", 20, 20, 0, Some(0.95)),
-        ("reorder_asym_same_start", 10, 60, 0, None),
+    let configs: &[(&str, u64, u64, u64, f64)] = &[
+        ("reorder_sym_same_start", 20, 20, 0, 0.95),
+        ("reorder_asym_same_start", 10, 60, 0, 0.92),
     ];
     for &(label, owd_a_ms, owd_b_ms, join_s, jain_floor) in configs {
         let mut jains = Vec::new();
@@ -1020,14 +1024,12 @@ async fn shared_bneck_reorder_tolerant_fairness() {
         eprintln!(
             "[reorder-fairness] {label} jain_mean={mean:.3} jain_min={min:.3} share_mean={mean_share:.3}"
         );
-        let Some(jain_floor) = jain_floor else {
-            continue;
-        };
         for (rep, jain) in jains.iter().enumerate() {
             assert!(
                 *jain >= jain_floor,
                 "{label} rep={rep}: Jain {jain:.3} below the {jain_floor:.2} reorder-lane \
-                 fairness floor (the additive step must survive the reorder cap on the wire)"
+                 fairness floor (both lanes must converge; a per-flow drain margin or a \
+                 clipped additive step fails this floor)"
             );
         }
         assert!(
