@@ -242,6 +242,35 @@ impl Drop for HardDeadline {
     }
 }
 
+/// Upper bound on the implicit runtime teardown.  A driver that never yields
+/// cannot park `Runtime::drop` past this, and [`HardDeadline`] aborts the
+/// binary if even this teardown overruns.
+const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(15);
+
+/// Run `body` on an explicit multi-thread runtime under [`HardDeadline`].
+///
+/// The deadline must outlive the runtime teardown: `#[tokio::test]` drops its
+/// runtime *after* the async body returns, so a guard living inside the body
+/// is already disarmed when it waits on a driver that never yields — the
+/// residual 48-minute hang — and `Runtime::drop` has no timeout of its own.
+/// Building the runtime here keeps the guard in the caller's frame (it is
+/// also dropped last on unwind, so it still covers a panicking body), and
+/// `shutdown_timeout` bounds the drop instead of parking forever.
+fn run_bounded<T>(
+    label: &'static str,
+    latest: Arc<Mutex<LatestState>>,
+    body: impl std::future::Future<Output = T>,
+) -> T {
+    let _hard = HardDeadline::arm(label, STALL_TIMEOUT, Arc::clone(&latest));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime");
+    let outcome = runtime.block_on(body);
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+    outcome
+}
+
 /// Write `CHUNK`-sized frames until [`WRITE_WINDOW`] elapses.
 ///
 /// A blocked `write_all` is only a stall when **no end-to-end progress** is
@@ -314,80 +343,86 @@ async fn drive_writes<W: AsyncWrite + Unpin>(
 /// stops advancing trips [`WRITE_WATCHDOG`], dumping the
 /// transport state. [`HardDeadline`] bounds the run even if the transport
 /// wedges hard enough to starve the tokio timer wheel.
-#[tokio::test(flavor = "multi_thread")]
-async fn clean_link_mux_bulk_completes_within_timeout() {
-    let mut tasks = TestScope::new();
-    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+#[test]
+fn clean_link_mux_bulk_completes_within_timeout() {
     // No metrics observer: attaching the snapshot observer masks the stall.
     let latest = Arc::new(Mutex::new(LatestState::default()));
-    let latest_for_run = Arc::clone(&latest);
-    let _hard = HardDeadline::arm(
-        "clean_link_mux_bulk_completes_within_timeout",
-        STALL_TIMEOUT,
-        Arc::clone(&latest),
-    );
-
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_run = Arc::clone(&delivered);
+    let latest_for_run = Arc::clone(&latest);
 
-    let run = tasks.run(async move {
-        let delivered_for_server = Arc::clone(&delivered_for_run);
-        let server_addr = spawn_mux_over_rtp_server_with_mss_via(
-            &task_tx,
-            false,
-            rtp::udp::NO_FEC_MSS,
-            move |mut stream_read, mut stream_write| {
-                let delivered = Arc::clone(&delivered_for_server);
-                async move {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    while let Ok(n) = stream_read.read(&mut buf).await {
-                        if n == 0 {
-                            break;
+    let outcome = run_bounded(
+        "clean_link_mux_bulk_completes_within_timeout",
+        Arc::clone(&latest),
+        async move {
+            let mut tasks = TestScope::new();
+            let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+            let run = tasks.run(async move {
+                let delivered_for_server = Arc::clone(&delivered_for_run);
+                let server_addr = spawn_mux_over_rtp_server_with_mss_via(
+                    &task_tx,
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                    move |mut stream_read, mut stream_write| {
+                        let delivered = Arc::clone(&delivered_for_server);
+                        async move {
+                            let mut buf = vec![0u8; 64 * 1024];
+                            while let Ok(n) = stream_read.read(&mut buf).await {
+                                if n == 0 {
+                                    break;
+                                }
+                                delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                            let _ = stream_write.shutdown();
                         }
-                        delivered.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                    let _ = stream_write.shutdown();
-                }
-            },
-        )
-        .await
-        .unwrap();
+                    },
+                )
+                .await
+                .unwrap();
 
-        let pair = NetemPair::spawn(server_addr, clean_link(11), clean_link(22)).unwrap();
-        let (connected_read, connected_write) =
-            rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
+                let pair = NetemPair::spawn(server_addr, clean_link(11), clean_link(22)).unwrap();
+                let (connected_read, connected_write) = rtp_connect_with_mss_via(
+                    &task_tx,
+                    pair.client_addr(),
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                )
                 .await;
-        let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
-        let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+                let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+                let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
 
-        // Drain the read half so flow-control ACKs keep moving.
-        submit_test_task(
-            &task_tx,
-            Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = stream_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }),
-        );
+                // Drain the read half so flow-control ACKs keep moving.
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 8 * 1024];
+                        while let Ok(n) = stream_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
 
-        let progress = || delivered_for_run.load(Ordering::Relaxed);
-        let outcome = drive_writes(
-            &mut stream_write,
-            &latest_for_run,
-            &delivered_for_run,
-            &progress,
-        )
-        .await;
-        let _ = stream_write.shutdown();
-        drop(opener);
-        pair.stop();
-        outcome
-    });
+                let progress = || delivered_for_run.load(Ordering::Relaxed);
+                let outcome = drive_writes(
+                    &mut stream_write,
+                    &latest_for_run,
+                    &delivered_for_run,
+                    &progress,
+                )
+                .await;
+                let _ = stream_write.shutdown();
+                drop(opener);
+                pair.stop();
+                outcome
+            });
 
-    match tokio::time::timeout(STALL_TIMEOUT, run).await {
+            tokio::time::timeout(STALL_TIMEOUT, run).await
+        },
+    );
+
+    match outcome {
         Ok(WriteOutcome::Completed { writes, elapsed }) => {
             let bytes = delivered.load(Ordering::Relaxed);
             eprintln!(
@@ -420,78 +455,82 @@ async fn clean_link_mux_bulk_completes_within_timeout() {
 /// of failing.  ([`slow_live_link_is_backpressure_not_a_stall`] is the paired
 /// negative control: the same slow writes with a *live* progress signal must
 /// not be misreported as a stall.)
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "watchdog validation via an induced stall; run with --ignored --nocapture --test-threads=1"]
-async fn induced_stall_fires_the_watchdog() {
-    let mut tasks = TestScope::new();
-    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+fn induced_stall_fires_the_watchdog() {
     let (observer, latest) = diagnostic_observer();
-    let _hard = HardDeadline::arm(
+
+    let outcome = run_bounded(
         "induced_stall_fires_the_watchdog",
-        STALL_TIMEOUT,
         Arc::clone(&latest),
+        async move {
+            let mut tasks = TestScope::new();
+            let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+            let run = tasks.run(async move {
+                let server_addr = spawn_mux_over_rtp_server_with_mss_via(
+                    &task_tx,
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                    move |mut stream_read, mut _stream_write| {
+                        async move {
+                            let mut buf = vec![0u8; 64 * 1024];
+                            // Read far slower than the sender writes: the mux window
+                            // fills and the peer's write_all blocks, while the stream
+                            // stays open (the read half keeps being polled).
+                            loop {
+                                match stream_read.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+
+                let pair = NetemPair::spawn(server_addr, slow_link(11), slow_link(22)).unwrap();
+                let (connected_read, connected_write) = rtp_connect_with_mss_and_observer_via(
+                    &task_tx,
+                    pair.client_addr(),
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                    observer,
+                )
+                .await;
+                let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+                let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 8 * 1024];
+                        while let Ok(n) = stream_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
+
+                let no_delivery = AtomicU64::new(0);
+                // Deliberately frozen progress: the injected stalled state the
+                // watchdog must flag even though the writer is only backpressured.
+                let progress = || no_delivery.load(Ordering::Relaxed);
+                let outcome =
+                    drive_writes(&mut stream_write, &latest, &no_delivery, &progress).await;
+                let _ = stream_write.shutdown();
+                drop(opener);
+                pair.stop();
+                outcome
+            });
+
+            tokio::time::timeout(STALL_TIMEOUT, run).await
+        },
     );
 
-    let run = tasks.run(async move {
-        let server_addr = spawn_mux_over_rtp_server_with_mss_via(
-            &task_tx,
-            false,
-            rtp::udp::NO_FEC_MSS,
-            move |mut stream_read, mut _stream_write| {
-                async move {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    // Read far slower than the sender writes: the mux window
-                    // fills and the peer's write_all blocks, while the stream
-                    // stays open (the read half keeps being polled).
-                    loop {
-                        match stream_read.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
-                        }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            },
-        )
-        .await
-        .unwrap();
-
-        let pair = NetemPair::spawn(server_addr, slow_link(11), slow_link(22)).unwrap();
-        let (connected_read, connected_write) = rtp_connect_with_mss_and_observer_via(
-            &task_tx,
-            pair.client_addr(),
-            false,
-            rtp::udp::NO_FEC_MSS,
-            observer,
-        )
-        .await;
-        let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
-        let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
-
-        submit_test_task(
-            &task_tx,
-            Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = stream_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }),
-        );
-
-        let no_delivery = AtomicU64::new(0);
-        // Deliberately frozen progress: the injected stalled state the
-        // watchdog must flag even though the writer is only backpressured.
-        let progress = || no_delivery.load(Ordering::Relaxed);
-        let outcome = drive_writes(&mut stream_write, &latest, &no_delivery, &progress).await;
-        let _ = stream_write.shutdown();
-        drop(opener);
-        pair.stop();
-        outcome
-    });
-
-    match tokio::time::timeout(STALL_TIMEOUT, run).await {
+    match outcome {
         Ok(WriteOutcome::Stalled { writes, .. }) => {
             eprintln!(
                 "[induced-stall] watchdog fired after {writes} writes — instrumentation validated"
@@ -509,79 +548,85 @@ async fn induced_stall_fires_the_watchdog() {
 /// sink keeps receiving (just slowly). That is backpressure, not a stall, so the
 /// run must finish [`WriteOutcome::Completed`] — this is the guard against the
 /// false positive that made the clean-link scenario flaky under load.
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "watchdog negative control: slow-but-live backpressure must not trip it; run with --ignored --nocapture --test-threads=1"]
-async fn slow_live_link_is_backpressure_not_a_stall() {
-    let mut tasks = TestScope::new();
-    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+fn slow_live_link_is_backpressure_not_a_stall() {
     let latest = Arc::new(Mutex::new(LatestState::default()));
-    let latest_for_run = Arc::clone(&latest);
-    let _hard = HardDeadline::arm(
-        "slow_live_link_is_backpressure_not_a_stall",
-        STALL_TIMEOUT,
-        Arc::clone(&latest),
-    );
-
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_run = Arc::clone(&delivered);
+    let latest_for_run = Arc::clone(&latest);
 
-    let run = tasks.run(async move {
-        let delivered_for_server = Arc::clone(&delivered_for_run);
-        let server_addr = spawn_mux_over_rtp_server_with_mss_via(
-            &task_tx,
-            false,
-            rtp::udp::NO_FEC_MSS,
-            move |mut stream_read, mut stream_write| {
-                let delivered = Arc::clone(&delivered_for_server);
-                async move {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    while let Ok(n) = stream_read.read(&mut buf).await {
-                        if n == 0 {
-                            break;
+    let outcome = run_bounded(
+        "slow_live_link_is_backpressure_not_a_stall",
+        Arc::clone(&latest),
+        async move {
+            let mut tasks = TestScope::new();
+            let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+            let run = tasks.run(async move {
+                let delivered_for_server = Arc::clone(&delivered_for_run);
+                let server_addr = spawn_mux_over_rtp_server_with_mss_via(
+                    &task_tx,
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                    move |mut stream_read, mut stream_write| {
+                        let delivered = Arc::clone(&delivered_for_server);
+                        async move {
+                            let mut buf = vec![0u8; 64 * 1024];
+                            while let Ok(n) = stream_read.read(&mut buf).await {
+                                if n == 0 {
+                                    break;
+                                }
+                                delivered.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                            let _ = stream_write.shutdown();
                         }
-                        delivered.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                    let _ = stream_write.shutdown();
-                }
-            },
-        )
-        .await
-        .unwrap();
+                    },
+                )
+                .await
+                .unwrap();
 
-        let pair = NetemPair::spawn(server_addr, slow_link(11), slow_link(22)).unwrap();
-        let (connected_read, connected_write) =
-            rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
+                let pair = NetemPair::spawn(server_addr, slow_link(11), slow_link(22)).unwrap();
+                let (connected_read, connected_write) = rtp_connect_with_mss_via(
+                    &task_tx,
+                    pair.client_addr(),
+                    false,
+                    rtp::udp::NO_FEC_MSS,
+                )
                 .await;
-        let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
-        let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+                let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+                let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
 
-        submit_test_task(
-            &task_tx,
-            Box::pin(async move {
-                let mut buf = vec![0u8; 8 * 1024];
-                while let Ok(n) = stream_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }),
-        );
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 8 * 1024];
+                        while let Ok(n) = stream_read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
 
-        let progress = || delivered_for_run.load(Ordering::Relaxed);
-        let outcome = drive_writes(
-            &mut stream_write,
-            &latest_for_run,
-            &delivered_for_run,
-            &progress,
-        )
-        .await;
-        let _ = stream_write.shutdown();
-        drop(opener);
-        pair.stop();
-        outcome
-    });
+                let progress = || delivered_for_run.load(Ordering::Relaxed);
+                let outcome = drive_writes(
+                    &mut stream_write,
+                    &latest_for_run,
+                    &delivered_for_run,
+                    &progress,
+                )
+                .await;
+                let _ = stream_write.shutdown();
+                drop(opener);
+                pair.stop();
+                outcome
+            });
 
-    match tokio::time::timeout(STALL_TIMEOUT, run).await {
+            tokio::time::timeout(STALL_TIMEOUT, run).await
+        },
+    );
+
+    match outcome {
         Ok(WriteOutcome::Completed { writes, elapsed }) => {
             let bytes = delivered.load(Ordering::Relaxed);
             eprintln!(
@@ -595,4 +640,33 @@ async fn slow_live_link_is_backpressure_not_a_stall() {
         ),
         Err(_) => panic!("the slow-but-live run did not finish within {STALL_TIMEOUT:?}"),
     }
+}
+
+/// Vacuity check for [`RUNTIME_SHUTDOWN`]: a blocking task that never returns
+/// must not park the runtime teardown.  `Runtime::drop` waits forever for such
+/// a task (the residual hang); `shutdown_timeout` is the bound that prevents
+/// it.  Remove the bound and this test parks instead of finishing.
+#[test]
+fn bounded_teardown_does_not_park_on_a_stuck_blocking_task() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime");
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    runtime.spawn_blocking(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    });
+    started_rx.recv().expect("blocking task started");
+
+    let bound = Duration::from_millis(500);
+    let start = Instant::now();
+    runtime.shutdown_timeout(bound);
+    let elapsed = start.elapsed();
+    drop(release_tx);
+    assert!(
+        elapsed >= bound && elapsed < Duration::from_secs(5),
+        "shutdown_timeout({bound:?}) returned in {elapsed:?}; it must bound (and not skip) a stuck blocking task"
+    );
 }
