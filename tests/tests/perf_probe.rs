@@ -208,7 +208,10 @@ const HOSTILE_GOODPUT_FLOOR_MIB_S: f64 = 0.5;
 ///
 /// Echo moves the payload twice, so throughput is reported as one-way bytes.
 /// The server is reused across the five iterations; each iteration opens a
-/// fresh RTP connection through the same `NetemPair`.
+/// fresh RTP connection through its own `NetemPair` because a standard pair
+/// pins its receive transport to the first client tuple, so a single shared
+/// pair would black-hole every connection after the first (a fresh connection
+/// binds a fresh ephemeral port).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_direct() {
@@ -216,13 +219,14 @@ async fn probe_rtp_echo_4mib_direct() {
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
 
     let data = payload(BULK);
-    let (samples, pair) = tasks
+    let (samples, forwarded) = tasks
         .run(async {
             let server_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
-            let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
 
             let mut samples = Vec::with_capacity(PROBE_ITERS);
+            let mut forwarded = 0u64;
             for _ in 0..PROBE_ITERS {
+                let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write) = rtp_connect_transient(
                     &task_tx,
                     pair.client_addr(),
@@ -240,22 +244,25 @@ async fn probe_rtp_echo_4mib_direct() {
                 let elapsed = start.elapsed();
                 assert_eq!(got, data);
                 samples.push(elapsed);
+                pair.stop();
+                forwarded += combined_stats(&pair).forwarded;
             }
-            pair.stop();
-            (samples, pair)
+            (samples, forwarded)
         })
         .await;
 
     print_median_worst("rtp 4MiB direct echo (one-way bytes)", BULK, samples);
 
-    let stats = combined_stats(&pair);
     assert!(
-        stats.forwarded > 0,
-        "proxy should forward packets, got {stats:?}"
+        forwarded > 0,
+        "proxy should forward packets, got {forwarded}"
     );
 }
 
 /// Raw `rtp` 4 MiB echo through a `NetemPair` using the loopback-sized MSS.
+///
+/// Each iteration gets its own pair for the same reason as
+/// [`probe_rtp_echo_4mib_direct`]: a standard pair pins the first client tuple.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "loopback perf-ceiling probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn probe_rtp_echo_4mib_mss8k() {
@@ -263,15 +270,16 @@ async fn probe_rtp_echo_4mib_mss8k() {
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
 
     let data = payload(BULK);
-    let (samples, pair) = tasks
+    let (samples, forwarded) = tasks
         .run(async {
             let server_addr = spawn_rtp_echo_server_with_mss_via(&task_tx, false, LOOPBACK_MSS)
                 .await
                 .unwrap();
-            let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
 
             let mut samples = Vec::with_capacity(PROBE_ITERS);
+            let mut forwarded = 0u64;
             for _ in 0..PROBE_ITERS {
+                let pair = NetemPair::spawn(server_addr, clean(), clean()).unwrap();
                 let (read, write) =
                     rtp_connect_transient(&task_tx, pair.client_addr(), false, LOOPBACK_MSS).await;
                 let start = Instant::now();
@@ -284,18 +292,18 @@ async fn probe_rtp_echo_4mib_mss8k() {
                 let elapsed = start.elapsed();
                 assert_eq!(got, data);
                 samples.push(elapsed);
+                pair.stop();
+                forwarded += combined_stats(&pair).forwarded;
             }
-            pair.stop();
-            (samples, pair)
+            (samples, forwarded)
         })
         .await;
 
     print_median_worst("rtp 4MiB 8KiB-MSS echo (one-way bytes)", BULK, samples);
 
-    let stats = combined_stats(&pair);
     assert!(
-        stats.forwarded > 0,
-        "proxy should forward packets, got {stats:?}"
+        forwarded > 0,
+        "proxy should forward packets, got {forwarded}"
     );
 }
 
