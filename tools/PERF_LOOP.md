@@ -593,9 +593,13 @@ bounded verdict.
 
 ## Verdicts and exit codes
 
-- `0` — the paired run completed and the comparison is valid.
+- `0` — the paired run completed and the comparison produced valid paired
+  evidence (a verdict other than `insufficient_evidence`).
 - `2` — probe/evidence failure: any probe exited non-zero, the comparison
-  evidence is invalid, or the comparison tool itself failed.
+  evidence is invalid, the comparison wrote no `comparison.json`, the
+  comparison tool itself failed, or no valid paired evidence remains
+  (verdict `insufficient_evidence`, including zero seed pairs or a trace
+  excluded for a malformed CSV field).
 - `3` — only with `--fail-on-regression` and a `likely_regression` verdict.
 - `4` — only with `--fail-on-control-instability` and an unstable
   same-binary `control_calibration`.

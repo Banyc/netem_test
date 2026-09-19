@@ -1308,9 +1308,10 @@ def command_run(args):
         output_root,
         allowed_config_mismatches=mismatches,
     )
+    comparison_path = output_root / "comparison.json"
     comparison = {}
-    if (output_root / "comparison.json").exists():
-        comparison = json.loads((output_root / "comparison.json").read_text(encoding="utf-8"))
+    if comparison_path.exists():
+        comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
     verdict = comparison.get("verdict", "insufficient_evidence")
     analysis = paired_result_analysis(
         comparison,
@@ -1413,8 +1414,33 @@ def command_run(args):
     write_json_object_atomic(output_root / "run.json", run_json)
     probe_failed = any(row["runner_exit"] != 0 for row in rows)
     evidence_invalid = comparison.get("evidence_quality") == "invalid"
-    if probe_failed or evidence_invalid or compare.returncode != 0:
-        verdict = "likely_regression"
+    no_valid_evidence = (
+        not comparison_path.exists() or verdict == "insufficient_evidence"
+    )
+    if (
+        probe_failed
+        or evidence_invalid
+        or compare.returncode != 0
+        or no_valid_evidence
+    ):
+        reasons = []
+        if probe_failed:
+            reasons.append("a probe exited non-zero")
+        if compare.returncode != 0:
+            reasons.append(f"the comparison tool exited {compare.returncode}")
+        if not comparison_path.exists():
+            reasons.append("the comparison wrote no comparison.json")
+        elif evidence_invalid:
+            reasons.append("the comparison evidence is invalid")
+        elif verdict == "insufficient_evidence":
+            reasons.append(
+                "no valid paired evidence remains (verdict "
+                "insufficient_evidence)"
+            )
+        print(
+            "error: refusing to report success: " + "; ".join(reasons),
+            file=sys.stderr,
+        )
         return 2
     if args.fail_on_regression and verdict == "likely_regression":
         return 3
@@ -1434,10 +1460,35 @@ def command_compare(args):
     baseline_dirs = [(f"base-{seed}", trace) for seed, trace in args.baseline]
     candidate_dirs = [(f"cand-{seed}", trace) for seed, trace in args.candidate]
     result = call_compare(baseline_dirs, candidate_dirs, output_root)
+    comparison_path = output_root / "comparison.json"
     comparison = {}
-    if (output_root / "comparison.json").exists():
-        comparison = json.loads((output_root / "comparison.json").read_text(encoding="utf-8"))
-    if result.returncode != 0 or comparison.get("evidence_quality") == "invalid":
+    if comparison_path.exists():
+        comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    insufficient = (
+        comparison.get("verdict", "insufficient_evidence") == "insufficient_evidence"
+    )
+    if (
+        result.returncode != 0
+        or not comparison_path.exists()
+        or comparison.get("evidence_quality") == "invalid"
+        or insufficient
+    ):
+        reasons = []
+        if result.returncode != 0:
+            reasons.append(f"the comparison tool exited {result.returncode}")
+        if not comparison_path.exists():
+            reasons.append("the comparison wrote no comparison.json")
+        elif comparison.get("evidence_quality") == "invalid":
+            reasons.append("the comparison evidence is invalid")
+        elif insufficient:
+            reasons.append(
+                "no valid paired evidence remains (verdict "
+                "insufficient_evidence)"
+            )
+        print(
+            "error: refusing to report success: " + "; ".join(reasons),
+            file=sys.stderr,
+        )
         return 2
     if args.fail_on_regression and comparison.get("verdict") == "likely_regression":
         return 3

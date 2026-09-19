@@ -285,6 +285,7 @@ class PerfLoopTest(unittest.TestCase):
 
     def test_same_binary_control_calibration_detects_false_changes(self):
         comparison = {
+            "verdict": "no_material_change",
             "evidence_quality": "healthy",
             "pairs": [
                 {
@@ -1000,6 +1001,7 @@ class PerfLoopTest(unittest.TestCase):
 
     def test_same_binary_run_records_and_can_fail_control_analysis(self):
         comparison = {
+            "verdict": "no_material_change",
             "evidence_quality": "healthy",
             "pairs": [
                 {
@@ -1596,6 +1598,149 @@ class PerfLoopTest(unittest.TestCase):
         # Non-positive second-half goodput is not accepted as evidence.
         analysis = LOOP.within_run_phase_analysis(comparison(1.0, 0.0))
         self.assertEqual(analysis["classification"], "insufficient_evidence")
+
+    def test_compare_refuses_a_passing_exit_without_valid_pairs(self):
+        def completed():
+            return subprocess.CompletedProcess([], 0, b"", b"")
+
+        def run_with(payload, missing=False):
+            with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+                root = Path(directory)
+                output_root = root / "out"
+                args = argparse.Namespace(
+                    mss_bytes=8192,
+                    output=str(output_root),
+                    baseline=[["11", str(root / "b")]],
+                    candidate=[["11", str(root / "c")]],
+                    fail_on_regression=False,
+                )
+
+                def fake_call_compare(
+                    baseline_dirs,
+                    candidate_dirs,
+                    output_root,
+                    allowed_config_mismatches=(),
+                ):
+                    if not missing:
+                        (Path(output_root) / "comparison.json").write_text(
+                            json.dumps(payload), encoding="utf-8"
+                        )
+                    return completed()
+
+                with mock.patch.object(LOOP, "call_compare", fake_call_compare):
+                    return LOOP.command_compare(args)
+
+        # Zero valid pairs with healthy traces is insufficient evidence, not a
+        # pass.
+        self.assertEqual(
+            run_with(
+                {
+                    "verdict": "insufficient_evidence",
+                    "evidence_quality": "healthy",
+                    "valid_pairs": 0,
+                    "total_pairs": 0,
+                }
+            ),
+            2,
+        )
+        # A zero-exit comparison that wrote no comparison.json is the same
+        # failure.
+        self.assertEqual(run_with({}, missing=True), 2)
+        # A genuine comparison still exits zero.
+        self.assertEqual(
+            run_with(
+                {
+                    "verdict": "no_material_change",
+                    "evidence_quality": "healthy",
+                    "valid_pairs": 2,
+                    "total_pairs": 2,
+                }
+            ),
+            0,
+        )
+
+    def test_run_refuses_a_passing_exit_without_valid_pairs(self):
+        def run_with(payload, missing=False):
+            with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+                root = Path(directory)
+                workspace = self.make_workspace(root, "netem_test_base")
+                candidate_workspace = self.make_workspace(root, "netem_test_cand")
+                output_root = root / "out"
+                executable = root / "bin" / "perf_probe-frozen"
+                executable.parent.mkdir(parents=True)
+                executable.write_text("#!/bin/sh\n", encoding="utf-8")
+                args = argparse.Namespace(
+                    mss_bytes=8192,
+                    fec=False,
+                    retransmission_armor=False,
+                    candidate=str(candidate_workspace),
+                    baseline=str(workspace),
+                    same_binary_control=False,
+                    same_workspace_treatment=False,
+                    candidate_fec="same",
+                    instream_group_fec=False,
+                    scenario="bulk",
+                    fail_on_control_instability=False,
+                    fail_on_regression=False,
+                    seeds=(11, 21),
+                    window_seconds=10,
+                    label=None,
+                    warmup_seconds=LOOP.DEFAULT_WARMUP_SECONDS,
+                    baseline_executable=None,
+                    release=True,
+                    target_dir=None,
+                    candidate_executable=None,
+                    baseline_source_manifest=None,
+                    candidate_source_manifest=None,
+                    output=str(output_root),
+                    link_profile="direct",
+                )
+
+                def fake_build_probe(
+                    workspace, role, output_root, *, release=True, target_dir=None
+                ):
+                    return str(executable.resolve())
+
+                def fake_run_probe(workspace, seed, role, output_root, **kwargs):
+                    return {
+                        "runner_exit": 0,
+                        "role": role,
+                        "seed": str(seed),
+                        "executable": kwargs["executable"],
+                        "trace_dir": str(output_root / f"trace-{role}-{seed}"),
+                        "fec": "true" if kwargs["fec"] else "false",
+                        "scenario": kwargs["scenario"],
+                    }
+
+                def fake_call_compare(
+                    baseline_dirs,
+                    candidate_dirs,
+                    output_root,
+                    allowed_config_mismatches=(),
+                ):
+                    if not missing:
+                        (Path(output_root) / "comparison.json").write_text(
+                            json.dumps(payload), encoding="utf-8"
+                        )
+                    return subprocess.CompletedProcess([], 0, b"", b"")
+
+                with mock.patch.object(LOOP, "build_probe", fake_build_probe), \
+                        mock.patch.object(LOOP, "run_probe", fake_run_probe), \
+                        mock.patch.object(LOOP, "call_compare", fake_call_compare):
+                    return LOOP.command_run(args)
+
+        self.assertEqual(
+            run_with(
+                {
+                    "verdict": "insufficient_evidence",
+                    "evidence_quality": "healthy",
+                    "pairs": [],
+                    "runs": [],
+                }
+            ),
+            2,
+        )
+        self.assertEqual(run_with({}, missing=True), 2)
 
 
 
