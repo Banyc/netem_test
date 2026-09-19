@@ -177,3 +177,27 @@ shared_bottleneck::shared_bneck_rr_under_bulk_10mbps = full
 shared_bottleneck::shared_bneck_rr_under_bulk_2mbps = full
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps = full
 ```
+
+## Opt-in targets outside this manifest
+
+`check-gate.py` covers only the `tests` package. Three other opt-in sets are
+never run by `cargo test` and are listed here so their skip is explicit:
+
+- **`netem-test` harness probes** (`cargo test --release -p netem-test --
+  --ignored`): `tests::clean_forwarding_perf_probe`,
+  `tests::learned_destination_cache_perf_probe`,
+  `tests::short_deadline_latency_perf_probe`,
+  `tests::std_udp_connected_peer_perf_probe`. Report-only wall-clock probes.
+- **`rtp` in-process oracles and perf lanes** (`cargo test --release --lib --
+  --ignored` from `crates/rtp`): `socket::stream::tests::probe_single_symbol_
+  interactive_fec_repair`, `socket::stream::tests::probe_fresh_tail_armor_
+  latency`, `socket::stream::tests::probe_fresh_tail_burst_loss_latency`,
+  `socket::stream::tests::probe_armor_copy_cell`, plus the four
+  `traffic_shaping`/`recv_queue` perf lanes. Report-only except the perf
+  lanes, which assert sub-linear scaling ratios.
+- **`mux` nightly bench** (`mux` with `--features nightly`):
+  `bench::profile_mux_send` is an infinite profiling loop and is never run to
+  completion by any gate.
+
+A target that is never run is an unstated gap: run these explicitly when the
+property they cover is in scope, and report the numbers, not just a pass.
