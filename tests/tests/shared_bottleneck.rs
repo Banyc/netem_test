@@ -886,17 +886,77 @@ impl TwoFlowRun {
 /// common-mode.  A floor at 0.95 fails that pre-fix state (measured 0.80-0.89)
 /// and passes the converged one (long-run windows at or above 0.976).
 ///
-/// The Jain index alone can hide the failure that matters most here: a flow
-/// can be starved below any usable rate while the two-flow Jain stays above
-/// its floor only because the winner is merely large.  Each arm additionally
-/// asserts a minimum share of the steady window averaged across its reps, so
-/// an arm in which either flow is consistently pinned near zero fails
-/// regardless of the Jain value.  The share is averaged rather than asserted
-/// per rep because the late-join arms carry a pre-existing, host-scheduling
-/// dependent incumbent-starvation race (observed on the unmodified controller
-/// too) that a single unlucky rep can trip without the controller converging
-/// badly.
-const MIN_MEAN_STEADY_SHARE: f64 = 0.25;
+/// The serialization rate shared by both fairness tests. Kept here (rather
+/// than as a literal inside [`two_flow_goodput`]) so the absolute starvation
+/// floor and the shaper cannot drift apart.
+const FAIRNESS_RATE_BPS: u64 = 10_000_000;
+
+/// The Jain index is scale-invariant, so the per-rep Jain floors above
+/// cannot catch the failure that matters most here: a *combined collapse*
+/// in which both flows are pinned far below link capacity still scores a
+/// near-perfect Jain and a 0.5 share.  The independent guard is an absolute
+/// floor on the slower flow's goodput, which no ratio-only Jain floor
+/// implies.  (An earlier mean-share-of-window guard was algebraically implied
+/// by the two-flow Jain floors — `jain >= 0.80` forces `share >= 0.25` — so it
+/// could never fire; this absolute floor is not implied and therefore can.)
+///
+/// Calibration (this workspace, 10 Mbps / 128 KiB shared shaper, 250 ms
+/// bins): across the sweep's seven arms and the reorder lane's two, the worst
+/// arm mean slower-flow goodput was 0.398x link capacity (`asym_late_join`);
+/// the reorder lane's worst was 0.445x.  The floor sits at 0.10x capacity, a
+/// 4.0x margin below the worst measured arm, so host-scheduling noise cannot
+/// trip it, while a real collapse (both flows at a few kB/s) fails it even
+/// though every Jain floor passes.  The mean is over reps rather than a
+/// per-rep bound because the late-join arms carry a pre-existing,
+/// host-scheduling dependent incumbent race.
+const MIN_MEAN_SLOW_FLOW_FRACTION_OF_CAP: f64 = 0.10;
+
+/// Assert the slower flow's goodput, averaged over `reps`, clears an absolute
+/// floor proportional to link capacity.  `reps` holds each rep's `(a, b)`
+/// steady goodput in B/s and `cap_bytes_per_sec` is the shaper's serialization
+/// capacity.  This is deliberately not a ratio: the two-flow Jain index is
+/// scale-invariant, so a combined collapse passes every Jain floor, and only
+/// an absolute bound can fail it.
+fn assert_slower_flow_above_absolute_floor(
+    label: &str,
+    reps: &[(f64, f64)],
+    cap_bytes_per_sec: f64,
+) {
+    assert!(!reps.is_empty(), "{label}: no fairness reps collected");
+    let mean_slow = reps.iter().map(|&(a, b)| a.min(b)).sum::<f64>() / reps.len() as f64;
+    let floor = cap_bytes_per_sec * MIN_MEAN_SLOW_FLOW_FRACTION_OF_CAP;
+    assert!(
+        mean_slow >= floor,
+        "{label}: the slower flow averages {mean_slow:.0} B/s, below the absolute \
+         starvation floor {floor:.0} B/s ({:.0}% of the {cap_bytes_per_sec:.0} B/s link \
+         capacity); the Jain floors cannot catch a scale-invariant collapse (reps: {reps:?})",
+        MIN_MEAN_SLOW_FLOW_FRACTION_OF_CAP * 100.0,
+    );
+}
+
+/// Vacuity guard for the floor above: a combined collapse that clears every
+/// Jain floor must still trip the absolute floor.  Without this the floor
+/// could silently become vacuous again (the earlier share-of-window bound was
+/// algebraically implied by the two-flow Jain floors and could never fire).
+#[test]
+fn absolute_starvation_floor_fires_on_a_jain_perfect_collapse() {
+    let cap = FAIRNESS_RATE_BPS as f64 / 8.0;
+    // Both flows pinned near 1 kB/s: a perfect Jain and a 0.5 share.
+    let reps = [(1_000.0, 1_050.0), (950.0, 1_100.0), (1_020.0, 980.0)];
+    let jain = jain_index(reps[0].0, reps[0].1);
+    assert!(
+        jain > 0.999,
+        "the collapse vector must look perfectly fair to the Jain floors, got {jain:.4}",
+    );
+    let tripped = std::panic::catch_unwind(|| {
+        assert_slower_flow_above_absolute_floor("collapse", &reps, cap);
+    });
+    assert!(
+        tripped.is_err(),
+        "the absolute starvation floor must fire on a scale-invariant collapse that \
+         passes every Jain floor",
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probes contested fairness and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
@@ -913,6 +973,7 @@ async fn shared_bneck_fairness_sweep() {
     for &(label, owd_a_ms, owd_b_ms, join_s, jain_floor) in configs {
         let mut jains = Vec::new();
         let mut shares = Vec::new();
+        let mut goodputs = Vec::new();
         for rep in 0..3u64 {
             let run = two_flow_goodput(
                 owd_a_ms,
@@ -924,6 +985,7 @@ async fn shared_bneck_fairness_sweep() {
             )
             .await;
             let (ga, gb) = run.steady_goodput();
+            goodputs.push((ga, gb));
             assert!(
                 ga > 0.0 && gb > 0.0,
                 "{label} rep={rep}: both flows must deliver, got a={ga:.0} b={gb:.0} B/s"
@@ -952,14 +1014,9 @@ async fn shared_bneck_fairness_sweep() {
                 "{label} rep={rep}: Jain {jain:.3} below the {jain_floor:.2} fairness floor"
             );
         }
-        // A starved flow can still clear every Jain floor when the winner is
-        // merely large; the mean minimum share is the independent starvation
-        // guard, so a change that pins either flow near zero cannot pass.
-        assert!(
-            mean_share >= MIN_MEAN_STEADY_SHARE,
-            "{label}: the slower flow holds only {mean_share:.3} of the steady window on \
-             average, below the {MIN_MEAN_STEADY_SHARE:.2} starvation floor (reps: {shares:?})"
-        );
+        // A combined collapse is scale-invariant: it passes every Jain floor
+        // above, so the independent absolute floor is what must catch it.
+        assert_slower_flow_above_absolute_floor(label, &goodputs, FAIRNESS_RATE_BPS as f64 / 8.0);
     }
 }
 
@@ -980,9 +1037,10 @@ async fn shared_bneck_fairness_sweep() {
 /// common-mode estimate, so the low-RTT contending flow armed the drain timer
 /// and drained instead of probing up. Feeding the timer the trending margin
 /// (common-mode across the queue) converges it to Jain 0.99+ with the slower
-/// flow holding ~0.47. Both arms now assert a Jain floor and the mean-share
-/// starvation guard; the floors sit below the post-fix measurements but above
-/// the pre-fix bias, so a regression to a per-flow drain margin fails them.
+/// flow holding ~0.47. Both arms now assert a Jain floor and the absolute
+/// slower-flow starvation floor; the floors sit below the post-fix
+/// measurements but above the pre-fix bias, so a regression to a per-flow
+/// drain margin fails them.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probes contested fairness and needs the in-flight rtp/mux path dependencies; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_reorder_tolerant_fairness() {
@@ -1001,6 +1059,7 @@ async fn shared_bneck_reorder_tolerant_fairness() {
     for &(label, owd_a_ms, owd_b_ms, join_s, jain_floor) in configs {
         let mut jains = Vec::new();
         let mut shares = Vec::new();
+        let mut goodputs = Vec::new();
         for rep in 0..3u64 {
             let run = two_flow_goodput(
                 owd_a_ms,
@@ -1012,6 +1071,7 @@ async fn shared_bneck_reorder_tolerant_fairness() {
             )
             .await;
             let (ga, gb) = run.steady_goodput();
+            goodputs.push((ga, gb));
             assert!(
                 ga > 0.0 && gb > 0.0,
                 "{label} rep={rep}: both flows must deliver, got a={ga:.0} b={gb:.0} B/s"
@@ -1040,11 +1100,7 @@ async fn shared_bneck_reorder_tolerant_fairness() {
                  clipped additive step fails this floor)"
             );
         }
-        assert!(
-            mean_share >= MIN_MEAN_STEADY_SHARE,
-            "{label}: the slower flow holds only {mean_share:.3} of the steady window on \
-             average, below the {MIN_MEAN_STEADY_SHARE:.2} starvation floor (reps: {shares:?})"
-        );
+        assert_slower_flow_above_absolute_floor(label, &goodputs, FAIRNESS_RATE_BPS as f64 / 8.0);
     }
 }
 
@@ -1166,7 +1222,7 @@ async fn two_flow_goodput(
     rep: u64,
     frame_delivery: rtp::FrameMode,
 ) -> TwoFlowRun {
-    let rate_bps = 10_000_000u64;
+    let rate_bps = FAIRNESS_RATE_BPS;
     let limit_bytes = 128 * 1024u64;
     let bin_width = Duration::from_millis(250);
 
