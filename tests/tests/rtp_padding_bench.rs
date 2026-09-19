@@ -275,16 +275,17 @@ async fn unpadded_wire_sizes_stay_multimodal() {
 /// Fitted ACK padding hides the ACK packets among the data packets: the
 /// tiny standalone-ACK cluster of the baseline disappears (or shrinks
 /// dramatically) while the large data peak is preserved.
+/// Independent trials per policy. A single transfer's standalone-ACK count is
+/// timing-dependent (an ACK flush whose fitted data-size sample window has
+/// expired goes out unpadded by design), so the shrink comparison aggregates
+/// several trials and compares stable totals instead of two noisy single-run
+/// counts.
+const ACK_PADDING_TRIALS: usize = 4;
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn ack_padding_hides_ack_packets_among_data() {
     let transfer_bytes = 256 * 1024;
-    let (baseline, _) = run_transfer(rtp::udp::HarmfulPaddingPolicy::None, transfer_bytes).await;
-    let (fitted, _) = run_transfer(
-        rtp::udp::HarmfulPaddingPolicy::AckMimicsData,
-        transfer_bytes,
-    )
-    .await;
 
     let small = |h: &std::collections::HashMap<usize, usize>| -> usize {
         h.iter().filter(|&(&n, _)| n < 200).map(|(_, &c)| c).sum()
@@ -292,23 +293,37 @@ async fn ack_padding_hides_ack_packets_among_data() {
     let large = |h: &std::collections::HashMap<usize, usize>| -> usize {
         h.iter().filter(|&(&n, _)| n >= 200).map(|(_, &c)| c).sum()
     };
-    let baseline_small = small(&baseline);
-    let fitted_small = small(&fitted);
-    let baseline_large = large(&baseline);
-    let fitted_large = large(&fitted);
+
+    let mut baseline_small = 0usize;
+    let mut fitted_small = 0usize;
+    let mut baseline_large = 0usize;
+    let mut fitted_large = 0usize;
+    for _ in 0..ACK_PADDING_TRIALS {
+        let (baseline, _) =
+            run_transfer(rtp::udp::HarmfulPaddingPolicy::None, transfer_bytes).await;
+        let (fitted, _) = run_transfer(
+            rtp::udp::HarmfulPaddingPolicy::AckMimicsData,
+            transfer_bytes,
+        )
+        .await;
+        baseline_small += small(&baseline);
+        fitted_small += small(&fitted);
+        baseline_large += large(&baseline);
+        fitted_large += large(&fitted);
+    }
     println!(
-        "ack_padding: baseline_small={baseline_small} fitted_small={fitted_small} baseline_large={baseline_large} fitted_large={fitted_large}"
+        "ack_padding: trials={ACK_PADDING_TRIALS} baseline_small={baseline_small} fitted_small={fitted_small} baseline_large={baseline_large} fitted_large={fitted_large}"
     );
     assert!(
         baseline_small > 0,
-        "the baseline must keep a distinct small-datagram cluster, got {baseline:?}"
+        "the baseline must keep a distinct small-datagram cluster, got {baseline_small}"
     );
     assert!(
-        fitted_small < baseline_small / 2,
+        fitted_small * 2 < baseline_small,
         "the fitted run's small cluster must be dramatically shrunken: baseline={baseline_small} fitted={fitted_small}"
     );
     assert!(
-        fitted_large >= baseline_large * 9 / 10,
+        fitted_large * 10 >= baseline_large * 9,
         "the large-data peak must be preserved: baseline={baseline_large} fitted={fitted_large}"
     );
 }
