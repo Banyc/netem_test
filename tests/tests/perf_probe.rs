@@ -199,10 +199,28 @@ const BULK: usize = 4 * 1024 * 1024;
 /// staging payload and comfortably under macOS `net.inet.udp.maxdgram` ≈ 9216.
 const LOOPBACK_MSS: usize = 8192;
 
-/// Minimum acceptable goodput for the hostile-link probe. The pre-fix collapse
-/// was ~0.015 MiB/s; this floor leaves a large margin while still catching a
-/// severe regression.
-const HOSTILE_GOODPUT_FLOOR_MIB_S: f64 = 0.5;
+/// Number of equal sub-windows the hostile measurement window is split into.
+/// The guarded quantity is the **median** sub-window goodput, so a single
+/// load-spiked sub-window cannot trip the floor; the whole-window rate is still
+/// reported and traced.
+const HOSTILE_GUARD_SUBWINDOWS: usize = 3;
+
+/// Minimum acceptable **median** goodput for the hostile-link probe.
+///
+/// Calibrated to the gap between the healthy band and the pre-fix collapse
+/// rather than to a single run: healthy 30 s windows measure 0.40-0.53 MiB/s
+/// at host load 3.7-4.8 (isolated minimum observed 0.356 MiB/s at load ~5),
+/// while the pre-fix collapse was ~0.015 MiB/s. 0.075 is the geometric
+/// midpoint of 0.356 and 0.015 -- ~4.7x below the slowest healthy sample and
+/// ~5x above the collapse -- so ordinary load noise cannot trip it while a
+/// genuine collapse still does.
+///
+/// A ratio against an in-run clean-lane reference was evaluated and rejected:
+/// the clean `mux`-over-`rtp` loopback ceiling is CPU-saturated (~1.4 GiB/s,
+/// stable to ~1% across host load) rather than load-limited, so the ratio
+/// inherits essentially all of the hostile lane's variance and adds no
+/// robustness over an absolute floor.
+const HOSTILE_GOODPUT_FLOOR_MIB_S: f64 = 0.075;
 
 /// Raw `rtp` 4 MiB direct echo, default MSS.
 ///
@@ -648,6 +666,11 @@ async fn probe_mux_echo_1mib_mss8k() {
 /// transfer is still mid-flight, so a reversed measurement order cannot inflate
 /// goodput.
 ///
+/// The window is split into [`HOSTILE_GUARD_SUBWINDOWS`] equal sub-windows and
+/// the guard asserts the **median** sub-window goodput against
+/// [`HOSTILE_GOODPUT_FLOOR_MIB_S`], so one load-spiked sub-window cannot trip
+/// it; a collapse moves every sub-window and still fails.
+///
 /// `NETEM_PERF_LINK_PROFILE=direct` bypasses NetemPair entirely: the client
 /// connects straight to the server and the trace records zero-valued netem
 /// placeholders so artifacts stay schema-compatible.
@@ -864,34 +887,55 @@ async fn probe_hostile_goodput_30s() {
             let mut netem_tick = tokio::time::interval(Duration::from_millis(50));
             netem_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            // Split the measurement window into equal sub-windows and record
+            // each one's delivered bytes independently. The guard consumes the
+            // median rate, so a single load-spiked sub-window cannot trip the
+            // floor; the whole-window rate is still reported and traced.
+            let subwindow = Duration::from_secs_f64(window_seconds / HOSTILE_GUARD_SUBWINDOWS as f64);
+            let mut subwindow_rates_mib_s = Vec::with_capacity(HOSTILE_GUARD_SUBWINDOWS);
             if pump_error.is_none() {
-                let window = tokio::time::sleep(Duration::from_secs_f64(window_seconds));
-                tokio::pin!(window);
-                loop {
-                    tokio::select! {
-                        joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
-                            let result = joined.expect("bulk pump exists").unwrap();
-                            pump_error = Some(match result {
-                                Ok(()) => "bulk pump ended before the measurement window".to_owned(),
-                                Err(error) => format!("bulk pump failed: {error:?}: {error}"),
-                            });
-                            break;
+                'subwindows: for _ in 0..HOSTILE_GUARD_SUBWINDOWS {
+                    let subwindow_mark = progress.delivered_bytes();
+                    let subwindow_start = Instant::now();
+                    let deadline = tokio::time::sleep(subwindow);
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            joined = pump_tasks.join_next(), if !pump_tasks.is_empty() => {
+                                let result = joined.expect("bulk pump exists").unwrap();
+                                pump_error = Some(match result {
+                                    Ok(()) => "bulk pump ended before the measurement window".to_owned(),
+                                    Err(error) => format!("bulk pump failed: {error:?}: {error}"),
+                                });
+                                break 'subwindows;
+                            }
+                            _ = netem_tick.tick(), if trace.is_some() => {
+                                trace.as_mut().unwrap().record_netem(
+                                    start.elapsed(),
+                                    pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_c2s()),
+                                    pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_s2c()),
+                                    progress.delivered_bytes() - warmup_delivered,
+                                );
+                            }
+                            _ = &mut deadline => break,
                         }
-                        _ = netem_tick.tick(), if trace.is_some() => {
-                            trace.as_mut().unwrap().record_netem(
-                                start.elapsed(),
-                                pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_c2s()),
-                                pair_ref.map_or(CountersSnapshot::default(), |pair| pair.snapshot_s2c()),
-                                progress.delivered_bytes() - warmup_delivered,
-                            );
-                        }
-                        _ = &mut window => break,
                     }
+                    subwindow_rates_mib_s.push(
+                        (progress.delivered_bytes() - subwindow_mark) as f64
+                            / (1024.0 * 1024.0)
+                            / subwindow_start.elapsed().as_secs_f64(),
+                    );
                 }
             }
 
             let delivered = progress.delivered_bytes() - warmup_delivered;
             let elapsed = start.elapsed();
+            let mut sorted_subwindow_rates = subwindow_rates_mib_s.clone();
+            sorted_subwindow_rates.sort_by(f64::total_cmp);
+            let median_goodput_mib_s = sorted_subwindow_rates
+                .get(sorted_subwindow_rates.len() / 2)
+                .copied()
+                .unwrap_or(0.0);
             assert!(
                 delivered > 0,
                 "probe must deliver payload bytes, got {delivered}"
@@ -1023,17 +1067,20 @@ async fn probe_hostile_goodput_30s() {
             }
 
             let goodput_mib_s = delivered as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+            eprintln!(
+                "[perf] hostile guard: whole-window {goodput_mib_s:.3} MiB/s, sub-window median {median_goodput_mib_s:.3} MiB/s, sub-windows {subwindow_rates_mib_s:?} MiB/s, floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s"
+            );
             let diagnostic_mode = std::env::var("NETEM_PERF_DIAGNOSTIC_MODE")
                 .map(|value| value == "1")
                 .unwrap_or(false);
-            if diagnostic_mode && goodput_mib_s < HOSTILE_GOODPUT_FLOOR_MIB_S {
+            if diagnostic_mode && median_goodput_mib_s < HOSTILE_GOODPUT_FLOOR_MIB_S {
                 eprintln!(
-                    "[diagnostic] goodput {goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s bypassed by NETEM_PERF_DIAGNOSTIC_MODE=1"
+                    "[diagnostic] median sub-window goodput {median_goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s bypassed by NETEM_PERF_DIAGNOSTIC_MODE=1"
                 );
             } else {
                 assert!(
-                    goodput_mib_s >= HOSTILE_GOODPUT_FLOOR_MIB_S,
-                    "goodput {goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s"
+                    median_goodput_mib_s >= HOSTILE_GOODPUT_FLOOR_MIB_S,
+                    "median sub-window goodput {median_goodput_mib_s:.3} MiB/s below floor {HOSTILE_GOODPUT_FLOOR_MIB_S} MiB/s (whole-window {goodput_mib_s:.3} MiB/s, sub-windows {subwindow_rates_mib_s:?})"
                 );
             }
 
