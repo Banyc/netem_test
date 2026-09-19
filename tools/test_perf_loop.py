@@ -356,7 +356,13 @@ class PerfLoopTest(unittest.TestCase):
                     "scenario": kwargs["scenario"],
                 }
 
-            def fake_call_compare(baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()):
+            def fake_call_compare(
+                baseline_dirs,
+                candidate_dirs,
+                output_root,
+                allowed_config_mismatches=(),
+                allowed_config_fields=None,
+            ):
                 (Path(output_root) / "comparison.json").write_text(
                     json.dumps(comparison), encoding="utf-8"
                 )
@@ -756,6 +762,38 @@ class PerfLoopTest(unittest.TestCase):
         # the raw tool for the artifacts rather than fail on its exit code.
         self.assertIn("--report-only", command)
 
+    def test_call_compare_forwards_declared_config_field_deltas(self):
+        captured = {}
+
+        def fake_run(command, capture_output=True, text=True):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(LOOP.subprocess, "run", fake_run):
+            LOOP.call_compare(
+                [("b", "/b")],
+                [("c", "/c")],
+                Path("/safe/out"),
+                ("fec",),
+                {
+                    "netem_s2c.loss_model.key_offset": 10,
+                    "netem_c2s.loss_model.key_offset": 10,
+                },
+            )
+        command = captured["command"]
+        fields = [
+            command[index + 1]
+            for index, item in enumerate(command)
+            if item == "--allow-config-field"
+        ]
+        self.assertEqual(
+            fields,
+            [
+                "netem_c2s.loss_model.key_offset=10",
+                "netem_s2c.loss_model.key_offset=10",
+            ],
+        )
+
     def test_call_compare_sorts_and_deduplicates_the_allowlist(self):
         captured = {}
 
@@ -1143,7 +1181,13 @@ class PerfLoopTest(unittest.TestCase):
                     "scenario": kwargs["scenario"],
                 }
 
-            def fake_call_compare(baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()):
+            def fake_call_compare(
+                baseline_dirs,
+                candidate_dirs,
+                output_root,
+                allowed_config_mismatches=(),
+                allowed_config_fields=None,
+            ):
                 (Path(output_root) / "comparison.json").write_text(
                     json.dumps(comparison), encoding="utf-8"
                 )
@@ -1222,7 +1266,13 @@ class PerfLoopTest(unittest.TestCase):
                     "scenario": kwargs["scenario"],
                 }
 
-            def fake_call_compare(baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()):
+            def fake_call_compare(
+                baseline_dirs,
+                candidate_dirs,
+                output_root,
+                allowed_config_mismatches=(),
+                allowed_config_fields=None,
+            ):
                 compare_allowlists.append(tuple(sorted(allowed_config_mismatches)))
                 (Path(output_root) / "comparison.json").write_text(
                     json.dumps(
@@ -1286,6 +1336,16 @@ class PerfLoopTest(unittest.TestCase):
             self.assertEqual(run_json["candidate_fec"], "on")
             self.assertFalse(run_json["instream_group_fec"])
             self.assertEqual(run_json["allowed_config_mismatches"], ["fec"])
+            # The paired-saturated treatment also declares the exact netem leaf
+            # the FEC envelope shifts, so the lane can yield a verdict without
+            # a blanket lane exemption.
+            self.assertEqual(
+                run_json["allowed_config_fields"],
+                [
+                    "netem_c2s.loss_model.key_offset=10",
+                    "netem_s2c.loss_model.key_offset=10",
+                ],
+            )
             self.assertEqual(
                 run_json["builds"]["baseline"]["executable"],
                 str(executable.resolve()),
@@ -1322,6 +1382,47 @@ class PerfLoopTest(unittest.TestCase):
             manifest_rows = (output_root / "manifest.csv").read_text(encoding="utf-8")
             self.assertIn("scenario", manifest_rows)
             self.assertIn("candidate_fec", manifest_rows)
+
+    def test_treatment_declares_only_the_netem_leaf_the_fec_envelope_shifts(self):
+        def args(**overrides):
+            values = dict(
+                fec=False,
+                candidate_fec="on",
+                instream_group_fec=False,
+                link_profile="fec-paired-saturated",
+            )
+            values.update(overrides)
+            return argparse.Namespace(**values)
+
+        self.assertEqual(
+            LOOP.treatment_config_field_differences(args()),
+            {
+                "netem_c2s.loss_model.key_offset": LOOP.FEC_DATA_ENVELOPE_BYTES,
+                "netem_s2c.loss_model.key_offset": LOOP.FEC_DATA_ENVELOPE_BYTES,
+            },
+        )
+        # Turning FEC off on the candidate shifts the key the other way.
+        self.assertEqual(
+            LOOP.treatment_config_field_differences(
+                args(fec=True, candidate_fec="off")
+            ),
+            {
+                "netem_c2s.loss_model.key_offset": -LOOP.FEC_DATA_ENVELOPE_BYTES,
+                "netem_s2c.loss_model.key_offset": -LOOP.FEC_DATA_ENVELOPE_BYTES,
+            },
+        )
+        # A lane whose netem loss does not key on the envelope declares
+        # nothing, and a treatment that does not move FEC declares nothing.
+        self.assertEqual(
+            LOOP.treatment_config_field_differences(
+                args(link_profile="fec-gaming-fat-pipe")
+            ),
+            {},
+        )
+        self.assertEqual(
+            LOOP.treatment_config_field_differences(args(candidate_fec="same")),
+            {},
+        )
 
     def test_parser_accepts_component_revisions_scenarios_and_treatments(self):
         parser = LOOP.build_parser()
@@ -1695,6 +1796,7 @@ class PerfLoopTest(unittest.TestCase):
                     candidate_dirs,
                     output_root,
                     allowed_config_mismatches=(),
+                    allowed_config_fields=None,
                 ):
                     if not missing:
                         (Path(output_root) / "comparison.json").write_text(
@@ -1792,6 +1894,7 @@ class PerfLoopTest(unittest.TestCase):
                     candidate_dirs,
                     output_root,
                     allowed_config_mismatches=(),
+                    allowed_config_fields=None,
                 ):
                     if not missing:
                         (Path(output_root) / "comparison.json").write_text(

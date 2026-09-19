@@ -1184,12 +1184,120 @@ def _retransmission_armor(value):
     return None
 
 
-def pair_config_agrees(baseline, candidate, allowed_config_mismatches=()):
+NETEM_CONFIG_KEYS = ("netem_c2s", "netem_s2c")
+
+
+def _split_top_level_fields(body):
+    """Split a Rust `Debug` field list on commas outside `{}`/`()` depth."""
+    fields = []
+    depth = 0
+    current = []
+    for char in body:
+        if char in "{(":
+            depth += 1
+        elif char in "})":
+            depth -= 1
+        if char == "," and depth == 0:
+            fields.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    fields.append("".join(current).strip())
+    return [field for field in fields if field]
+
+
+def parse_netem_fields(description):
+    """Flatten a Rust `Debug` `NetemConfig` into dotted leaf paths.
+
+    A struct field that itself renders as a struct keeps its discriminant as
+    its own leaf (so a variant change is named) and contributes its nested
+    scalar fields under a dotted path. Returns None when the description is
+    absent or not a parseable `NetemConfig { ... }` rendering, so an
+    unparseable config can never be field-compared into agreement.
+    """
+    text = description.strip()
+    prefix = "NetemConfig {"
+    if not text.startswith(prefix) or not text.endswith("}"):
+        return None
+    body = text[len(prefix) : -1].strip()
+    leaves = {}
+    for entry in _split_top_level_fields(body):
+        name, separator, value = entry.partition(":")
+        name = name.strip()
+        value = value.strip()
+        if not separator or not name or not value:
+            return None
+        if "{" in value:
+            leaves[name] = value[: value.index("{")].strip().rstrip("(").strip()
+            inner = value[value.index("{") + 1 : value.rindex("}")].strip()
+            for nested in _split_top_level_fields(inner):
+                nested_name, nested_separator, nested_value = nested.partition(":")
+                nested_name = nested_name.strip()
+                nested_value = nested_value.strip()
+                if not nested_separator or not nested_name or not nested_value:
+                    return None
+                leaves[f"{name}.{nested_name}"] = nested_value
+        else:
+            leaves[name] = value
+    return leaves
+
+
+def _signed_integer(value):
+    """Parse a signed integer leaf, or None when it is not one."""
+    text = str(value).strip()
+    if text.startswith(("+", "-")):
+        text = text[1:]
+    return int(text) if text.isdigit() else None
+
+
+def netem_config_mismatches(config_key, left, right, allowed_config_fields):
+    """Field-level netem mismatches between two arms.
+
+    Every leaf of the `NetemConfig` debug rendering is compared. A leaf named
+    in `allowed_config_fields` must differ by exactly its declared signed
+    integer delta; any other differing leaf is an undeclared mismatch named by
+    its dotted path. A description that cannot be parsed falls back to a
+    whole-key mismatch rather than being silently admitted.
+    """
+    if left == right:
+        return []
+    left_fields = parse_netem_fields(left) if left else None
+    right_fields = parse_netem_fields(right) if right else None
+    if left_fields is None or right_fields is None:
+        return [config_key]
+    mismatches = []
+    for path in sorted(set(left_fields) | set(right_fields)):
+        full = f"{config_key}.{path}"
+        left_value = left_fields.get(path)
+        right_value = right_fields.get(path)
+        if full in allowed_config_fields:
+            delta = allowed_config_fields[full]
+            left_integer = _signed_integer(left_value) if left_value is not None else None
+            right_integer = (
+                _signed_integer(right_value) if right_value is not None else None
+            )
+            if (
+                left_integer is None
+                or right_integer is None
+                or right_integer - left_integer != delta
+            ):
+                mismatches.append(full)
+        elif left_value != right_value:
+            mismatches.append(full)
+    return mismatches
+
+
+def pair_config_agrees(
+    baseline, candidate, allowed_config_mismatches=(), allowed_config_fields=None
+):
     """Compare every CONFIG_KEYS entry in order; only keys explicitly named
     by the frozen allowlist are suppressed. Only 'warmup_seconds' defaults
     (to '"0"'); an absent, non-boolean, or different 'retransmission_armor'
-    is always a mismatch unless explicitly allowed."""
+    is always a mismatch unless explicitly allowed. The two netem keys are
+    compared field by field so a declared leaf difference can be admitted
+    without admitting an undeclared one."""
     allowed = frozenset(allowed_config_mismatches)
+    allowed_fields = dict(allowed_config_fields or {})
     mismatches = []
     for key in CONFIG_KEYS:
         if key in allowed:
@@ -1206,6 +1314,10 @@ def pair_config_agrees(baseline, candidate, allowed_config_mismatches=()):
                 or left_boolean != right_boolean
             ):
                 mismatches.append(key)
+        elif key in NETEM_CONFIG_KEYS:
+            mismatches.extend(
+                netem_config_mismatches(key, left, right, allowed_fields)
+            )
         elif left != right and (left or right):
             mismatches.append(key)
     return mismatches
@@ -1864,7 +1976,12 @@ def guidance_hints(pairs, verdict):
     return hints
 
 
-def build_comparison(baseline_specs, candidate_specs, allowed_config_mismatches=()):
+def build_comparison(
+    baseline_specs,
+    candidate_specs,
+    allowed_config_mismatches=(),
+    allowed_config_fields=None,
+):
     runs = []
     for spec in baseline_specs:
         run = read_run(spec)
@@ -1888,6 +2005,7 @@ def build_comparison(baseline_specs, candidate_specs, allowed_config_mismatches=
             baseline["manifest"],
             candidate["manifest"],
             allowed_config_mismatches,
+            allowed_config_fields,
         )
         reasons = []
         reasons.extend(f"{key} mismatch" for key in mismatches)
@@ -1963,6 +2081,10 @@ def build_comparison(baseline_specs, candidate_specs, allowed_config_mismatches=
         "behavior_conditioned_observations": conditioned,
         "controller_activation_coverage": controller_activation_coverage(valid_pairs),
         "allowed_config_mismatches": list(allowed_config_mismatches),
+        "allowed_config_fields": [
+            f"{path}={delta}"
+            for path, delta in sorted(dict(allowed_config_fields or {}).items())
+        ],
         "agent_guidance": hints,
     }
 
@@ -2205,12 +2327,14 @@ def render_html(comparison, runs):
     allowed_mismatches = ", ".join(
         comparison["allowed_config_mismatches"]
     ) or "none"
+    allowed_fields = ", ".join(comparison["allowed_config_fields"]) or "none"
     readiness = (
         f"<p>verdict: {escape(comparison['verdict'])}; "
         f"{comparison['valid_pairs']} valid / {comparison['total_pairs']} "
         f"total pairs; evidence quality: "
         f"{escape(comparison['evidence_quality'])}; allowed config "
-        f"mismatches: {escape(allowed_mismatches)}</p>"
+        f"mismatches: {escape(allowed_mismatches)}; allowed config fields: "
+        f"{escape(allowed_fields)}</p>"
     )
 
     content = f"""<!doctype html>
@@ -2260,7 +2384,13 @@ def comparison_cannot_produce_a_verdict(comparison):
     )
 
 
-def render_comparison(baseline_specs, candidate_specs, output_dir, allowed_config_mismatches=()):
+def render_comparison(
+    baseline_specs,
+    candidate_specs,
+    output_dir,
+    allowed_config_mismatches=(),
+    allowed_config_fields=None,
+):
     output_dir = Path(output_dir)
     runs = []
     for spec in list(baseline_specs) + list(candidate_specs):
@@ -2268,7 +2398,10 @@ def render_comparison(baseline_specs, candidate_specs, output_dir, allowed_confi
         run["role"] = "baseline" if spec in baseline_specs else "candidate"
         runs.append(run)
     comparison = build_comparison(
-        baseline_specs, candidate_specs, allowed_config_mismatches
+        baseline_specs,
+        candidate_specs,
+        allowed_config_mismatches,
+        allowed_config_fields,
     )
     content = render_html(comparison, runs)
     if comparison["valid_pairs"] > 0 and "<svg" not in content:
@@ -2285,6 +2418,21 @@ def render_comparison(baseline_specs, candidate_specs, output_dir, allowed_confi
         render_html(comparison, runs), encoding="utf-8"
     )
     return output_dir, comparison
+
+
+def parse_config_field(value):
+    path, separator, delta = value.partition("=")
+    if not separator or not path:
+        raise argparse.ArgumentTypeError(
+            "--allow-config-field must be PATH=SIGNED_INTEGER"
+        )
+    try:
+        parsed = int(delta)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--allow-config-field delta must be an integer, got {delta!r}"
+        )
+    return path, parsed
 
 
 def parse_spec(value):
@@ -2327,6 +2475,19 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--allow-config-field",
+        action="append",
+        type=parse_config_field,
+        default=[],
+        metavar="PATH=SIGNED_INTEGER",
+        help=(
+            "permit this netem CONFIG_KEYS leaf to differ by exactly the signed "
+            "integer delta (repeatable; e.g. "
+            "netem_c2s.loss_model.key_offset=10). Every other leaf stays a "
+            "mismatch, so a declared treatment cannot hide an undeclared change"
+        ),
+    )
+    parser.add_argument(
         "--report-only",
         action="store_true",
         help=(
@@ -2343,6 +2504,7 @@ def main(argv=None):
         args.candidate,
         args.out,
         tuple(args.allow_config_mismatch),
+        dict(args.allow_config_field),
     )
     if not args.report_only and comparison_cannot_produce_a_verdict(comparison):
         print(

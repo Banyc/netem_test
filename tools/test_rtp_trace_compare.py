@@ -1355,6 +1355,107 @@ class TraceCompareTest(unittest.TestCase):
             ["mss_bytes"],
         )
 
+    def test_declared_netem_field_admits_only_its_exact_delta(self):
+        raw = (
+            "NetemConfig { latency: 300ms, jitter: 0ns, delay_corr: 0, "
+            "loss: 214748364, loss_corr: 0, duplicate: 0, dup_corr: 0, "
+            "reorder: 0, reorder_corr: 0, reorder_gap_pkts: 0, "
+            "loss_model: PacketKeyed { key_offset: 1 }, rate: 50000000, "
+            "seed: 11, queue_limit_pkts: 1024, max_datagram_size: 0 }"
+        )
+        enveloped = raw.replace("key_offset: 1 }", "key_offset: 11 }")
+        baseline = {
+            "warmup_seconds": "0",
+            "window_seconds": "30",
+            "mss_bytes": "8192",
+            "retransmission_armor": "false",
+            "rtp_handshake": "false",
+            "fec": "false",
+            "instream_group_fec": "false",
+            "netem_c2s": raw,
+            "netem_s2c": raw,
+            "link_d": "link",
+            "perf_loop_profile": "release",
+        }
+        candidate = {
+            **baseline,
+            "fec": "true",
+            "netem_c2s": enveloped,
+            "netem_s2c": enveloped,
+        }
+        declared = {
+            "netem_c2s.loss_model.key_offset": 10,
+            "netem_s2c.loss_model.key_offset": 10,
+        }
+        # The deliberate FEC-envelope key shift is an undeclared mismatch until
+        # the treatment names exactly that leaf.
+        self.assertEqual(
+            COMPARE.pair_config_agrees(baseline, candidate, ("fec",)),
+            [
+                "netem_c2s.loss_model.key_offset",
+                "netem_s2c.loss_model.key_offset",
+            ],
+        )
+        self.assertEqual(
+            COMPARE.pair_config_agrees(baseline, candidate, ("fec",), declared),
+            [],
+        )
+        # The declared leaf is pinned to an exact signed delta.
+        wrong = {
+            "netem_c2s.loss_model.key_offset": 9,
+            "netem_s2c.loss_model.key_offset": 9,
+        }
+        self.assertEqual(
+            COMPARE.pair_config_agrees(baseline, candidate, ("fec",), wrong),
+            [
+                "netem_c2s.loss_model.key_offset",
+                "netem_s2c.loss_model.key_offset",
+            ],
+        )
+        # An undeclared netem difference on the same lane is still rejected and
+        # named by its dotted field.
+        shifted = enveloped.replace("latency: 300ms", "latency: 250ms")
+        undeclared = {**candidate, "netem_c2s": shifted, "netem_s2c": shifted}
+        self.assertEqual(
+            COMPARE.pair_config_agrees(baseline, undeclared, ("fec",), declared),
+            ["netem_c2s.latency", "netem_s2c.latency"],
+        )
+
+    def test_netem_difference_that_cannot_be_parsed_stays_a_whole_key_mismatch(self):
+        base = {
+            "retransmission_armor": "false",
+            "netem_c2s": "NetemConfig { latency: 1ms }",
+            "netem_s2c": "x",
+        }
+        self.assertEqual(
+            COMPARE.pair_config_agrees(base, {**base, "netem_c2s": "not-a-config"}),
+            ["netem_c2s"],
+        )
+
+    def test_parse_netem_fields_keeps_the_variant_and_leaf_paths(self):
+        fields = COMPARE.parse_netem_fields(
+            "NetemConfig { rate: 5, loss_model: PacketKeyed { key_offset: 11 } }"
+        )
+        self.assertEqual(fields["rate"], "5")
+        self.assertEqual(fields["loss_model"], "PacketKeyed")
+        self.assertEqual(fields["loss_model.key_offset"], "11")
+        self.assertIsNone(COMPARE.parse_netem_fields(""))
+        self.assertIsNone(COMPARE.parse_netem_fields("NetemConfig { broken }"))
+
+    def test_allow_config_field_parser_requires_a_signed_integer(self):
+        self.assertEqual(
+            COMPARE.parse_config_field("netem_c2s.loss_model.key_offset=10"),
+            ("netem_c2s.loss_model.key_offset", 10),
+        )
+        self.assertEqual(
+            COMPARE.parse_config_field("netem_s2c.loss_model.key_offset=-10"),
+            ("netem_s2c.loss_model.key_offset", -10),
+        )
+        with self.assertRaises(Exception):
+            COMPARE.parse_config_field("netem_c2s.latency")
+        with self.assertRaises(Exception):
+            COMPARE.parse_config_field("netem_c2s.latency=fast")
+
     def test_retransmission_armor_mismatch_is_configuration_mismatch(self):
         base = {"retransmission_armor": "false"}
         self.assertEqual(

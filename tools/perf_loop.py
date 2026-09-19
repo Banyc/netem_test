@@ -669,10 +669,15 @@ def write_manifest(output_root, rows):
 
 
 def call_compare(
-    baseline_dirs, candidate_dirs, output_root, allowed_config_mismatches=()
+    baseline_dirs,
+    candidate_dirs,
+    output_root,
+    allowed_config_mismatches=(),
+    allowed_config_fields=None,
 ):
     """Run the paired comparison tool; the frozen allowlist suppresses only
-    the named CONFIG_KEYS that actually differ between the roles."""
+    the named CONFIG_KEYS that actually differ between the roles, and each
+    declared config field admits only its exact signed leaf delta."""
     command = ["python3", str(Path(__file__).with_name("rtp_trace_compare.py"))]
     for label, trace_dir in baseline_dirs:
         command += ["--baseline", f"{label}={trace_dir}"]
@@ -680,6 +685,8 @@ def call_compare(
         command += ["--candidate", f"{label}={trace_dir}"]
     for key in sorted(set(allowed_config_mismatches)):
         command += ["--allow-config-mismatch", key]
+    for path, delta in sorted(dict(allowed_config_fields or {}).items()):
+        command += ["--allow-config-field", f"{path}={delta}"]
     command += ["--out", str(output_root)]
     # The loop enforces the evidence contract itself (it inspects the written
     # comparison.json and names the exact reason), so it asks the raw tool for
@@ -1081,6 +1088,22 @@ def role_fec_configuration(args, role):
     }
 
 
+# The FEC data envelope prepended to each data packet; it shifts the
+# packet-keyed netem loss key on the FEC-on arm of the paired-saturated lane.
+# Must match `FEC_DATA_ENVELOPE_BYTES` in
+# `tests/tests/support/presets.rs::fec_paired_saturated_bottleneck`.
+FEC_DATA_ENVELOPE_BYTES = 10
+
+# Lanes whose netem loss is keyed to the logical RTP sequence and therefore
+# shifts with the FEC envelope. The lane set only decides *whether* the
+# treatment has a mechanical consequence; the consequence itself is declared
+# below as a value-checked leaf delta, so an undeclared netem change on these
+# lanes is still a mismatch.
+FEC_PACKET_KEYED_LANES = frozenset(
+    {"fec-paired-saturated", "fec-paired-saturated-bottleneck"}
+)
+
+
 def treatment_config_differences(args):
     """CONFIG_KEYS that actually differ between the treatment roles.
 
@@ -1094,6 +1117,30 @@ def treatment_config_differences(args):
         for key in ("fec", "instream_group_fec")
         if baseline[key] != candidate[key]
     )
+
+
+def treatment_config_field_differences(args):
+    """Declared netem leaf differences the FEC treatment mechanically shifts.
+
+    The runtime FEC envelope prepends bytes to the data packet, so a
+    packet-keyed loss model on the paired-saturated lanes must move its key
+    offset by exactly the envelope size on the FEC-on arm. Only that exact
+    signed delta on the exact leaf is declared; every other netem leaf remains
+    an undeclared mismatch naming its field. The declaration tracks the actual
+    role FEC flags, so a treatment that does not move FEC declares nothing.
+    """
+    if args.link_profile not in FEC_PACKET_KEYED_LANES:
+        return {}
+    baseline = role_fec_configuration(args, "baseline")
+    candidate = role_fec_configuration(args, "candidate")
+    moved = int(bool(candidate["fec"])) - int(bool(baseline["fec"]))
+    if moved == 0:
+        return {}
+    delta = moved * FEC_DATA_ENVELOPE_BYTES
+    return {
+        "netem_c2s.loss_model.key_offset": delta,
+        "netem_s2c.loss_model.key_offset": delta,
+    }
 
 
 def command_run(args):
@@ -1123,6 +1170,7 @@ def command_run(args):
                 "prebuilt role executables would break the single-binary contract"
             )
         mismatches = treatment_config_differences(args)
+        field_mismatches = treatment_config_field_differences(args)
         if not mismatches:
             raise SystemExit(
                 "--same-workspace-treatment requires an explicit role difference; "
@@ -1131,6 +1179,7 @@ def command_run(args):
             )
     else:
         mismatches = ()
+        field_mismatches = {}
         if args.candidate_fec != "same":
             raise SystemExit(
                 "--candidate-fec on|off requires --same-workspace-treatment; a "
@@ -1335,6 +1384,7 @@ def command_run(args):
         candidate_dirs,
         output_root,
         allowed_config_mismatches=mismatches,
+        allowed_config_fields=field_mismatches,
     )
     comparison_path = output_root / "comparison.json"
     comparison = {}
@@ -1380,6 +1430,10 @@ def command_run(args):
         "scenario": args.scenario,
         "same_workspace_treatment": bool(args.same_workspace_treatment),
         "allowed_config_mismatches": sorted(mismatches),
+        "allowed_config_fields": [
+            f"{path}={delta}"
+            for path, delta in sorted(field_mismatches.items())
+        ],
         "baseline": str(baseline),
         "candidate": str(candidate),
         "label": args.label,
