@@ -2762,28 +2762,60 @@ mod tests {
 
     #[test]
     fn limit_decisions_consume_no_prng_draws() {
+        // Jitter makes every accepted enqueue draw a delay sample, and a
+        // non-zero reorder gap makes it draw a reorder decision, so this
+        // config genuinely moves the PRNG on the accepted path. (With the
+        // original zero-jitter, zero-gap config *no* code path drew from the
+        // RNG, so the "unchanged" assertion held no matter what tail-drop
+        // did; the positive control below restores its discriminating power.)
         let config = NetemConfig {
-            latency: Duration::from_secs(1),
+            latency: Duration::from_millis(10),
+            jitter: Duration::from_millis(2),
+            reorder_gap_pkts: 2,
+            reorder: u32::MAX,
             queue_limit_pkts: 1,
+            seed: 7,
             ..Default::default()
         };
-        // Gap/reorder/reorder_corr are zero so no reorder draws happen anyway;
-        // this test primarily exercises that tail-drop returns early.
         let (mut runner, sent) = one_packet_runner(
             b"a",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
             config,
         );
+        let clock = sent.clock();
         let rng_before = runner.pipeline.rng;
+        // The queue already holds the first packet, so this one is tail-dropped
+        // before any delay/reorder draw.
         runner.handle_datagram(
             b"overflow",
             SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
-            Instant::now(),
+            clock.now(),
         );
+        assert_eq!(runner.pipeline.stats.snapshot().overflow_dropped, 1);
         assert_eq!(runner.pipeline.rng.s1, rng_before.s1);
         assert_eq!(runner.pipeline.rng.s2, rng_before.s2);
         assert_eq!(runner.pipeline.rng.s3, rng_before.s3);
         assert_eq!(runner.pipeline.rng.s4, rng_before.s4);
+        // Positive control: once the queued packet drains, an accepted enqueue
+        // must consume a draw. If it does not, the assertion above is vacuous.
+        clock.advance(Duration::from_millis(20));
+        runner.drain_ready(clock.now());
+        assert_eq!(runner.pipeline.queue.len(), 0);
+        runner.handle_datagram(
+            b"accepted",
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234)),
+            clock.now(),
+        );
+        assert_ne!(
+            (
+                runner.pipeline.rng.s1,
+                runner.pipeline.rng.s2,
+                runner.pipeline.rng.s3,
+                runner.pipeline.rng.s4,
+            ),
+            (rng_before.s1, rng_before.s2, rng_before.s3, rng_before.s4),
+            "an accepted enqueue must draw from the PRNG, or the overflow no-draw assertion is vacuous"
+        );
         drop(sent);
     }
 
@@ -4259,5 +4291,204 @@ mod tests {
             max_exit <= expected + Duration::from_micros(50),
             "duplicated serialization: max exit {max_exit:?} after {expected:?}"
         );
+    }
+
+    // ──────────────── fault-injection liveness proofs ────────────────
+
+    /// Drive `count` payloads through the direct stochastic pipeline (the
+    /// path a no-scheduling duplicate/loss config selects) and return
+    /// `(dropped, duplicated)`. Every draw comes from the seeded PRNG, so two
+    /// configs that differ only in a correlation knob must yield different
+    /// counts.
+    fn stochastic_outcomes(config: NetemConfig, count: usize) -> (u64, u64) {
+        let (mut runner, sent) = mock_runner(config);
+        let dst = Some(sent.local_addr().unwrap());
+        for i in 0..count {
+            let payload = (i as u32).to_le_bytes();
+            runner
+                .pipeline
+                .forward_stochastic_direct(&payload, dst, &*sent);
+        }
+        let stats = runner.pipeline.stats.snapshot();
+        drop(sent);
+        (stats.dropped, stats.duplicated)
+    }
+
+    /// Count reordered packets over 256 heap-path enqueues for a config whose
+    /// only stochastic draw is the reorder decision.
+    fn reordered_count(reorder_corr: u32) -> u64 {
+        let config = NetemConfig {
+            reorder: u32::MAX / 2,
+            reorder_corr,
+            reorder_gap_pkts: 2,
+            seed: 7,
+            ..NetemConfig::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        let clock = sent.clock();
+        let dst = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234));
+        for i in 0..256u32 {
+            runner.handle_datagram(&i.to_le_bytes(), dst, clock.now());
+        }
+        let n = runner.pipeline.stats.snapshot().reordered;
+        drop(sent);
+        n
+    }
+
+    /// `loss_corr` must change the loss decision. A fully correlated
+    /// correlator reproduces its zero-initialised memory as a constant draw,
+    /// so every packet is lost; iid loss of the same average rate drops only a
+    /// fraction. Same seed, one knob different.
+    #[test]
+    fn loss_correlation_changes_the_drop_pattern() {
+        let base = NetemConfig {
+            loss: u32::MAX / 4,
+            seed: 7,
+            ..NetemConfig::default()
+        };
+        let iid = stochastic_outcomes(base.clone(), 512).0;
+        let correlated = stochastic_outcomes(
+            NetemConfig {
+                loss_corr: u32::MAX,
+                ..base
+            },
+            512,
+        )
+        .0;
+        assert!(
+            iid > 0 && iid < 512,
+            "iid loss must drop a fraction, not all or none, got {iid}"
+        );
+        assert_eq!(
+            correlated, 512,
+            "a fully correlated correlator must reproduce its constant draw and drop every packet"
+        );
+    }
+
+    /// `dup_corr` must change the duplication decision, exactly as
+    /// `loss_corr` does for loss.
+    #[test]
+    fn duplication_correlation_changes_the_duplicate_pattern() {
+        let base = NetemConfig {
+            duplicate: u32::MAX / 4,
+            seed: 7,
+            ..NetemConfig::default()
+        };
+        let iid = stochastic_outcomes(base.clone(), 512).1;
+        let correlated = stochastic_outcomes(
+            NetemConfig {
+                dup_corr: u32::MAX,
+                ..base
+            },
+            512,
+        )
+        .1;
+        assert!(
+            iid > 0 && iid < 512,
+            "iid duplication must duplicate a fraction, not all or none, got {iid}"
+        );
+        assert_eq!(
+            correlated, 512,
+            "a fully correlated correlator must duplicate every packet"
+        );
+    }
+
+    /// `delay_corr` must change the sampled delays: iid jitter spreads them
+    /// across `latency ± jitter`, while the fully correlated constant draw
+    /// pins every delay to `latency - jitter`.
+    #[test]
+    fn delay_correlation_changes_the_sampled_delays() {
+        let samples = |delay_corr: u32| {
+            let config = NetemConfig {
+                latency: Duration::from_millis(50),
+                jitter: Duration::from_millis(40),
+                delay_corr,
+                seed: 7,
+                ..NetemConfig::default()
+            };
+            let mut rng = RndState::seed(config.seed);
+            let mut cor = CorRng::new(config.delay_corr);
+            (0..64)
+                .map(|_| sample_delay(&config, &mut rng, &mut cor))
+                .collect::<Vec<_>>()
+        };
+        let iid = samples(0);
+        let correlated = samples(u32::MAX);
+        let distinct = iid.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(
+            distinct > 1,
+            "iid jitter must produce a spread of delays, got {iid:?}"
+        );
+        assert!(
+            correlated.iter().all(|d| *d == Duration::from_millis(10)),
+            "a fully correlated correlator must pin every delay to latency - jitter, got {correlated:?}"
+        );
+    }
+
+    /// `reorder_corr` must change the reorder decision pattern.
+    #[test]
+    fn reorder_correlation_changes_the_reorder_pattern() {
+        let iid = reordered_count(0);
+        let correlated = reordered_count(u32::MAX);
+        assert!(
+            iid > 0 && iid < 256,
+            "iid reorder must reorder a fraction of the 256 packets, got {iid}"
+        );
+        assert_ne!(
+            iid, correlated,
+            "the reorder correlation knob must change the reorder pattern (both {iid})"
+        );
+    }
+
+    /// The byte counters must actually track the payload lengths the transport
+    /// moves, not merely increment. (`received_bytes` / `forwarded_bytes` were
+    /// previously written to the perf-trace CSV but never asserted on.)
+    #[test]
+    fn byte_counters_track_payload_lengths() {
+        let (runner, sent) = mock_runner(NetemConfig::default());
+        let dst = Some(sent.local_addr().unwrap());
+        assert!(runner.pipeline.forward_direct(&[0u8; 100], dst, &*sent));
+        assert!(runner.pipeline.forward_direct(&[0u8; 24], dst, &*sent));
+        let stats = runner.pipeline.stats.snapshot();
+        assert_eq!(stats.received, 2);
+        assert_eq!(stats.forwarded, 2);
+        assert_eq!(stats.received_bytes, 124);
+        assert_eq!(stats.forwarded_bytes, 124);
+        drop(sent);
+    }
+
+    /// The two doubles the deterministic pipeline tests rest on must be live:
+    /// the in-memory transport must genuinely receive what is queued for it,
+    /// and the injected clock must genuinely hold a queued packet until it is
+    /// advanced.
+    #[test]
+    fn mock_transport_and_injected_clock_are_live() {
+        let (mut runner, sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(5),
+            ..NetemConfig::default()
+        });
+        let clock = sent.clock();
+        let dst = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        // The mock dequeues what it was told to receive.
+        sent.push_recv(b"from-network".to_vec(), dst);
+        let mut buf = [0u8; 32];
+        let (n, from) = sent.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"from-network");
+        assert_eq!(from, dst);
+        // A queued packet is held until the emulated clock passes its deadline.
+        runner.handle_datagram(b"held", dst, clock.now());
+        runner.drain_ready(clock.now());
+        assert_eq!(
+            sent.sent.lock().unwrap().len(),
+            0,
+            "a packet inside its latency must not be forwarded before the clock advances"
+        );
+        clock.advance(Duration::from_millis(10));
+        runner.drain_ready(clock.now());
+        let delivered = sent.sent.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, b"held");
+        drop(delivered);
+        drop(sent);
     }
 }
