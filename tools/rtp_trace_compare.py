@@ -16,6 +16,7 @@ import importlib.util
 import json
 import math
 import statistics
+import sys
 from pathlib import Path
 
 COMPARISON_SCHEMA_VERSION = 38
@@ -2245,6 +2246,20 @@ th, td {{ text-align: left; border-bottom: 1px solid #e5e7eb; padding: .4rem .55
     return content
 
 
+def comparison_cannot_produce_a_verdict(comparison):
+    """True when the comparison has no evidence that can support a verdict.
+
+    A verdict of ``insufficient_evidence`` means no valid seed pair survived
+    trace-health and configuration filtering, and ``invalid`` overall quality
+    means at least one role's trace is corrupt; neither can support a verdict,
+    so a direct caller must not read a zero exit as success.
+    """
+    return (
+        comparison.get("evidence_quality") == "invalid"
+        or comparison.get("verdict") == "insufficient_evidence"
+    )
+
+
 def render_comparison(baseline_specs, candidate_specs, output_dir, allowed_config_mismatches=()):
     output_dir = Path(output_dir)
     runs = []
@@ -2269,7 +2284,7 @@ def render_comparison(baseline_specs, candidate_specs, output_dir, allowed_confi
     (output_dir / "comparison.html").write_text(
         render_html(comparison, runs), encoding="utf-8"
     )
-    return output_dir
+    return output_dir, comparison
 
 
 def parse_spec(value):
@@ -2282,7 +2297,7 @@ def parse_spec(value):
     return label, source, "rtp.csv"
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--baseline",
@@ -2311,17 +2326,37 @@ def main():
             "(repeatable; only explicitly named keys are suppressed)"
         ),
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "write the comparison artifacts and exit 0 even when the evidence "
+            "cannot support a verdict; by default the tool exits 2 instead so a "
+            "direct caller cannot read success from invalid evidence"
+        ),
+    )
+    args = parser.parse_args(argv)
     if not args.baseline or not args.candidate:
         parser.error("at least one --baseline and one --candidate trace are required")
-    output_dir = render_comparison(
+    output_dir, comparison = render_comparison(
         args.baseline,
         args.candidate,
         args.out,
         tuple(args.allow_config_mismatch),
     )
+    if not args.report_only and comparison_cannot_produce_a_verdict(comparison):
+        print(
+            "error: refusing to report success: the comparison cannot produce a "
+            f"verdict (evidence_quality={comparison.get('evidence_quality')!r}, "
+            f"verdict={comparison.get('verdict')!r}); the artifacts were written "
+            "to "
+            f"{output_dir}. Pass --report-only to accept them and exit 0 anyway.",
+            file=sys.stderr,
+        )
+        return 2
     print(output_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

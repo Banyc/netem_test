@@ -653,6 +653,17 @@ The `perf-loop` subcommands:
 - `4` — only with `--fail-on-control-instability` and an unstable
   same-binary `control_calibration`.
 
+The raw comparison tool (`tools/rtp_trace_compare.py`) carries the same
+evidence contract when invoked directly: it exits `0` only when it produced a
+comparison that can support a verdict, and exits `2` with a message naming the
+problem when the comparison cannot produce one (overall `evidence_quality`
+`invalid`, or verdict `insufficient_evidence`). The artifacts are still
+written on the failing path so a caller can inspect them; pass `--report-only`
+to accept those artifacts and exit `0` anyway. `perf_loop.call_compare` always
+passes `--report-only` because the loop inspects the written `comparison.json`
+and enforces (and names) the evidence contract itself, so its own exit codes
+and reasons are unchanged.
+
 The verdict is a consistency label over valid seed-paired evidence only; it
 is not statistical confidence or causality. Every agent hint carries a
 `does_not_prove` constraint and no hint identifies a specific branch as

@@ -657,6 +657,10 @@ def call_compare(
     for key in sorted(set(allowed_config_mismatches)):
         command += ["--allow-config-mismatch", key]
     command += ["--out", str(output_root)]
+    # The loop enforces the evidence contract itself (it inspects the written
+    # comparison.json and names the exact reason), so it asks the raw tool for
+    # the artifacts on every outcome rather than short-circuiting on its exit.
+    command += ["--report-only"]
     result = subprocess.run(command, capture_output=True, text=True)
     return result
 

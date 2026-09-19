@@ -731,6 +731,52 @@ class PerfLoopTest(unittest.TestCase):
         self.assertFalse(plain.fec)
         self.assertFalse(plain.retransmission_armor)
 
+    def test_call_compare_requests_report_only_and_the_fec_allowlist(self):
+        captured = {}
+
+        def fake_run(command, capture_output=True, text=True):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(LOOP.subprocess, "run", fake_run):
+            LOOP.call_compare(
+                [("base-11", "/traces/b")],
+                [("cand-11", "/traces/c")],
+                Path("/safe/out"),
+                ("fec",),
+            )
+        command = captured["command"]
+        self.assertEqual(command[0], "python3")
+        self.assertEqual(command[1], str(TOOLS.with_name("rtp_trace_compare.py")))
+        self.assertIn("base-11=/traces/b", command)
+        self.assertIn("cand-11=/traces/c", command)
+        self.assertEqual(command[command.index("--allow-config-mismatch") + 1], "fec")
+        # The loop enforces the evidence contract itself, so it always asks
+        # the raw tool for the artifacts rather than fail on its exit code.
+        self.assertIn("--report-only", command)
+
+    def test_call_compare_sorts_and_deduplicates_the_allowlist(self):
+        captured = {}
+
+        def fake_run(command, capture_output=True, text=True):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(LOOP.subprocess, "run", fake_run):
+            LOOP.call_compare(
+                [("b", "/b")],
+                [("c", "/c")],
+                Path("/safe/out"),
+                ("instream_group_fec", "fec", "fec"),
+            )
+        command = captured["command"]
+        keys = [
+            command[index + 1]
+            for index, item in enumerate(command)
+            if item == "--allow-config-mismatch"
+        ]
+        self.assertEqual(keys, ["fec", "instream_group_fec"])
+
     def test_run_parser_accepts_clean_link_and_rejects_nonpositive_mss(self):
         parser = LOOP.build_parser()
         snapshot = parser.parse_args(

@@ -2,10 +2,12 @@
 
 import csv
 import importlib.util
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from unittest import mock
 from pathlib import Path
 
@@ -1214,6 +1216,44 @@ class TraceCompareTest(unittest.TestCase):
             with_wire["wire_bytes_per_delivered_byte"], 8000.0 / (1024 ** 3)
         )
         self.assertEqual(with_wire["scheduled_drain_packets"], 10.0)
+
+    def test_comparison_cli_exit_code_reflects_the_evidence(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            good_before = root / "gb"
+            good_after = root / "ga"
+            self.write_trace(good_before, "b", "1.0", 11, 12)
+            self.write_trace(good_after, "a", "1.1", 11, 12)
+            broken = root / "broken"
+            self.write_trace(broken, "x", "1.0", 11, 12, broken=True)
+
+            def run(baseline, candidate, out, *extra):
+                stderr = io.StringIO()
+                argv = [
+                    "--baseline", f"b-1={baseline}",
+                    "--candidate", f"c-1={candidate}",
+                    "--out", str(root / out),
+                ] + list(extra)
+                with redirect_stderr(stderr):
+                    code = COMPARE.main(argv)
+                return code, stderr.getvalue()
+
+            healthy_code, healthy_err = run(good_before, good_after, "o1")
+            self.assertEqual(healthy_code, 0)
+            self.assertEqual(healthy_err, "")
+
+            invalid_code, invalid_err = run(broken, broken, "o2")
+            self.assertEqual(invalid_code, 2)
+            self.assertIn("refusing to report success", invalid_err)
+            self.assertIn("insufficient_evidence", invalid_err)
+            # The artifacts are still written so a caller can inspect them.
+            self.assertTrue((root / "o2" / "comparison.json").is_file())
+
+            # --report-only is the explicit opt-out for a caller that wants
+            # the JSON on invalid input.
+            report_code, report_err = run(broken, broken, "o3", "--report-only")
+            self.assertEqual(report_code, 0)
+            self.assertEqual(report_err, "")
 
     def test_explicit_fec_treatment_allows_only_its_declared_difference(self):
         baseline = {
