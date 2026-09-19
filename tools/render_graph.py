@@ -81,18 +81,32 @@ class RenderGraphError(Exception):
 def extract_svg_panels(html: str) -> list[str]:
     """Return the text of every ``<svg ...>`` panel opening, in order.
 
-    Each panel spans from an ``<svg ...>`` opening tag to its ``</svg>`` close;
-    an opening with no close returns the remainder of the document so that
-    ``validate_panel`` can flag the missing close instead of silently dropping
-    the panel (which would look like a graph that was never generated).
+    Each panel spans from an ``<svg ...>`` opening tag to its own ``</svg>``
+    close. The close must come before the next opening tag: when a panel's
+    close is removed mid-document, the following panel's close would otherwise
+    silently terminate it, and the panel would be emitted as a concatenation of
+    two charts while still carrying drawable series. In that case the span is
+    emitted without a close so ``validate_panel`` flags it as truncated. An
+    opening with no close at all returns the remainder of the document for the
+    same reason.
     """
     panels = []
-    for match in SVG_OPEN_RE.finditer(html):
-        end = html.find(SVG_CLOSE, match.start())
-        if end < 0:
+    position = 0
+    while True:
+        match = SVG_OPEN_RE.search(html, position)
+        if match is None:
+            break
+        close = html.find(SVG_CLOSE, match.start())
+        if close < 0:
             panels.append(html[match.start():])
-        else:
-            panels.append(html[match.start():end + len(SVG_CLOSE)])
+            break
+        next_open = SVG_OPEN_RE.search(html, match.end())
+        if next_open is not None and next_open.start() < close:
+            panels.append(html[match.start():next_open.start()])
+            position = next_open.start()
+            continue
+        panels.append(html[match.start():close + len(SVG_CLOSE)])
+        position = close + len(SVG_CLOSE)
     return panels
 
 
@@ -124,8 +138,14 @@ def panel_series_count(panel: str) -> int:
 def validate_panel(index: int, panel: str) -> list[str]:
     """Return the problems that make this panel unusable as evidence."""
     problems = []
+    openings = len(SVG_OPEN_RE.findall(panel))
     if SVG_CLOSE not in panel:
         problems.append(f"panel {index}: missing </svg> close tag (truncated panel)")
+    elif openings != 1:
+        problems.append(
+            f"panel {index}: {openings} <svg> opening tags; a panel must be one "
+            "SVG document, so a missing close concatenated the next panel"
+        )
     if panel_series_count(panel) <= 0:
         problems.append(
             f"panel {index}: no series data (an empty chart is not a graph)"

@@ -112,6 +112,40 @@ class RenderGraphTest(unittest.TestCase):
         panels = RENDER.extract_svg_panels(f"<html><body>{UNTERMINATED_PANEL}</body></html>")
         self.assertEqual(len(panels), 1)
 
+    def test_a_removed_middle_close_is_not_terminated_by_the_next_panel(self):
+        # The middle panel loses its own close tag. The next panel's close
+        # must not be allowed to terminate it, which would emit a panel that
+        # is really two charts concatenated.
+        broken = "<html><body>" + HEALTHY_PANEL + HEALTHY_PANEL[:-6] + HEALTHY_PANEL + "</body></html>"
+        panels = RENDER.extract_svg_panels(broken)
+        self.assertEqual(len(panels), 3)
+        self.assertEqual([panel.count("<svg") for panel in panels], [1, 1, 1])
+        # The damaged panel is reported, not silently concatenated.
+        problems = RENDER.validate_panel(1, panels[1])
+        self.assertTrue(any("missing </svg>" in problem for problem in problems))
+
+    def test_a_removed_middle_close_fails_the_whole_render(self):
+        html = self.write_html(
+            "<html><body>" + HEALTHY_PANEL + HEALTHY_PANEL[:-6] + HEALTHY_PANEL + "</body></html>"
+        )
+        message = self.assertRaisesMessage(
+            RENDER.RenderGraphError,
+            "missing </svg> close tag",
+            RENDER.render_panels,
+            html,
+            self.root / "out",
+            rasterize=False,
+        )
+        self.assertIn("panel 1", message)
+
+    def test_a_panel_with_nested_openings_is_an_error(self):
+        # Defense in depth: even if an extractor handed back a concatenation,
+        # validate_panel refuses a panel that is not exactly one SVG document.
+        concatenated = HEALTHY_PANEL + HEALTHY_PANEL
+        problems = RENDER.validate_panel(4, concatenated)
+        self.assertTrue(any("panel 4" in problem for problem in problems))
+        self.assertTrue(any("opening tags" in problem for problem in problems))
+
     # -- series-data check -------------------------------------------------
 
     def test_series_count_is_positive_for_a_real_panel(self):
