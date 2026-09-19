@@ -275,12 +275,19 @@ async fn unpadded_wire_sizes_stay_multimodal() {
 /// Fitted ACK padding hides the ACK packets among the data packets: the
 /// tiny standalone-ACK cluster of the baseline disappears (or shrinks
 /// dramatically) while the large data peak is preserved.
-/// Independent trials per policy. A single transfer's standalone-ACK count is
-/// timing-dependent (an ACK flush whose fitted data-size sample window has
-/// expired goes out unpadded by design), so the shrink comparison aggregates
-/// several trials and compares stable totals instead of two noisy single-run
-/// counts.
-const ACK_PADDING_TRIALS: usize = 4;
+///
+/// The standalone-ACK count is timing-dependent (an ACK flush whose fitted
+/// data-size sample window has expired goes out unpadded by design), so the
+/// shrink comparison pools several independent trials. Four trials were too
+/// few: the pooled 256 KiB fitted/baseline small-cluster ratio reached 0.554
+/// in earlier runs, and a 40-experiment release harness on this host still
+/// reproduced a 1/40 failure rate (the audit saw ~1/25). Pooling 24 trials
+/// concentrated the ratio enough that 0/60 experiments in the same harness
+/// exceeded the < 0.5 bound under load average ~10, while the neutralized
+/// policy (`AckMimicsData` -> `None`) failed 8/8 — so the bound still
+/// separates fitted from unpadded. The 256 KiB transfer keeps the added
+/// default-tier cost near two seconds.
+const ACK_PADDING_TRIALS: usize = 24;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
