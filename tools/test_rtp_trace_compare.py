@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).with_name("rtp_trace_compare.py")
@@ -1590,6 +1591,87 @@ class TraceCompareTest(unittest.TestCase):
         )
         self.assertEqual(summary_no_bytes["ack_flush_claims_total"], 20.0)
         self.assertIsNone(summary_no_bytes["ack_flush_claims_total_per_gib_delivered"])
+
+    def test_csv_rows_well_formed_rejects_short_control_and_non_finite_fields(self):
+        self.assertTrue(
+            COMPARE.csv_rows_well_formed(
+                [{"a": "1", "b": "", "c": "true", "d": "1.5e3", "e": "x"}]
+            )
+        )
+        # A short row (missing trailing field) is None under DictReader.
+        self.assertFalse(COMPARE.csv_rows_well_formed([{"a": "1", "b": None}]))
+        self.assertFalse(COMPARE.csv_rows_well_formed([{"a": "nan"}]))
+        self.assertFalse(COMPARE.csv_rows_well_formed([{"a": "inf"}]))
+        self.assertFalse(COMPARE.csv_rows_well_formed([{"a": "-infinity"}]))
+        self.assertFalse(COMPARE.csv_rows_well_formed([{"a": "x\x00y"}]))
+
+    def _corrupt_healthy_trace(self, trace, filename, mutate):
+        self.write_trace(trace, "cand-1", "1.0", 11, 12)
+        path = trace / filename
+        rows = list(csv.reader(path.open(newline="")))
+        mutate(rows)
+        self.write_csv(path, rows)
+        return COMPARE.read_run(("cand-1", trace))
+
+    def test_non_finite_numeric_field_invalidates_the_trace(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            trace = Path(directory) / "trace"
+
+            def mutate(rows):
+                rows[1][rows[0].index("delivered_bytes")] = "nan"
+
+            run = self._corrupt_healthy_trace(trace, "progress.csv", mutate)
+            self.assertFalse(run["health"]["checks"]["csv_fields_well_formed"])
+            self.assertEqual(run["health"]["evidence_quality"], "invalid")
+
+    def test_short_csv_row_invalidates_the_trace(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            trace = Path(directory) / "trace"
+            run = self._corrupt_healthy_trace(
+                trace, "rtp.csv", lambda rows: rows.__setitem__(1, rows[1][:-1])
+            )
+            self.assertFalse(run["health"]["checks"]["csv_fields_well_formed"])
+            self.assertEqual(run["health"]["evidence_quality"], "invalid")
+
+    def test_control_character_in_csv_field_invalidates_the_trace(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            trace = Path(directory) / "trace"
+            run = self._corrupt_healthy_trace(
+                trace,
+                "rtp.csv",
+                lambda rows: rows[1].__setitem__(0, rows[1][0] + "\x00"),
+            )
+            self.assertFalse(run["health"]["checks"]["csv_fields_well_formed"])
+            self.assertEqual(run["health"]["evidence_quality"], "invalid")
+
+    def test_render_refuses_a_graphless_comparison_with_valid_pairs(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            output = Path(directory) / "out"
+            with mock.patch.object(
+                COMPARE,
+                "build_comparison",
+                lambda *a, **k: {"valid_pairs": 1, "pairs": [], "runs": []},
+            ), mock.patch.object(
+                COMPARE, "render_html", lambda *a, **k: "<html></html>"
+            ):
+                with self.assertRaises(ValueError) as context:
+                    COMPARE.render_comparison([], [], output)
+            self.assertIn("no graph panel", str(context.exception))
+
+    def test_render_writes_graph_panels_for_a_healthy_pair(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            before = root / "before"
+            after = root / "after"
+            self.write_trace(before, "base-1", "1.0", 11, 12)
+            self.write_trace(after, "cand-1", "1.1", 11, 12)
+            output = root / "out"
+            COMPARE.render_comparison(
+                [("base-1", before)], [("cand-1", after)], output
+            )
+            content = (output / "comparison.html").read_text(encoding="utf-8")
+            self.assertIn("<svg", content)
+
 
 if __name__ == "__main__":
     unittest.main()

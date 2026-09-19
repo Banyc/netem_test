@@ -109,6 +109,32 @@ def read_manifest(trace_dir):
     return {row["key"]: row["value"] for row in read_csv(trace_dir / "manifest.csv")}
 
 
+def csv_rows_well_formed(rows):
+    """A trace CSV row must carry every declared field, embed no control
+    character, and hold no non-finite number.
+
+    A short row (missing field), an embedded NUL, or a NaN/Infinity would
+    otherwise be silently coerced to an absent value and let a corrupt
+    capture pass as healthy evidence.
+    """
+    for row in rows:
+        for value in row.values():
+            if value is None:
+                return False
+            if any(
+                ord(character) < 0x20 and character not in "\t\r\n"
+                for character in value
+            ):
+                return False
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(number):
+                return False
+    return True
+
+
 def optional_float(value):
     return None if value in (None, "") else float(value)
 
@@ -488,6 +514,9 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     checks["runner_succeeded"] = runner_exit in (None, 0)
     checks["rtp_readable"] = len(rtp) > 0
     checks["peer_readable"] = len(peer) > 0
+    checks["csv_fields_well_formed"] = all(
+        csv_rows_well_formed(rows) for rows in (rtp, peer, netem, progress)
+    )
     expected_rtp = metric_number(manifest.get("rtp_captured"))
     expected_peer = metric_number(manifest.get("rtp_peer_captured"))
     checks["capture_counts_match"] = (
@@ -540,6 +569,7 @@ def trace_health(trace_dir, manifest, rtp, peer, netem, progress):
     invalid_keys = {
         "rtp_readable",
         "peer_readable",
+        "csv_fields_well_formed",
         "schema_compatible",
         "task_completed",
         "endpoint_integrity",
@@ -2225,6 +2255,13 @@ def render_comparison(baseline_specs, candidate_specs, output_dir, allowed_confi
     comparison = build_comparison(
         baseline_specs, candidate_specs, allowed_config_mismatches
     )
+    content = render_html(comparison, runs)
+    if comparison["valid_pairs"] > 0 and "<svg" not in content:
+        raise ValueError(
+            "a comparison with valid pairs rendered no graph panel; refusing to "
+            "write a graphless comparison.html that a reader could mistake for "
+            "rendered evidence"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "comparison.json").write_text(
         json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8"
