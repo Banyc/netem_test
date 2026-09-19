@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
 use support::payload::cyclic_payload;
-use support::rtp::{rtp_connect_with_mss_fec_tuning_and_observer_via, spawn_rtp_byte_sink_server_via};
+use support::rtp::{
+    rtp_connect_with_mss_fec_tuning_and_observer_via, spawn_rtp_byte_sink_server_via,
+};
 use support::submit_test_task;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -90,8 +92,9 @@ async fn gentle_mode_exits_via_gate_open_after_a_standing_queue_drains() {
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
     let delivered = tasks
         .run(async {
-            let (sink_addr, delivered) =
-                spawn_rtp_byte_sink_server_via(&task_tx, false).await.unwrap();
+            let (sink_addr, delivered) = spawn_rtp_byte_sink_server_via(&task_tx, false)
+                .await
+                .unwrap();
             let pair = NetemPair::spawn(
                 sink_addr,
                 NetemConfig {
@@ -171,9 +174,7 @@ async fn gentle_mode_exits_via_gate_open_after_a_standing_queue_drains() {
         .await;
 
     let exits = gate_open_exits.load(Ordering::Relaxed);
-    eprintln!(
-        "[rtp_gentle] delivered={delivered} bytes; gentle_mode_exit_gate_open={exits}"
-    );
+    eprintln!("[rtp_gentle] delivered={delivered} bytes; gentle_mode_exit_gate_open={exits}");
     assert!(
         delivered > 0,
         "the connection must have delivered the backlog phase's bytes"
