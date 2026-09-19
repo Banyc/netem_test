@@ -46,11 +46,22 @@ re-read every iteration:
    `ready` lane. The interactive change is a no-op for the stock/bulk tuning
    (`fec_instream_flush == false`).
 5. **Read the generated graph (MUST) and the summary** — render the perf-loop
-   `comparison.html` and read the RTT-CDF / throughput plots (base ≈ cand for a
-   neutral change), not just the text verdict.
+   `comparison.html` with `tools/render_graph.py` and read the RTT-CDF /
+   throughput plots (base ≈ cand for a neutral change), not just the text
+   verdict. The tool asserts that panels exist and carry series data; a graph
+   that cannot be produced is a non-zero-exit error, not an empty file to skim
+   past.
 
-`/Users/charliesmith/code/tmp/rtp-loop/loop-report.sh` prints (1)(2)(4) and
-renders (5); `render-graph.sh` rasterises the SVGs via headless Chrome.
+```sh
+python3 tools/render_graph.py $TMPDIR/<run-output>/comparison.html \
+  --out $TMPDIR/<run-output>/graphs
+```
+
+`/Users/charliesmith/code/tmp/rtp-loop/loop-report.sh` prints (1)(2)(4). For
+(5), use the in-repo `tools/render_graph.py`; the old manual `render-graph.sh`
+that lived outside the repository in an unversioned scratch directory degraded
+silently (a missing graph produced a blank PNG and still exited zero), so it
+must not be relied on.
 
 ## The rtp-side in-process oracle
 

@@ -39,7 +39,10 @@ python3 tools/check-gate.py
 
 The long-running `perf-loop` battery (`tools/perf-loop`, lanes `clean`,
 `controller-fat-pipe`, `hostile`, `lossy-400kib`, `hostile-fat-pipe`) is a
-separate, much slower evidence path and is not part of `cargo test`.
+separate, much slower evidence path and is not part of `cargo test`. Its
+mandatory rendered-graph evidence is produced by `tools/render_graph.py`; a
+graph that cannot be produced is a non-zero-exit error, not an empty file to
+skim past (see `tools/PERF_LOOP.md`, "Rendered graph evidence (mandatory)").
 
 ## Default tier (runs in `cargo test -p tests`)
 

@@ -432,6 +432,9 @@ Every output, temporary, trace, log, and Cargo target resolves beneath
   manifest.
 - `<role>-<seed>.log` — streamed probe log.
 - `comparison.json` / `comparison.html` — schema-34 comparison and report.
+- `graphs/g*.svg` and `graphs/g*.png` — the verified rendered graph panels
+  produced from `comparison.html` by `tools/render_graph.py` (see "Rendered
+  graph evidence (mandatory)"). Missing or data-free panels are an error.
 - `{baseline,candidate}-probe-source.json` — probe source manifests binding
   each preserved executable's SHA-256 to exact component revisions.
 
@@ -590,6 +593,45 @@ lanes additionally carry `message_latency_p50_ms`/`p95`/`p99`,
 wire cost per delivered byte. Inspect the trace health, the paired deltas,
 and the one largest material change before trusting any `does_not_prove`-
 bounded verdict.
+
+## Rendered graph evidence (mandatory)
+
+The comparison HTML carries the graph evidence a reader must inspect before
+accepting a verdict: one `<svg>` panel per chart (rolling application goodput,
+the global raw-RTT CDF, and one baseline/candidate raw-RTT CDF per valid seed
+pair). Rendering those panels is a mandatory step of the capture loop, and it
+is performed by `tools/render_graph.py`:
+
+```sh
+python3 tools/render_graph.py $TMPDIR/<run-output>/comparison.html \
+  --out $TMPDIR/<run-output>/graphs
+```
+
+The tool extracts every `<svg>` panel, asserts that at least one panel was
+produced, asserts that every panel carries series data (a polyline with at
+least two points, a non-empty `<path>`, or a bar rect - an empty chart with
+only axes and a background is rejected), writes each panel as a standalone SVG,
+and prints the panel count. **A graph that cannot be produced is an error, not
+an empty file to skim past:** with no `<svg>` panel, or a missing/empty input,
+the tool exits non-zero and names the problem instead of reporting success.
+
+Rasterization to PNG needs an external headless browser (Chrome/Chromium). The
+SVG extraction and verification run fully in-repo and do not need one. When
+rasterization is requested (the default) and no browser can be found, the PNG
+step **fails loudly** with a non-zero exit and a message naming the missing
+browser, after the SVGs have already been written and verified; pass
+`--browser <path>` or set `NETEM_RENDER_BROWSER` to point at one, or pass
+`--no-rasterize` to accept SVG-only evidence explicitly. When a browser is used,
+every produced PNG is verified to be a real, non-degenerate PNG before the tool
+reports success.
+
+Do **not** rely on the old manual `render-graph.sh` that lived outside the
+repository in an unversioned scratch directory: it degraded silently - with no
+`<svg>` in the
+HTML the `g*.svg` glob stayed literal, Chrome rasterized the literal name into
+a blank PNG, and the script still exited zero while printing `svgs: N` without
+checking `N > 0`. The in-repo tool replaces it, and its checks are exercised by
+`python3 -m pytest tools/ -q`.
 
 ## Verdicts and exit codes
 
