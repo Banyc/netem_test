@@ -21,6 +21,14 @@ Each `perf` scenario's own source body is scanned for assertion tokens, so an
 asserting check filed under the report-only tier -- which would never run -- is
 an error that names the scenario.
 
+A token in a scenario's own body is not the whole story: an assertion moved one
+call away, into a helper the scenario calls, would escape that scan. The
+checker therefore also builds a crate-local call graph (regex + brace counting,
+no Rust parser) from every `perf` scenario and requires every asserting
+function it can reach to be declared in the `gate-perf-guard-helpers` block,
+with its assertion-token count. An unrecorded asserting helper, a changed
+token count, or a stale entry is an error.
+
 Usage:
     python3 tools/check-gate.py
 """
@@ -40,7 +48,12 @@ ASSERTING_TIERS = {"standard", "full"}
 ASSERTION_TOKENS = re.compile(
     r"(assert!|assert_eq!|assert_ne!|panic!|unreachable!)"
 )
-FN_RE = re.compile(r"\b(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(")
+FN_RE = re.compile(
+    r"\b(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\("
+)
+CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
+SUPPORT_DIR = TEST_DIR / "support"
+PKG_DIR = REPO / "tests"
 
 
 def manifest_block(name: str) -> str | None:
@@ -120,6 +133,261 @@ def body_asserts(target: str, name: str, bodies: dict[str, str]) -> bool:
     """True when the test function's own body contains an assertion token."""
     body = bodies.get(name)
     return bool(body) and ASSERTION_TOKENS.search(body) is not None
+
+
+def source_module(path: Path) -> str | None:
+    """Rust module path of a source file, or None when it is not crate-local."""
+    parts = path.relative_to(PKG_DIR).parts
+    if len(parts) == 2 and parts[0] == "tests":
+        return ""
+    if len(parts) == 3 and parts[0] == "tests" and parts[1] == "support":
+        stem = parts[2][:-3]
+        return "support" if stem == "mod" else f"support::{stem}"
+    return None
+
+
+class SourceFunction:
+    """A crate-local function: identity, owning module, name, and body."""
+
+    __slots__ = ("identity", "module", "name", "body")
+
+    def __init__(self, identity: str, module: str, name: str, body: str) -> None:
+        self.identity = identity
+        self.module = module
+        self.name = name
+        self.body = body
+
+
+def parse_functions(path: Path) -> list[SourceFunction]:
+    """Crate-local functions in ``path`` with brace-balanced bodies.
+
+    Regex plus brace counting, not a Rust parser: shared by the direct body scan
+    and the crate-local call graph so both agree on what a function body is.
+    """
+    module = source_module(path)
+    if module is None:
+        return []
+    text = path.read_text(encoding="utf-8")
+    seen: set[str] = set()
+    functions: list[SourceFunction] = []
+    for match in FN_RE.finditer(text):
+        start = text.find("{", match.end())
+        if start == -1:
+            continue
+        depth = 0
+        idx = start
+        while idx < len(text):
+            char = text[idx]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            idx += 1
+        name = match.group(1)
+        ident = f"{path.relative_to(PKG_DIR)}::{name}"
+        if ident in seen:
+            continue
+        seen.add(ident)
+        functions.append(SourceFunction(ident, module, name, text[start : idx + 1]))
+    return functions
+
+
+def normalize_module(base: str, current_module: str) -> str:
+    """Resolve a use-path prefix to a crate-root-absolute module path.
+
+    Handles the forms present in this crate: ``crate::...``, one or more
+    ``super::...`` levels, and plain ``support::...`` paths from the crate root.
+    """
+    segments = [segment for segment in base.split("::") if segment]
+    if not segments:
+        return current_module
+    if segments[0] == "crate":
+        return "::".join(segments[1:])
+    current = current_module.split("::") if current_module else []
+    index = 0
+    while index < len(segments) and segments[index] in ("super", "self"):
+        if segments[index] == "super" and current:
+            current = current[:-1]
+        index += 1
+    return "::".join(current + segments[index:])
+
+
+USE_RE = re.compile(r"^use\s+(.+?);", re.M | re.S)
+
+
+def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[str]]:
+    """Map each imported bare name to its module, plus ``super::*``-style globs."""
+    imports: dict[str, str] = {}
+    globs: list[str] = []
+    for match in USE_RE.finditer(text):
+        statement = match.group(1).strip()
+        if "{" in statement:
+            base, _, rest = statement.partition("{")
+            inner = rest.rsplit("}", 1)[0]
+            base_module = normalize_module(base.strip(), current_module)
+        else:
+            inner = statement
+            base_module = ""
+        for item in inner.split(","):
+            item = item.split(" as ", 1)[0].strip()
+            if not item:
+                continue
+            if item == "*":
+                if base_module:
+                    globs.append(base_module)
+                continue
+            if base_module:
+                imports[item] = base_module
+                continue
+            segments = item.split("::")
+            if len(segments) < 2:
+                continue
+            imports[segments[-1]] = normalize_module(
+                "::".join(segments[:-1]), current_module
+            )
+    return imports, globs
+
+
+def target_source_files(target: str) -> list[Path]:
+    """Source files compiled into the ``tests/<target>.rs`` integration target."""
+    files = [TEST_DIR / f"{target}.rs"]
+    text = files[0].read_text(encoding="utf-8")
+    if re.search(r"^mod support;", text, re.M):
+        files.extend(sorted(SUPPORT_DIR.glob("*.rs")))
+    return [path for path in files if path.exists()]
+
+
+def target_functions(paths: list[Path]) -> list[SourceFunction]:
+    functions: list[SourceFunction] = []
+    for path in paths:
+        functions.extend(parse_functions(path))
+    return functions
+
+
+class TargetGraph:
+    """Crate-local call graph for one integration target.
+
+    Edges are resolved with the caller file's ``use`` declarations before falling
+    back to a bare-name match, so same-named functions in different modules are
+    not confused (e.g. ``support::stats::summarize`` vs
+    ``support::contested::summarize``). A call whose target still cannot be
+    narrowed (no local definition, no import, several same-named functions) keeps
+    every candidate, so the graph over-approximates rather than dropping a direct
+    call. It cannot see an edge created by passing a function by name, through a
+    trait object, or generated by a macro.
+    """
+
+    def __init__(self, functions: list[SourceFunction], paths: list[Path]) -> None:
+        self.functions = {function.identity: function for function in functions}
+        self.by_name: dict[str, list[str]] = {}
+        self.by_module_name: dict[tuple[str, str], list[str]] = {}
+        self.imports: dict[str, dict[str, str]] = {}
+        self.globs: dict[str, list[str]] = {}
+        for function in functions:
+            self.by_name.setdefault(function.name, []).append(function.identity)
+            self.by_module_name.setdefault(
+                (function.module, function.name), []
+            ).append(function.identity)
+        for path in paths:
+            module = source_module(path)
+            if module is None:
+                continue
+            imports, globs = parse_imports(path.read_text(encoding="utf-8"), module)
+            self.imports.setdefault(module, {}).update(imports)
+            self.globs.setdefault(module, []).extend(globs)
+
+    def resolve(self, module: str, path: str) -> list[str]:
+        """Candidate identities for a call written as ``path(`` inside ``module``."""
+        name = path.rsplit("::", 1)[-1]
+        if "::" in path:
+            target_module = normalize_module(path.rsplit("::", 1)[0], module)
+            found = self.by_module_name.get((target_module, name))
+            if found:
+                return found
+        found = self.by_module_name.get((module, name))
+        if found:
+            return found
+        imported = self.imports.get(module, {}).get(name)
+        if imported is not None:
+            found = self.by_module_name.get((imported, name))
+            if found:
+                return found
+        for glob in self.globs.get(module, ()):
+            found = self.by_module_name.get((glob, name))
+            if found:
+                return found
+        return self.by_name.get(name, [])
+
+    def reachable(self, seeds: list[str]) -> set[str]:
+        seen: set[str] = set()
+        stack = list(seeds)
+        while stack:
+            ident = stack.pop()
+            function = self.functions.get(ident)
+            if function is None or ident in seen:
+                continue
+            seen.add(ident)
+            for call in CALL_RE.finditer(function.body):
+                for callee in self.resolve(function.module, call.group(1)):
+                    if callee not in seen:
+                        stack.append(callee)
+        return seen
+
+
+def helper_scan(manifest: dict[str, str]) -> tuple[dict[str, int], list[str]]:
+    """Asserting crate functions reachable from the perf tier, with token counts.
+
+    Returns ``(identity -> assertion_count, unlocatable_perf_scenarios)``.
+    """
+    perf_by_target: dict[str, list[str]] = {}
+    for name, tier in manifest.items():
+        if tier == "perf":
+            target, _, test = name.partition("::")
+            perf_by_target.setdefault(target, []).append(test)
+    reachable: dict[str, int] = {}
+    unlocatable: list[str] = []
+    for target, tests in sorted(perf_by_target.items()):
+        paths = target_source_files(target)
+        graph = TargetGraph(target_functions(paths), paths)
+        seeds = []
+        for test in tests:
+            ident = f"tests/{target}.rs::{test}"
+            if ident in graph.functions:
+                seeds.append(ident)
+            else:
+                unlocatable.append(f"{target}::{test}")
+        seed_set = set(seeds)
+        for ident in graph.reachable(seeds):
+            if ident in seed_set:
+                continue
+            count = len(ASSERTION_TOKENS.findall(graph.functions[ident].body))
+            if count:
+                reachable[ident] = max(reachable.get(ident, 0), count)
+    return reachable, unlocatable
+
+
+def recorded_perf_guard_helpers() -> dict[str, int]:
+    """`RELATIVE_PATH::fn = assertion_count` entries from GATE.md."""
+    block = manifest_block("gate-perf-guard-helpers")
+    if block is None:
+        sys.exit(f"{MANIFEST}: no ```gate-perf-guard-helpers block found")
+    recorded: dict[str, int] = {}
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        ident, _, count = line.partition(" = ")
+        ident, count = ident.strip(), count.strip()
+        try:
+            parsed = int(count)
+        except ValueError:
+            sys.exit(f"{MANIFEST}: malformed perf guard helper entry: {line!r}")
+        if ident in recorded:
+            sys.exit(f"{MANIFEST}: duplicate perf guard helper {ident}")
+        recorded[ident] = parsed
+    return recorded
 
 
 def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
@@ -216,6 +484,38 @@ def main() -> int:
             )
             bad = True
 
+    # The direct-body scan only sees assertions in a `perf` scenario's own
+    # body. Close the one-call-away hole: the crate-local call graph closure of
+    # every `perf` scenario may only reach asserting functions that GATE.md
+    # declares as report-only guards (`gate-perf-guard-helpers`), with token
+    # counts so an assertion added to a guard is caught too.
+    derived_helpers, unlocatable = helper_scan(manifest)
+    for name in unlocatable:
+        print(
+            f"PERF scenario body not found in source (macro-generated or moved?): {name}"
+        )
+        bad = True
+    recorded_helpers = recorded_perf_guard_helpers()
+    for ident in sorted(set(derived_helpers) - set(recorded_helpers)):
+        print(
+            f"PERF scenario reaches asserting helper not recorded as report-only: "
+            f"{ident} ({derived_helpers[ident]} assertion token(s))"
+        )
+        bad = True
+    for ident in sorted(set(recorded_helpers) - set(derived_helpers)):
+        print(
+            f"recorded perf guard helper is not reachable from any perf scenario "
+            f"(stale entry?): {ident}"
+        )
+        bad = True
+    for ident in sorted(set(derived_helpers) & set(recorded_helpers)):
+        if derived_helpers[ident] != recorded_helpers[ident]:
+            print(
+                f"perf guard helper assertion count changed for {ident}: "
+                f"recorded {recorded_helpers[ident]}, found {derived_helpers[ident]}"
+            )
+            bad = True
+
     if bad:
         print(
             f"\nmanifest has {len(manifest)} entries, binaries report "
@@ -232,6 +532,10 @@ def main() -> int:
         print(f"  {tier}: {by_tier[tier]}")
     print(f"  default-required: {len(required)} asserting scenario(s) present")
     print(f"  gate-asserting: {len(expected_asserting)} asserting scenario(s) recorded")
+    print(
+        f"  gate-perf-guard-helpers: {len(derived_helpers)} asserting helper(s) "
+        f"reachable from the perf tier"
+    )
     return 0
 
 
