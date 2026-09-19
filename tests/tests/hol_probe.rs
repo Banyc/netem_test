@@ -2548,32 +2548,38 @@ async fn hol_rtt100_ge5_shared_dual_lane() {
 
 // ───── dual‑lane: both lanes frame‑delivery ─────
 
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
-async fn hol_rtt100_ge5_shared_dual_lane_frame_delivery() {
+fn hol_rtt100_ge5_shared_dual_lane_frame_delivery() {
     let label = "rtt100 GE5 shared dual-lane frame-delivery";
-    let summary = with_timeout(
-        Duration::from_secs(120),
-        label,
-        run_hol_probe_dual_lane(
+    // `run_bounded` (rather than `#[tokio::test]`) keeps the wall-clock
+    // deadline alive across the implicit runtime teardown: this row leaves the
+    // shared bulk lane's rtp session alive with a large in-flight set, and
+    // `Runtime::drop` waits unboundedly on its non-yielding write driver.
+    let summary = run_bounded(label, Duration::from_secs(180), async {
+        with_timeout(
+            Duration::from_secs(120),
             label,
-            rtt100_ge5(101),
-            rtt100_ge5(102),
-            rtt100_ge5(103),
-            rtt100_ge5(104),
-            DualLaneProbeConfig {
-                interactive_frame: true,
-                bulk_frame: true,
-                traffic: TrafficConfig {
-                    msg_bytes: DEFAULT_MSG_BYTES,
-                    cadence: DEFAULT_CADENCE,
-                    run_for: DEFAULT_RUN_FOR,
-                    grace: DEFAULT_GRACE,
+            run_hol_probe_dual_lane(
+                label,
+                rtt100_ge5(101),
+                rtt100_ge5(102),
+                rtt100_ge5(103),
+                rtt100_ge5(104),
+                DualLaneProbeConfig {
+                    interactive_frame: true,
+                    bulk_frame: true,
+                    traffic: TrafficConfig {
+                        msg_bytes: DEFAULT_MSG_BYTES,
+                        cadence: DEFAULT_CADENCE,
+                        run_for: DEFAULT_RUN_FOR,
+                        grace: DEFAULT_GRACE,
+                    },
                 },
-            },
-        ),
-    )
-    .await;
+            ),
+        )
+        .await
+    });
     assert!(
         summary.delivery_pct >= 0.999,
         "delivery {:.3} < 0.999",
