@@ -216,8 +216,12 @@ async fn run_transfer(
 /// The padded wire size distribution must be one-peaked: the profile band
 /// holds the overwhelming majority of datagrams, and the natural small
 /// packet sizes are gone.
+///
+/// Default tier: the fixed profile pads every datagram to the same plaintext
+/// size, so the measure is structural rather than timing-dependent. Over 5
+/// runs at load average 4.2-6.4 it held 100% in-band with `small == 0`, and a
+/// single 256 KiB transfer completes in well under a second.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn padded_wire_sizes_converge_to_one_peak() {
     let (histogram, _) = run_transfer(PROFILE, 256 * 1024).await;
 
@@ -250,8 +254,12 @@ async fn padded_wire_sizes_converge_to_one_peak() {
 
 /// The unpadded baseline keeps the natural multimodal distribution (small
 /// control/ACK packets plus large data packets).
+///
+/// Default tier: the unpadded baseline always emits control/ACK datagrams
+/// below 200 bytes; over 5 runs at load average 4.2-6.4 the small count was
+/// 30-85 against the `> 0` bound. One 256 KiB transfer completes in well
+/// under a second.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn unpadded_wire_sizes_stay_multimodal() {
     let (histogram, _) = run_transfer(rtp::udp::HarmfulPaddingPolicy::None, 256 * 1024).await;
 

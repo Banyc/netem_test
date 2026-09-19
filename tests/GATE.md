@@ -25,7 +25,13 @@ python3 tools/check-gate.py
   too slow for the default gate. Run the target explicitly.
 - **perf** — `#[ignore]`d, report-only measurement or long-run tooling; these
   produce numbers (or feed `tools/perf-loop`), they do not assert a gate floor.
-  Do not treat a perf target's absence from a run as coverage of the property.
+  A `perf` scenario must not contain an assertion in its own body; `check-gate.py`
+  fails with the scenario name if one does, because a check that never runs is
+  not coverage. Do not treat a perf target's absence from a run as coverage of
+  the property. The three report-only `rtp_padding_bench` A/B benches and the
+  `rtp_mux_jitter` arms call shared helpers (`run_transfer*`, `assert_sane`,
+  `assert_reportable`) whose assertions are setup/sanity guards, not gates; the
+  round-trip integrity they check is gated by the default-tier padding tests.
 
 The long-running `perf-loop` battery (`tools/perf-loop`, lanes `clean`,
 `controller-fat-pipe`, `hostile`, `lossy-400kib`, `hostile-fat-pipe`) is a
@@ -48,12 +54,28 @@ too: it asserts a correctness property (the fitted ACK cluster is shrunken
 against the unpadded baseline while the large-data peak is preserved) and its
 24-trial pool keeps the pooled fitted/baseline small-cluster ratio at
 0.13-0.28 across the debug default gate and release (bound 0.5, so a >1.7x
-margin), so leaving it `#[ignore]`d made the assertion unreachable. The
-`gate-default-required` block names the asserting scenarios that must stay in
-this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed.
+margin), so leaving it `#[ignore]`d made the assertion unreachable.
+The padding distribution pair
+(`rtp_padding_bench::padded_wire_sizes_converge_to_one_peak` and
+`rtp_padding_bench::unpadded_wire_sizes_stay_multimodal`) and the three
+`mux_over_rtp_perf` scenarios (`mux_over_rtp_lossy_perf_smoke`,
+`mux_over_rtp_400kib_lossy_contended_perf`,
+`mux_over_rtp_small_stream_while_bulk_perf`) are default too: each asserts a
+property (a one-peaked padded wire-size distribution, a preserved multimodal
+unpadded baseline, rate-limited forwarding, or small-before-bulk fairness),
+passes reliably, and keeps the added default-tier cost near three seconds.
+
+The `gate-default-required` block names the asserting scenarios that must stay in
+this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
+`gate-asserting` block records the full report-only/asserting split.
 
 ```gate-default-required
+mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf
+mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
+mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
 rtp_padding_bench::ack_padding_hides_ack_packets_among_data
+rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
+rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
 ```
 
 ## Opt-in manifest
@@ -64,8 +86,8 @@ non-`support` tests reported by `cargo test -p tests --test <target> -- --list
 
 ```gate-manifest
 contested_latency::contested_capped_clean = full
-contested_latency::contested_capped_jitter_loss = full
-contested_latency::contested_hostile = full
+contested_latency::contested_capped_jitter_loss = perf
+contested_latency::contested_hostile = perf
 dynamic_contested::dyn_dual_auto_big_first = full
 dynamic_contested::dyn_dual_auto_big_first_migrating = full
 dynamic_contested::dyn_dual_auto_per_message = full
@@ -79,8 +101,8 @@ dynamic_contested::dyn_game_sync_single_mux = full
 dynamic_contested::dyn_game_sync_sticky = full
 dynamic_contested::dyn_single_mux = full
 hol_probe::dual_lane_asym_frame_delivers_and_tears_down = full
-hol_probe::hol_cap400_fec_solo = full
-hol_probe::hol_cap400_loss1_split_shared = full
+hol_probe::hol_cap400_fec_solo = perf
+hol_probe::hol_cap400_loss1_split_shared = perf
 hol_probe::hol_cap400_shared = full
 hol_probe::hol_cap400_shared_frame_delivery_diag = full
 hol_probe::hol_cap400_solo = full
@@ -125,20 +147,17 @@ hol_verify4::v4_ge5_muxbulk = perf
 hol_verify4::v4_ge5_rawbulk = perf
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog = full
 mux_bulk_clean_stall::slow_live_link_is_backpressure_not_a_stall = full
-mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf = perf
-mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = perf
-mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke = perf
-mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf = perf
+mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full
 mux_stream_fairness::mux_stream_fairness_longrun = full
 mux_stream_fairness::mux_stream_fairness_sweep = full
-perf_probe::probe_hostile_goodput_30s = perf
-perf_probe::probe_hostile_message_latency = perf
-perf_probe::probe_mux_echo_1mib_direct = perf
-perf_probe::probe_mux_echo_1mib_mss8k = perf
-perf_probe::probe_mux_sink_4mib_direct = perf
-perf_probe::probe_mux_sink_4mib_mss8k = perf
-perf_probe::probe_rtp_echo_4mib_direct = perf
-perf_probe::probe_rtp_echo_4mib_mss8k = perf
+perf_probe::probe_hostile_goodput_30s = full
+perf_probe::probe_hostile_message_latency = full
+perf_probe::probe_mux_echo_1mib_direct = standard
+perf_probe::probe_mux_echo_1mib_mss8k = standard
+perf_probe::probe_mux_sink_4mib_direct = standard
+perf_probe::probe_mux_sink_4mib_mss8k = standard
+perf_probe::probe_rtp_echo_4mib_direct = standard
+perf_probe::probe_rtp_echo_4mib_mss8k = standard
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
 rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss = full
@@ -146,8 +165,8 @@ rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss = standa
 rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains = standard
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard
 rtp_liveness::rtp_permanent_hole_liveness_smoke = standard
-rtp_longrun::longrun_duallane = perf
-rtp_longrun::multiflow_duallane = perf
+rtp_longrun::longrun_duallane = full
+rtp_longrun::multiflow_duallane = full
 rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
 rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
 rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
@@ -178,9 +197,7 @@ rtp_padding_bench::ab_bulk_throughput_across_presets = perf
 rtp_padding_bench::ab_small_echo_latency = perf
 rtp_padding_bench::ab_small_echo_latency_ack_padding = perf
 rtp_padding_bench::ab_small_echo_latency_across_presets = perf
-rtp_padding_bench::padded_wire_sizes_converge_to_one_peak = perf
 rtp_padding_bench::padding_throughput_overhead = perf
-rtp_padding_bench::unpadded_wire_sizes_stay_multimodal = perf
 shared_bottleneck::shared_bneck_fairness_longrun = full
 shared_bottleneck::shared_bneck_fairness_sweep = full
 shared_bottleneck::shared_bneck_late_joiner_fairness = full
@@ -188,6 +205,113 @@ shared_bottleneck::shared_bneck_reorder_tolerant_fairness = full
 shared_bottleneck::shared_bneck_rr_under_bulk_10mbps = full
 shared_bottleneck::shared_bneck_rr_under_bulk_2mbps = full
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps = full
+```
+
+The `gate-asserting` block below records the report-only/asserting split. It
+names every scenario that asserts a property (a gate): all `standard` and
+`full` scenarios plus the default-tier assertions. The `perf` tier is
+report-only by definition, so no `perf` scenario may appear here. The checker
+derives the expected set from the manifest tiers plus `gate-default-required`
+and fails if this block disagrees, and it also scans each `perf` scenario's own
+body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
+`panic!`/`unreachable!` is an error (an asserting check filed under the
+report-only tier would never run). The scan covers the test function body only;
+an assertion hidden behind a shared helper must still be reviewed by hand.
+
+```gate-asserting
+contested_latency::contested_capped_clean
+dynamic_contested::dyn_dual_auto_big_first
+dynamic_contested::dyn_dual_auto_big_first_migrating
+dynamic_contested::dyn_dual_auto_per_message
+dynamic_contested::dyn_dual_auto_small_first
+dynamic_contested::dyn_dual_auto_small_first_migrating
+dynamic_contested::dyn_dual_hint_static
+dynamic_contested::dyn_dual_msg_channel
+dynamic_contested::dyn_dual_msg_channel_ordered
+dynamic_contested::dyn_game_sync_migrating
+dynamic_contested::dyn_game_sync_single_mux
+dynamic_contested::dyn_game_sync_sticky
+dynamic_contested::dyn_single_mux
+hol_probe::dual_lane_asym_frame_delivers_and_tears_down
+hol_probe::hol_cap400_shared
+hol_probe::hol_cap400_shared_frame_delivery_diag
+hol_probe::hol_cap400_solo
+hol_probe::hol_hostile_shared
+hol_probe::hol_hostile_shared_frame_delivery_diag
+hol_probe::hol_hostile_solo
+hol_probe::hol_hostile_split
+hol_probe::hol_paced_bulk_median_p99_regression
+hol_probe::hol_rtp_mux_fec_default_on_recovery
+hol_probe::hol_rtt100_clean_shared
+hol_probe::hol_rtt100_clean_shared_frame_delivery_diag
+hol_probe::hol_rtt100_clean_solo
+hol_probe::hol_rtt100_clean_split
+hol_probe::hol_rtt100_ge1_loss1_shared
+hol_probe::hol_rtt100_ge1_loss1_solo
+hol_probe::hol_rtt100_ge1_loss1_split
+hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag
+hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag
+hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag
+hol_probe::hol_rtt100_ge5_shared
+hol_probe::hol_rtt100_ge5_shared_dual_lane
+hol_probe::hol_rtt100_ge5_shared_dual_lane_asym_frame_diag
+hol_probe::hol_rtt100_ge5_shared_dual_lane_frame_delivery
+hol_probe::hol_rtt100_ge5_shared_frame_delivery
+hol_probe::hol_rtt100_ge5_solo
+hol_probe::hol_rtt100_ge5_split
+hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery
+hol_probe::hol_rtt100_ge5_v2_shared
+hol_probe::hol_rtt100_ge5_v2_solo
+hol_probe::hol_rtt100_ge5_v3_shared
+hol_probe::hol_rtt100_ge5_v3_solo
+hol_probe::hol_rtt100_ge5_v3_split
+hol_probe::hol_rtt40_ge1_loss1_shared
+hol_probe::hol_rtt40_ge1_loss1_solo
+hol_probe::hol_rtt40_ge1_loss1_split
+hol_probe::hol_rtt40_ge1_shared
+hol_probe::hol_rtt40_ge1_solo
+hol_probe::hol_rtt40_ge1_split
+mux_bulk_clean_stall::induced_stall_fires_the_watchdog
+mux_bulk_clean_stall::slow_live_link_is_backpressure_not_a_stall
+mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf
+mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf
+mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
+mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
+mux_stream_fairness::mux_stream_fairness_longrun
+mux_stream_fairness::mux_stream_fairness_sweep
+perf_probe::probe_hostile_goodput_30s
+perf_probe::probe_hostile_message_latency
+perf_probe::probe_mux_echo_1mib_direct
+perf_probe::probe_mux_echo_1mib_mss8k
+perf_probe::probe_mux_sink_4mib_direct
+perf_probe::probe_mux_sink_4mib_mss8k
+perf_probe::probe_rtp_echo_4mib_direct
+perf_probe::probe_rtp_echo_4mib_mss8k
+rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
+rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random
+rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss
+rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss
+rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains
+rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive
+rtp_liveness::rtp_permanent_hole_liveness_smoke
+rtp_longrun::longrun_duallane
+rtp_longrun::multiflow_duallane
+rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers
+rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams
+rtp_mux::rtp_mux_explorer_relays_onto_better_path
+rtp_mux::rtp_mux_recycle_migrates_live_streams
+rtp_mux::rtp_mux_response_migration_offloads_download
+rtp_mux::rtp_mux_survives_independent_impaired_lanes
+rtp_padding_bench::ack_padding_hides_ack_packets_among_data
+rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
+rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
+shared_bottleneck::shared_bneck_fairness_longrun
+shared_bottleneck::shared_bneck_fairness_sweep
+shared_bottleneck::shared_bneck_late_joiner_fairness
+shared_bottleneck::shared_bneck_reorder_tolerant_fairness
+shared_bottleneck::shared_bneck_rr_under_bulk_10mbps
+shared_bottleneck::shared_bneck_rr_under_bulk_2mbps
+shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps
 ```
 
 ## Opt-in targets outside this manifest

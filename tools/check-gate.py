@@ -12,6 +12,15 @@ that MUST run in the default (`cargo test`, non-`#[ignore]`d) tier. The default
 tier is defined by the absence of `#[ignore]`, so without this an asserting
 scenario can silently be re-ignored and stop running.
 
+Finally it enforces the report-only/asserting split. `standard` and `full`
+scenarios assert a property; `perf` scenarios are report-only by definition and
+must not contain an assertion in their own body. The `gate-asserting` block
+records the asserting scenarios, and it must equal the tier-derived set
+(every `standard`/`full` scenario plus every `gate-default-required` entry).
+Each `perf` scenario's own source body is scanned for assertion tokens, so an
+asserting check filed under the report-only tier -- which would never run -- is
+an error that names the scenario.
+
 Usage:
     python3 tools/check-gate.py
 """
@@ -27,6 +36,11 @@ REPO = Path(__file__).resolve().parent.parent
 MANIFEST = REPO / "tests" / "GATE.md"
 TEST_DIR = REPO / "tests" / "tests"
 TIERS = {"standard", "full", "perf"}
+ASSERTING_TIERS = {"standard", "full"}
+ASSERTION_TOKENS = re.compile(
+    r"(assert!|assert_eq!|assert_ne!|panic!|unreachable!)"
+)
+FN_RE = re.compile(r"\b(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(")
 
 
 def manifest_block(name: str) -> str | None:
@@ -65,6 +79,47 @@ def required_default_entries() -> list[str]:
         for line in block.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
+
+
+def asserting_entries() -> list[str]:
+    """`target::test` names recorded as asserting a gate property."""
+    block = manifest_block("gate-asserting")
+    if block is None:
+        sys.exit(f"{MANIFEST}: no ```gate-asserting block found")
+    return [
+        line.strip()
+        for line in block.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_bodies(target: str) -> dict[str, str]:
+    """Map each top-level `fn NAME` to its brace-balanced body."""
+    text = (TEST_DIR / f"{target}.rs").read_text(encoding="utf-8")
+    bodies: dict[str, str] = {}
+    for match in FN_RE.finditer(text):
+        start = text.find("{", match.end())
+        if start == -1:
+            continue
+        depth = 0
+        idx = start
+        while idx < len(text):
+            char = text[idx]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            idx += 1
+        bodies.setdefault(match.group(1), text[start : idx + 1])
+    return bodies
+
+
+def body_asserts(target: str, name: str, bodies: dict[str, str]) -> bool:
+    """True when the test function's own body contains an assertion token."""
+    body = bodies.get(name)
+    return bool(body) and ASSERTION_TOKENS.search(body) is not None
 
 
 def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
@@ -126,6 +181,41 @@ def main() -> int:
             )
             bad = True
 
+    # The report-only/asserting split: a scenario asserts a gate iff it is in
+    # the default tier, or it is `#[ignore]`d under an asserting opt-in tier
+    # (`standard`/`full`). `perf` is report-only by definition. The gate-asserting
+    # block records that split and must match it exactly.
+    expected_asserting = {
+        name for name, tier in manifest.items() if tier in ASSERTING_TIERS
+    } | set(required)
+    recorded_asserting = asserting_entries()
+    if len(recorded_asserting) != len(set(recorded_asserting)):
+        print("DUPLICATE entry in gate-asserting")
+        bad = True
+    recorded_set = set(recorded_asserting)
+    for name in sorted(expected_asserting - recorded_set):
+        print(f"ASSERTING scenario missing from gate-asserting: {name}")
+        bad = True
+    for name in sorted(recorded_set - expected_asserting):
+        print(
+            f"gate-asserting entry is not an asserting scenario "
+            f"(perf-tier or unknown): {name}"
+        )
+        bad = True
+
+    # A `perf` scenario must be report-only: an assertion in its own body is an
+    # asserting check filed under the tier that never runs, so it is an error.
+    for name, tier in sorted(manifest.items()):
+        if tier != "perf":
+            continue
+        target, _, test = name.partition("::")
+        if body_asserts(target, test, test_bodies(target)):
+            print(
+                f"ASSERTING scenario in report-only perf tier "
+                f"(re-tier to standard/full/default or make it report-only): {name}"
+            )
+            bad = True
+
     if bad:
         print(
             f"\nmanifest has {len(manifest)} entries, binaries report "
@@ -141,6 +231,7 @@ def main() -> int:
     for tier in sorted(by_tier):
         print(f"  {tier}: {by_tier[tier]}")
     print(f"  default-required: {len(required)} asserting scenario(s) present")
+    print(f"  gate-asserting: {len(expected_asserting)} asserting scenario(s) recorded")
     return 0
 
 
