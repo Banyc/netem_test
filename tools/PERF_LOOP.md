@@ -37,6 +37,18 @@ deliberately not mutable JJ workspaces.
 The historical/default scenario is hostile with MSS 8192
 (`--link-profile hostile --mss-bytes 8192`).
 
+**The `hostile` lane is diagnostic-only: report its numbers, never
+retain/reject on it.** In every one of the 70 recorded `hostile` lane runs — at
+both the 5 s and the 20 s warmup — the lane was `not_ready`
+(`within_run_phase_not_stable`), and the spread was the lane's own stochastic
+first/second-half goodput phase variance rather than a candidate effect (the
+baseline and candidate trees were byte-identical in the control). It remains
+useful as a diagnostic, but it cannot attribute a delta to a candidate. A run
+records the lane's role as `link_role` (`verdict` or `diagnostic`) in
+`run.json`; the full role table lives in `tests/GATE.md` (`gate-lane-roles`) and
+is machine-checked by `python3 tools/check-gate.py` against
+`perf_loop.lane_classification`.
+
 # Reanalyze an existing capture
 
 Recompute phase stability, execution-order effects, AB/BA role effects, readiness, and same-binary calibration from a preserved result without building or running the network again:
@@ -667,7 +679,10 @@ and reasons are unchanged.
 The verdict is a consistency label over valid seed-paired evidence only; it
 is not statistical confidence or causality. Every agent hint carries a
 `does_not_prove` constraint and no hint identifies a specific branch as
-causal.
+causal. The verdict of a **diagnostic** lane (recorded as `link_role =
+"diagnostic"` in `run.json`) is reported for diagnosis only: a change must
+never be retained or rejected on it. This is the lane role, not the
+`NETEM_PERF_DIAGNOSTIC_MODE` evidence-collection bypass below.
 
 ## Diagnostic-mode limits
 

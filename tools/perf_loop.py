@@ -59,6 +59,30 @@ LINK_PROFILES = (
     "hostile-periodic-bottleneck-100ms",
     "hostile-periodic-bottleneck-300ms",
 )
+# Lane roles for a retention decision.  `verdict` lanes may retain or reject a
+# change; `diagnostic` lanes report their numbers only and must never be read as
+# a verdict instrument.  `hostile` is diagnostic-only: every one of the 70
+# recorded `hostile` lane runs (both 5 s and 20 s warmup, with a byte-identical
+# baseline/candidate control tree) returned `not_ready`
+# (`within_run_phase_not_stable`), and the spread was the lane's own stochastic
+# phase variance rather than a candidate effect, so the lane cannot produce a
+# verdict.  The role of every lane is documented in tests/GATE.md
+# (`gate-lane-roles`) and machine-checked by tools/check-gate.py against
+# `lane_classification`, so a lane cannot be mis-declared verdict or diagnostic.
+DIAGNOSTIC_LANES = ("hostile",)
+
+
+def lane_classification(profile):
+    """The role a `--link-profile` lane plays in a retention decision.
+
+    A `diagnostic` lane is a report-only instrument: its paired numbers are
+    recorded and may guide follow-up work, but a change must never be retained
+    or rejected on it, because the lane is not phase-stable enough to attribute
+    a delta to the candidate.
+    """
+    return "diagnostic" if profile in DIAGNOSTIC_LANES else "verdict"
+
+
 COMPONENTS = ("netem_test", "rtp", "mux", "rtp_mux", "tokio_udp", "udp_listener")
 SUITE_REVISION_MANIFEST = "suite-revisions.json"
 SUITE_REVISION_MANIFEST_SCHEMA = 2
@@ -1346,6 +1370,7 @@ def command_run(args):
         "within_run_phase_analysis": phase_analysis,
         "comparison_readiness": readiness,
         "link_profile": args.link_profile,
+        "link_role": lane_classification(args.link_profile),
         "mss_bytes": args.mss_bytes,
         "fec": bool(args.fec),
         "candidate_fec": args.candidate_fec,

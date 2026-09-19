@@ -29,12 +29,21 @@ function it can reach to be declared in the `gate-perf-guard-helpers` block,
 with its assertion-token count. An unrecorded asserting helper, a changed
 token count, or a stale entry is an error.
 
+It also checks the perf-loop lane roles in the `gate-lane-roles` block against
+`perf_loop.lane_classification`, the function that stamps `link_role` into a
+run's `run.json`. A lane is either a verdict instrument or diagnostic-only; a
+verdict lane mis-declared as diagnostic (or the reverse), an unlisted lane, or
+a `hostile` lane that is no longer diagnostic-only is an error. `hostile`
+returned `not_ready` (`within_run_phase_not_stable`) in all 70 recorded runs, so
+it must never be read as a verdict.
+
 Usage:
     python3 tools/check-gate.py
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import subprocess
 import sys
@@ -42,8 +51,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MANIFEST = REPO / "tests" / "GATE.md"
+PERF_LOOP = Path(__file__).resolve().parent / "perf_loop.py"
 TEST_DIR = REPO / "tests" / "tests"
 TIERS = {"standard", "full", "perf"}
+LANE_ROLES = {"verdict", "diagnostic"}
 ASSERTING_TIERS = {"standard", "full"}
 ASSERTION_TOKENS = re.compile(
     r"(assert!|assert_eq!|assert_ne!|panic!|unreachable!)"
@@ -390,6 +401,70 @@ def recorded_perf_guard_helpers() -> dict[str, int]:
     return recorded
 
 
+def load_perf_loop():
+    """Import tools/perf_loop.py without letting its CLI run."""
+    spec = importlib.util.spec_from_file_location("perf_loop", PERF_LOOP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def lane_role_entries() -> dict[str, str]:
+    """`lane = role` entries from the ```gate-lane-roles block in GATE.md."""
+    block = manifest_block("gate-lane-roles")
+    if block is None:
+        sys.exit(f"{MANIFEST}: no ```gate-lane-roles block found")
+    roles: dict[str, str] = {}
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lane, _, role = line.partition(" = ")
+        lane, role = lane.strip(), role.strip()
+        if role not in LANE_ROLES:
+            sys.exit(f"{MANIFEST}: lane {lane} has unknown role {role!r}")
+        if lane in roles:
+            sys.exit(f"{MANIFEST}: duplicate lane entry {lane}")
+        roles[lane] = role
+    return roles
+
+
+def check_lane_roles() -> tuple[dict[str, str], list[str]]:
+    """Cross-check the documented perf-loop lane roles against the classifier.
+
+    `perf_loop.lane_classification` is the same function that stamps
+    `link_role` into a run's `run.json`, so a lane can never be documented as
+    verdict in one place and recorded as diagnostic in the other. `hostile` is
+    pinned diagnostic-only: it was `not_ready`
+    (`within_run_phase_not_stable`) in all 70 recorded runs, so it can never
+    carry a retention verdict.
+    """
+    perf_loop = load_perf_loop()
+    documented = lane_role_entries()
+    errors: list[str] = []
+    known = set(perf_loop.LINK_PROFILES)
+    for lane in sorted(set(documented) - known):
+        errors.append(f"gate-lane-roles names unknown --link-profile lane: {lane}")
+    for lane in sorted(known - set(documented)):
+        errors.append(f"--link-profile lane missing from gate-lane-roles: {lane}")
+    for lane in sorted(known & set(documented)):
+        expected = perf_loop.lane_classification(lane)
+        if documented[lane] != expected:
+            errors.append(
+                f"lane role mismatch for {lane}: GATE.md says "
+                f"{documented[lane]!r}, perf_loop.lane_classification says "
+                f"{expected!r}"
+            )
+    if documented.get("hostile") != "diagnostic":
+        errors.append(
+            "the hostile lane must be declared diagnostic-only: it returned "
+            "not_ready (within_run_phase_not_stable) in all 70 recorded runs"
+        )
+    if not any(role == "verdict" for role in documented.values()):
+        errors.append("no verdict lane is declared")
+    return documented, errors
+
+
 def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
     cmd = ["cargo", "test", "-p", "tests", "--test", target, "--", "--list"]
     if ignored:
@@ -516,6 +591,15 @@ def main() -> int:
             )
             bad = True
 
+    # The perf-loop lane roles: a lane is either a verdict instrument or
+    # diagnostic-only. The documented roles must match
+    # `perf_loop.lane_classification` exactly, and `hostile` must stay
+    # diagnostic-only (70/70 `not_ready` in the recorded runs).
+    lane_roles, lane_errors = check_lane_roles()
+    for error in lane_errors:
+        print(error)
+        bad = True
+
     if bad:
         print(
             f"\nmanifest has {len(manifest)} entries, binaries report "
@@ -535,6 +619,11 @@ def main() -> int:
     print(
         f"  gate-perf-guard-helpers: {len(derived_helpers)} asserting helper(s) "
         f"reachable from the perf tier"
+    )
+    diagnostic = sum(1 for role in lane_roles.values() if role == "diagnostic")
+    print(
+        f"  gate-lane-roles: {len(lane_roles)} perf-loop lane(s), "
+        f"{diagnostic} diagnostic-only"
     )
     return 0
 

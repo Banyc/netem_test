@@ -381,6 +381,54 @@ tests/support/task_scope.rs::submit_test_task = 2
 tests/support/task_scope.rs::submit_test_task_required = 1
 ```
 
+## Perf-loop lane roles
+
+`tools/perf-loop` runs each paired capture on a `--link-profile` lane. Every
+lane is either a **verdict** lane (a change may be retained or rejected on its
+paired evidence) or **diagnostic** (the lane reports its numbers but a change
+must never be retained or rejected on it). The `hostile` lane is
+**diagnostic-only**: in every one of the 70 recorded `hostile` runs — at both
+the 5 s and the 20 s warmup, with a byte-identical baseline/candidate control
+tree — the lane was `not_ready` (`within_run_phase_not_stable`), and the spread
+was the lane's own stochastic first/second-half goodput phase variance, not a
+candidate effect. Its numbers stay useful as a diagnostic, but it cannot
+attribute a delta to a candidate, so it must never be read as a verdict.
+
+The `gate-lane-roles` block below records every lane's role. It is
+machine-checked by `tools/check-gate.py` against `perf_loop.lane_classification`
+— the same function that stamps `link_role` into `run.json` — so a lane cannot
+be declared verdict in one place and diagnostic in the other. Run the checker
+after adding a lane or changing a role:
+
+```sh
+python3 tools/check-gate.py
+```
+
+```gate-lane-roles
+hostile = diagnostic
+hostile-steady = verdict
+hostile-steady-bottleneck = verdict
+hostile-steady-bottleneck-20ms = verdict
+hostile-steady-bottleneck-100ms = verdict
+hostile-periodic-bottleneck = verdict
+lossy-400kib = verdict
+hostile-fat-pipe = verdict
+controller-fat-pipe = verdict
+deterministic-iid-loss-fat-pipe = verdict
+clean = verdict
+direct = verdict
+hostile-bottleneck-20ms = verdict
+hostile-bottleneck-100ms = verdict
+hostile-bottleneck-300ms = verdict
+fec-recoverable-bottleneck = verdict
+fec-gaming-fat-pipe = verdict
+fec-paired-saturated = verdict
+fec-paired-saturated-bottleneck = verdict
+hostile-periodic-bottleneck-20ms = verdict
+hostile-periodic-bottleneck-100ms = verdict
+hostile-periodic-bottleneck-300ms = verdict
+```
+
 ## Opt-in targets outside this manifest
 
 `check-gate.py` covers only the `tests` package. Three other opt-in sets are

@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1560,6 +1561,34 @@ class PerfLoopTest(unittest.TestCase):
         self.assertIn(
             "does_not_prove", readiness["does_not_prove"].lower()
         )
+
+    def test_lane_roles_match_the_documented_gate_block(self):
+        # `hostile` is diagnostic-only: it was `not_ready`
+        # (`within_run_phase_not_stable`) in all 70 recorded runs.
+        self.assertEqual(LOOP.lane_classification("hostile"), "diagnostic")
+        self.assertIn("hostile", LOOP.DIAGNOSTIC_LANES)
+        self.assertLessEqual(set(LOOP.DIAGNOSTIC_LANES), set(LOOP.LINK_PROFILES))
+        for profile in LOOP.LINK_PROFILES:
+            expected = "diagnostic" if profile in LOOP.DIAGNOSTIC_LANES else "verdict"
+            self.assertEqual(LOOP.lane_classification(profile), expected)
+        self.assertEqual(LOOP.lane_classification("clean"), "verdict")
+
+        gate_md = (Path(__file__).resolve().parent.parent / "tests" / "GATE.md").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r"```gate-lane-roles\n(.*?)```", gate_md, re.S)
+        self.assertIsNotNone(match, "tests/GATE.md must carry a gate-lane-roles block")
+        documented = dict(
+            line.split(" = ", 1)
+            for line in (raw.strip() for raw in match.group(1).splitlines())
+            if line and not line.startswith("#")
+        )
+        self.assertEqual(
+            documented,
+            {profile: LOOP.lane_classification(profile) for profile in LOOP.LINK_PROFILES},
+            "the documented perf-loop lane roles must match lane_classification",
+        )
+        self.assertEqual(documented["hostile"], "diagnostic")
 
     def test_analyze_existing_result_recomputes_and_optionally_updates_run_json(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:

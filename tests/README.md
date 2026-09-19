@@ -43,8 +43,10 @@ re-read every iteration:
 4. **Bulk-lane throughput untouched** — the 5-lane perf battery
    (`tools/perf-loop`, lanes `clean / controller-fat-pipe / hostile /
    lossy-400kib / hostile-fat-pipe`) must be `no_material_change` on every
-   `ready` lane. The interactive change is a no-op for the stock/bulk tuning
-   (`fec_instream_flush == false`).
+   `ready` **verdict** lane. The interactive change is a no-op for the
+   stock/bulk tuning (`fec_instream_flush == false`). `hostile` is
+   **diagnostic-only** (see below): report its numbers, never retain/reject on
+   it.
 5. **Read the generated graph (MUST) and the summary** — render the perf-loop
    `comparison.html` with `tools/render_graph.py` and read the RTT-CDF /
    throughput plots (base ≈ cand for a neutral change), not just the text
@@ -62,6 +64,27 @@ python3 tools/render_graph.py $TMPDIR/<run-output>/comparison.html \
 that lived outside the repository in an unversioned scratch directory degraded
 silently (a missing graph produced a blank PNG and still exited zero), so it
 must not be relied on.
+
+## Perf-loop lane roles: verdict vs diagnostic
+
+A `tools/perf-loop` lane is either a **verdict** lane (a change may be retained
+or rejected on its paired evidence) or **diagnostic-only** (its numbers are
+reported and may guide follow-up work, but a change must never be retained or
+rejected on it). The lane's role is stamped as `link_role` into `run.json` by
+`perf_loop.lane_classification`.
+
+**`hostile` is diagnostic-only.** In every one of the 70 recorded `hostile`
+lane runs — both the 5 s and the 20 s warmup — the lane was `not_ready`
+(`within_run_phase_not_stable`), and the spread was the lane's own stochastic
+first/second-half goodput phase variance rather than a candidate effect (the
+baseline and candidate trees were byte-identical in the control). The lane
+cannot attribute a delta to a candidate, so it must not be read as a verdict.
+Report its paired numbers as a diagnostic only.
+
+The full lane-role table lives in `tests/GATE.md` (`gate-lane-roles`) and is
+machine-checked by `python3 tools/check-gate.py` against
+`perf_loop.lane_classification`, so a verdict lane cannot be mis-declared
+diagnostic (or the reverse) without the checker failing.
 
 ## The rtp-side in-process oracle
 
