@@ -6,6 +6,11 @@ throughput for a seeded, deterministic impairment link.
 
 Binary: `tests/tests/rtp_mux_jitter.rs`. Support: `tests/tests/support/{rtp,mux,frame,dual,stats}.rs`.
 
+> **Gate scope:** the interactive oracle below is the `perf` tier. The full
+> scenario-gate scope, with every `#[ignore]`d test's tier, lives in
+> `tests/GATE.md` and is verified by `python3 tools/check-gate.py`. A plain
+> `cargo test -p tests` runs only the default tier and none of these arms.
+
 ## Running
 
 ```sh

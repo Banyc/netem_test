@@ -56,8 +56,16 @@ When a performance comparison is part of a conclusion, report:
 
 ## Testing
 
+`cargo test -p tests` runs only the default tier: the harness and support unit
+tests plus the seeded sub-second scenarios (netem behaviour, clean/loss/FEC/MSS
+delivery, mux-over-rtp). Every other scenario is `#[ignore]`d, and its name and
+tier are recorded in `tests/GATE.md`; `python3 tools/check-gate.py` fails if a
+scenario is not classified, so an unnoticed skip cannot happen.
+
 ```sh
-cargo test -p netem-test       # harness unit tests
-cargo test -p tests            # integration scenarios (loss, delay, FEC, MSS, …)
+cargo test -p netem-test        # harness unit tests
+cargo test -p tests             # default gate (see tests/GATE.md)
+cargo test -p tests -- --ignored --test-threads=1   # opt-in standard/full tiers
 cargo test -p tests --test perf_probe -- --ignored --nocapture   # perf probes
+python3 tools/check-gate.py     # verify the gate manifest matches reality
 ```
