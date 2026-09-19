@@ -547,19 +547,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mux"
-version = "0.1.0"
-source = "git+https://github.com/Banyc/mux.git?tag=v0.0.28#5bb8bf7abb3e9536b870892ce85ecf7eafbc36c2"
-dependencies = [
- "futures-util",
- "getrandom 0.4.3",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "netem-test"
 version = "0.1.0"
 dependencies = [
@@ -944,7 +931,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "metrics",
- "mux 0.1.0 (git+https://github.com/Banyc/mux.git?tag=v0.0.28)",
+ "mux",
  "rand 0.10.2",
  "rtp",
  "thiserror",
@@ -1094,7 +1081,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 name = "tests"
 version = "0.1.0"
 dependencies = [
- "mux 0.1.0",
+ "mux",
  "netem-test",
  "rtp",
  "rtp_mux",
