@@ -1217,6 +1217,68 @@ class TraceCompareTest(unittest.TestCase):
         )
         self.assertEqual(with_wire["scheduled_drain_packets"], 10.0)
 
+    def add_fec_snapshot(self, trace_dir, parity, recovered):
+        """Add trace-schema-32 FEC snapshot columns to both endpoint RTP CSVs.
+
+        The FEC counters are state-row snapshot columns, not manifest keys, so
+        a comparison only sees them when the RTP CSV carries the columns.
+        """
+        for name in ("rtp.csv", "rtp_peer.csv"):
+            path = Path(trace_dir) / name
+            with path.open(newline="") as source:
+                rows = list(csv.DictReader(source))
+            fieldnames = list(rows[0])
+            for field in COMPARE.FEC_COUNTER_FIELDS:
+                if field not in fieldnames:
+                    fieldnames.append(field)
+            values = {field: "0" for field in COMPARE.FEC_COUNTER_FIELDS}
+            values["fec_parity_sent"] = str(parity)
+            values["fec_groups_flushed"] = "12"
+            values["fec_recovered_symbols"] = str(recovered)
+            for row in rows:
+                row.update(values)
+            with path.open("w", newline="") as sink:
+                writer = csv.DictWriter(sink, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+    def test_fec_enabled_arm_flows_through_metrics_and_guidance(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            before = root / "before"
+            after = root / "after"
+            self.write_trace(before, "old", "1.0", 11, 12)
+            self.write_trace(after, "new", "1.1", 11, 12)
+            self.add_fec_snapshot(before, parity=200, recovered=2)
+            self.add_fec_snapshot(after, parity=100, recovered=8)
+            output = root / "comparison"
+            COMPARE.render_comparison(
+                [("before-1", before)], [("after-1", after)], output
+            )
+            comparison = json.loads(
+                (output / "comparison.json").read_text(encoding="utf-8")
+            )
+            # A real FEC capture must surface present counters, never None.
+            for run in comparison["runs"]:
+                self.assertTrue(run["summary"]["fec_counters_present"])
+            pair = comparison["pairs"][0]["metrics"]
+            self.assertIsNotNone(
+                pair["fec_parity_sent_per_gib_delivered"]["baseline"]
+            )
+            self.assertIsNotNone(
+                pair["fec_parity_sent_per_gib_delivered"]["candidate"]
+            )
+            hints = {hint["metric"]: hint for hint in comparison["agent_guidance"]}
+            # Parity cost is lower-is-better; the candidate sent half.
+            self.assertEqual(
+                hints["fec_parity_sent_per_gib_delivered"]["direction"], "better"
+            )
+            # Recovered symbols are direction-neutral diagnostics.
+            self.assertEqual(
+                hints["fec_recovered_symbols_per_gib_delivered"]["direction"],
+                "changed",
+            )
+
     def test_comparison_cli_exit_code_reflects_the_evidence(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
             root = Path(directory)
