@@ -1,7 +1,8 @@
 //! End-to-end scenario tests that drive a real [`netem_test::NetemLink`] over
-//! loopback UDP sockets. Marked `#[ignore]` because they spawn threads and
-//! bind ephemeral ports; run them with `--ignored --nocapture
-//! --test-threads=1` as specified in the workspace task brief.
+//! loopback UDP sockets. They run in the default gate: every case is seeded
+//! and finishes in a few seconds, so `cargo test -p tests` exercises the
+//! harness's pass/drop/duplicate/delay/reorder/rate-limit/queue behaviour
+//! without an explicit `--ignored`.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -100,7 +101,6 @@ fn burst_exact(
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_passes_traffic_unimpaired() {
     let (recv, server) = recv_socket();
     let link = NetemLink::spawn(server, NetemConfig::default()).unwrap();
@@ -116,7 +116,6 @@ fn netem_passes_traffic_unimpaired() {
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_drops_all_with_max_random_loss() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
@@ -133,7 +132,6 @@ fn netem_drops_all_with_max_random_loss() {
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_four_state_loss_drops_some() {
     let (recv, server) = recv_socket();
     // p14 = ~25% chance from gap-Tx to isolated loss, p31 = max so any burst
@@ -159,7 +157,6 @@ fn netem_four_state_loss_drops_some() {
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_delay_adds_latency() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
@@ -184,7 +181,6 @@ fn netem_delay_adds_latency() {
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_duplicate_produces_extra_packets() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {
@@ -203,7 +199,6 @@ fn netem_duplicate_produces_extra_packets() {
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_rate_limit_throttles_burst() {
     let (recv, server) = recv_socket();
     // 8 kbit/s. Each 8-byte payload = 64 bits, so serialization time is
@@ -258,7 +253,6 @@ fn netem_rate_limit_throttles_burst() {
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_reorder_with_rate_jumps_ahead() {
     // Reorder + rate together: a reordered packet must be scheduled at `now`
     // and must NOT be rate-shaped, so it is delivered ahead of the shaped
@@ -326,7 +320,6 @@ fn netem_reorder_with_rate_jumps_ahead() {
 }
 
 #[test]
-#[ignore = "spawns threads and binds ephemeral ports; run with --ignored --nocapture --test-threads=1 (see module header)"]
 fn netem_snapshot_reports_queue_and_stats() {
     let (recv, server) = recv_socket();
     let cfg = NetemConfig {

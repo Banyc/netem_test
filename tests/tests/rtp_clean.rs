@@ -4,10 +4,10 @@
 //! unimpaired bidirectional proxy, both for small payloads and for a 400 KiB
 //! clean payload, and that the proxy's added latency is observable end-to-end.
 //!
-//! Run with:
+//! Runs in the default gate (seeded, sub-second):
 //!
 //! ```sh
-//! cargo test --test rtp_clean -- --ignored --nocapture --test-threads=1
+//! cargo test --test rtp_clean
 //! ```
 
 use std::time::Duration;
@@ -22,7 +22,6 @@ mod support;
 
 /// `rtp` should deliver a byte stream reliably over a *clean* netem link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_data() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
@@ -53,7 +52,6 @@ async fn rtp_over_netem_clean_link_delivers_data() {
 /// `rtp` should deliver a 400 KiB deterministic payload intact over a clean
 /// link. This is the clean baseline for the perf scenarios.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_clean_link_delivers_400kib() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
@@ -88,7 +86,6 @@ async fn rtp_over_netem_clean_link_delivers_400kib() {
 /// should take at least the configured one-way delay (the round trip crosses
 /// both directions, so roughly `2 * latency`).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp clean-delivery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_latency_is_observable() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);

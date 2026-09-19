@@ -5,10 +5,10 @@
 //! datagrams correctly when driven by plain OS UDP sockets, before any
 //! `rtp`/`mux` behaviour is layered on top.
 //!
-//! Run with:
+//! Runs in the default gate (seeded, sub-second):
 //!
 //! ```sh
-//! cargo test --test raw_netem_pair -- --ignored --nocapture --test-threads=1
+//! cargo test --test raw_netem_pair
 //! ```
 
 use std::time::Duration;
@@ -24,7 +24,6 @@ mod support;
 /// Sanity check: raw UDP echo through the bidirectional proxy works on a
 /// clean link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "raw bidirectional UDP echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn netem_pair_raw_udp_echo_clean_link() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
@@ -68,7 +67,6 @@ async fn netem_pair_raw_udp_echo_clean_link() {
 /// take at least the configured one-way delay (the round trip crosses both
 /// directions, so roughly `2 * latency`).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "raw bidirectional UDP echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn netem_pair_raw_udp_latency_is_observable() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);

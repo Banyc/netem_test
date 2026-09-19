@@ -5,10 +5,10 @@
 //! delivers a multiplexed stream intact over a clean link and over a
 //! latency-only impaired link.
 //!
-//! Run with:
+//! Runs in the default gate (seeded, sub-second):
 //!
 //! ```sh
-//! cargo test --test mux_over_rtp -- --ignored --nocapture --test-threads=1
+//! cargo test --test mux_over_rtp
 //! ```
 
 use std::time::Duration;
@@ -27,7 +27,6 @@ mod support;
 /// `mux` layered on `rtp` should multiplex a stream over the netem-impaired
 /// link and echo data back intact on a clean link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_over_netem_clean_link_echoes() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
@@ -63,7 +62,6 @@ async fn mux_over_rtp_over_netem_clean_link_echoes() {
 /// arrives intact. A small payload is used because larger transfers can trip
 /// rtp's broken-pipe heuristic when mux's control-plane stalls the ACK path.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "mux-over-rtp echo scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn mux_over_rtp_survives_netem_latency() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);

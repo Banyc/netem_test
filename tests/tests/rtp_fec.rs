@@ -4,10 +4,13 @@
 //! data symbols via parity even when the netem proxy drops a few percent of
 //! packets in each direction.
 //!
-//! Run with:
+//! Runs in the default gate: this is the scenario that reaches the sender's
+//! in-stream FEC capacity gate, so promoting it keeps the FEC retain/reject
+//! decision path exercised by `cargo test -p tests`. It takes about five
+//! seconds and is seeded.
 //!
 //! ```sh
-//! cargo test --test rtp_fec -- --ignored --nocapture --test-threads=1
+//! cargo test --test rtp_fec
 //! ```
 
 use std::time::Duration;
@@ -25,7 +28,6 @@ mod support;
 /// `rtp` with FEC enabled should recover under ~3% netem loss in each
 /// direction — the byte stream must arrive intact.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp+FEC recovery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_with_fec_recovers_under_netem_loss() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);

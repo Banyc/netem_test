@@ -4,10 +4,10 @@
 //! loss introduced by the proxy, both for a 400 KiB loss payload, and that
 //! the proxy reports non-zero drops.
 //!
-//! Run with:
+//! Runs in the default gate (seeded, sub-second):
 //!
 //! ```sh
-//! cargo test --test rtp_loss -- --ignored --nocapture --test-threads=1
+//! cargo test --test rtp_loss
 //! ```
 
 use std::time::Duration;
@@ -24,7 +24,6 @@ mod support;
 /// the netem proxy — a 400 KiB byte stream must arrive intact despite ~5%
 /// loss in both directions.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp loss-recovery end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_over_netem_survives_mild_loss_400kib() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);

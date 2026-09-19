@@ -5,10 +5,10 @@
 //! impairment proxy. Small MSS values make loss and latency more stressful
 //! because the reliable layer must ACK/segment many more packets.
 //!
-//! Run with:
+//! Runs in the default gate (seeded, sub-second):
 //!
 //! ```sh
-//! cargo test --test rtp_mss -- --ignored --nocapture --test-threads=1
+//! cargo test --test rtp_mss
 //! ```
 
 use std::time::Duration;
@@ -24,7 +24,6 @@ mod support;
 /// A small non-default MSS (512 bytes) should still deliver a small payload
 /// over a clean netem link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_small_mss_clean_link_delivers_data() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
@@ -59,7 +58,6 @@ async fn rtp_small_mss_clean_link_delivers_data() {
 /// A very small MSS (256 bytes) should recover from mild loss on a 100 KiB
 /// transfer, exercising many more segments than the default MSS.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_tiny_mss_survives_mild_loss() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
@@ -96,7 +94,6 @@ async fn rtp_tiny_mss_survives_mild_loss() {
 /// A custom MSS (1024 bytes) mid-way between tiny and default should deliver
 /// a 200 KiB payload intact over a clean link.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp MSS end-to-end scenario; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn rtp_custom_mss_clean_link_delivers_200kib() {
     let mut tasks = support::TestScope::new();
     let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
