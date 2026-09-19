@@ -252,19 +252,20 @@ async fn mux_over_rtp_small_stream_while_bulk_perf() {
     assert!(stats.forwarded > 0, "proxy should forward packets");
 }
 
-/// `mux` over `rtp` should deliver a 400 MiB payload intact through a hostile
-/// link profiled from real ICMP measurements against `google.com` /
-/// `8.8.8.8` (~15% loss, 300 ms latency, 500 ms jitter stddev) to a read-only
-/// sink, and report throughput with `--nocapture`. The fat pipe + long latency
-/// inflates the bandwidth-delay product, growing the proxy's internal queue
-/// past tens of thousands of entries and exposing O(n²) insertion, per-packet
-/// lock contention, and per-packet allocation — bottlenecks the mild synthetic
-/// presets cannot reach.
+/// `mux` over `rtp` should deliver a 400 MiB payload intact through the
+/// [`hostile_fat_pipe`] link — a 100 Mbit/s rate cap, 150 ms one-way latency,
+/// 30 ms jitter, ~2% Gilbert-Elliott burst loss (mean burst 4), a 16k-packet
+/// queue limit, seed 4 — to a read-only sink, and report throughput with
+/// `--nocapture`. The fat pipe + long latency inflates the bandwidth-delay
+/// product toward the queue limit, exposing proxy-level bottlenecks (queue
+/// insertion, per-packet lock contention, per-packet allocation) that the mild
+/// synthetic presets cannot reach.
 ///
-/// At 15% loss the throughput is dominated by `rtp`'s ARQ, not the proxy: a
-/// 10 MiB run takes ~10 min (~0.016 MiB/s), so 400 MiB takes many hours. The
-/// timeout is set generously; run this only when investigating proxy-level
-/// behaviour under a real fat, hostile pipe.
+/// Throughput is dominated by `rtp`'s ARQ, not the proxy, and varies run to
+/// run with host scheduling: 400 MiB completes in ~146-243 s (~1.65-2.75
+/// MiB/s) across observed runs — 145.7 s (2.75 MiB/s) on one run at load ~5.4,
+/// 243 s (1.65 MiB/s) on a loaded one. `BUDGET` (335 s) bounds the run; this is
+/// a measurement, not a throughput gate.
 ///
 /// Run with:
 ///
