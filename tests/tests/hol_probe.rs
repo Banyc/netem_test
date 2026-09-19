@@ -56,7 +56,7 @@ use support::mux::{
     mux_client_connect_via, send_timestamped_messages,
     spawn_mux_frame_delivery_latency_bulk_server_via, spawn_mux_latency_bulk_server_via,
 };
-use support::payload::{cyclic_payload, with_timeout};
+use support::payload::{cyclic_payload, run_bounded, with_timeout};
 use support::presets::gilbert_elliott_loss;
 use support::rtp::{
     rtp_connect_with_mss_via, spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via,
@@ -677,10 +677,23 @@ fn hostile_real_link_seeded(seed: u64) -> NetemConfig {
     c
 }
 
-/// [`support::presets::fec_gaming_fat_pipe`] with an explicit seed, so
-/// paired default-on-FEC HOL runs stay reproducible.
-fn fec_gaming_fat_pipe_seeded(seed: u64) -> NetemConfig {
+/// [`support::presets::fec_gaming_fat_pipe`] with the iid loss raised to 20 %
+/// and an explicit seed, for the default-on-FEC recovery probe.
+///
+/// The interactive lane's parity is *reactive*: the loss gate flushes a group
+/// only after recovery evidence, and the flush protects the group the sender
+/// is currently carrying.  At the preset's 5 % loss the contended sparse
+/// stream opens the gate for only a handful of single-symbol groups in the
+/// measurement window and none of them loses its data symbol, so the decoder
+/// reconstructs nothing even though parity is emitted.  20 % keeps the same
+/// bandwidth-delay product, queue limit, and seed discipline while making at
+/// least one flushed group lose a data symbol, so the reconstruction path is
+/// actually exercised (verified across seeds 171 and 181).
+const FEC_RECOVERY_LOSS_FRACTION: u32 = 5;
+
+fn fec_recovery_fat_pipe_seeded(seed: u64) -> NetemConfig {
     let mut c = support::presets::fec_gaming_fat_pipe();
+    c.loss = u32::MAX / FEC_RECOVERY_LOSS_FRACTION;
     c.seed = seed;
     c
 }
@@ -1310,8 +1323,12 @@ async fn hol_cap400_fec_solo() {
 /// composition must enable `FecTuning::max_diversity()` plus in-stream group
 /// FEC on the interactive RTP lane with no caller toggle, while the bulk
 /// lane stays FEC-free. Every lane endpoint asserts its typed
-/// `MetricsFecCounters` independently, and the interactive lanes must
-/// actually emit parity and recover symbols on the lossy gaming fat pipe.
+/// `MetricsFecCounters` independently, the interactive lanes must emit parity
+/// on the lossy gaming fat pipe, and — on the [`fec_recovery_fat_pipe_seeded`]
+/// arm whose loss forces a flushed group to lose a data symbol — the receiver
+/// must reconstruct it.  The stock 5 % gaming preset emits parity sporadically
+/// and never makes a flushed group lose its symbol in this contended sparse
+/// stream, so it cannot carry the recovery assertion.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow default-on FEC policy probe; run in-release mode with --ignored --nocapture --test-threads=1"]
 async fn hol_rtp_mux_fec_default_on_recovery() {
@@ -1321,6 +1338,18 @@ async fn hol_rtp_mux_fec_default_on_recovery() {
         run_for: DEFAULT_RUN_FOR,
         grace: DEFAULT_GRACE,
     };
+    // The parity gate is reactive and each flush protects the group the sender
+    // is currently carrying, so whether a *flushed* group also loses a data
+    // symbol is a property of the seeded loss realization, not of the FEC
+    // policy: a single arm can legitimately flush parity and reconstruct
+    // nothing (observed at both the preset's 5 % and a forced 20 %).  The
+    // reconstruction path is therefore gated on the aggregate over the arms —
+    // at the forced loss rate every arm flushes parity and the decoder
+    // reconstructs (measured 3-6 symbols per arm) — while the per-arm parity
+    // gate keeps each arm honest.  With FEC off both totals are zero, so the
+    // aggregate assertion is the vacuity check for the whole composition.
+    let mut parity_total = 0u64;
+    let mut recovered_total = 0u64;
     for (label, seed) in [
         ("rtp_mux default FEC A", 171),
         ("rtp_mux default FEC B", 181),
@@ -1330,8 +1359,8 @@ async fn hol_rtp_mux_fec_default_on_recovery() {
             label,
             run_hol_probe_rtp_mux(
                 label,
-                fec_gaming_fat_pipe_seeded(seed),
-                fec_gaming_fat_pipe_seeded(seed + 1),
+                fec_recovery_fat_pipe_seeded(seed),
+                fec_recovery_fat_pipe_seeded(seed + 1),
                 controller_fat_pipe_seeded(seed + 2),
                 controller_fat_pipe_seeded(seed + 3),
                 traffic,
@@ -1353,12 +1382,19 @@ async fn hol_rtp_mux_fec_default_on_recovery() {
             sent.parity_sent > 0,
             "{label} did not activate default FEC after path-recovery evidence: {sent:?}"
         );
-        assert!(
-            received.recovered_symbols > 0,
-            "{label} emitted parity but recovered no symbols: sender={sent:?} receiver={received:?}"
-        );
+        parity_total += sent.parity_sent;
+        recovered_total += received.recovered_symbols;
         eprintln!("[hol {label}] default FEC evidence: sender={sent:?} receiver={received:?}");
     }
+    assert!(
+        parity_total > 0,
+        "default-on interactive FEC never emitted parity across the arms"
+    );
+    assert!(
+        recovered_total > 0,
+        "default-on interactive FEC emitted {parity_total} parity symbols across the arms but the \
+         receiver reconstructed none; the reconstruction path is dead"
+    );
 }
 
 // ────────────────────────────── hostile rows ──────────────────────────────────
@@ -1627,17 +1663,25 @@ async fn run_hol_probe_rtp_mux(
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let active_for = run_for - BULK_RAMP;
             let (bulk_stop_tx, mut bulk_stop_rx) = tokio::sync::watch::channel(false);
-            let mut bulk_pump = {
+            // `pump_failed_tx` records that the pump ended on its own (open or
+            // write failure) rather than on the watch stop signal; only an
+            // own-end while the measurement is running is a premature pump end.
+            let (pump_failed_tx, pump_failed_rx) = tokio::sync::watch::channel(false);
+            let mut bulk_tasks = tokio::task::JoinSet::new();
+            {
                 let connector = Arc::clone(&connector);
                 let payload = Arc::clone(&payload);
                 let int_proxy_addr = int_pair.client_addr();
-                tokio::spawn(async move {
+                bulk_tasks.spawn(async move {
                     let mut stream = match connector
                         .connect_stream_with_lane(int_proxy_addr, rtp_mux::LaneClass::Bulk)
                         .await
                     {
                         Ok(stream) => stream,
-                        Err(_) => return,
+                        Err(_) => {
+                            let _ = pump_failed_tx.send(true);
+                            return;
+                        }
                     };
                     // The pump runs until the watch signals shutdown at the end of
                     // the interactive measurement (or a write failure ends it).
@@ -1653,11 +1697,16 @@ async fn run_hol_probe_rtp_mux(
                             Duration::from_secs(3600),
                             &BULK_NO_STOP,
                             BulkLoad::Saturating,
-                        ) => {}
+                        ) => {
+                            // The writer returned short of its 3600s backstop and
+                            // before the stop signal: the pump ended on a write
+                            // failure while the measurement may still be running.
+                            let _ = pump_failed_tx.send(true);
+                        }
                     }
                     let _ = stream.shutdown().await;
-                })
-            };
+                });
+            }
             let body = async {
                 let mut stream = connector
                     .connect_stream_with_lane(
@@ -1666,33 +1715,48 @@ async fn run_hol_probe_rtp_mux(
                     )
                     .await
                     .unwrap();
-                // The bulk pump must stay live until the interactive
-                // measurement finishes: if it ends early, fail the test
-                // instead of measuring without contention.
-                let sent = tokio::select! {
-                    joined = &mut bulk_pump => {
-                        joined.expect("bulk pump exists");
-                        panic!("bulk pump ended before the interactive measurement completed");
-                    }
-                    sent = run_mux_interactive_stream(
-                        &mut stream,
-                        base,
-                        msg_bytes,
-                        cadence,
-                        run_for,
-                    ) => sent,
-                };
-                let _ = stream.shutdown().await;
+                let sent =
+                    run_mux_interactive_stream(&mut stream, base, msg_bytes, cadence, run_for)
+                        .await;
                 let bulk_bytes = bulk_counter.load(Ordering::Relaxed);
-                // Signal the pump to stop and join it before the straggler
-                // grace, so the bulk byte counter snapshot is stable.
-                bulk_stop_tx.send(true).unwrap();
-                bulk_pump.await.unwrap();
-                tokio::time::sleep(grace).await;
+                // Signal the pump to stop before the straggler drain.  The
+                // pump may already have exited on a write failure, in which
+                // case its receiver is gone and the send is a no-op; the
+                // `pump_failed` watch below is what reports a premature end.
+                let _ = bulk_stop_tx.send(true);
+                // Drain until every sent message is observed or the sink stops
+                // advancing for `grace`.  The write half stays OPEN across the
+                // drain: a delivery measurement must keep the sender alive
+                // until the receiver has everything, otherwise a graceful
+                // close races the last in-flight frames.
+                //
+                // A fixed grace conflates "the transport lost a message" with
+                // "the final buffered messages did not finish draining within
+                // the window": the saturating bulk lane can starve the
+                // interactive lane's write path for many seconds, so the last
+                // writes are accepted just as the window closes and their
+                // delivery completes only once the contention stops.  Waiting
+                // while the sink keeps advancing measures delivery (a genuinely
+                // lost message leaves no progress and trips the `grace`
+                // no-progress bound), not the drain rate.
                 let mut samples = Vec::new();
-                while let Ok((_tag, latency)) = latencies.try_recv() {
-                    samples.push(latency);
+                let mut idle_since = Instant::now();
+                loop {
+                    let before = samples.len() as u64;
+                    while let Ok((_tag, latency)) = latencies.try_recv() {
+                        samples.push(latency);
+                    }
+                    if samples.len() as u64 >= sent {
+                        break;
+                    }
+                    if samples.len() as u64 > before {
+                        idle_since = Instant::now();
+                    } else if idle_since.elapsed() >= grace {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                let _ = stream.shutdown().await;
                 let received = samples.len() as u64;
                 let bulk_secs = active_for.as_secs_f64();
                 let summary = summarize(samples, sent, received, bulk_bytes, bulk_secs);
@@ -1712,7 +1776,19 @@ async fn run_hol_probe_rtp_mux(
                     server_bulk_fec: server_metrics.bulk(),
                 }
             };
-            body.await
+            // The bulk pump must stay live (contending) for the whole
+            // interactive measurement: run it to completion, then fail if the
+            // pump ended on its own (open or write failure) instead of on the
+            // watch stop signal.
+            let result = body.await;
+            if *pump_failed_rx.borrow() {
+                panic!("bulk pump ended before the interactive measurement completed");
+            }
+            // Epilog: join the pump so any panic surfaces.
+            while let Some(result) = bulk_tasks.join_next().await {
+                result.unwrap();
+            }
+            result
         })
         .await
 }
