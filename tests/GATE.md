@@ -38,7 +38,10 @@ separate, much slower evidence path and is not part of `cargo test`.
 in-stream FEC capacity gate), `rtp_and_mux`, and `mux_over_rtp`. Plus the two
 `hol_probe` and two `perf_probe` seeding tests, and the single
 `rtp_liveness` / `shared_bottleneck` resynchronisation tests that were already
-un-ignored.
+un-ignored. The clean-link mux bulk progress gate
+(`mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout`) is also
+default: it is seeded, deterministic, and bounds itself with a wall-clock
+deadline so a wedged transport cannot hang the suite.
 
 ## Opt-in manifest
 
@@ -107,8 +110,8 @@ hol_verify4::v4_clean_muxbulk = perf
 hol_verify4::v4_clean_rawbulk = perf
 hol_verify4::v4_ge5_muxbulk = perf
 hol_verify4::v4_ge5_rawbulk = perf
-mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout = full
 mux_bulk_clean_stall::induced_stall_fires_the_watchdog = full
+mux_bulk_clean_stall::slow_live_link_is_backpressure_not_a_stall = full
 mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf = perf
 mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = perf
 mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke = perf

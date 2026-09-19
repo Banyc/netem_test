@@ -22,6 +22,16 @@
 //! congestion window, by a full send stage, or by an underlay that stopped
 //! accepting — and whether the peer stopped acknowledging.
 //!
+//! A blocked `write_all` is *by itself* only backpressure, not a stall: when
+//! the link keeps delivering (the server sink keeps advancing), a slow write is
+//! exactly what a full pipe looks like.  The
+//! detector therefore declares a stall only when the write blocks for the
+//! watchdog window **and** no end-to-end progress is observed in that window,
+//! which is the property the scenario claims to measure.  A hard-wall
+//! deadline on a detached thread bounds the run even if a wedged transport
+//! starves the tokio timer wheel (the failure mode that used to leave the
+//! suite hanging for minutes).
+//!
 //! Run with:
 //!
 //! ```sh
@@ -30,7 +40,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use netem_test::{NetemConfig, NetemPair};
@@ -192,32 +202,102 @@ enum WriteOutcome {
     Stalled { writes: u64, elapsed: Duration },
 }
 
-/// Write `CHUNK`-sized frames until [`WRITE_WINDOW`] elapses.  Each write is
-/// raced against [`WRITE_WATCHDOG`]; if it blocks, the transport state is
-/// dumped and the stall is returned instead of hanging.
+/// A hard, wall-clock deadline on a detached OS thread.
+///
+/// Every tokio timer in the test is useless once a wedged transport starves
+/// the timer wheel: the per-write watchdog and the outer `STALL_TIMEOUT` both
+/// stop firing and the binary hangs for minutes. This guard runs off-runtime,
+/// so on expiry it prints a diagnostic and aborts the test binary (a fast,
+/// diagnosable failure) instead of poisoning the suite. It is disarmed on
+/// drop, so a normal run pays nothing.
+struct HardDeadline {
+    done: Arc<AtomicBool>,
+}
+
+impl HardDeadline {
+    fn arm(label: &'static str, limit: Duration, latest: Arc<Mutex<LatestState>>) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_thread = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done_for_thread.load(Ordering::Relaxed) {
+                if start.elapsed() >= limit {
+                    eprintln!("===== mux bulk stall: HARD DEADLINE {limit:?} exceeded =====");
+                    eprintln!(
+                        "  the transport wedged hard enough that tokio timers no longer fire;\n  aborting the test binary so a stalled run cannot hang the suite ({label})"
+                    );
+                    dump_stall("hard deadline", &latest, 0, 0, limit);
+                    std::process::abort();
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        Self { done }
+    }
+}
+
+impl Drop for HardDeadline {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Write `CHUNK`-sized frames until [`WRITE_WINDOW`] elapses.
+///
+/// A blocked `write_all` is only a stall when **no end-to-end progress** is
+/// observed for [`WRITE_WATCHDOG`]. `progress()` reports the server sink's
+/// advanced byte count; a slow-but-live link (or a momentarily starved tokio
+/// scheduler whose sink still drains) is backpressure, not a stall. Only a
+/// write that blocks while the sink stops advancing is reported as
+/// [`WriteOutcome::Stalled`], with the transport dump. The window is
+/// self-bounded (`WRITE_WINDOW` plus at most one watchdog), so the run always
+/// returns and teardown never depends on the outer timeout cancelling a live
+/// future.
 async fn drive_writes<W: AsyncWrite + Unpin>(
     stream_write: &mut W,
     latest: &Arc<Mutex<LatestState>>,
     delivered: &AtomicU64,
+    progress: &dyn Fn() -> u64,
 ) -> WriteOutcome {
     let payload = cyclic_payload(CHUNK);
     let start = Instant::now();
+    let window_end = start + WRITE_WINDOW;
+    let hard_end = window_end + WRITE_WATCHDOG;
     let mut writes = 0u64;
-    while start.elapsed() < WRITE_WINDOW {
+    while Instant::now() < window_end {
         let write = stream_write.write_all(&payload[..CHUNK]);
         tokio::pin!(write);
-        match tokio::time::timeout(WRITE_WATCHDOG, &mut write).await {
-            Ok(result) => result.unwrap(),
-            Err(_) => {
-                let elapsed = start.elapsed();
-                dump_stall(
-                    "write_all watchdog",
-                    latest,
-                    writes,
-                    delivered.load(Ordering::Relaxed),
-                    elapsed,
-                );
-                return WriteOutcome::Stalled { writes, elapsed };
+        loop {
+            let before = progress();
+            match tokio::time::timeout(WRITE_WATCHDOG, &mut write).await {
+                Ok(result) => {
+                    result.unwrap();
+                    break;
+                }
+                Err(_) => {
+                    if progress() > before {
+                        // The path is still advancing: upstream backpressure,
+                        // not a stall. Wait for the same write again, unless
+                        // the window has fully elapsed (then the writer is
+                        // merely slow-but-live and the run finishes cleanly).
+                        if Instant::now() >= hard_end {
+                            return WriteOutcome::Completed {
+                                writes,
+                                elapsed: start.elapsed(),
+                            };
+                        }
+                        continue;
+                    }
+                    let elapsed = start.elapsed();
+                    dump_stall(
+                        "write_all watchdog (end-to-end progress stopped)",
+                        latest,
+                        writes,
+                        delivered.load(Ordering::Relaxed),
+                        elapsed,
+                    );
+                    return WriteOutcome::Stalled { writes, elapsed };
+                }
             }
         }
         writes += 1;
@@ -228,18 +308,24 @@ async fn drive_writes<W: AsyncWrite + Unpin>(
     }
 }
 
-/// A clean-link mux bulk stream must make progress and complete its write
-/// window.  A blocking `write_all` is caught by [`WRITE_WATCHDOG`] (and the
-/// transport state is dumped), so a stalled run fails fast and diagnosably
-/// instead of only timing out at the end.
+/// A clean-link mux bulk stream must make end-to-end progress and complete
+/// its write window.  A write that blocks while the whole path keeps advancing
+/// is backpressure and is not a stall; only a write that blocks while the sink
+/// stops advancing trips [`WRITE_WATCHDOG`], dumping the
+/// transport state. [`HardDeadline`] bounds the run even if the transport
+/// wedges hard enough to starve the tokio timer wheel.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "clean-link mux bulk stall watchdog; run with --ignored --nocapture --test-threads=1"]
 async fn clean_link_mux_bulk_completes_within_timeout() {
     let mut tasks = TestScope::new();
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     // No metrics observer: attaching the snapshot observer masks the stall.
     let latest = Arc::new(Mutex::new(LatestState::default()));
     let latest_for_run = Arc::clone(&latest);
+    let _hard = HardDeadline::arm(
+        "clean_link_mux_bulk_completes_within_timeout",
+        STALL_TIMEOUT,
+        Arc::clone(&latest),
+    );
 
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_for_run = Arc::clone(&delivered);
@@ -287,7 +373,14 @@ async fn clean_link_mux_bulk_completes_within_timeout() {
             }),
         );
 
-        let outcome = drive_writes(&mut stream_write, &latest_for_run, &delivered_for_run).await;
+        let progress = || delivered_for_run.load(Ordering::Relaxed);
+        let outcome = drive_writes(
+            &mut stream_write,
+            &latest_for_run,
+            &delivered_for_run,
+            &progress,
+        )
+        .await;
         let _ = stream_write.shutdown();
         drop(opener);
         pair.stop();
@@ -319,17 +412,25 @@ async fn clean_link_mux_bulk_completes_within_timeout() {
     }
 }
 
-/// Deterministic validation of the watchdog: the server sink stops reading
-/// after a little data, so the mux stream's flow-control window fills and the
-/// client's `write_all` blocks.  The watchdog must fire and dump the transport
-/// state — this is the instrumentation working even when the load-dependent
-/// real stall does not reproduce.
+/// Deterministic validation of the watchdog: on a 200 Kbps link the client's
+/// `write_all` blocks for longer than [`WRITE_WATCHDOG`] on every frame while
+/// the stream stays open, and the progress signal is deliberately frozen (the
+/// injected stalled state).  The watchdog must fire and dump the transport
+/// state — this is the vacuity check for the detector, proving it is capable
+/// of failing.  ([`slow_live_link_is_backpressure_not_a_stall`] is the paired
+/// negative control: the same slow writes with a *live* progress signal must
+/// not be misreported as a stall.)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "watchdog validation via an induced stall; run with --ignored --nocapture --test-threads=1"]
 async fn induced_stall_fires_the_watchdog() {
     let mut tasks = TestScope::new();
     let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     let (observer, latest) = diagnostic_observer();
+    let _hard = HardDeadline::arm(
+        "induced_stall_fires_the_watchdog",
+        STALL_TIMEOUT,
+        Arc::clone(&latest),
+    );
 
     let run = tasks.run(async move {
         let server_addr = spawn_mux_over_rtp_server_with_mss_via(
@@ -380,7 +481,10 @@ async fn induced_stall_fires_the_watchdog() {
         );
 
         let no_delivery = AtomicU64::new(0);
-        let outcome = drive_writes(&mut stream_write, &latest, &no_delivery).await;
+        // Deliberately frozen progress: the injected stalled state the
+        // watchdog must flag even though the writer is only backpressured.
+        let progress = || no_delivery.load(Ordering::Relaxed);
+        let outcome = drive_writes(&mut stream_write, &latest, &no_delivery, &progress).await;
         let _ = stream_write.shutdown();
         drop(opener);
         pair.stop();
@@ -397,5 +501,98 @@ async fn induced_stall_fires_the_watchdog() {
             "the watchdog did not fire on an induced stall (writes={writes} elapsed={elapsed:?})"
         ),
         Err(_) => panic!("the induced-stall run did not finish within {STALL_TIMEOUT:?}"),
+    }
+}
+
+/// The watchdog's negative control: on a very slow but *live* link the client's
+/// `write_all` blocks for longer than [`WRITE_WATCHDOG`] on every frame, yet the
+/// sink keeps receiving (just slowly). That is backpressure, not a stall, so the
+/// run must finish [`WriteOutcome::Completed`] — this is the guard against the
+/// false positive that made the clean-link scenario flaky under load.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "watchdog negative control: slow-but-live backpressure must not trip it; run with --ignored --nocapture --test-threads=1"]
+async fn slow_live_link_is_backpressure_not_a_stall() {
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
+    let latest = Arc::new(Mutex::new(LatestState::default()));
+    let latest_for_run = Arc::clone(&latest);
+    let _hard = HardDeadline::arm(
+        "slow_live_link_is_backpressure_not_a_stall",
+        STALL_TIMEOUT,
+        Arc::clone(&latest),
+    );
+
+    let delivered = Arc::new(AtomicU64::new(0));
+    let delivered_for_run = Arc::clone(&delivered);
+
+    let run = tasks.run(async move {
+        let delivered_for_server = Arc::clone(&delivered_for_run);
+        let server_addr = spawn_mux_over_rtp_server_with_mss_via(
+            &task_tx,
+            false,
+            rtp::udp::NO_FEC_MSS,
+            move |mut stream_read, mut stream_write| {
+                let delivered = Arc::clone(&delivered_for_server);
+                async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n) = stream_read.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        delivered.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    let _ = stream_write.shutdown();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let pair = NetemPair::spawn(server_addr, slow_link(11), slow_link(22)).unwrap();
+        let (connected_read, connected_write) =
+            rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
+                .await;
+        let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
+        let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
+
+        submit_test_task(
+            &task_tx,
+            Box::pin(async move {
+                let mut buf = vec![0u8; 8 * 1024];
+                while let Ok(n) = stream_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }),
+        );
+
+        let progress = || delivered_for_run.load(Ordering::Relaxed);
+        let outcome = drive_writes(
+            &mut stream_write,
+            &latest_for_run,
+            &delivered_for_run,
+            &progress,
+        )
+        .await;
+        let _ = stream_write.shutdown();
+        drop(opener);
+        pair.stop();
+        outcome
+    });
+
+    match tokio::time::timeout(STALL_TIMEOUT, run).await {
+        Ok(WriteOutcome::Completed { writes, elapsed }) => {
+            let bytes = delivered.load(Ordering::Relaxed);
+            eprintln!(
+                "[slow-live] backpressure not a stall: writes={writes} elapsed={elapsed:?} delivered={bytes}B"
+            );
+            assert!(writes > 0, "the slow-but-live writer made no progress");
+            assert!(bytes > 0, "the slow-but-live sink delivered nothing");
+        }
+        Ok(WriteOutcome::Stalled { writes, elapsed }) => panic!(
+            "a slow-but-live link was misreported as a stall after {writes} writes ({elapsed:?})"
+        ),
+        Err(_) => panic!("the slow-but-live run did not finish within {STALL_TIMEOUT:?}"),
     }
 }
