@@ -289,8 +289,11 @@ async fn unpadded_wire_sizes_stay_multimodal() {
 /// default-tier cost near two seconds.
 const ACK_PADDING_TRIALS: usize = 24;
 
+/// Runs in the default tier: the property is deterministic (fitted ACKs
+/// mimic the data envelope) and the 24-trial pool both fits the default
+/// budget and separates fitted from unpadded, so leaving it report-only or
+/// `#[ignore]`d would have made the assertion unreachable.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "rtp padding bench; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn ack_padding_hides_ack_packets_among_data() {
     let transfer_bytes = 256 * 1024;
 

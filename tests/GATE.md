@@ -41,7 +41,20 @@ in-stream FEC capacity gate), `rtp_and_mux`, and `mux_over_rtp`. Plus the two
 un-ignored. The clean-link mux bulk progress gate
 (`mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout`) is also
 default: it is seeded, deterministic, and bounds itself with a wall-clock
-deadline so a wedged transport cannot hang the suite.
+deadline so a wedged transport cannot hang the suite. The padding bench's
+fitted-ACK assertion
+(`rtp_padding_bench::ack_padding_hides_ack_packets_among_data`) is default
+too: it asserts a correctness property (the fitted ACK cluster is shrunken
+against the unpadded baseline while the large-data peak is preserved) and its
+24-trial pool keeps the pooled fitted/baseline small-cluster ratio at
+0.13-0.28 across the debug default gate and release (bound 0.5, so a >1.7x
+margin), so leaving it `#[ignore]`d made the assertion unreachable. The
+`gate-default-required` block names the asserting scenarios that must stay in
+this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed.
+
+```gate-default-required
+rtp_padding_bench::ack_padding_hides_ack_packets_among_data
+```
 
 ## Opt-in manifest
 
@@ -165,7 +178,6 @@ rtp_padding_bench::ab_bulk_throughput_across_presets = perf
 rtp_padding_bench::ab_small_echo_latency = perf
 rtp_padding_bench::ab_small_echo_latency_ack_padding = perf
 rtp_padding_bench::ab_small_echo_latency_across_presets = perf
-rtp_padding_bench::ack_padding_hides_ack_packets_among_data = perf
 rtp_padding_bench::padded_wire_sizes_converge_to_one_peak = perf
 rtp_padding_bench::padding_throughput_overhead = perf
 rtp_padding_bench::unpadded_wire_sizes_stay_multimodal = perf
