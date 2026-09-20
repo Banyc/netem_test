@@ -16,3 +16,15 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", 
 # by the scenario crates. The feature stays OFF for plain library builds so
 # the leaf harness does not drag tokio into the normal dependency graph.
 test-kit = ["dep:tokio"]
+
+[dev-dependencies]
+# Self dev-dependency, mirroring rtp's `rtp = { path = ".", features =
+# ["testing"] }` pattern: the library's own test targets are built with the
+# `test-kit` feature enabled, so the kit's unit tests run in the harness's
+# default test invocation (`cargo test -p netem-test`, and therefore the
+# `--workspace` gate) instead of only under an explicit
+# `--features test-kit`. The feature is enabled only for this package's test
+# builds: a plain `cargo build` of the library, and every consumer that does
+# not request the feature itself, still compiles without `test-kit`, so the
+# leaf harness keeps its lean dependency graph.
+netem-test = { path = ".", features = ["test-kit"] }
