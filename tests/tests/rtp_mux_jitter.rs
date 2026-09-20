@@ -2296,6 +2296,75 @@ async fn jitter_duallane_constitution_gate() {
     );
 }
 
+/// The interactive p99 ceiling above the one-way floor: a repair that needs
+/// more than this many milliseconds of p99 latency violates the README's
+/// "zero >250 ms spikes" criterion. Measured p99 on the seeded `both` arm is
+/// ~29 ms (25 ms one-way + jitter + repairs), so the 250 ms ceiling leaves a
+/// ~8× margin while still biting on any regression that lets the interactive
+/// tail decay (the GE-burst diagnostics that keep delivery at 1.000 push p99
+/// well past this ceiling).
+const INTERACTIVE_P99_CEILING_MS: f64 = 250.0;
+
+/// The median-of-3 interactive-latency constitution gate: the production
+/// `both` dual-lane arm (frame + fast-forward + prompt-FEC interactive lane at
+/// 2 % loss, separate strict bulk lane) run three times, asserting the
+/// interactive outcome triad on every run — `delivery == 1.000` and the
+/// client→server wire within the [`INTERACTIVE_WIRE_BUDGET_X`] budget (both
+/// deterministic counts, min over the three reps) — and the median-of-3 p99
+/// against the [`INTERACTIVE_P99_CEILING_MS`] ceiling. The p99 is a single
+/// wall-clock observation and its timing against the seeded loss stream varies
+/// with host scheduling, so it is gated on the median of the three runs,
+/// exactly as the contested-latency and paced-bulk HOL gates do.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; three ~35 s dual-lane constitution runs; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_duallane_constitution_gate_p99() {
+    const REPS: usize = 3;
+    let mut p99s = [0.0f64; REPS];
+    for (rep, slot) in p99s.iter_mut().enumerate() {
+        let label = format!("duallane_constitution_p99/both/rep{}", rep + 1);
+        let run = with_timeout(
+            Duration::from_secs(120),
+            &label,
+            run_duallane(&label, true, DualImpairment::Both),
+        )
+        .await;
+        let summary = &run.run.summary;
+        assert_sane(&label, summary);
+        let offered = summary.sent * MSG_BYTES as u64;
+        let wire = run.int_c2s_wire_bytes;
+        assert_eq!(
+            summary.received, summary.sent,
+            "[{label}] interactive delivery must be exactly 1.000: {}/{} messages delivered ({:.3}), the interactive lane ate its own goodput",
+            summary.received, summary.sent, summary.delivery_pct,
+        );
+        assert!(
+            wire <= offered * INTERACTIVE_WIRE_BUDGET_X,
+            "[{label}] interactive c2s wire {wire} bytes exceeds the {INTERACTIVE_WIRE_BUDGET_X}x offered-payload budget ({} bytes): redundant wire must not inflate unboundedly (measured {:.2}x)",
+            offered * INTERACTIVE_WIRE_BUDGET_X,
+            wire as f64 / offered as f64,
+        );
+        *slot = summary.p99;
+        eprintln!(
+            "[{label}] rep {}: delivery {:.3}, c2s wire {wire} bytes = {:.2}x offered {offered} bytes, p50 {:.1} p99 {:.1} ms",
+            rep + 1,
+            summary.delivery_pct,
+            wire as f64 / offered as f64,
+            summary.p50,
+            summary.p99,
+        );
+    }
+    let mut sorted = p99s;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = sorted[REPS / 2];
+    assert!(
+        median <= INTERACTIVE_P99_CEILING_MS,
+        "[duallane_constitution_p99/both] median p99 {median:.1} ms > {INTERACTIVE_P99_CEILING_MS} ms ceiling (per-run p99: {p99s:?}): the interactive tail must stay at the one-way floor"
+    );
+    eprintln!(
+        "[duallane_constitution_p99/both] median-of-3 p99 {median:.1} ms <= {INTERACTIVE_P99_CEILING_MS} ms ceiling OK"
+    );
+}
+
 /// Print one burst-loss arm's interactive-latency percentiles (p99.9 beside
 /// p99 so a rare repair spike is not hidden by the floor), delivery, offered
 /// interactive wire, and the RTP repair counters.
