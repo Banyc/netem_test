@@ -540,7 +540,9 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
+ "netem-test",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
+ "rtp",
  "tokio",
  "tokio-util",
  "tracing",
@@ -551,6 +553,7 @@ name = "netem-test"
 version = "0.1.0"
 dependencies = [
  "dfsql",
+ "netem-test",
  "parking_lot 0.12.5",
  "serde",
  "tokio",
