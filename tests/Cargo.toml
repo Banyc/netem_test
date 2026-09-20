@@ -6,7 +6,7 @@ license.workspace = true
 
 [dev-dependencies]
 netem-test = { path = "../netem-test", features = ["test-kit"] }
-rtp = { path = "../../rtp" }
+rtp = { path = "../../rtp", features = ["testing"] }
 # rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.88" }
 # mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.28" }
 mux = { path = "../../mux" }

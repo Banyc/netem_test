@@ -913,6 +913,7 @@ dependencies = [
  "dre",
  "fec",
  "mpudp",
+ "netem-test",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
  "rand 0.10.2",
  "self_assign",

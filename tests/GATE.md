@@ -382,7 +382,9 @@ Since the shared scaffolding relocated into the harness `test-kit` feature
 the helpers that used to live in
 `tests/tests/support/{payload,presets,stats,task_scope,mod}.rs`
 (`with_timeout`, `gilbert_elliott_loss`, `percentile`, `try_send_observation`,
-and the `TestScope` reaper machinery) are outside this crate-local scan; each
+and the `TestScope` reaper machinery, plus the rtp layer kit
+(`rtp::testkit::{rtp,frame,perf_trace}`, hosted by the owning crate behind
+its `testing` feature)) are outside this crate-local scan; each
 keeps its report-only role, guarded by the vacuity tests in its kit home
 instead. They are re-added when the checker is parameterized per crate.
 
@@ -397,7 +399,6 @@ tests/support/mux.rs::mux_client_connect_frame_delivery_via = 1
 tests/support/mux.rs::send_timestamped_messages = 1
 tests/support/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
 tests/support/mux.rs::spawn_mux_over_rtp_server_core = 1
-tests/support/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 ```
 
 ## Perf-loop lane roles
