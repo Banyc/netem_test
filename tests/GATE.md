@@ -233,7 +233,6 @@ harness's own default test invocation via the `test-kit` self dev-dependency.
 
 ```gate-perf-guard-helpers
 mux/src/testkit/mux.rs::mux_client_connect_core = 1
-mux/src/testkit/mux.rs::send_timestamped_messages = 1
 mux/src/testkit/mux.rs::spawn_mux_over_rtp_server_core = 1
 netem_test/netem-test/src/kit/mod.rs::try_send_observation = 1
 netem_test/netem-test/src/kit/payload.rs::with_timeout = 1
@@ -243,6 +242,7 @@ netem_test/netem-test/src/kit/task_scope.rs::run = 1
 netem_test/netem-test/src/kit/task_scope.rs::spawn_required = 1
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
+rtp/src/testkit/rtp.rs::send_timestamped_messages = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 ```
 
