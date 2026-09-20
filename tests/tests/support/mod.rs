@@ -5,6 +5,12 @@
 //! reusable plumbing (impairment presets, deterministic payloads, timeout
 //! guards, and `rtp` / `mux` echo servers) so each focused test target stays
 //! small and readable.
+//!
+//! The generic helpers (payload, presets, stats reporting, prng, task_scope,
+//! contested, fan, and the module core) now live in the harness kit behind
+//! the `test-kit` feature; this module is a thin re-export view of that
+//! single authority and is removed as the scenarios relocate into their
+//! owning crates.
 
 #![allow(dead_code)]
 
@@ -24,61 +30,11 @@ pub(crate) mod task_scope;
 // Re-exported for the scenario files; targets that spawn no background tasks
 // (e.g. `netem_scenarios`) do not reference them.
 #[allow(unused_imports)]
-pub(crate) use task_scope::{
+pub(crate) use netem_test::kit::{
+    LANE_EVENT_CAPACITY, LATENCY_SAMPLE_CAPACITY, TEST_ACCEPT_CAPACITY, TEST_TASK_QUEUE_BOUND,
     TestScope, TestTask, TestTaskSubmitter, abort_and_reap_test_tasks,
     spawn_test_task_reaper_with_shutdown, submit_test_task, submit_test_task_required,
+    try_send_observation,
 };
 
 pub mod contested;
-
-pub(crate) const LATENCY_SAMPLE_CAPACITY: usize = 4096;
-pub(crate) const TEST_ACCEPT_CAPACITY: usize = 64;
-pub(crate) const LANE_EVENT_CAPACITY: usize = 64;
-pub(crate) const TEST_TASK_QUEUE_BOUND: usize = 256;
-
-pub(crate) fn try_send_observation<T>(
-    tx: &tokio::sync::mpsc::Sender<T>,
-    value: T,
-    kind: &'static str,
-) -> bool {
-    match tx.try_send(value) {
-        Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            panic!("{} channel is full; the test harness is not draining", kind)
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[should_panic(expected = "channel is full")]
-    fn try_send_observation_panics_when_channel_is_full() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        assert!(try_send_observation(&tx, 1u8, "latency sample"));
-        try_send_observation(&tx, 2u8, "latency sample");
-    }
-
-    #[tokio::test]
-    async fn bounded_send_applies_backpressure_until_drained() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        assert!(try_send_observation(&tx, 1u8, "accept"));
-        let tx2 = tx.clone();
-        let second = tx2.send(2u8);
-        tokio::pin!(second);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
-                .await
-                .is_err()
-        );
-        assert_eq!(rx.recv().await, Some(1u8));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), second)
-                .await
-                .is_ok()
-        );
-    }
-}

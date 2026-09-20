@@ -377,26 +377,27 @@ indirection limits from the previous paragraph still apply: an assertion
 reached only by passing a function by name, through a trait object, or
 through a macro alias remains invisible to the graph.
 
+Since the shared scaffolding relocated into the harness `test-kit` feature
+(`netem_test::kit::{payload,presets,stats,prng,fan,contested,task_scope,mod-core}`),
+the helpers that used to live in
+`tests/tests/support/{payload,presets,stats,task_scope,mod}.rs`
+(`with_timeout`, `gilbert_elliott_loss`, `percentile`, `try_send_observation`,
+and the `TestScope` reaper machinery) are outside this crate-local scan; each
+keeps its report-only role, guarded by the vacuity tests in its kit home
+instead. They are re-added when the checker is parameterized per crate.
+
 ```gate-perf-guard-helpers
 tests/rtp_mux_jitter.rs::assert_reportable = 2
 tests/rtp_mux_jitter.rs::assert_sane = 2
 tests/rtp_padding_bench.rs::run_transfer = 1
 tests/rtp_padding_bench.rs::run_transfer_preset = 1
 tests/support/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
-tests/support/mod.rs::try_send_observation = 1
 tests/support/mux.rs::mux_client_connect_core = 1
 tests/support/mux.rs::mux_client_connect_frame_delivery_via = 1
 tests/support/mux.rs::send_timestamped_messages = 1
 tests/support/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
 tests/support/mux.rs::spawn_mux_over_rtp_server_core = 1
-tests/support/payload.rs::with_timeout = 1
-tests/support/presets.rs::gilbert_elliott_loss = 2
 tests/support/rtp.rs::spawn_rtp_byte_sink_server_core = 1
-tests/support/stats.rs::percentile = 1
-tests/support/task_scope.rs::run = 1
-tests/support/task_scope.rs::spawn_required = 1
-tests/support/task_scope.rs::submit_test_task = 2
-tests/support/task_scope.rs::submit_test_task_required = 1
 ```
 
 ## Perf-loop lane roles

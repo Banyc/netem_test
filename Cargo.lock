@@ -553,6 +553,7 @@ dependencies = [
  "dfsql",
  "parking_lot 0.12.5",
  "serde",
+ "tokio",
 ]
 
 [[package]]

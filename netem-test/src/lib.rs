@@ -15,6 +15,14 @@
 
 pub mod report;
 
+/// Generic scenario-testing kit, compiled only when the `test-kit` feature is
+/// enabled: deterministic payloads, impairment presets, reporting stats,
+/// task scopes, and per-flow fans shared by the scenario crates. The kit is
+/// the single home for this scaffolding; scenario packages consume it by
+/// local path rather than re-implementing it.
+#[cfg(feature = "test-kit")]
+pub mod kit;
+
 mod loss;
 mod queue;
 mod rng;

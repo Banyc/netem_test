@@ -8,3 +8,11 @@ license.workspace = true
 dfsql = { git = "https://github.com/Banyc/dfsql", tag = "v0.18.0" }
 serde = { version = "1", features = ["derive"] }
 parking_lot = "0.12"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+
+[features]
+# Shared scenario-testing kit: generic helpers (deterministic payload,
+# impairment presets, reporting stats, task scopes, per-flow fans) consumed
+# by the scenario crates. The feature stays OFF for plain library builds so
+# the leaf harness does not drag tokio into the normal dependency graph.
+test-kit = ["dep:tokio"]
