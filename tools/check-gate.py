@@ -117,6 +117,10 @@ class CrateLayout:
     def mux_kit_dir(self) -> Path:
         return self.crates_root / "mux" / "src" / "testkit"
 
+    @property
+    def rtp_mux_kit_dir(self) -> Path:
+        return self.crates_root / "rtp_mux" / "src" / "testkit"
+
 
 def harness_layout(script_dir: Path) -> CrateLayout:
     """The default layout: the netem_test `tests` package."""
@@ -133,12 +137,13 @@ def harness_layout(script_dir: Path) -> CrateLayout:
 
 PERF_LOOP = Path(__file__).resolve().parent / "perf_loop.py"
 # Bare `use` first segments that name external crate roots in the scanned
-# sources: `netem_test::kit::…`, `rtp::testkit::…` and `mux::testkit::…` from
-# the kit sources and the shims, plus `tokio`/`std` imports. Everything else
+# sources: `netem_test::kit::…`, `rtp::testkit::…`, `mux::testkit::…` and
+# `rtp_mux::testkit::…` from the kit sources and the shims, plus
+# `tokio`/`std` imports. Everything else
 # resolves like rustc does for a bare `use` path: against the current
 # module's scope (the kit's `pub use task_scope::…` sibling re-exports), so
 # an in-crate bare path is never mistaken for an external crate.
-EXTERNAL_ROOT_STEMS = {"netem_test", "rtp", "mux", "tokio", "std"}
+EXTERNAL_ROOT_STEMS = {"netem_test", "rtp", "mux", "rtp_mux", "tokio", "std"}
 
 LAYOUT: CrateLayout | None = None
 
@@ -238,18 +243,20 @@ def source_module(path: Path) -> str | None:
     Scenario targets keep the historical `""` module name. In harness mode the
     `tests` crate's `support/**` modules keep their `support`-prefixed names.
     The harness kit sources (`netem-test/src/kit/**`), the rtp layer kit
-    sources (`rtp/src/testkit/**`) and the mux layer kit sources
-    (`mux/src/testkit/**`) are registered under their crate-qualified module
-    names so the call graph can follow a `pub use` shim view or a direct kit
-    import into the kit files.
+    sources (`rtp/src/testkit/**`), the mux layer kit sources
+    (`mux/src/testkit/**`) and the rtp_mux layer kit sources
+    (`rtp_mux/src/testkit/**`) are registered under their crate-qualified
+    module names so the call graph can follow a `pub use` shim view or a
+    direct kit import into the kit files.
     """
     try:
         parts = path.relative_to(layout().dir).parts
     except ValueError:
         for base, prefix in (
             (layout().rtp_kit_dir, "rtp::testkit"),
-            (layout().kit_dir, "netem_test::kit"),
             (layout().mux_kit_dir, "mux::testkit"),
+            (layout().rtp_mux_kit_dir, "rtp_mux::testkit"),
+            (layout().kit_dir, "netem_test::kit"),
         ):
             try:
                 kit_parts = path.relative_to(base).parts
@@ -277,19 +284,33 @@ def source_identity(path: Path) -> str:
 
     In harness mode files inside the `tests` package keep their historical
     package-relative identity (`tests/<file>.rs`, `tests/support/<file>.rs`)
-    so recorded manifest entries stay stable; kit sources are identified
+    so recorded manifest entries stay stable. Kit sources are identified
     relative to the shared crates root (`netem-test/src/kit/<file>.rs`,
-    `rtp/src/testkit/<file>.rs`, `mux/src/testkit/<file>.rs`). In per-crate
-    mode every scanned file — the crate's own scenario targets and the kit
-    sources it reaches — is identified relative to the shared crates root
-    (`mux/tests/<file>.rs`, `mux/src/testkit/<file>.rs`), so entries in the
-    crate's own `GATE.md` never collide with the harness's.
+    `rtp/src/testkit/<file>.rs`, `mux/src/testkit/<file>.rs`,
+    `rtp_mux/src/testkit/<file>.rs`) so they are stable regardless of which
+    crate checkout the checker runs from. In per-crate mode the crate's own
+    scenario targets are identified relative to the crate root
+    (`tests/<file>.rs`), mirroring the harness mode: a repo can be checked
+    out at any sibling path (e.g. `crates/rtp_mux_it178_ws`) while the gate
+    is authored and verified, so a `GATE.md` entry recorded against one
+    checkout location must not go stale when the same tree lands at
+    `crates/<crate>`.
     """
     if layout().is_harness:
         try:
             return str(path.relative_to(layout().root / layout().package))
         except ValueError:
             pass
+    # Scenario targets live directly in the crate's `tests/` dir; in per-crate
+    # mode they are identified relative to the crate root (`tests/<file>.rs`)
+    # so recordings stay stable whether the repo is checked out at
+    # `crates/<crate>` or a session worktree. Kit sources (including the
+    # checked-out crate's own `src/testkit/**`, which sits under the same
+    # root) are identified relative to the shared crates root below, so
+    # `mux/src/testkit/mux.rs` never shifts to `src/testkit/mux.rs` or to
+    # `<worktree>/src/testkit/mux.rs` depending on where the crate lives.
+    if path.parent == layout().dir:
+        return str(path.relative_to(layout().root))
     return str(path.relative_to(layout().crates_root))
 
 
@@ -421,7 +442,8 @@ def target_source_files(target: str) -> list[Path]:
     In harness mode the target includes the crate-local `support/**` modules it
     declares. The kit source files behind the shim views / direct imports are
     always scanned: the harness kit (`netem-test/src/kit/**`), the rtp layer
-    kit (`rtp/src/testkit/**`) and the mux layer kit (`mux/src/testkit/**`).
+    kit (`rtp/src/testkit/**`), the mux layer kit (`mux/src/testkit/**`) and
+    the rtp_mux layer kit (`rtp_mux/src/testkit/**`).
     The kit files belong to other crates but are scanned so the report-only
     perf tier's reach into them stays declared; every crate shares the sibling
     checkout layout, so Cargo assumes exactly that layout.
@@ -432,6 +454,7 @@ def target_source_files(target: str) -> list[Path]:
         files.extend(sorted(layout().support_dir.glob("*.rs")))
     files.extend(sorted(layout().kit_dir.glob("*.rs")))
     files.extend(sorted(layout().rtp_kit_dir.glob("*.rs")))
+    files.extend(sorted(layout().rtp_mux_kit_dir.glob("*.rs")))
     files.extend(sorted(layout().mux_kit_dir.glob("*.rs")))
     return [path for path in files if path.exists()]
 

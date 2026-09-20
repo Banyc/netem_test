@@ -1,75 +1,48 @@
-# Interactive-latency oracle (`rtp_mux_jitter`)
+# The netem_test scenario gate scope
 
-The game-relay oracle: `game client -TCP-> access-server -rtp_mux(rtp+mux)-> proxy-server -TCP-> game server`.
-It measures the interactive lane's per-message latency and the bulk lane's
-throughput for a seeded, deterministic impairment link.
+This package (`tests`) is the **impairment harness**, not the owner of any
+application performance contract. It consumes the `netem-test` instrument (the
+kernel-faithful `NetemPair`/`NetemConfig` impairment plumbing and the
+`test-kit` generic helpers) and hosts the rtp-owned scenarios that have not
+yet relocated into the `rtp` crate (step 5 of the relocation — the `perf_probe`
+probes, `rtp_bufferbloat`, `rtp_burst_loss`, `rtp_fec`, `rtp_gentle`,
+`rtp_liveness`, `rtp_loss`, `rtp_mss`, `rtp_padding_bench`, `contested_latency`,
+`shared_bottleneck`, `hol_verify4`, `netem_scenarios`, `raw_netem_pair`).
 
-Binary: `tests/tests/rtp_mux_jitter.rs`. Support: `tests/tests/support/{rtp,mux,frame,dual,stats}.rs`.
+The scenario suites for `mux` and `rtp_mux` relocated into their owning
+crates with the layer kits (`mux::testkit`, `rtp_mux::testkit`). Their gates
+and the tri-mandate constitution live **in those crates**, so every mandate
+has exactly one asserting authority — see `tests/GATE.md` for the manifest/tier
+mechanics of THIS package only.
 
-> **Gate scope:** the interactive oracle below is the `perf` tier. The full
-> scenario-gate scope, with every `#[ignore]`d test's tier, lives in
-> `tests/GATE.md` and is verified by `python3 tools/check-gate.py`. A plain
-> `cargo test -p tests` runs only the default tier and none of these arms.
+## The tri-mandate constitution: one authority per mandate
 
-## Running
+| mandate | asserted by (crate) | gate | run (M1/M3 opt-in `full`; M2 default) |
+| --- | --- | --- | --- |
+| **M1** low latency of the interactive lane (p99 floor + zero >250 ms spikes, median-of-3) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate_p99` | `cargo test --release -p rtp_mux --test rtp_mux_jitter -- --ignored jitter_duallane_constitution_gate_p99 --nocapture --test-threads=1` |
+| **M2** reasonable goodput of the interactive lane (`delivery == 1.000` + own-wire ≤ 6× offered) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate` (default tier — runs on every `cargo test -p rtp_mux`; deterministic counts) | `cargo test -p rtp_mux` |
+| **M3** high goodput of the bulk lane (≥ 0.35 × configured link rate, median-of-3) | `rtp_mux` | `dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction` | `cargo test --release -p rtp_mux --test dual_lane_mandates -- --ignored bulk_lane_goodput_stays_above_capacity_fraction --nocapture --test-threads=1` |
 
-```sh
-cargo test --release -p tests --test rtp_mux_jitter -- --ignored --nocapture --test-threads=1
-```
+The bounds and their derivations, and the interactive scaling boundary
+(`hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery`), are stated in
+`rtp_mux/GATE.md` ("Performance") and module-level in
+`rtp_mux/tests/dual_lane_mandates.rs` — never restated here. The mux layer's
+per-stream contributions are in `mux/GATE.md` (default tier: delivered == the
+offered payload; standard tier: loopback bulk ceilings; full tier: fairness
+floors). The harness tooling gates stay with the tooling: `perf-loop run|analyze
+--fail-on-phase-drift` and `--fail-on-wakes-cap` (see
+`tools/PERF_LOOP.md`).
 
-Arms: interactive latency (`solo` / `loss` / `bulk` / `bulk+loss`) in byte-stream,
-frame-delivery, frame-reorder, and **dual-lane** modes; FEC arms at 2 % and 6 %
-loss; the frame-reorder+FEC arms. The **dual-lane** arms are the deployment
-topology: interactive lane on its own RTP connection (frame mode + fast-forward
-+ FEC + fresh-tail armor), bulk lane separate and strict.
+## Running the gate
 
-## Acceptance criteria (the optimization loop gate)
-
-Every change to the interactive path must clear ALL of these, and the gate is
-re-read every iteration:
-
-1. **Interactive latency** — the dual-lane `bulk+loss` (`both`) p50/p90/p99/max
-   must improve or stay at the one-way floor, with zero `>250 ms` spikes.
-2. **Interactive throughput is normal** — the interactive lane's OWN wire
-   (`interactive pair ... forwarded_bytes`, 30 s run) stays bounded and the
-   message delivery ratio is `1.000` (all offered messages delivered at the
-   expected rate). Redundancy may raise the wire modestly, never the delivery
-   correctness.
-3. **Outcomes hold as loss rises (hostile-safe)** — the constitution is the
-   outcome, not the mechanism: the interactive lane keeps `delivery = 1.000`
-   (its redundancy never eats its own goodput), its latency stays at the
-   one-way floor, and the bulk lane's goodput does not materially change. The
-   two redundancy ladders are **reported diagnostics**, not pass/fail rules:
-   the interactive armor ladder is expected to be non-increasing in loss (its
-   extra packets do not inflate with loss), while FEC recovery parity may grow
-   with loss to compensate for the extra erasures. Neither ladder is gated on
-   monotonicity; only the delivery/latency/goodput outcomes are. Any assertion
-   added for this criterion must be outcome-based (goodput / latency /
-   delivery), never parity-monotonicity.
-4. **Bulk-lane throughput untouched** — the 5-lane perf battery
-   (`tools/perf-loop`, lanes `clean / controller-fat-pipe / hostile /
-   lossy-400kib / hostile-fat-pipe`) must be `no_material_change` on every
-   `ready` **verdict** lane. The interactive change is a no-op for the
-   stock/bulk tuning (`fec_instream_flush == false`). `hostile` is
-   **diagnostic-only** (see below): report its numbers, never retain/reject on
-   it.
-5. **Read the generated graph (MUST) and the summary** — render the perf-loop
-   `comparison.html` with `tools/render_graph.py` and read the RTT-CDF /
-   throughput plots (base ≈ cand for a neutral change), not just the text
-   verdict. The tool asserts that panels exist and carry series data; a graph
-   that cannot be produced is a non-zero-exit error, not an empty file to skim
-   past.
+`python3 tools/check-gate.py` verifies this package's manifest and the
+perf-loop lane roles against the compiled test binaries. The per-crate gates
+run with the parameterized checker from each crate checkout:
 
 ```sh
-python3 tools/render_graph.py $TMPDIR/<run-output>/comparison.html \
-  --out $TMPDIR/<run-output>/graphs
+python3 ../netem_test/tools/check-gate.py --crate . mux tests GATE.md
+python3 ../netem_test/tools/check-gate.py --crate . rtp_mux tests GATE.md
 ```
-
-`/Users/charliesmith/code/tmp/rtp-loop/loop-report.sh` prints (1)(2)(4). For
-(5), use the in-repo `tools/render_graph.py`; the old manual `render-graph.sh`
-that lived outside the repository in an unversioned scratch directory degraded
-silently (a missing graph produced a blank PNG and still exited zero), so it
-must not be relied on.
 
 ## Perf-loop lane roles: verdict vs diagnostic
 
@@ -108,13 +81,14 @@ harness, and they read the sender/receiver FEC counters directly):
 cargo test --lib probe_ -- --ignored --nocapture   # from crates/rtp
 ```
 
-Use these to attribute a repair-latency change before/after a fix; use the
-netem harness above for the end-to-end dual-lane latency + throughput gate.
+Use these to attribute a repair-latency change before/after a fix; the
+end-to-end dual-lane latency/throughput constitution gates live in `rtp_mux`
+(pointer table above), not here.
 
 ## Notes
 
-- The oracle is stock byte-stream by default; the deployment runs frame mode +
-  dual lane, so the `*_frame*` and `_duallane_*` arms are the ones that match
-  production.
-- FEC/redundancy counters (parity_sent, armor duplicates, recovered) and the
-  per-lane wire counters are printed per arm for attribution.
+- The rtp-owned scenarios still hosted here are the ones the relocation has
+  not yet moved (step 5 moves them into `rtp`); their manifest/tier records
+  live in `tests/GATE.md`.
+- FEC/redundancy counters and per-lane wire counters are printed per arm for
+  attribution by the `rtp_mux_jitter` arms, which now run from `rtp_mux`.

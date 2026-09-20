@@ -13,7 +13,11 @@ rtp = { path = "../../rtp", features = ["testing"] }
 # shim by the scenarios that stay in the harness, so mux's `testing` feature
 # must be enabled here.
 mux = { path = "../../mux", features = ["testing"] }
-rtp_mux = { path = "../../rtp_mux" }
+# The rtp_mux scenarios relocated into the owning crate with the rtp_mux
+# layer kit (step 4 of the relocation); the harness no longer consumes
+# rtp_mux, so the local dev-dependency is commented out to keep the harness
+# graph pointing only at what it builds.
+# rtp_mux = { path = "../../rtp_mux" }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [lib]

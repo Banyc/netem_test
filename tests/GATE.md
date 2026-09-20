@@ -31,11 +31,10 @@ python3 tools/check-gate.py
   through a helper: the checker derives the crate-local call-graph closure of
   every `perf` scenario and requires every asserting helper it reaches to be
   declared report-only in the `gate-perf-guard-helpers` block. Do not treat a
-  perf target's absence from a run as coverage of the property. The three
-  report-only `rtp_padding_bench` A/B benches and the `rtp_mux_jitter` arms
-  call shared helpers (`run_transfer*`, `assert_sane`, `assert_reportable`)
-  whose assertions are setup/sanity guards, not gates; the round-trip integrity
-  they check is gated by the default-tier padding tests.
+  perf target's absence from a run as coverage of the property. The
+  report-only `rtp_padding_bench` A/B benches call shared helpers
+  (`run_transfer*`) whose assertions are setup/sanity guards, not gates; the
+  round-trip integrity they check is gated by the default-tier padding tests.
 
 The long-running `perf-loop` battery (`tools/perf-loop`, lanes `clean`,
 `controller-fat-pipe`, `hostile`, `lossy-400kib`, `hostile-fat-pipe`) is a
@@ -48,7 +47,7 @@ skim past (see `tools/PERF_LOOP.md`, "Rendered graph evidence (mandatory)").
 
 `netem_scenarios`, `raw_netem_pair`, `rtp_clean`, `rtp_loss`, `rtp_mss`,
 `rtp_fec` (the seeded default-FEC recovery case, which reaches the sender's
-in-stream FEC capacity gate). Plus the two `hol_probe` and two `perf_probe`
+in-stream FEC capacity gate). Plus the two `perf_probe`
 seeding tests, and the single `rtp_liveness` / `shared_bottleneck`
 resynchronisation tests that were already un-ignored. The padding bench's
 fitted-ACK assertion
@@ -72,6 +71,17 @@ with the mux layer kit: they now run in `cargo test -p mux` and are recorded
 in `mux/GATE.md` (checked with `python3 ../netem_test/tools/check-gate.py
 --crate . mux tests GATE.md`).
 
+The rtp_mux-owned scenarios (the `dynamic_contested` battery, the `hol_probe`
+head-of-line battery, `rtp_longrun`, the `rtp_mux` explorer/migration suite,
+the `rtp_mux_jitter` oracle with its two constitution gates, and the new
+`dual_lane_mandates` bulk-lane constitution gate) moved to the owning crate
+with the rtp_mux layer kit (`support/{dual,rtp_mux}.rs` →
+`rtp_mux/src/testkit/`): they now run in `cargo test -p rtp_mux` and are
+recorded in `rtp_mux/GATE.md`, which states the tri-mandate constitution
+(one authority per mandate). The two `hol_probe` seeding tests and the
+`hol_rtt100_ge5_four_interactive_frame_delivery` scaling gate moved with the
+rest of the target.
+
 The `gate-default-required` block names the asserting scenarios that must stay in
 this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
 `gate-asserting` block records the full report-only/asserting split.
@@ -92,60 +102,6 @@ non-`support` tests reported by `cargo test -p tests --test <target> -- --list
 contested_latency::contested_capped_clean = full
 contested_latency::contested_capped_jitter_loss = perf
 contested_latency::contested_hostile = perf
-dynamic_contested::dyn_dual_auto_big_first = full
-dynamic_contested::dyn_dual_auto_big_first_migrating = full
-dynamic_contested::dyn_dual_auto_per_message = full
-dynamic_contested::dyn_dual_auto_small_first = full
-dynamic_contested::dyn_dual_auto_small_first_migrating = full
-dynamic_contested::dyn_dual_hint_static = full
-dynamic_contested::dyn_dual_msg_channel = full
-dynamic_contested::dyn_dual_msg_channel_ordered = full
-dynamic_contested::dyn_game_sync_migrating = full
-dynamic_contested::dyn_game_sync_single_mux = full
-dynamic_contested::dyn_game_sync_sticky = full
-dynamic_contested::dyn_single_mux = full
-hol_probe::dual_lane_asym_frame_delivers_and_tears_down = full
-hol_probe::hol_cap400_fec_solo = perf
-hol_probe::hol_cap400_loss1_split_shared = perf
-hol_probe::hol_cap400_shared = full
-hol_probe::hol_cap400_shared_frame_delivery_diag = full
-hol_probe::hol_cap400_solo = full
-hol_probe::hol_hostile_shared = full
-hol_probe::hol_hostile_shared_frame_delivery_diag = full
-hol_probe::hol_hostile_solo = full
-hol_probe::hol_hostile_split = full
-hol_probe::hol_paced_bulk_median_p99_regression = full
-hol_probe::hol_rtp_mux_fec_default_on_recovery = full
-hol_probe::hol_rtt100_clean_shared = full
-hol_probe::hol_rtt100_clean_shared_frame_delivery_diag = full
-hol_probe::hol_rtt100_clean_solo = full
-hol_probe::hol_rtt100_clean_split = full
-hol_probe::hol_rtt100_ge1_loss1_shared = full
-hol_probe::hol_rtt100_ge1_loss1_solo = full
-hol_probe::hol_rtt100_ge1_loss1_split = full
-hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag = full
-hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag = full
-hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag = full
-hol_probe::hol_rtt100_ge5_shared = full
-hol_probe::hol_rtt100_ge5_shared_dual_lane = full
-hol_probe::hol_rtt100_ge5_shared_dual_lane_asym_frame_diag = full
-hol_probe::hol_rtt100_ge5_shared_dual_lane_frame_delivery = full
-hol_probe::hol_rtt100_ge5_shared_frame_delivery = full
-hol_probe::hol_rtt100_ge5_solo = full
-hol_probe::hol_rtt100_ge5_split = full
-hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery = full
-hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full
-hol_probe::hol_rtt100_ge5_v2_shared = full
-hol_probe::hol_rtt100_ge5_v2_solo = full
-hol_probe::hol_rtt100_ge5_v3_shared = full
-hol_probe::hol_rtt100_ge5_v3_solo = full
-hol_probe::hol_rtt100_ge5_v3_split = full
-hol_probe::hol_rtt40_ge1_loss1_shared = full
-hol_probe::hol_rtt40_ge1_loss1_solo = full
-hol_probe::hol_rtt40_ge1_loss1_split = full
-hol_probe::hol_rtt40_ge1_shared = full
-hol_probe::hol_rtt40_ge1_solo = full
-hol_probe::hol_rtt40_ge1_split = full
 hol_verify4::v4_clean_rawbulk = perf
 hol_verify4::v4_ge5_rawbulk = perf
 perf_probe::probe_hostile_goodput_30s = full
@@ -159,35 +115,6 @@ rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss = standa
 rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains = standard
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard
 rtp_liveness::rtp_permanent_hole_liveness_smoke = standard
-rtp_longrun::longrun_duallane = full
-rtp_longrun::multiflow_duallane = full
-rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers = full
-rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams = full
-rtp_mux::rtp_mux_explorer_relays_onto_better_path = full
-rtp_mux::rtp_mux_recycle_migrates_live_streams = full
-rtp_mux::rtp_mux_response_migration_offloads_download = full
-rtp_mux::rtp_mux_survives_independent_impaired_lanes = full
-rtp_mux_jitter::jitter_bulk_idle_restart_arm = perf
-rtp_mux_jitter::jitter_burst_loss_arms = perf
-rtp_mux_jitter::jitter_cellular_timeline_arms = perf
-rtp_mux_jitter::jitter_decomposition = perf
-rtp_mux_jitter::jitter_duallane_arms = perf
-rtp_mux_jitter::jitter_duallane_constitution_gate = full
-rtp_mux_jitter::jitter_duallane_constitution_gate_p99 = full
-rtp_mux_jitter::jitter_fec_arms_2pct = perf
-rtp_mux_jitter::jitter_fec_arms_6pct = perf
-rtp_mux_jitter::jitter_frame_reorder_decomposition = perf
-rtp_mux_jitter::jitter_frame_reorder_fec_arms = perf
-rtp_mux_jitter::jitter_frame_reorder_fec_bulk_loss_reorder = perf
-rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf
-rtp_mux_jitter::jitter_interactive_solo = perf
-rtp_mux_jitter::jitter_interactive_with_bulk = perf
-rtp_mux_jitter::jitter_interactive_with_loss = perf
-rtp_mux_jitter::jitter_latency_dimension_arms = perf
-rtp_mux_jitter::jitter_nonloss_impairments = perf
-rtp_mux_jitter::jitter_reorder_direction = perf
-rtp_mux_jitter::jitter_reorder_rate_curve = perf
-rtp_mux_jitter::jitter_shared_bottleneck_arms = perf
 rtp_padding_bench::ab_bulk_throughput_ack_padding = perf
 rtp_padding_bench::ab_bulk_throughput_across_presets = perf
 rtp_padding_bench::ab_small_echo_latency = perf
@@ -216,58 +143,6 @@ body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
 
 ```gate-asserting
 contested_latency::contested_capped_clean
-dynamic_contested::dyn_dual_auto_big_first
-dynamic_contested::dyn_dual_auto_big_first_migrating
-dynamic_contested::dyn_dual_auto_per_message
-dynamic_contested::dyn_dual_auto_small_first
-dynamic_contested::dyn_dual_auto_small_first_migrating
-dynamic_contested::dyn_dual_hint_static
-dynamic_contested::dyn_dual_msg_channel
-dynamic_contested::dyn_dual_msg_channel_ordered
-dynamic_contested::dyn_game_sync_migrating
-dynamic_contested::dyn_game_sync_single_mux
-dynamic_contested::dyn_game_sync_sticky
-dynamic_contested::dyn_single_mux
-hol_probe::dual_lane_asym_frame_delivers_and_tears_down
-hol_probe::hol_cap400_shared
-hol_probe::hol_cap400_shared_frame_delivery_diag
-hol_probe::hol_cap400_solo
-hol_probe::hol_hostile_shared
-hol_probe::hol_hostile_shared_frame_delivery_diag
-hol_probe::hol_hostile_solo
-hol_probe::hol_hostile_split
-hol_probe::hol_paced_bulk_median_p99_regression
-hol_probe::hol_rtp_mux_fec_default_on_recovery
-hol_probe::hol_rtt100_clean_shared
-hol_probe::hol_rtt100_clean_shared_frame_delivery_diag
-hol_probe::hol_rtt100_clean_solo
-hol_probe::hol_rtt100_clean_split
-hol_probe::hol_rtt100_ge1_loss1_shared
-hol_probe::hol_rtt100_ge1_loss1_solo
-hol_probe::hol_rtt100_ge1_loss1_split
-hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag
-hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag
-hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag
-hol_probe::hol_rtt100_ge5_shared
-hol_probe::hol_rtt100_ge5_shared_dual_lane
-hol_probe::hol_rtt100_ge5_shared_dual_lane_asym_frame_diag
-hol_probe::hol_rtt100_ge5_shared_dual_lane_frame_delivery
-hol_probe::hol_rtt100_ge5_shared_frame_delivery
-hol_probe::hol_rtt100_ge5_solo
-hol_probe::hol_rtt100_ge5_split
-hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery
-hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
-hol_probe::hol_rtt100_ge5_v2_shared
-hol_probe::hol_rtt100_ge5_v2_solo
-hol_probe::hol_rtt100_ge5_v3_shared
-hol_probe::hol_rtt100_ge5_v3_solo
-hol_probe::hol_rtt100_ge5_v3_split
-hol_probe::hol_rtt40_ge1_loss1_shared
-hol_probe::hol_rtt40_ge1_loss1_solo
-hol_probe::hol_rtt40_ge1_loss1_split
-hol_probe::hol_rtt40_ge1_shared
-hol_probe::hol_rtt40_ge1_solo
-hol_probe::hol_rtt40_ge1_split
 perf_probe::probe_hostile_goodput_30s
 perf_probe::probe_hostile_message_latency
 perf_probe::probe_rtp_echo_4mib_direct
@@ -279,16 +154,6 @@ rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss
 rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive
 rtp_liveness::rtp_permanent_hole_liveness_smoke
-rtp_longrun::longrun_duallane
-rtp_longrun::multiflow_duallane
-rtp_mux::rtp_mux_bidirectional_contention_offloads_both_transfers
-rtp_mux::rtp_mux_clean_dual_lane_echoes_interactive_and_bulk_streams
-rtp_mux::rtp_mux_explorer_relays_onto_better_path
-rtp_mux::rtp_mux_recycle_migrates_live_streams
-rtp_mux::rtp_mux_response_migration_offloads_download
-rtp_mux::rtp_mux_survives_independent_impaired_lanes
-rtp_mux_jitter::jitter_duallane_constitution_gate
-rtp_mux_jitter::jitter_duallane_constitution_gate_p99
 rtp_padding_bench::ack_padding_hides_ack_packets_among_data
 rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
 rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
@@ -325,8 +190,7 @@ Every entry is a report-only harness guard, not a gate: finalize/setup helpers
 that abort on harness malfunction (`with_timeout`, `submit_test_task`,
 `submit_test_task_required`, `spawn_required`, the `spawn_*_server_core`
 helpers, `try_send_observation`), argument validation (`percentile`,
-`gilbert_elliott_loss`), the `rtp_mux_jitter` report-only
-`assert_sane`/`assert_reportable` liveness floors, and the `rtp_padding_bench`
+`gilbert_elliott_loss`), and the `rtp_padding_bench`
 A/B `run_transfer`/`run_transfer_preset` setup guards. The round-trip
 properties they touch are gated by the default-tier padding tests named in
 `gate-default-required`.
@@ -355,29 +219,26 @@ Since the shared scaffolding relocated into the harness `test-kit` feature
 the helpers that used to live in `tests/tests/support/**` are no longer
 inlined in the scenario crate: `with_timeout`, `gilbert_elliott_loss`,
 `percentile`, `try_send_observation`, and the `TestScope` reaper machinery
-now live in `netem-test/src/kit/**` (behind `netem_test::kit`), and the rtp
+now live in `netem-test/src/kit/**` (behind `netem_test::kit`), the rtp
 echo/connect/sink/frame/perf-trace scaffolding lives in
-`rtp/src/testkit/**` behind rtp's `testing` feature. The checker follows the
-`pub use` shim views in `support/**` into both kit source sets, so the
-reachable asserting helpers below are declared exactly as they were before
-the relocation. What remains genuinely outside the scan: assertions inside
-the `netem-test` library itself (e.g. `NetemPair` internals) and rtp's own
-lib internals (e.g. `crate::metrics`), which the scenario crate can reach but
-whose sources belong to other crates and are not parsed here - the same
-boundary the scan always had. The perf tier's kit-home helpers keep their
-report-only role, and the kit unit tests that enforce them run in the
+`rtp/src/testkit/**` behind rtp's `testing` feature, the mux-over-rtp
+scaffolding in `mux/src/testkit/**` behind mux's `testing`, and the
+dual-lane server/connector plumbing in `rtp_mux/src/testkit/**` behind
+rtp_mux's `testing` (the rtp_mux kit moved with the rtp_mux scenarios, so
+this harness is left with the rtp/rtp kit + mux kit views). The checker
+follows the `pub use` shim views in `support/**` into the kit source sets,
+so the reachable asserting helpers below are declared exactly as they were
+before the relocation. What remains genuinely outside the scan: assertions
+inside the `netem-test` library itself (e.g. `NetemPair` internals) and
+rtp's own lib internals (e.g. `crate::metrics`), which the scenario crate
+can reach but whose sources belong to other crates and are not parsed here -
+the same boundary the scan always had. The perf tier's kit-home helpers keep
+their report-only role, and the kit unit tests that enforce them run in the
 harness's own default test invocation via the `test-kit` self dev-dependency.
 
 ```gate-perf-guard-helpers
-tests/rtp_mux_jitter.rs::assert_reportable = 2
-tests/rtp_mux_jitter.rs::assert_sane = 2
-tests/rtp_padding_bench.rs::run_transfer = 1
-tests/rtp_padding_bench.rs::run_transfer_preset = 1
-tests/support/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
 mux/src/testkit/mux.rs::mux_client_connect_core = 1
-mux/src/testkit/mux.rs::mux_client_connect_frame_delivery_via = 1
 mux/src/testkit/mux.rs::send_timestamped_messages = 1
-mux/src/testkit/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
 mux/src/testkit/mux.rs::spawn_mux_over_rtp_server_core = 1
 netem_test/netem-test/src/kit/mod.rs::try_send_observation = 1
 netem_test/netem-test/src/kit/payload.rs::with_timeout = 1
@@ -388,6 +249,8 @@ netem_test/netem-test/src/kit/task_scope.rs::spawn_required = 1
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
+tests/rtp_padding_bench.rs::run_transfer = 1
+tests/rtp_padding_bench.rs::run_transfer_preset = 1
 ```
 
 ## Perf-loop lane roles
