@@ -447,6 +447,33 @@ hostile-periodic-bottleneck-100ms = verdict
 hostile-periodic-bottleneck-300ms = verdict
 ```
 
+### Midpoint phase assertion (time-to-steady)
+
+`perf_loop.py` exposes the within-run midpoint phase analysis as an asserting
+gate: `perf-loop run|analyze --fail-on-phase-drift` exits non-zero when the
+capture is `not_ready` with `within_run_phase_not_stable` — the first
+half's goodput moving >= 20 % from the second half's at the exact measurement
+midpoint, the same 20 % material bound the readiness gate and the same-binary
+control use. This is the asserting time-to-steady check for the deterministic
+`controller-fat-pipe` lane (pure fixed shaping, no stochastic loss or jitter,
+so phase drift there is a controller/queue-growth defect, not noise): an arm
+that is not `ready` is inconclusive, never a pass, and the flag turns that
+inconclusive phase drift into a failure. Opt-in — stochastic lanes are
+expected to phase-drift and must not be run with the flag (the deterministic
+lane is where it must always hold).
+
+### Wakeups-per-GiB cap (structural wake ceiling)
+
+`perf-loop run --fail-on-wakes-cap <WAKES_PER_GIB>` exits 2 when any valid
+pair's per-endpoint protocol-timer wakes per GiB of delivered application
+bytes exceeds the cap. The counters already exist in the trace (schema 28)
+and were compared only; the flag makes the absolute ceiling asserting. On the
+deterministic controller-fat-pipe lane the delivered rate is link-shaped
+(~12 MiB/s), so wakes/GiB is a fixed ratio — measured 0 sender / ~21.5k peer
+on a 30 s window — and the documented cap (100k/GiB, ~4.7x the measured peer
+band) is the ceiling a wakeup regression must respect; absent values (an
+endpoint never observed protocol-timer wakes) stay `null` and never fail.
+
 ## Opt-in targets outside this manifest
 
 `check-gate.py` covers only the `tests` package. Three other opt-in sets are

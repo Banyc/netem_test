@@ -776,6 +776,60 @@ def within_run_phase_analysis(comparison):
     }
 
 
+def wakes_cap_failures(comparison, cap_wakes_per_gib):
+    """The wakes/GiB cap: every valid pair's per-endpoint protocol-timer
+    wakes per GiB of delivered application bytes must stay under the cap. The
+    deterministic controller-fat-pipe lane delivers at the link-shaped rate
+    (~12 MiB/s), so wakes/GiB is a fixed ratio (~21.5k peer / 0 sender on the
+    measured band); the cap is the absolute ceiling a regression that adds
+    protocol-timer wakes must respect. Absent values (the event was never
+    observed) stay None and never fail."""
+    failures = []
+    for index, pair in enumerate(comparison.get("pairs", [])):
+        if not pair.get("valid"):
+            continue
+        for side in ("baseline", "candidate"):
+            for key in (
+                "sender_protocol_timer_wakes_per_gib_delivered",
+                "peer_protocol_timer_wakes_per_gib_delivered",
+            ):
+                metric = pair.get("metrics", {}).get(key, {})
+                value = metric.get(side)
+                if value is None:
+                    continue
+                if value > cap_wakes_per_gib:
+                    failures.append(
+                        f"controller-fat-pipe wakes/GiB cap: pair {index} "
+                        f"{side} {key}={value:.0f} wakes/GiB exceeds the "
+                        f"{cap_wakes_per_gib:.0f} wakes/GiB cap "
+                        "(--fail-on-wakes-cap): protocol-timer wakeups on the "
+                        "deterministic lane must stay bounded per delivered "
+                        "byte"
+                    )
+    return failures
+
+
+def phase_drift_failure(readiness, link_profile):
+    """The asserting midpoint-phase gate: None unless the capture is
+    phase-unstable; otherwise a non-zero-exit error naming the property. The
+    deterministic controller-fat-pipe lane has no stochastic loss or jitter,
+    so first/second-half goodput moving >= 20% at the exact midpoint is a
+    controller or queue-growth defect, not noise: an arm that is not `ready`
+    is inconclusive, never a pass, and --fail-on-phase-drift turns that
+    inconclusive phase drift into a hard failure."""
+    if readiness.get("classification") != "not_ready":
+        return None
+    if "within_run_phase_not_stable" not in readiness.get("blocking_reasons", []):
+        return None
+    return (
+        "controller-fat-pipe midpoint phase assertion: --link-profile "
+        f"{link_profile} is not phase-stable (first/second-half goodput "
+        "differs >= 20% at the exact midpoint: within_run_phase_not_stable); "
+        "a deterministic lane must be phase-stable to support a verdict, so "
+        "the run is inconclusive and fails rather than passing"
+    )
+
+
 def comparison_readiness(
     comparison, phase_analysis, order_analysis, counterbalanced_analysis
 ):
@@ -873,6 +927,13 @@ def command_analyze(args):
     run_json.update(analysis) if args.update_run_json else None
     write_json_object_atomic(run_json_path, run_json) if args.update_run_json else None
     print(json.dumps(report, indent=2, sort_keys=True))
+    phase_failure = phase_drift_failure(
+        analysis["comparison_readiness"],
+        run_json.get("link_profile") or "(unknown)",
+    )
+    if args.fail_on_phase_drift and phase_failure is not None:
+        print(f"error: {phase_failure}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -1527,6 +1588,15 @@ def command_run(args):
         return 2
     if args.fail_on_regression and verdict == "likely_regression":
         return 3
+    phase_failure = phase_drift_failure(readiness, args.link_profile)
+    if args.fail_on_phase_drift and phase_failure is not None:
+        print(f"error: {phase_failure}", file=sys.stderr)
+        return 2
+    wakes_cap = getattr(args, "fail_on_wakes_cap", None)
+    if wakes_cap is not None:
+        for failure in wakes_cap_failures(comparison, wakes_cap):
+            print(f"error: {failure}", file=sys.stderr)
+            return 2
     if (
         args.fail_on_control_instability
         and calibration is not None
@@ -1621,6 +1691,15 @@ def build_parser():
         "--update-run-json",
         action="store_true",
         help="write the recomputed analysis back into the preserved run.json",
+    )
+    analyze.add_argument(
+        "--fail-on-phase-drift",
+        action="store_true",
+        default=False,
+        help="exit non-zero when the within-run midpoint phase analysis is "
+        "unstable (first/second-half goodput differs >= 20% at the exact "
+        "midpoint); the asserting phase gate for the deterministic "
+        "controller-fat-pipe lane",
     )
     analyze.set_defaults(handler=command_analyze)
 
@@ -1729,6 +1808,24 @@ def build_parser():
     )
     run.add_argument("--output", type=Path, default=None, help="output directory beneath $TMPDIR")
     run.add_argument("--fail-on-regression", action="store_true")
+    run.add_argument(
+        "--fail-on-wakes-cap",
+        type=float,
+        default=None,
+        metavar="WAKES_PER_GIB",
+        help="exit 2 when any valid pair's per-endpoint protocol-timer wakes "
+        "per GiB of delivered bytes exceeds WAKES_PER_GIB; the absolute "
+        "wakeup ceiling for the deterministic controller-fat-pipe lane",
+    )
+    run.add_argument(
+        "--fail-on-phase-drift",
+        action="store_true",
+        default=False,
+        help="exit 2 when the within-run midpoint phase analysis is "
+        "unstable (within_run_phase_not_stable: first/second-half goodput "
+        "differs >= 20% at the exact midpoint); the asserting phase gate for "
+        "the deterministic controller-fat-pipe lane",
+    )
     run.add_argument(
         "--same-binary-control", action="store_true",
         help="compare a workspace with itself to calibrate run-to-run variance",

@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -328,6 +329,7 @@ class PerfLoopTest(unittest.TestCase):
                 scenario="bulk",
                 fail_on_control_instability=True,
                 fail_on_regression=False,
+                fail_on_phase_drift=False,
                 seeds=(11, 21),
                 window_seconds=10,
                 label=None,
@@ -410,6 +412,142 @@ class PerfLoopTest(unittest.TestCase):
             self.assertTrue(
                 all(run["executable"] == str(executable.resolve()) for run in run_json["runs"])
             )
+
+    def test_wakes_cap_fails_on_inflated_protocol_timer_wakes(self):
+        comparison = {
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {
+                        "peer_protocol_timer_wakes_per_gib_delivered": {
+                            "baseline": 21466.0,
+                            "candidate": 21466.0,
+                        },
+                        "sender_protocol_timer_wakes_per_gib_delivered": {
+                            "baseline": 0.0,
+                            "candidate": 0.0,
+                        },
+                    },
+                },
+                {
+                    "valid": True,
+                    "metrics": {
+                        "peer_protocol_timer_wakes_per_gib_delivered": {
+                            "baseline": None,
+                            "candidate": 300000.0,
+                        },
+                        "sender_protocol_timer_wakes_per_gib_delivered": {
+                            "baseline": None,
+                            "candidate": None,
+                        },
+                    },
+                },
+            ]
+        }
+        failures = LOOP.wakes_cap_failures(comparison, 100000.0)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("wakes/GiB cap", failures[0])
+        self.assertIn("peer_protocol_timer_wakes_per_gib_delivered", failures[0])
+        self.assertIn("300000", failures[0])
+        self.assertIn("candidate", failures[0])
+        self.assertIn("per delivered byte", failures[0])
+        # Under the cap nothing fails; absent values never fail.
+        self.assertEqual(LOOP.wakes_cap_failures(comparison, 400000.0), [])
+        self.assertEqual(LOOP.wakes_cap_failures({"pairs": []}, 100000.0), [])
+
+    def test_run_exits_nonzero_when_wakes_exceed_the_cap(self):
+        comparison = {
+            "verdict": "no_material_change",
+            "evidence_quality": "healthy",
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {
+                        "goodput_mib_per_second": {"delta_percent": 3.0},
+                        "peer_protocol_timer_wakes_per_gib_delivered": {
+                            "baseline": 21466.0,
+                            "candidate": 300000.0,
+                        },
+                        "sender_protocol_timer_wakes_per_gib_delivered": {
+                            "baseline": 0.0,
+                            "candidate": 0.0,
+                        },
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            workspace = self.make_workspace(root, "netem_test")
+            output_root = root / "out"
+            executable = root / "bin" / "perf_probe-frozen"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            args = argparse.Namespace(
+                mss_bytes=8192,
+                fec=False,
+                retransmission_armor=False,
+                candidate=str(workspace),
+                baseline=str(workspace),
+                same_binary_control=True,
+                same_workspace_treatment=False,
+                candidate_fec="same",
+                instream_group_fec=False,
+                scenario="bulk",
+                fail_on_control_instability=False,
+                fail_on_regression=False,
+                fail_on_phase_drift=False,
+                fail_on_wakes_cap=100000.0,
+                seeds=(11, 21),
+                window_seconds=10,
+                label=None,
+                warmup_seconds=LOOP.DEFAULT_WARMUP_SECONDS,
+                baseline_executable=None,
+                release=True,
+                target_dir=None,
+                candidate_executable=None,
+                baseline_source_manifest=None,
+                candidate_source_manifest=None,
+                output=str(output_root),
+                link_profile="controller-fat-pipe",
+            )
+
+            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+                return str(executable.resolve())
+
+            def fake_run_probe(workspace, seed, role, output_root, **kwargs):
+                return {
+                    "runner_exit": 0,
+                    "role": role,
+                    "seed": str(seed),
+                    "executable": kwargs["executable"],
+                    "trace_dir": str(output_root / f"trace-{role}-{seed}"),
+                    "fec": "true" if kwargs["fec"] else "false",
+                    "scenario": kwargs["scenario"],
+                }
+
+            def fake_call_compare(
+                baseline_dirs,
+                candidate_dirs,
+                output_root,
+                allowed_config_mismatches=(),
+                allowed_config_fields=None,
+            ):
+                (Path(output_root) / "comparison.json").write_text(
+                    json.dumps(comparison), encoding="utf-8"
+                )
+                return subprocess.CompletedProcess([], 0, b"", b"")
+
+            err = io.StringIO()
+            with mock.patch.object(LOOP, "build_probe", fake_build_probe), mock.patch.object(
+                LOOP, "run_probe", fake_run_probe
+            ), mock.patch.object(LOOP, "call_compare", fake_call_compare), mock.patch.object(
+                sys, "stderr", err
+            ):
+                exit_code = LOOP.command_run(args)
+            self.assertEqual(exit_code, 2)
+            self.assertIn("controller-fat-pipe wakes/GiB cap", err.getvalue())
+            self.assertIn("300000", err.getvalue())
 
     def test_run_probe_sets_diagnostic_and_safe_build_environment(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
@@ -1084,6 +1222,128 @@ class PerfLoopTest(unittest.TestCase):
             1,
         )
 
+    def test_phase_drift_failure_names_the_property_on_deterministic_lanes(self):
+        unstable = {
+            "evidence_quality": "healthy",
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {"goodput_mib_per_second": {"delta_percent": 3.0}},
+                }
+            ],
+            "runs": [
+                {
+                    "label": "same-11",
+                    "role": "baseline",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 7.5,
+                    },
+                },
+                {
+                    "label": "same-11",
+                    "role": "candidate",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 7.5,
+                    },
+                },
+            ],
+        }
+        readiness = LOOP.paired_result_analysis(unstable, [])["comparison_readiness"]
+        self.assertEqual(readiness["classification"], "not_ready")
+        failure = LOOP.phase_drift_failure(readiness, "controller-fat-pipe")
+        self.assertIsNotNone(failure)
+        self.assertIn("controller-fat-pipe midpoint phase assertion", failure)
+        self.assertIn("within_run_phase_not_stable", failure)
+        self.assertIn("inconclusive", failure)
+        # A ready capture never trips the phase assertion.
+        stable = {
+            "evidence_quality": "healthy",
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {"goodput_mib_per_second": {"delta_percent": 3.0}},
+                }
+            ],
+            "runs": [
+                {
+                    "label": "same-11",
+                    "role": "baseline",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 9.5,
+                    },
+                },
+                {
+                    "label": "same-11",
+                    "role": "candidate",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 9.5,
+                    },
+                },
+            ],
+        }
+        stable_readiness = LOOP.paired_result_analysis(stable, [])["comparison_readiness"]
+        self.assertIsNone(LOOP.phase_drift_failure(stable_readiness, "controller-fat-pipe"))
+
+    def test_analyze_exits_nonzero_on_phase_drift_with_the_flag(self):
+        comparison = {
+            "evidence_quality": "healthy",
+            "pairs": [
+                {
+                    "valid": True,
+                    "metrics": {"goodput_mib_per_second": {"delta_percent": 3.0}},
+                }
+            ],
+            "runs": [
+                {
+                    "label": "same-11",
+                    "role": "baseline",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 7.5,
+                    },
+                },
+                {
+                    "label": "same-11",
+                    "role": "candidate",
+                    "summary": {
+                        "goodput_first_half_mib_per_second": 10.0,
+                        "goodput_second_half_mib_per_second": 7.5,
+                    },
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            result_dir = Path(directory) / "result"
+            result_dir.mkdir()
+            (result_dir / "comparison.json").write_text(
+                json.dumps(comparison), encoding="utf-8"
+            )
+            (result_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "runs": [],
+                        "link_profile": "controller-fat-pipe",
+                        "same_binary_control": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                result=str(result_dir),
+                update_run_json=False,
+                fail_on_phase_drift=False,
+            )
+            self.assertEqual(LOOP.command_analyze(args), 0)
+            args.fail_on_phase_drift = True
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                self.assertEqual(LOOP.command_analyze(args), 2)
+            self.assertIn("controller-fat-pipe midpoint phase assertion", err.getvalue())
+
     def test_same_binary_run_records_and_can_fail_control_analysis(self):
         comparison = {
             "verdict": "no_material_change",
@@ -1153,6 +1413,7 @@ class PerfLoopTest(unittest.TestCase):
                 scenario="bulk",
                 fail_on_control_instability=True,
                 fail_on_regression=False,
+                fail_on_phase_drift=False,
                 seeds=(11, 21),
                 window_seconds=10,
                 label=None,
@@ -1300,6 +1561,7 @@ class PerfLoopTest(unittest.TestCase):
                 scenario="bulk",
                 fail_on_control_instability=False,
                 fail_on_regression=False,
+                fail_on_phase_drift=False,
                 seeds=(11, 21),
                 window_seconds=10,
                 label=None,
@@ -1495,6 +1757,7 @@ class PerfLoopTest(unittest.TestCase):
                     scenario="bulk",
                     fail_on_control_instability=False,
                     fail_on_regression=False,
+                fail_on_phase_drift=False,
                     seeds=(11,),
                     window_seconds=10,
                     label=None,
@@ -1715,7 +1978,9 @@ class PerfLoopTest(unittest.TestCase):
             )
             report = LOOP.command_analyze(
                 argparse.Namespace(
-                    result=str(result_dir), update_run_json=False
+                    result=str(result_dir),
+                    update_run_json=False,
+                    fail_on_phase_drift=False,
                 )
             )
             self.assertEqual(report, 0)
@@ -1726,7 +1991,9 @@ class PerfLoopTest(unittest.TestCase):
             # With --update-run-json the recomputed analysis is written back.
             LOOP.command_analyze(
                 argparse.Namespace(
-                    result=str(result_dir), update_run_json=True
+                    result=str(result_dir),
+                    update_run_json=True,
+                    fail_on_phase_drift=False,
                 )
             )
             updated = json.loads(
@@ -1789,6 +2056,7 @@ class PerfLoopTest(unittest.TestCase):
                     baseline=[["11", str(root / "b")]],
                     candidate=[["11", str(root / "c")]],
                     fail_on_regression=False,
+                fail_on_phase_drift=False,
                 )
 
                 def fake_call_compare(
@@ -1859,6 +2127,7 @@ class PerfLoopTest(unittest.TestCase):
                     scenario="bulk",
                     fail_on_control_instability=False,
                     fail_on_regression=False,
+                fail_on_phase_drift=False,
                     seeds=(11, 21),
                     window_seconds=10,
                     label=None,

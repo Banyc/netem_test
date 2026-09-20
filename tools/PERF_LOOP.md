@@ -396,6 +396,35 @@ in `comparison.json` (`allowed_config_mismatches`) lists exactly the keys
 that differed (`fec`), so a treatment can never paper over an accidental
 `mss_bytes`, seed, link, or workspace difference.
 
+## Deterministic-lane asserting gates
+
+Two opt-in asserting flags (recorded in `tests/GATE.md`) turn the
+controller-fat-pipe midpoint phase analysis and the wakes-per-GiB counters
+into hard failures instead of report-only evidence:
+
+```sh
+./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
+--link-profile controller-fat-pipe --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30 --fail-on-phase-drift \
+--fail-on-wakes-cap 100000
+```
+
+`--fail-on-phase-drift` (also on `analyze`) exits 2 when the capture is
+`not_ready` with `within_run_phase_not_stable` — the first half's goodput
+moving >= 20 % from the second half's at the exact measurement midpoint. An
+arm that is not `ready` is inconclusive, never a pass, and on the
+deterministic lane that inconclusive drift is a controller/queue defect.
+
+`--fail-on-wakes-cap WAKES_PER_GIB` exits 2 when any valid pair's
+per-endpoint protocol-timer wakes per GiB of delivered bytes exceed the cap.
+On the link-shaped controller-fat-pipe lane the delivered rate is fixed
+(~12 MiB/s), so wakes/GiB is a fixed ratio: measured 0 sender / ~21.5k peer
+on a 30 s window, and 100k/GiB leaves ~4.7x margin. Absent values stay `null`
+and never fail.
+
+Both flags are opt-in and meant for the deterministic lane; stochastic lanes
+(whose phase drift is expected) must not be run with `--fail-on-phase-drift`.
+
 ## Same-binary control
 
 `--same-binary-control` compares a workspace with itself (the only mode that
