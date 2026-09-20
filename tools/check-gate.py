@@ -92,6 +92,20 @@ class CrateLayout:
     the kit-source identities (`mux/src/testkit/…`) equally in every mode.
     Harness mode (`is_harness`) additionally enables the `support/**` shim
     scan and the perf-loop lane-role check.
+
+    In per-crate mode the checked crate's own layer kit is read from the
+    checked root (`<root>/src/testkit`), never from the crates-root sibling:
+    a scenario move lands in the checked tree, and the landed sibling may not
+    yet contain the kit the moved scenarios call, so resolving the own kit
+    from the sibling makes the perf-tier call-graph closure resolve nothing
+    and the gate reports success while the same check fails on the landed
+    trunk. The sibling kits stay crates-root-anchored (they are compiled
+    through path dev-dependencies relative to the checked root, which resolve
+    to the crates-root checkouts).
+
+    ``own_kit_dir`` is the checked crate's own layer kit when it is read from
+    the checked root; it is `None` in harness mode (the `tests` package has no
+    layer kit) and for per-crate checks whose root has no `src/testkit`.
     """
 
     root: Path
@@ -100,6 +114,38 @@ class CrateLayout:
     manifest: Path
     crates_root: Path
     is_harness: bool = False
+
+    @property
+    def own_kit_dir(self) -> Path | None:
+        if self.package == "tests":
+            return None
+        own = self.root / "src" / "testkit"
+        return own if own.is_dir() else None
+
+    def kit_source_dirs(self) -> list[tuple[Path, str]]:
+        """(kit dir, crate-qualified module prefix) pairs scanned per target.
+
+        The checked crate's own kit is read from the same root as its
+        scenarios (`own_kit_dir`) so a not-yet-landed kit cannot make the
+        perf-tier call-graph closure resolve nothing; the remaining kits
+        (harness kit and the other layer kits) resolve from the crates-root
+        siblings, matching the path dev-dependencies the checked crate
+        compiles against.
+        """
+        dirs: list[tuple[Path, str]] = []
+        if self.own_kit_dir is not None:
+            dirs.append((self.own_kit_dir, f"{self.package}::testkit"))
+        seen_dirs = {d for d, _ in dirs}
+        for kit_dir, prefix in (
+            (self.rtp_kit_dir, "rtp::testkit"),
+            (self.mux_kit_dir, "mux::testkit"),
+            (self.rtp_mux_kit_dir, "rtp_mux::testkit"),
+            (self.kit_dir, "netem_test::kit"),
+        ):
+            if kit_dir not in seen_dirs:
+                dirs.append((kit_dir, prefix))
+                seen_dirs.add(kit_dir)
+        return dirs
 
     @property
     def support_dir(self) -> Path:
@@ -252,12 +298,7 @@ def source_module(path: Path) -> str | None:
     try:
         parts = path.relative_to(layout().dir).parts
     except ValueError:
-        for base, prefix in (
-            (layout().rtp_kit_dir, "rtp::testkit"),
-            (layout().mux_kit_dir, "mux::testkit"),
-            (layout().rtp_mux_kit_dir, "rtp_mux::testkit"),
-            (layout().kit_dir, "netem_test::kit"),
-        ):
+        for base, prefix in layout().kit_source_dirs():
             try:
                 kit_parts = path.relative_to(base).parts
             except ValueError:
@@ -311,6 +352,13 @@ def source_identity(path: Path) -> str:
     # `<worktree>/src/testkit/mux.rs` depending on where the crate lives.
     if path.parent == layout().dir:
         return str(path.relative_to(layout().root))
+    own = layout().own_kit_dir
+    if own is not None and path.parent == own:
+        # The checked crate's own kit is read from the checked root; record
+        # it under the canonical crate name so a GATE.md entry written against
+        # one checkout location (e.g. a session worktree) stays valid when
+        # the same tree lands at `crates/<crate>`.
+        return f"{layout().package}/src/testkit/{path.name}"
     return str(path.relative_to(layout().crates_root))
 
 
@@ -452,10 +500,8 @@ def target_source_files(target: str) -> list[Path]:
     text = files[0].read_text(encoding="utf-8")
     if layout().is_harness and re.search(r"^mod support;", text, re.M):
         files.extend(sorted(layout().support_dir.glob("*.rs")))
-    files.extend(sorted(layout().kit_dir.glob("*.rs")))
-    files.extend(sorted(layout().rtp_kit_dir.glob("*.rs")))
-    files.extend(sorted(layout().rtp_mux_kit_dir.glob("*.rs")))
-    files.extend(sorted(layout().mux_kit_dir.glob("*.rs")))
+    for kit_dir, _ in layout().kit_source_dirs():
+        files.extend(sorted(kit_dir.glob("*.rs")))
     return [path for path in files if path.exists()]
 
 
