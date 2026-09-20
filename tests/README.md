@@ -3,17 +3,17 @@
 This package (`tests`) is the **impairment harness**, not the owner of any
 application performance contract. It consumes the `netem-test` instrument (the
 kernel-faithful `NetemPair`/`NetemConfig` impairment plumbing and the
-`test-kit` generic helpers) and hosts the rtp-owned scenarios that have not
-yet relocated into the `rtp` crate (step 5 of the relocation — the `perf_probe`
-probes, `rtp_bufferbloat`, `rtp_burst_loss`, `rtp_fec`, `rtp_gentle`,
-`rtp_liveness`, `rtp_loss`, `rtp_mss`, `rtp_padding_bench`, `contested_latency`,
-`shared_bottleneck`, `hol_verify4`, `netem_scenarios`, `raw_netem_pair`).
+`test-kit` generic helpers) and hosts the instrument's own conformance suite
+(`netem_scenarios`, `raw_netem_pair`, the `perf_probe` probes and seeding
+tests, `contested_latency`, `hol_verify4`, `shared_bottleneck`).
 
-The scenario suites for `mux` and `rtp_mux` relocated into their owning
-crates with the layer kits (`mux::testkit`, `rtp_mux::testkit`). Their gates
-and the tri-mandate constitution live **in those crates**, so every mandate
-has exactly one asserting authority — see `tests/GATE.md` for the manifest/tier
-mechanics of THIS package only.
+The rtp-owned scenario suites relocated into the `rtp` crate with step 5 of
+the relocation (`rtp_bufferbloat`, `rtp_burst_loss`, `rtp_fec`, `rtp_gentle`,
+`rtp_liveness`, `rtp_loss`, `rtp_mss`, `rtp_padding_bench`; see
+`rtp/GATE.md`), the `mux` suites into `mux` (step 3) and the `rtp_mux` suites
+into `rtp_mux` (step 4). Their gates and the tri-mandate constitution live
+**in those crates**, so every mandate has exactly one asserting authority —
+see `tests/GATE.md` for the manifest/tier mechanics of THIS package only.
 
 ## The tri-mandate constitution: one authority per mandate
 
@@ -40,6 +40,7 @@ perf-loop lane roles against the compiled test binaries. The per-crate gates
 run with the parameterized checker from each crate checkout:
 
 ```sh
+python3 ../netem_test/tools/check-gate.py --crate . rtp tests GATE.md
 python3 ../netem_test/tools/check-gate.py --crate . mux tests GATE.md
 python3 ../netem_test/tools/check-gate.py --crate . rtp_mux tests GATE.md
 ```
@@ -87,8 +88,8 @@ end-to-end dual-lane latency/throughput constitution gates live in `rtp_mux`
 
 ## Notes
 
-- The rtp-owned scenarios still hosted here are the ones the relocation has
-  not yet moved (step 5 moves them into `rtp`); their manifest/tier records
-  live in `tests/GATE.md`.
+- The harness holds only the instrument and its own conformance tests; every
+  rtp/mux/rtp_mux floor is asserted by the owning crate's gate and stated in
+  that crate's `GATE.md` (the constitution is never restated here).
 - FEC/redundancy counters and per-lane wire counters are printed per arm for
   attribution by the `rtp_mux_jitter` arms, which now run from `rtp_mux`.

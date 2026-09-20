@@ -31,10 +31,8 @@ python3 tools/check-gate.py
   through a helper: the checker derives the crate-local call-graph closure of
   every `perf` scenario and requires every asserting helper it reaches to be
   declared report-only in the `gate-perf-guard-helpers` block. Do not treat a
-  perf target's absence from a run as coverage of the property. The
-  report-only `rtp_padding_bench` A/B benches call shared helpers
-  (`run_transfer*`) whose assertions are setup/sanity guards, not gates; the
-  round-trip integrity they check is gated by the default-tier padding tests.
+  perf target's absence from a run as coverage of the property. The`contested_latency`/`hol_verify4` report-only arms call shared helpers whose
+  assertions are setup/sanity guards, not gates.
 
 The long-running `perf-loop` battery (`tools/perf-loop`, lanes `clean`,
 `controller-fat-pipe`, `hostile`, `lossy-400kib`, `hostile-fat-pipe`) is a
@@ -45,23 +43,18 @@ skim past (see `tools/PERF_LOOP.md`, "Rendered graph evidence (mandatory)").
 
 ## Default tier (runs in `cargo test -p tests`)
 
-`netem_scenarios`, `raw_netem_pair`, `rtp_clean`, `rtp_loss`, `rtp_mss`,
-`rtp_fec` (the seeded default-FEC recovery case, which reaches the sender's
-in-stream FEC capacity gate). Plus the two `perf_probe`
-seeding tests, and the single `rtp_liveness` / `shared_bottleneck`
-resynchronisation tests that were already un-ignored. The padding bench's
-fitted-ACK assertion
-(`rtp_padding_bench::ack_padding_hides_ack_packets_among_data`) is default
-too: it asserts a correctness property (the fitted ACK cluster is shrunken
-against the unpadded baseline while the large-data peak is preserved) and its
-24-trial pool keeps the pooled fitted/baseline small-cluster ratio at
-0.13-0.28 across the debug default gate and release (bound 0.5, so a >1.7x
-margin), so leaving it `#[ignore]`d made the assertion unreachable.
-The padding distribution pair
-(`rtp_padding_bench::padded_wire_sizes_converge_to_one_peak` and
-`rtp_padding_bench::unpadded_wire_sizes_stay_multimodal`) is default too and
-asserts a one-peaked padded wire-size distribution (the multimodal unpadded
-baseline is preserved), passing reliably at near-zero added cost.
+`netem_scenarios` and `raw_netem_pair` are the instrument's own conformance
+suite (every impairment knob fires, the four-state loss model matches the
+`sch_netem` semantics, the pair echoes and reports), plus the two `perf_probe`
+seeding tests (fixed-shaping / deterministic-loss profiles assert their
+classification, not a wall-clock) and the un-ignored `shared_bottleneck`
+resynchronisation tests. The rtp-owned floor tests that used to live here
+(`rtp_clean`, `rtp_loss`, `rtp_mss`, the default-FEC recovery case, the
+padding distribution/ACK-hiding trio, the `rtp_liveness` unit test) moved to
+the owning crate with the relocation's step 5: they now run in
+`cargo test -p rtp` and are pinned in `rtp/GATE.md` (`gate-default-required`),
+checked with `python3 ../netem_test/tools/check-gate.py --crate . rtp tests
+GATE.md`.
 
 The mux-owned scenarios (the clean/latency `mux_over_rtp` echoes,
 `mux_over_rtp_perf`'s lossy smoke / contended transfer / small-before-bulk
@@ -87,9 +80,20 @@ this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
 `gate-asserting` block records the full report-only/asserting split.
 
 ```gate-default-required
-rtp_padding_bench::ack_padding_hides_ack_packets_among_data
-rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
-rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
+netem_scenarios::netem_delay_adds_latency
+netem_scenarios::netem_duplicate_produces_extra_packets
+netem_scenarios::netem_four_state_loss_drops_some
+netem_scenarios::netem_passes_traffic_unimpaired
+netem_scenarios::netem_rate_limit_throttles_burst
+netem_scenarios::netem_reorder_with_rate_jumps_ahead
+netem_scenarios::netem_drops_all_with_max_random_loss
+netem_scenarios::netem_snapshot_reports_queue_and_stats
+perf_probe::controller_fat_pipe_has_only_fixed_shaping
+perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
+raw_netem_pair::netem_pair_raw_udp_echo_clean_link
+raw_netem_pair::netem_pair_raw_udp_latency_is_observable
+shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse
+shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
 ```
 
 ## Opt-in manifest
@@ -108,19 +112,6 @@ perf_probe::probe_hostile_goodput_30s = full
 perf_probe::probe_hostile_message_latency = full
 perf_probe::probe_rtp_echo_4mib_direct = standard
 perf_probe::probe_rtp_echo_4mib_mss8k = standard
-rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
-rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
-rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss = full
-rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss = standard
-rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains = standard
-rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard
-rtp_liveness::rtp_permanent_hole_liveness_smoke = standard
-rtp_padding_bench::ab_bulk_throughput_ack_padding = perf
-rtp_padding_bench::ab_bulk_throughput_across_presets = perf
-rtp_padding_bench::ab_small_echo_latency = perf
-rtp_padding_bench::ab_small_echo_latency_ack_padding = perf
-rtp_padding_bench::ab_small_echo_latency_across_presets = perf
-rtp_padding_bench::padding_throughput_overhead = perf
 shared_bottleneck::shared_bneck_fairness_longrun = full
 shared_bottleneck::shared_bneck_fairness_sweep = full
 shared_bottleneck::shared_bneck_late_joiner_fairness = full
@@ -143,20 +134,22 @@ body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
 
 ```gate-asserting
 contested_latency::contested_capped_clean
+netem_scenarios::netem_delay_adds_latency
+netem_scenarios::netem_duplicate_produces_extra_packets
+netem_scenarios::netem_four_state_loss_drops_some
+netem_scenarios::netem_passes_traffic_unimpaired
+netem_scenarios::netem_rate_limit_throttles_burst
+netem_scenarios::netem_reorder_with_rate_jumps_ahead
+netem_scenarios::netem_drops_all_with_max_random_loss
+netem_scenarios::netem_snapshot_reports_queue_and_stats
 perf_probe::probe_hostile_goodput_30s
 perf_probe::probe_hostile_message_latency
 perf_probe::probe_rtp_echo_4mib_direct
 perf_probe::probe_rtp_echo_4mib_mss8k
-rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
-rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random
-rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss
-rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss
-rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains
-rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive
-rtp_liveness::rtp_permanent_hole_liveness_smoke
-rtp_padding_bench::ack_padding_hides_ack_packets_among_data
-rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
-rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
+perf_probe::controller_fat_pipe_has_only_fixed_shaping
+perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
+raw_netem_pair::netem_pair_raw_udp_echo_clean_link
+raw_netem_pair::netem_pair_raw_udp_latency_is_observable
 shared_bottleneck::shared_bneck_fairness_longrun
 shared_bottleneck::shared_bneck_fairness_sweep
 shared_bottleneck::shared_bneck_late_joiner_fairness
@@ -164,6 +157,8 @@ shared_bottleneck::shared_bneck_reorder_tolerant_fairness
 shared_bottleneck::shared_bneck_rr_under_bulk_10mbps
 shared_bottleneck::shared_bneck_rr_under_bulk_2mbps
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps
+shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse
+shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
 ```
 
 The direct-body scan only sees assertions in a `perf` scenario's own body, so
@@ -190,10 +185,10 @@ Every entry is a report-only harness guard, not a gate: finalize/setup helpers
 that abort on harness malfunction (`with_timeout`, `submit_test_task`,
 `submit_test_task_required`, `spawn_required`, the `spawn_*_server_core`
 helpers, `try_send_observation`), argument validation (`percentile`,
-`gilbert_elliott_loss`), and the `rtp_padding_bench`
-A/B `run_transfer`/`run_transfer_preset` setup guards. The round-trip
-properties they touch are gated by the default-tier padding tests named in
-`gate-default-required`.
+`gilbert_elliott_loss`) and the sparse-ping frame encoder's setup guard
+(`send_timestamped_messages`). The rtp padding A/B benches that used to be
+gated here relocated with the rest of the rtp scenarios into `rtp/GATE.md`
+(step 5); the harness no longer hosts them.
 
 Residual limitations, stated so they are not mistaken for coverage. The graph
 is name-based and over-approximates whenever a call cannot be narrowed, so a
@@ -249,8 +244,6 @@ netem_test/netem-test/src/kit/task_scope.rs::spawn_required = 1
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
-tests/rtp_padding_bench.rs::run_transfer = 1
-tests/rtp_padding_bench.rs::run_transfer_preset = 1
 ```
 
 ## Perf-loop lane roles
