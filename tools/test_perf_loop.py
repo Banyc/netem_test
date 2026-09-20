@@ -344,7 +344,7 @@ class PerfLoopTest(unittest.TestCase):
                 link_profile="direct",
             )
 
-            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None, toolchain=None):
                 return str(executable.resolve())
 
             def fake_run_probe(workspace, seed, role, output_root, **kwargs):
@@ -512,7 +512,7 @@ class PerfLoopTest(unittest.TestCase):
                 link_profile="controller-fat-pipe",
             )
 
-            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None, toolchain=None):
                 return str(executable.resolve())
 
             def fake_run_probe(workspace, seed, role, output_root, **kwargs):
@@ -721,7 +721,7 @@ class PerfLoopTest(unittest.TestCase):
                 "candidate": b"#!/bin/sh\n# candidate\n",
             }
 
-            def fake_build(role, workspace, build_root, build_log, *, release=True):
+            def fake_build(role, workspace, build_root, build_log, *, release=True, toolchain=None):
                 executable.write_bytes(role_bytes[role])
                 executable.chmod(0o755)
                 build_log.write_text(
@@ -1428,7 +1428,7 @@ class PerfLoopTest(unittest.TestCase):
                 link_profile="direct",
             )
 
-            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None, toolchain=None):
                 return str(executable.resolve())
 
             def fake_run_probe(workspace, seed, role, output_root, **kwargs):
@@ -1500,11 +1500,13 @@ class PerfLoopTest(unittest.TestCase):
             executable.parent.mkdir(parents=True)
             executable.write_text("#!/bin/sh\n", encoding="utf-8")
             build_roles = []
+            toolchain_pins = []
             run_calls = []
             compare_allowlists = []
 
-            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+            def fake_build_probe(workspace, role, output_root, *, release=True, target_dir=None, toolchain=None):
                 build_roles.append(role)
+                toolchain_pins.append(toolchain)
                 return str(executable.resolve())
 
             def fake_run_probe(workspace, seed, role, output_root, **kwargs):
@@ -1576,14 +1578,29 @@ class PerfLoopTest(unittest.TestCase):
                 link_profile="fec-paired-saturated",
             )
 
-            with mock.patch.object(LOOP, "build_probe", fake_build_probe), mock.patch.object(
-                LOOP, "run_probe", fake_run_probe
-            ), mock.patch.object(LOOP, "call_compare", fake_call_compare):
-                exit_code = LOOP.command_run(args)
+            # The invocation-site toolchain pin is honoured from the
+            # environment and forwarded to the (frozen) build: the snapshot
+            # workspaces live outside the source tree, where rustup would not
+            # find its rust-toolchain.toml, so the pin must ride through to
+            # the cargo invocation or the probe could be compiled with a
+            # different rustc than the in-tree gates use.
+            previous_toolchain = os.environ.get("RUSTUP_TOOLCHAIN")
+            os.environ["RUSTUP_TOOLCHAIN"] = "it180-test-pin"
+            try:
+                with mock.patch.object(LOOP, "build_probe", fake_build_probe), mock.patch.object(
+                    LOOP, "run_probe", fake_run_probe
+                ), mock.patch.object(LOOP, "call_compare", fake_call_compare):
+                    exit_code = LOOP.command_run(args)
+            finally:
+                if previous_toolchain is None:
+                    os.environ.pop("RUSTUP_TOOLCHAIN", None)
+                else:
+                    os.environ["RUSTUP_TOOLCHAIN"] = previous_toolchain
             self.assertEqual(exit_code, 0)
             # The treatment builds and freezes ONE executable before timing;
             # baseline and candidate are never compiled separately.
             self.assertEqual(build_roles, ["treatment"])
+            self.assertEqual(toolchain_pins, ["it180-test-pin"])
             self.assertEqual(compare_allowlists, [("fec",)])
             baseline_fec = [call["fec"] for call in run_calls if call["role"] == "baseline"]
             candidate_fec = [call["fec"] for call in run_calls if call["role"] == "candidate"]
@@ -1595,6 +1612,7 @@ class PerfLoopTest(unittest.TestCase):
             )
             self.assertTrue(run_json["same_workspace_treatment"])
             self.assertEqual(run_json["scenario"], "bulk")
+            self.assertEqual(run_json["toolchain_pin"], "it180-test-pin")
             self.assertEqual(run_json["candidate_fec"], "on")
             self.assertFalse(run_json["instream_group_fec"])
             self.assertEqual(run_json["allowed_config_mismatches"], ["fec"])
@@ -2143,7 +2161,7 @@ class PerfLoopTest(unittest.TestCase):
                 )
 
                 def fake_build_probe(
-                    workspace, role, output_root, *, release=True, target_dir=None
+                    workspace, role, output_root, *, release=True, target_dir=None, toolchain=None
                 ):
                     return str(executable.resolve())
 

@@ -478,15 +478,56 @@ def use_prebuilt_probe(executable, role):
     return str(executable)
 
 
-def stream_build_command(role, workspace, build_root, build_log, *, release=True):
+def effective_toolchain_pin() -> str | None:
+    """The toolchain the invoking environment resolves, as a rustup pin.
+
+    The frozen probe is compiled in a snapshot workspace (beneath the safe
+    temp root) that is *outside* the source tree, so rustup's directory-walk
+    does not find the source tree's `rust-toolchain.toml` there and the
+    build silently falls back to the *default* toolchain - a frozen probe
+    compiled with a different rustc than the in-tree gates use. Pin the
+    frozen build to the toolchain the invocation site resolves (the same
+    override the in-tree `cargo test` uses), so the probe bytes match what
+    the source tree's own gates would produce. An explicit
+    `RUSTUP_TOOLCHAIN` in the environment is honoured as-is; when rustup is
+    absent or reports nothing usable, the probe is built unpinned (the
+    historical behaviour), because there is no pin to carry.
+    """
+    explicit = os.environ.get("RUSTUP_TOOLCHAIN")
+    if explicit:
+        return explicit
+    try:
+        completed = subprocess.run(
+            ["rustup", "show", "active-toolchain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    name = (completed.stdout or "").split()[0] if (completed.stdout or "").strip() else ""
+    return name or None
+
+
+def stream_build_command(role, workspace, build_root, build_log, *, release=True, toolchain=None):
     """Run the frozen ``cargo test --no-run`` build once for one role,
-    streaming JSON diagnostics into ``build-ROLE.log``."""
+    streaming JSON diagnostics into ``build-ROLE.log``.
+
+    ``toolchain`` is the invocation-site rustup pin captured by
+    [`command_run`] (see [`effective_toolchain_pin`]); when present it is
+    exported as `RUSTUP_TOOLCHAIN` for the build so the frozen probe is
+    compiled with the same toolchain the source tree's gates resolve.
+    """
     env = dict(os.environ)
     env["CARGO_TARGET_DIR"] = str(build_root)
     env["RUST_WRAPPER"] = ""
     env["RUSTC_WORKSPACE_WRAPPER"] = ""
     env["RUSTC_WRAPPER"] = ""
     env["RUSTFLAGS"] = ""
+    if toolchain:
+        env["RUSTUP_TOOLCHAIN"] = toolchain
     command = ["cargo", "test", "-j1"]
     if release:
         command.append("--release")
@@ -501,19 +542,21 @@ def stream_build_command(role, workspace, build_root, build_log, *, release=True
     return completed
 
 
-def build_probe(workspace, role, output_root, *, release=True, target_dir=None):
+def build_probe(workspace, role, output_root, *, release=True, target_dir=None, toolchain=None):
     """Build the frozen perf_probe for a role once, before any timed run.
 
     Fails when the build fails or the executable is absent, so the run
     errors instead of compiling inside a timed window; a nonexistent
-    workspace also errors.
+    workspace also errors. ``toolchain`` (the invocation-site rustup pin,
+    see [`command_run`]) is forwarded to the build so the frozen probe is
+    compiled with the same toolchain the source tree's gates use.
     """
     workspace = validate_workspace(workspace, role)
     profile = "release" if release else "debug"
     build_root = safe_build_dir(target_dir, workspace.parent, profile)
     build_log = output_root / f"build-{role}.log"
     completed = stream_build_command(
-        role, workspace, build_root, build_log, release=release
+        role, workspace, build_root, build_log, release=release, toolchain=toolchain
     )
     if completed.returncode != 0:
         raise ValueError(
@@ -1210,6 +1253,13 @@ def command_run(args):
     baseline = validate_workspace(Path(args.baseline), "baseline")
     candidate = validate_workspace(Path(args.candidate), "candidate")
     treatment = bool(args.same_workspace_treatment)
+    # Pin the frozen probe builds to the toolchain the invocation site
+    # resolves (see [`effective_toolchain_pin`]): the snapshot workspaces
+    # live outside the source tree, where rustup's directory-walk would not
+    # find the tree's `rust-toolchain.toml`, so without the pin the frozen
+    # probe could be compiled with a *different* rustc than the in-tree
+    # gates use.
+    toolchain = effective_toolchain_pin()
     role_configuration = {
         role: role_fec_configuration(args, role)
         for role in ("baseline", "candidate")
@@ -1321,6 +1371,7 @@ def command_run(args):
             output_root,
             release=args.release,
             target_dir=args.target_dir,
+            toolchain=toolchain,
         )
         executables = {"baseline": executable, "candidate": executable}
         build_sources = {role: "built" for role in executables}
@@ -1353,6 +1404,7 @@ def command_run(args):
                 output_root,
                 release=args.release,
                 target_dir=args.target_dir,
+                toolchain=toolchain,
             )
         build_sources = {role: "built" for role in executables}
         build_logs = {
@@ -1502,6 +1554,7 @@ def command_run(args):
         "window_seconds": args.window_seconds,
         "warmup_seconds": args.warmup_seconds,
         "release": args.release,
+        "toolchain_pin": toolchain,
         "same_binary_control": bool(args.same_binary_control),
         "control_calibration": calibration,
         "builds": {
