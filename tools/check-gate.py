@@ -31,8 +31,12 @@ call away, into a helper the scenario calls, would escape that scan. The
 checker therefore also builds a crate-local call graph (regex + brace counting,
 no Rust parser) from every `perf` scenario and requires every asserting
 function it can reach to be declared in the `gate-perf-guard-helpers` block,
-with its assertion-token count. An unrecorded asserting helper, a changed
-token count, or a stale entry is an error.
+with its assertion-token count. The graph follows the `pub use` shim views in
+`tests/tests/support/**` into the kit sources they re-export -- the harness kit
+(`netem-test/src/kit/**`, behind the `test-kit` feature) and the rtp layer kit
+(`rtp/src/testkit/**`, behind rtp's `testing` feature) -- so a perf scenario's
+reach into the relocated helpers is still declared. An unrecorded asserting
+helper, a changed token count, or a stale entry is an error.
 
 It also checks the perf-loop lane roles in the `gate-lane-roles` block against
 `perf_loop.lane_classification`, the function that stamps `link_role` into a
@@ -70,6 +74,26 @@ FN_RE = re.compile(
 CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
 SUPPORT_DIR = TEST_DIR / "support"
 PKG_DIR = REPO / "tests"
+# The harness kit sources: the generic scenario helpers moved out of
+# `tests/tests/support/**` into the leaf harness crate behind the `test-kit`
+# feature (`netem-test/src/kit/**`). The support modules are now `pub use`
+# shim views of these files, so the call graph must reach into them to keep
+# the perf tier's transitive assertion scan honest.
+KIT_DIR = REPO / "netem-test" / "src" / "kit"
+# The rtp layer kit: the rtp echo/connect/sink/frame/perf-trace scaffolding
+# relocated into the owning crate behind its `testing` feature
+# (`rtp/src/testkit/**`), reachable from the scenario crate through the
+# `support/rtp.rs`, `support/frame.rs` shims. `tests` already path-depends on
+# the sibling `rtp` checkout (Cargo cannot build the suite without it), so
+# scanning its kit source adds no new coupling.
+RTP_KIT_DIR = REPO.parent / "rtp" / "src" / "testkit"
+# Bare `use` first segments that name external crate roots in the scanned
+# sources: `netem_test::kit::…` and `rtp::testkit::…` from the shims and the
+# rtp kit, plus `tokio`/`std` imports. Everything else resolves like rustc
+# does for a bare `use` path: against the current module's scope (the kit's
+# `pub use task_scope::…` sibling re-exports), so an in-crate bare path is
+# never mistaken for an external crate.
+EXTERNAL_ROOT_STEMS = {"netem_test", "rtp", "tokio", "std"}
 
 
 def manifest_block(name: str) -> str | None:
@@ -157,14 +181,52 @@ def body_asserts(target: str, name: str, bodies: dict[str, str]) -> bool:
 
 
 def source_module(path: Path) -> str | None:
-    """Rust module path of a source file, or None when it is not crate-local."""
-    parts = path.relative_to(PKG_DIR).parts
-    if len(parts) == 2 and parts[0] == "tests":
+    """Rust module path of a source file, or None when it is not scanned.
+
+    Scenario targets and the tests crate's `support/**` modules keep the
+    historical `""` / `support`-prefixed names. The harness kit sources
+    (`netem-test/src/kit/**`) and the rtp layer kit sources
+    (`rtp/src/testkit/**`) are registered under their crate-qualified module
+    names so the call graph can follow a `pub use` shim view into the kit
+    files.
+    """
+    try:
+        parts = path.relative_to(TEST_DIR).parts
+    except ValueError:
+        for base, prefix in (
+            (RTP_KIT_DIR, "rtp::testkit"),
+            (KIT_DIR, "netem_test::kit"),
+        ):
+            try:
+                kit_parts = path.relative_to(base).parts
+            except ValueError:
+                continue
+            if len(kit_parts) != 1:
+                return None
+            stem = kit_parts[0][:-3]
+            return prefix if stem == "mod" else f"{prefix}::{stem}"
+        return None
+    if len(parts) == 1:
         return ""
-    if len(parts) == 3 and parts[0] == "tests" and parts[1] == "support":
-        stem = parts[2][:-3]
+    if len(parts) == 2 and parts[0] == "support":
+        stem = parts[1][:-3]
         return "support" if stem == "mod" else f"support::{stem}"
     return None
+
+
+def source_identity(path: Path) -> str:
+    """Stable identity prefix for a scanned source file.
+
+    Files inside the tests package keep their historical package-relative
+    identity (`tests/<file>.rs`, `tests/support/<file>.rs`) so recorded
+    manifest entries stay stable across the kit relocation; kit sources are
+    identified relative to the workspace family root
+    (`netem-test/src/kit/<file>.rs`, `rtp/src/testkit/<file>.rs`).
+    """
+    try:
+        return str(path.relative_to(PKG_DIR))
+    except ValueError:
+        return str(path.relative_to(REPO.parent))
 
 
 class SourceFunction:
@@ -207,7 +269,7 @@ def parse_functions(path: Path) -> list[SourceFunction]:
                     break
             idx += 1
         name = match.group(1)
-        ident = f"{path.relative_to(PKG_DIR)}::{name}"
+        ident = f"{source_identity(path)}::{name}"
         if ident in seen:
             continue
         seen.add(ident)
@@ -218,14 +280,23 @@ def parse_functions(path: Path) -> list[SourceFunction]:
 def normalize_module(base: str, current_module: str) -> str:
     """Resolve a use-path prefix to a crate-root-absolute module path.
 
-    Handles the forms present in this crate: ``crate::...``, one or more
-    ``super::...`` levels, and plain ``support::...`` paths from the crate root.
+    Handles the forms present in the scanned sources: ``crate::...`` (crate
+    root), one or more ``super::...`` / ``self::...`` levels (relative to the
+    importing module), bare sibling module paths in a `use` declaration
+    (resolved like rustc does: against the current module's scope, which is
+    how the kit's ``pub use task_scope::…`` sibling re-exports work), and bare
+    paths whose first segment names an external crate root
+    (``netem_test::kit::…``, ``rtp::testkit::…``) for the `pub use` shim views.
     """
     segments = [segment for segment in base.split("::") if segment]
     if not segments:
         return current_module
     if segments[0] == "crate":
         return "::".join(segments[1:])
+    if segments[0] in EXTERNAL_ROOT_STEMS:
+        # Rejoin the filtered segments: a brace-form `use` base ends with a
+        # trailing `::` (partition on `{`) that must not survive.
+        return "::".join(segments)
     current = current_module.split("::") if current_module else []
     index = 0
     while index < len(segments) and segments[index] in ("super", "self"):
@@ -235,7 +306,7 @@ def normalize_module(base: str, current_module: str) -> str:
     return "::".join(current + segments[index:])
 
 
-USE_RE = re.compile(r"^use\s+(.+?);", re.M | re.S)
+USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+(.+?);", re.M | re.S)
 
 
 def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[str]]:
@@ -255,7 +326,15 @@ def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[
             item = item.split(" as ", 1)[0].strip()
             if not item:
                 continue
-            if item == "*":
+            if item == "*" or item.endswith("::*"):
+                # Brace-form globs (`use support::{*, …}`) carry their base
+                # module in `base_module`; the shim views use the non-brace
+                # star form (`pub use netem_test::kit::payload::*`), where the
+                # whole item is the glob path.
+                if not base_module:
+                    base_module = normalize_module(
+                        item[:-2].strip(), current_module
+                    )
                 if base_module:
                     globs.append(base_module)
                 continue
@@ -272,11 +351,21 @@ def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[
 
 
 def target_source_files(target: str) -> list[Path]:
-    """Source files compiled into the ``tests/<target>.rs`` integration target."""
+    """Source files compiled into the ``tests/<target>.rs`` integration target.
+
+    The target includes the crate-local `support/**` modules it declares plus
+    the kit source files behind the shim views: the harness kit
+    (`netem-test/src/kit/**`) and the rtp layer kit (`rtp/src/testkit/**`).
+    The kit files belong to other crates but are scanned so the report-only
+    perf tier's reach into them stays declared; `tests` already path-depends
+    on the sibling `rtp` checkout, so Cargo assumes exactly that layout.
+    """
     files = [TEST_DIR / f"{target}.rs"]
     text = files[0].read_text(encoding="utf-8")
     if re.search(r"^mod support;", text, re.M):
         files.extend(sorted(SUPPORT_DIR.glob("*.rs")))
+    files.extend(sorted(KIT_DIR.glob("*.rs")))
+    files.extend(sorted(RTP_KIT_DIR.glob("*.rs")))
     return [path for path in files if path.exists()]
 
 
@@ -333,13 +422,47 @@ class TargetGraph:
         imported = self.imports.get(module, {}).get(name)
         if imported is not None:
             found = self.by_module_name.get((imported, name))
+            if not found:
+                found = self._through_views(imported, name, set())
             if found:
                 return found
         for glob in self.globs.get(module, ()):
             found = self.by_module_name.get((glob, name))
             if found:
                 return found
+            found = self._through_views(glob, name, set())
+            if found:
+                return found
         return self.by_name.get(name, [])
+
+    def _through_views(self, module: str, name: str, seen: set[str]) -> list[str]:
+        """Resolve ``name`` visible in ``module`` through its re-export views.
+
+        A support shim (`support::stats`) is a `pub use` view of a kit module
+        (`netem_test::kit::stats`) and the kit module itself re-exports from
+        its children (`pub use task_scope::…`), so a name imported into a view
+        resolves several hops away even though each view defines nothing. The
+        lookup follows the view's own imports and globs, cycle-guarded, so the
+        graph does not dead-end at the shim.
+        """
+        if module in seen:
+            return []
+        seen = seen | {module}
+        imported = self.imports.get(module, {}).get(name)
+        if imported is not None:
+            found = self.by_module_name.get((imported, name))
+            if not found:
+                found = self._through_views(imported, name, seen)
+            if found:
+                return found
+        for glob in self.globs.get(module, ()):
+            found = self.by_module_name.get((glob, name))
+            if found:
+                return found
+            found = self._through_views(glob, name, seen)
+            if found:
+                return found
+        return []
 
     def reachable(self, seeds: list[str]) -> set[str]:
         seen: set[str] = set()

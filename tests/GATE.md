@@ -378,15 +378,21 @@ reached only by passing a function by name, through a trait object, or
 through a macro alias remains invisible to the graph.
 
 Since the shared scaffolding relocated into the harness `test-kit` feature
-(`netem_test::kit::{payload,presets,stats,prng,fan,contested,task_scope,mod-core}`),
-the helpers that used to live in
-`tests/tests/support/{payload,presets,stats,task_scope,mod}.rs`
-(`with_timeout`, `gilbert_elliott_loss`, `percentile`, `try_send_observation`,
-and the `TestScope` reaper machinery, plus the rtp layer kit
-(`rtp::testkit::{rtp,frame,perf_trace}`, hosted by the owning crate behind
-its `testing` feature)) are outside this crate-local scan; each
-keeps its report-only role, guarded by the vacuity tests in its kit home
-instead. They are re-added when the checker is parameterized per crate.
+the helpers that used to live in `tests/tests/support/**` are no longer
+inlined in the scenario crate: `with_timeout`, `gilbert_elliott_loss`,
+`percentile`, `try_send_observation`, and the `TestScope` reaper machinery
+now live in `netem-test/src/kit/**` (behind `netem_test::kit`), and the rtp
+echo/connect/sink/frame/perf-trace scaffolding lives in
+`rtp/src/testkit/**` behind rtp's `testing` feature. The checker follows the
+`pub use` shim views in `support/**` into both kit source sets, so the
+reachable asserting helpers below are declared exactly as they were before
+the relocation. What remains genuinely outside the scan: assertions inside
+the `netem-test` library itself (e.g. `NetemPair` internals) and rtp's own
+lib internals (e.g. `crate::metrics`), which the scenario crate can reach but
+whose sources belong to other crates and are not parsed here - the same
+boundary the scan always had. The perf tier's kit-home helpers keep their
+report-only role, and the kit unit tests that enforce them run in the
+harness's own default test invocation via the `test-kit` self dev-dependency.
 
 ```gate-perf-guard-helpers
 tests/rtp_mux_jitter.rs::assert_reportable = 2
@@ -399,6 +405,15 @@ tests/support/mux.rs::mux_client_connect_frame_delivery_via = 1
 tests/support/mux.rs::send_timestamped_messages = 1
 tests/support/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
 tests/support/mux.rs::spawn_mux_over_rtp_server_core = 1
+netem_test/netem-test/src/kit/mod.rs::try_send_observation = 1
+netem_test/netem-test/src/kit/payload.rs::with_timeout = 1
+netem_test/netem-test/src/kit/presets.rs::gilbert_elliott_loss = 2
+netem_test/netem-test/src/kit/stats.rs::percentile = 1
+netem_test/netem-test/src/kit/task_scope.rs::run = 1
+netem_test/netem-test/src/kit/task_scope.rs::spawn_required = 1
+netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
+netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
+rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 ```
 
 ## Perf-loop lane roles
