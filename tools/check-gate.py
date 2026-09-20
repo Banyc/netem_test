@@ -464,10 +464,12 @@ def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[
                 # Brace-form globs (`use support::{*, …}`) carry their base
                 # module in `base_module`; the shim views use the non-brace
                 # star form (`pub use netem_test::kit::payload::*`), where the
-                # whole item is the glob path.
+                # whole item is the glob path. The `::*` suffix is three
+                # characters; a `[:-2]` strip would leave a trailing `:` that
+                # no longer matches any registered module.
                 if not base_module:
                     base_module = normalize_module(
-                        item[:-2].strip(), current_module
+                        item[:-3].strip(), current_module
                     )
                 if base_module:
                     globs.append(base_module)
@@ -550,6 +552,14 @@ class TargetGraph:
         if "::" in path:
             target_module = normalize_module(path.rsplit("::", 1)[0], module)
             found = self.by_module_name.get((target_module, name))
+            if found:
+                return found
+            # A qualified path into a `pub use` shim view (`support::mux::…`,
+            # `support::rtp::…`) names a module that defines nothing; follow
+            # the view's own re-exports before scattering over every
+            # same-named function, so two kits defining the same helper cannot
+            # both be dragged into the closure by one shim call.
+            found = self._through_views(target_module, name, set())
             if found:
                 return found
         found = self.by_module_name.get((module, name))
