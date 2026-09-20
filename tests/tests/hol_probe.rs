@@ -2296,6 +2296,157 @@ async fn run_frame_delivery_two_interactive(
         .await
 }
 
+/// The per-flow tag byte for multi-flow frame-delivery probes. The server
+/// routes every stream whose first byte is not `b'B'` through its latency
+/// parser (`b'B'` is the reserved bulk-sink tag), so the two-interactive
+/// battery's second flow already uses `b'L'`; every later flow gets a fresh
+/// distinct letter (`b'C'`, `b'D', ...) so each flow's samples are
+/// attributable and no flow silently lands in another flow's bucket.
+fn flow_tag(flow: usize) -> u8 {
+    match flow {
+        0 => b'A',
+        1 => b'L',
+        _ => b'A' + flow as u8,
+    }
+}
+
+/// Run a frame-delivery probe with `flows` interactive streams on ONE mux
+/// connection over ONE frame-delivery RTP connection: the two-interactive
+/// pattern generalized. Every stream tags its first message with a distinct
+/// [`flow_tag`] byte so the server routes it through the latency parser and
+/// its samples are bucketed per flow; the returned vector is indexed by flow
+/// with the combined summary last. The single connection is the point of the
+/// arm — four interactive flows sharing one frame path — and the link is
+/// exactly the two-interactive battery's GE5 seed pair so the per-flow
+/// percentiles are comparable.
+async fn run_frame_delivery_multi_interactive(
+    label: &str,
+    c2s: NetemConfig,
+    s2c: NetemConfig,
+    flows: usize,
+    config: FrameDeliveryProbeConfig,
+) -> (Vec<HolSummary>, HolSummary) {
+    assert!(
+        (1..=7).contains(&flows),
+        "{label}: flows {flows} out of the A..H (b'B' reserved) tag range"
+    );
+    let FrameDeliveryProbeConfig {
+        fec,
+        traffic:
+            TrafficConfig {
+                msg_bytes,
+                cadence,
+                run_for,
+                grace,
+            },
+    } = config;
+    let base = Instant::now();
+    let mut tasks = support::TestScope::new();
+    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    tasks
+        .run(async {
+            let (server_addr, mut latencies, _bulk_counter) =
+                spawn_mux_frame_delivery_latency_bulk_server_via(&task_tx, fec, base)
+                    .await
+                    .unwrap();
+            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
+            let (reader, writer) =
+                rtp_frame_delivery_connect_via(&task_tx, pair.client_addr(), fec).await;
+            let config = mux::MuxConfig {
+                initiation: mux::Initiation::Client,
+                heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: true,
+            };
+            let mut spawner = tokio::task::JoinSet::new();
+            let (opener, _accepter) =
+                mux::spawn_mux_no_reconnection(reader, writer, config, &mut spawner);
+            // The mux supervision is drained by a non-required background
+            // task: these echo lanes let the session tear down normally (FIN
+            // exchanged) before the measurement body finishes, so a required
+            // task would panic on that normal early completion. A panicked
+            // supervision task still surfaces at scope end, and the JoinSet
+            // is dropped when the task completes, aborting any stragglers.
+            submit_test_task(
+                &task_tx,
+                Box::pin(async move {
+                    if let Some(Err(err)) = spawner.join_next().await {
+                        panic!("mux client session supervision failed: {err:?}");
+                    }
+                }),
+            );
+            let mut streams = Vec::with_capacity(flows);
+            for flow in 0..flows {
+                let (mut read, write) = opener.open().await.unwrap();
+                // Parked until the streams close; the owning JoinSet aborts
+                // them at scope end.
+                submit_test_task(
+                    &task_tx,
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; 8 * 1024];
+                        while let Ok(n) = read.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }),
+                );
+                streams.push((flow_tag(flow), write));
+            }
+
+            let mut sent_per_flow = vec![0u64; flows];
+            let mut writes = Vec::with_capacity(flows);
+            for (tag, write) in streams.iter_mut() {
+                let _ = write.write_all(&[*tag]).await;
+                writes.push(&mut *write);
+            }
+
+            // All flows offered concurrently, joined before shutdown.
+            let mut futs = Vec::with_capacity(flows);
+            for write in writes {
+                futs.push(send_timestamped_messages(
+                    write, base, msg_bytes, cadence, run_for,
+                ));
+            }
+            for (i, fut) in futs.into_iter().enumerate() {
+                sent_per_flow[i] = fut.await;
+            }
+            for (_, write) in streams.iter_mut() {
+                let _ = write.shutdown();
+            }
+
+            tokio::time::sleep(grace).await;
+            let mut samples: Vec<f64> = Vec::new();
+            let mut per_flow: Vec<Vec<f64>> = vec![Vec::new(); flows];
+            while let Ok((tag, lat)) = latencies.try_recv() {
+                samples.push(lat);
+                if let Some(flow) = (0..flows).find(|&i| flow_tag(i) == tag) {
+                    per_flow[flow].push(lat);
+                }
+            }
+            let total_sent: u64 = sent_per_flow.iter().sum();
+            let combined = summarize(samples.clone(), total_sent, samples.len() as u64, 0, 0.0);
+            let mut summaries = Vec::with_capacity(flows);
+            for flow in 0..flows {
+                let summary = summarize(
+                    per_flow[flow].clone(),
+                    sent_per_flow[flow],
+                    per_flow[flow].len() as u64,
+                    0,
+                    0.0,
+                );
+                eprintln!(
+                    "[hol {} flow {}] p50={:.1} p99={:.1} max={:.1}",
+                    label, flow, summary.p50, summary.p99, summary.max
+                );
+                summaries.push(summary);
+            }
+            print_hol_summary(&format!("{}_combined", label), &combined);
+            pair.stop();
+            (summaries, combined)
+        })
+        .await
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Frame‑delivery & dual‑lane scenarios (all #[ignore])
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2407,6 +2558,61 @@ async fn hol_rtt100_ge5_two_interactive_frame_delivery() {
         summary_b.p50,
         solo_ref * 2.5,
     );
+}
+
+/// Multi-flow interactive scaling beyond the two-interactive battery: four
+/// interactive streams sharing ONE frame-delivery connection at the same GE5
+/// link as the two-interactive arm, asserting the outcome triad per flow —
+/// delivery >= 0.90 and p50 <= 125 ms (the solo reference x2.5) — plus the
+/// combined delivery >= 0.90. The single-flow HOL battery and the
+/// two-interactive arm cover one and two flows; the inventory called
+/// multi-flow (4/8) scaling never-measured, and this arm closes the 4-flow
+/// rung.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; slow end-to-end probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn hol_rtt100_ge5_four_interactive_frame_delivery() {
+    const FLOWS: usize = 4;
+    let label = "rtt100 GE5 four-interactive frame-delivery";
+    let (summaries, combined) = with_timeout(
+        Duration::from_secs(180),
+        label,
+        run_frame_delivery_multi_interactive(
+            label,
+            rtt100_ge5(31),
+            rtt100_ge5(32),
+            FLOWS,
+            FrameDeliveryProbeConfig {
+                fec: false,
+                traffic: TrafficConfig {
+                    msg_bytes: DEFAULT_MSG_BYTES,
+                    cadence: DEFAULT_CADENCE,
+                    run_for: DEFAULT_RUN_FOR,
+                    grace: DEFAULT_GRACE,
+                },
+            },
+        ),
+    )
+    .await;
+    assert!(
+        combined.delivery_pct >= 0.90,
+        "combined delivery {:.3} < 0.90",
+        combined.delivery_pct
+    );
+    let solo_ref = 50.0;
+    for (flow, summary) in summaries.iter().enumerate() {
+        let name = flow_tag(flow) as char;
+        assert!(
+            summary.delivery_pct >= 0.90,
+            "flow {name} delivery {:.3} < 0.90",
+            summary.delivery_pct
+        );
+        assert!(
+            summary.p50 <= solo_ref * 2.5,
+            "flow {name} p50 {:.1} > {:.0} ms",
+            summary.p50,
+            solo_ref * 2.5,
+        );
+    }
 }
 
 // ───── diagnostics: frame‑delivery shared on various link profiles ─────

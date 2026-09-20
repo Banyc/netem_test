@@ -137,6 +137,7 @@ hol_probe::hol_rtt100_ge5_shared_frame_delivery = full
 hol_probe::hol_rtt100_ge5_solo = full
 hol_probe::hol_rtt100_ge5_split = full
 hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery = full
+hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full
 hol_probe::hol_rtt100_ge5_v2_shared = full
 hol_probe::hol_rtt100_ge5_v2_solo = full
 hol_probe::hol_rtt100_ge5_v3_shared = full
@@ -269,6 +270,7 @@ hol_probe::hol_rtt100_ge5_shared_frame_delivery
 hol_probe::hol_rtt100_ge5_solo
 hol_probe::hol_rtt100_ge5_split
 hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery
+hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery
 hol_probe::hol_rtt100_ge5_v2_shared
 hol_probe::hol_rtt100_ge5_v2_solo
 hol_probe::hol_rtt100_ge5_v3_shared
