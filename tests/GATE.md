@@ -26,16 +26,16 @@ python3 tools/check-gate.py
 - **perf** — `#[ignore]`d, report-only measurement or long-run tooling; these
   produce numbers (or feed `tools/perf-loop`), they do not assert a gate floor.
   A `perf` scenario must not contain an assertion in its own body; `check-gate.py`
-  fails with the scenario name if one does, because a check that never runs is
-  not coverage. It must also not reach an assertion through a helper: the
-  checker derives the crate-local call-graph closure of every `perf` scenario
-  and requires every asserting helper it reaches to be declared report-only in
-  the `gate-perf-guard-helpers` block. Do not treat a perf target's absence from
-  a run as coverage of the property. The three report-only `rtp_padding_bench`
-  A/B benches and the `rtp_mux_jitter` arms call shared helpers (`run_transfer*`,
-  `assert_sane`, `assert_reportable`) whose assertions are setup/sanity guards,
-  not gates; the round-trip integrity they check is gated by the default-tier
-  padding tests.
+  fails with the scenario name, its file, and the token if one does, because a
+  check that never runs is not coverage. It must also not reach an assertion
+  through a helper: the checker derives the crate-local call-graph closure of
+  every `perf` scenario and requires every asserting helper it reaches to be
+  declared report-only in the `gate-perf-guard-helpers` block. Do not treat a
+  perf target's absence from a run as coverage of the property. The three
+  report-only `rtp_padding_bench` A/B benches and the `rtp_mux_jitter` arms
+  call shared helpers (`run_transfer*`, `assert_sane`, `assert_reportable`)
+  whose assertions are setup/sanity guards, not gates; the round-trip integrity
+  they check is gated by the default-tier padding tests.
 
 The long-running `perf-loop` battery (`tools/perf-loop`, lanes `clean`,
 `controller-fat-pipe`, `hostile`, `lossy-400kib`, `hostile-fat-pipe`) is a
@@ -221,8 +221,9 @@ report-only by definition, so no `perf` scenario may appear here. The checker
 derives the expected set from the manifest tiers plus `gate-default-required`
 and fails if this block disagrees, and it also scans each `perf` scenario's own
 body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
-`panic!`/`unreachable!` is an error (an asserting check filed under the
-report-only tier would never run).
+`panic!`/`unreachable!` (or the debug-only `debug_assert!`/`debug_assert_eq!`/
+`debug_assert_ne!` forms) is an error, named with its file and the token found
+(an asserting check filed under the report-only tier would never run).
 
 ```gate-asserting
 contested_latency::contested_capped_clean
@@ -332,7 +333,9 @@ closure. A call that still cannot be narrowed keeps every same-named candidate,
 so the graph over-approximates rather than dropping a direct call. Every
 asserting function the closure reaches must be listed here as
 `RELATIVE_PATH::fn = assertion-token-count`, together with the number of
-`assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!` tokens in its body.
+`assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!` tokens in its body
+(the debug-only `debug_assert!`/`debug_assert_eq!`/`debug_assert_ne!` forms
+count as assertion tokens too).
 The checker fails when a reachable asserting helper is unrecorded, when a
 recorded helper's token count changes, when a recorded helper is no longer
 reachable, or when a `perf` scenario's own body cannot be located in its source
@@ -356,8 +359,17 @@ cannot see an edge created by passing a function by name (e.g.
 an assertion reached only through such an indirection is invisible to the scan.
 It records a guard helper's assertion *token count*, not the text of the
 assertions, so replacing an assertion in a recorded guard with a different
-assertion of the same token count is not detected. `debug_assert!` is not in the
-token set (it is inert in release).
+assertion of the same token count is not detected. The plain tokens match
+inside the debug-only forms as substrings, so `debug_assert!` was never fully
+invisible to the scan, but the set now names the three debug forms explicitly
+(`debug_assert!`/`debug_assert_eq!`/`debug_assert_ne!`) and the error messages
+report the exact token found instead of a bare count. A debug-only assertion
+is inert in a release build of the scenario that carries it, so under
+`--release` it would not even execute; the gate treats its presence in the
+report-only tier as a violation regardless of build profile. The residual
+indirection limits from the previous paragraph still apply: an assertion
+reached only by passing a function by name, through a trait object, or
+through a macro alias remains invisible to the graph.
 
 ```gate-perf-guard-helpers
 tests/rtp_mux_jitter.rs::assert_reportable = 2

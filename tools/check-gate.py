@@ -19,7 +19,12 @@ records the asserting scenarios, and it must equal the tier-derived set
 (every `standard`/`full` scenario plus every `gate-default-required` entry).
 Each `perf` scenario's own source body is scanned for assertion tokens, so an
 asserting check filed under the report-only tier -- which would never run -- is
-an error that names the scenario.
+an error that names the scenario, its file, and the token found. The scan
+recognises the debug-only assertion forms (`debug_assert!`,
+`debug_assert_eq!`, `debug_assert_ne!`) as assertion tokens too: they are
+inert in release builds of the scenario, so an author could hide a check
+under the report-only tier hoping it is ignored by the gate, and the presence
+of any assertion token in a `perf` body violates the report-only contract.
 
 A token in a scenario's own body is not the whole story: an assertion moved one
 call away, into a helper the scenario calls, would escape that scan. The
@@ -57,7 +62,7 @@ TIERS = {"standard", "full", "perf"}
 LANE_ROLES = {"verdict", "diagnostic"}
 ASSERTING_TIERS = {"standard", "full"}
 ASSERTION_TOKENS = re.compile(
-    r"(assert!|assert_eq!|assert_ne!|panic!|unreachable!)"
+    r"(debug_assert_ne!|debug_assert_eq!|debug_assert!|assert_ne!|assert_eq!|assert!|panic!|unreachable!)"
 )
 FN_RE = re.compile(
     r"\b(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\("
@@ -138,6 +143,11 @@ def test_bodies(target: str) -> dict[str, str]:
             idx += 1
         bodies.setdefault(match.group(1), text[start : idx + 1])
     return bodies
+
+
+def found_tokens(body: str | None) -> list[str]:
+    """The assertion tokens in ``body``, in source order."""
+    return list(ASSERTION_TOKENS.findall(body or ""))
 
 
 def body_asserts(target: str, name: str, bodies: dict[str, str]) -> bool:
@@ -347,10 +357,11 @@ class TargetGraph:
         return seen
 
 
-def helper_scan(manifest: dict[str, str]) -> tuple[dict[str, int], list[str]]:
+def helper_scan(manifest: dict[str, str]) -> tuple[dict[str, int], dict[str, list[str]], list[str]]:
     """Asserting crate functions reachable from the perf tier, with token counts.
 
-    Returns ``(identity -> assertion_count, unlocatable_perf_scenarios)``.
+    Returns ``(identity -> assertion_count, identity -> tokens,
+    unlocatable_perf_scenarios)``.
     """
     perf_by_target: dict[str, list[str]] = {}
     for name, tier in manifest.items():
@@ -358,6 +369,7 @@ def helper_scan(manifest: dict[str, str]) -> tuple[dict[str, int], list[str]]:
             target, _, test = name.partition("::")
             perf_by_target.setdefault(target, []).append(test)
     reachable: dict[str, int] = {}
+    tokens: dict[str, list[str]] = {}
     unlocatable: list[str] = []
     for target, tests in sorted(perf_by_target.items()):
         paths = target_source_files(target)
@@ -373,10 +385,14 @@ def helper_scan(manifest: dict[str, str]) -> tuple[dict[str, int], list[str]]:
         for ident in graph.reachable(seeds):
             if ident in seed_set:
                 continue
-            count = len(ASSERTION_TOKENS.findall(graph.functions[ident].body))
+            body = graph.functions[ident].body
+            count = len(ASSERTION_TOKENS.findall(body))
             if count:
                 reachable[ident] = max(reachable.get(ident, 0), count)
-    return reachable, unlocatable
+                found = found_tokens(body)
+                if len(found) > len(tokens.get(ident, [])):
+                    tokens[ident] = found
+    return reachable, tokens, unlocatable
 
 
 def recorded_perf_guard_helpers() -> dict[str, int]:
@@ -552,10 +568,13 @@ def main() -> int:
         if tier != "perf":
             continue
         target, _, test = name.partition("::")
-        if body_asserts(target, test, test_bodies(target)):
+        bodies = test_bodies(target)
+        if body_asserts(target, test, bodies):
             print(
                 f"ASSERTING scenario in report-only perf tier "
-                f"(re-tier to standard/full/default or make it report-only): {name}"
+                f"(re-tier to standard/full/default or make it report-only): {name} "
+                f"[file tests/{target}.rs, token(s): "
+                f"{', '.join(sorted(set(found_tokens(bodies.get(test)))))}]"
             )
             bad = True
 
@@ -564,7 +583,7 @@ def main() -> int:
     # every `perf` scenario may only reach asserting functions that GATE.md
     # declares as report-only guards (`gate-perf-guard-helpers`), with token
     # counts so an assertion added to a guard is caught too.
-    derived_helpers, unlocatable = helper_scan(manifest)
+    derived_helpers, helper_tokens, unlocatable = helper_scan(manifest)
     for name in unlocatable:
         print(
             f"PERF scenario body not found in source (macro-generated or moved?): {name}"
@@ -574,7 +593,8 @@ def main() -> int:
     for ident in sorted(set(derived_helpers) - set(recorded_helpers)):
         print(
             f"PERF scenario reaches asserting helper not recorded as report-only: "
-            f"{ident} ({derived_helpers[ident]} assertion token(s))"
+            f"{ident} ({derived_helpers[ident]} assertion token(s): "
+            f"{', '.join(helper_tokens[ident])})"
         )
         bad = True
     for ident in sorted(set(recorded_helpers) - set(derived_helpers)):
