@@ -222,6 +222,38 @@ const HOSTILE_GUARD_SUBWINDOWS: usize = 3;
 /// robustness over an absolute floor.
 const HOSTILE_GOODPUT_FLOOR_MIB_S: f64 = 0.075;
 
+/// Release-only bulk-goodput floors (MiB/s, median of [`PROBE_ITERS`]) for
+/// the loopback ceiling probes. Calibrated against the measured release
+/// medians — ~191 MiB/s (mux sink 4 MiB 8 KiB-MSS) and ~117 MiB/s (mux sink
+/// 4 MiB direct), each with worst-of-5 no lower than ~140 / ~82 MiB/s — with
+/// the floor at ~0.5× the median band, so a merge that halves loopback
+/// throughput fails the gate while ordinary host-load noise (the measured
+/// median held through load ~6) never trips it. Wall-clock, so the floors are
+/// compiled out of debug builds entirely and only bite under `--release`,
+/// where loopback throughput is representative.
+#[cfg(not(debug_assertions))]
+const MUX_SINK_MSS8K_FLOOR_MIB_S: f64 = 96.0;
+#[cfg(not(debug_assertions))]
+const MUX_SINK_DIRECT_FLOOR_MIB_S: f64 = 58.0;
+
+/// Assert the median-of-[`PROBE_ITERS`] MiB/s against a release-only floor.
+/// Only the median is gated — a single load-spiked iteration cannot trip the
+/// floor — mirroring the hostile probe's median-sub-window guard.
+#[cfg(not(debug_assertions))]
+fn assert_median_bulk_floor(label: &str, bytes: usize, samples: &[Duration], floor_mib_s: f64) {
+    assert!(!samples.is_empty(), "{label}: no samples");
+    let mut rates: Vec<f64> = samples
+        .iter()
+        .map(|elapsed| bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64())
+        .collect();
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = rates[rates.len() / 2];
+    assert!(
+        median >= floor_mib_s,
+        "bulk goodput floor: {label} median {median:.2} MiB/s < {floor_mib_s} MiB/s (per-sample {rates:?})"
+    );
+}
+
 /// Raw `rtp` 4 MiB direct echo, default MSS.
 ///
 /// Echo moves the payload twice, so throughput is reported as one-way bytes.
@@ -412,6 +444,13 @@ async fn probe_mux_sink_4mib_direct() {
         })
         .await;
 
+    #[cfg(not(debug_assertions))]
+    assert_median_bulk_floor(
+        "mux sink 4MiB direct",
+        BULK,
+        &samples,
+        MUX_SINK_DIRECT_FLOOR_MIB_S,
+    );
     print_median_worst("mux sink 4MiB direct", BULK, samples);
 }
 
@@ -492,6 +531,13 @@ async fn probe_mux_sink_4mib_mss8k() {
         })
         .await;
 
+    #[cfg(not(debug_assertions))]
+    assert_median_bulk_floor(
+        "mux sink 4MiB 8KiB-MSS",
+        BULK,
+        &samples,
+        MUX_SINK_MSS8K_FLOOR_MIB_S,
+    );
     print_median_worst("mux sink 4MiB 8KiB-MSS", BULK, samples);
 }
 
