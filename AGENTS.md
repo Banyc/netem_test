@@ -9,8 +9,15 @@ scenarios consuming `netem-test`, `rtp`, and `mux`.
 
 - `netem-test/` — the generic harness crate (`NetemConfig`, `NetemLink`,
   `NetemPair`, `RndState`/`CorRng`, `LossModel`, `UdpTransport`, counters).
-- `tests/` — application-specific scenarios (`mux_over_rtp`, `rtp_loss`,
-  `rtp_fec`, `rtp_mss`, `netem_scenarios`, `perf_probe`, …).
+- `tests/` — application-specific scenarios for the harness, `rtp` and
+  `rtp_mux` (`rtp_loss`, `rtp_fec`, `rtp_mss`, `netem_scenarios`,
+  `perf_probe`, `rtp_mux_jitter`, `hol_probe`, …). The mux-owned scenarios
+  (`mux_over_rtp`, `mux_over_rtp_perf`, `rtp_and_mux`, `mux_bulk_clean_stall`,
+  `mux_stream_fairness`, the `probe_mux_*` ceilings and the v4 mux bulk-lane
+  probes) relocated into the owning crate (`mux/tests`, `mux/GATE.md`) with
+  the mux layer kit (`mux::testkit`, behind mux's `testing` feature); the
+  harness reaches the same single authority through the `support/{mux,stats}.rs`
+  shim views. `netem-test` stays a leaf: it consumes none of `rtp`/`mux`/`rtp_mux`.
 - `tools/` — performance capture and comparison tooling
   (`perf-loop`, `perf_loop.py`, `rtp_trace_compare.py`,
   `rtp_trace_report.py`, `samply_hotspots.py`, `calib.py`, …).
@@ -57,10 +64,13 @@ When a performance comparison is part of a conclusion, report:
 ## Testing
 
 `cargo test -p tests` runs only the default tier: the harness and support unit
-tests plus the seeded sub-second scenarios (netem behaviour, clean/loss/FEC/MSS
-delivery, mux-over-rtp). Every other scenario is `#[ignore]`d, and its name and
-tier are recorded in `tests/GATE.md`; `python3 tools/check-gate.py` fails if a
-scenario is not classified, so an unnoticed skip cannot happen.
+tests plus the seeded sub-second scenarios (netem behaviour, clean/loss/FEC/MSS/
+interactive-lane delivery). The mux scenarios run in the owning crate
+(`cargo test -p mux`, gate recorded in `mux/GATE.md`). Every other scenario is
+`#[ignore]`d, and its name and tier are recorded in `tests/GATE.md`; the
+per-crate checker (`tools/check-gate.py`, parameterized with `--crate <root>
+<package> <dir> <GATE.md>`) fails if a scenario is not classified, so an
+unnoticed skip cannot happen.
 
 ```sh
 cargo test -p netem-test        # harness unit tests

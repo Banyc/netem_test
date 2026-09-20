@@ -48,13 +48,9 @@ skim past (see `tools/PERF_LOOP.md`, "Rendered graph evidence (mandatory)").
 
 `netem_scenarios`, `raw_netem_pair`, `rtp_clean`, `rtp_loss`, `rtp_mss`,
 `rtp_fec` (the seeded default-FEC recovery case, which reaches the sender's
-in-stream FEC capacity gate), `rtp_and_mux`, and `mux_over_rtp`. Plus the two
-`hol_probe` and two `perf_probe` seeding tests, and the single
-`rtp_liveness` / `shared_bottleneck` resynchronisation tests that were already
-un-ignored. The clean-link mux bulk progress gate
-(`mux_bulk_clean_stall::clean_link_mux_bulk_completes_within_timeout`) is also
-default: it is seeded, deterministic, and bounds itself with a wall-clock
-deadline so a wedged transport cannot hang the suite. The padding bench's
+in-stream FEC capacity gate). Plus the two `hol_probe` and two `perf_probe`
+seeding tests, and the single `rtp_liveness` / `shared_bottleneck`
+resynchronisation tests that were already un-ignored. The padding bench's
 fitted-ACK assertion
 (`rtp_padding_bench::ack_padding_hides_ack_packets_among_data`) is default
 too: it asserts a correctness property (the fitted ACK cluster is shrunken
@@ -64,22 +60,23 @@ against the unpadded baseline while the large-data peak is preserved) and its
 margin), so leaving it `#[ignore]`d made the assertion unreachable.
 The padding distribution pair
 (`rtp_padding_bench::padded_wire_sizes_converge_to_one_peak` and
-`rtp_padding_bench::unpadded_wire_sizes_stay_multimodal`) and the three
-`mux_over_rtp_perf` scenarios (`mux_over_rtp_lossy_perf_smoke`,
-`mux_over_rtp_400kib_lossy_contended_perf`,
-`mux_over_rtp_small_stream_while_bulk_perf`) are default too: each asserts a
-property (a one-peaked padded wire-size distribution, a preserved multimodal
-unpadded baseline, rate-limited forwarding, or small-before-bulk fairness),
-passes reliably, and keeps the added default-tier cost near three seconds.
+`rtp_padding_bench::unpadded_wire_sizes_stay_multimodal`) is default too and
+asserts a one-peaked padded wire-size distribution (the multimodal unpadded
+baseline is preserved), passing reliably at near-zero added cost.
+
+The mux-owned scenarios (the clean/latency `mux_over_rtp` echoes,
+`mux_over_rtp_perf`'s lossy smoke / contended transfer / small-before-bulk
+fairness, the reassigned `rtp_and_mux` smoke trio, and the
+`mux_bulk_clean_stall` progress + teardown gates) moved to the owning crate
+with the mux layer kit: they now run in `cargo test -p mux` and are recorded
+in `mux/GATE.md` (checked with `python3 ../netem_test/tools/check-gate.py
+--crate . mux tests GATE.md`).
 
 The `gate-default-required` block names the asserting scenarios that must stay in
 this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
 `gate-asserting` block records the full report-only/asserting split.
 
 ```gate-default-required
-mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf
-mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
-mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
 rtp_padding_bench::ack_padding_hides_ack_packets_among_data
 rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
 rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
@@ -149,21 +146,10 @@ hol_probe::hol_rtt40_ge1_loss1_split = full
 hol_probe::hol_rtt40_ge1_shared = full
 hol_probe::hol_rtt40_ge1_solo = full
 hol_probe::hol_rtt40_ge1_split = full
-hol_verify4::v4_clean_muxbulk = perf
 hol_verify4::v4_clean_rawbulk = perf
-hol_verify4::v4_ge5_muxbulk = perf
 hol_verify4::v4_ge5_rawbulk = perf
-mux_bulk_clean_stall::induced_stall_fires_the_watchdog = full
-mux_bulk_clean_stall::slow_live_link_is_backpressure_not_a_stall = full
-mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full
-mux_stream_fairness::mux_stream_fairness_longrun = full
-mux_stream_fairness::mux_stream_fairness_sweep = full
 perf_probe::probe_hostile_goodput_30s = full
 perf_probe::probe_hostile_message_latency = full
-perf_probe::probe_mux_echo_1mib_direct = standard
-perf_probe::probe_mux_echo_1mib_mss8k = standard
-perf_probe::probe_mux_sink_4mib_direct = standard
-perf_probe::probe_mux_sink_4mib_mss8k = standard
 perf_probe::probe_rtp_echo_4mib_direct = standard
 perf_probe::probe_rtp_echo_4mib_mss8k = standard
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
@@ -282,20 +268,8 @@ hol_probe::hol_rtt40_ge1_loss1_split
 hol_probe::hol_rtt40_ge1_shared
 hol_probe::hol_rtt40_ge1_solo
 hol_probe::hol_rtt40_ge1_split
-mux_bulk_clean_stall::induced_stall_fires_the_watchdog
-mux_bulk_clean_stall::slow_live_link_is_backpressure_not_a_stall
-mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf
-mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf
-mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
-mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf
-mux_stream_fairness::mux_stream_fairness_longrun
-mux_stream_fairness::mux_stream_fairness_sweep
 perf_probe::probe_hostile_goodput_30s
 perf_probe::probe_hostile_message_latency
-perf_probe::probe_mux_echo_1mib_direct
-perf_probe::probe_mux_echo_1mib_mss8k
-perf_probe::probe_mux_sink_4mib_direct
-perf_probe::probe_mux_sink_4mib_mss8k
 perf_probe::probe_rtp_echo_4mib_direct
 perf_probe::probe_rtp_echo_4mib_mss8k
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
@@ -400,11 +374,11 @@ tests/rtp_mux_jitter.rs::assert_sane = 2
 tests/rtp_padding_bench.rs::run_transfer = 1
 tests/rtp_padding_bench.rs::run_transfer_preset = 1
 tests/support/dual.rs::dual_mux_client_connect_lane_rtp_via = 1
-tests/support/mux.rs::mux_client_connect_core = 1
-tests/support/mux.rs::mux_client_connect_frame_delivery_via = 1
-tests/support/mux.rs::send_timestamped_messages = 1
-tests/support/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
-tests/support/mux.rs::spawn_mux_over_rtp_server_core = 1
+mux/src/testkit/mux.rs::mux_client_connect_core = 1
+mux/src/testkit/mux.rs::mux_client_connect_frame_delivery_via = 1
+mux/src/testkit/mux.rs::send_timestamped_messages = 1
+mux/src/testkit/mux.rs::spawn_mux_frame_delivery_latency_bulk_server_core = 1
+mux/src/testkit/mux.rs::spawn_mux_over_rtp_server_core = 1
 netem_test/netem-test/src/kit/mod.rs::try_send_observation = 1
 netem_test/netem-test/src/kit/payload.rs::with_timeout = 1
 netem_test/netem-test/src/kit/presets.rs::gilbert_elliott_loss = 2

@@ -18,6 +18,18 @@ pub fn latency(ms: u64) -> NetemConfig {
     }
 }
 
+/// A clean delay-only link with an explicit seed — one-way delay `owd`, no
+/// loss/jitter/rate, deterministic. Promoted from the `hol_verify4` A/B
+/// probes' local `clean_link` helper when the bulk-lane arms relocated into
+/// the owning crates (mux and rtp each consume the same single authority).
+pub fn clean_delay_link(owd: Duration, seed: u64) -> NetemConfig {
+    NetemConfig {
+        latency: owd,
+        seed,
+        ..NetemConfig::default()
+    }
+}
+
 /// Mild impairment that exercises both directions without making `rtp`'s
 /// reliable layer give up: ~5% random loss, 10 ms latency, small jitter.
 pub fn mild_loss() -> NetemConfig {

@@ -1,34 +1,26 @@
-//! `DualMux`-v4 bulk-lane verification: four A/B report-only probes that compare
-//! a single-mux-session bulk lane against raw `rtp` over identically-seeded
-//! netem links.
+//! `DualMux`-v4 bulk-lane A/B report-only probes: the raw `rtp` arms.
 //!
 //! The dual-lane `DualMux` architecture intends its bulk lane to be a full
-//! `mux` session over its own `rtp` connection. These report-only probes answer
-//! whether the claimed `+47-49%` bulk goodput gain over raw `rtp` transfers to
-//! that design, separating the cap-escape effect from the ACK/loss-fate
-//! effect.
+//! `mux` session over its own `rtp` connection. These report-only probes
+//! measure the raw `rtp` bulk lane on identically-seeded netem links; the mux
+//! bulk-lane arms live in the owning crate (`mux/tests/hol_verify4.rs`,
+//! `v4_clean_muxbulk` / `v4_ge5_muxbulk`), so each crate owns its half of the
+//! A/B comparison and the links stay reproducible from the seeds.
 //!
 //! Run with:
 //!
 //! ```sh
-//! cargo test --release --test hol_verify4 -- --ignored --nocapture --test-threads=1
+//! cargo test --release -p tests --test hol_verify4 -- --ignored --nocapture --test-threads=1
 //! ```
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use netem_test::kit::payload::{cyclic_payload, with_timeout};
+use netem_test::kit::presets::{burst_loss_link, clean_delay_link};
 use netem_test::{NetemConfig, NetemPair};
-use support::mux::{mux_client_connect_via, spawn_mux_over_rtp_server_with_mss_via};
-use support::payload::{cyclic_payload, with_timeout};
-use support::presets::burst_loss_link;
-use support::rtp::{
-    rtp_connect_with_mss_via, spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via,
-};
-use support::submit_test_task;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use support::rtp::{spawn_rtp_bulk_upload_via, spawn_rtp_byte_sink_server_via};
+use tokio::io::AsyncWriteExt;
 
 mod support;
 
@@ -37,114 +29,6 @@ const BULK_WINDOW: Duration = Duration::from_millis(19_500);
 
 /// Bulk write chunk size: 251-aligned (~256 KiB).
 const CHUNK: usize = 262_044;
-
-/// Spawn a mux-over-RTP server that accepts a single `mux` session and treats
-/// every accepted stream as a deterministic bulk byte sink.
-///
-/// Returns the RTP listener address and an atomic counter that is incremented
-/// by the number of bytes read from each stream until `Ok(0)`/Err. There is
-/// no payload verification; all bytes are counted.
-async fn spawn_mux_bulk_sink(
-    tx: &crate::support::TestTaskSubmitter,
-) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
-    let delivered = Arc::new(AtomicU64::new(0));
-    let delivered_for_server = Arc::clone(&delivered);
-    let addr = spawn_mux_over_rtp_server_with_mss_via(
-        tx,
-        false,
-        rtp::udp::NO_FEC_MSS,
-        move |mut stream_read, mut stream_write| {
-            let delivered_for_stream = Arc::clone(&delivered_for_server);
-            async move {
-                let mut buf = vec![0u8; 64 * 1024];
-                while let Ok(n) = stream_read.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    delivered_for_stream.fetch_add(n as u64, Ordering::Relaxed);
-                }
-                let _ = stream_write.shutdown();
-            }
-        },
-    )
-    .await?;
-    Ok((addr, delivered))
-}
-
-/// Open a full `mux` session through a `NetemPair`, then write a single bulk
-/// stream of deterministic cyclic payload for `BULK_WINDOW`.
-///
-/// `label` is used only for logging. Returns the total bytes delivered at the
-/// server-side sink.
-async fn run_muxbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
-    let mut tasks = support::TestScope::new();
-    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
-    let (elapsed, delivered_at_window, total) = tasks
-        .run(async {
-            let (server_addr, delivered) = spawn_mux_bulk_sink(&task_tx).await.unwrap();
-            let pair = NetemPair::spawn(server_addr, c2s, s2c).unwrap();
-
-            let (connected_read, connected_write) =
-                rtp_connect_with_mss_via(&task_tx, pair.client_addr(), false, rtp::udp::NO_FEC_MSS)
-                    .await;
-            let opener = mux_client_connect_via(&task_tx, connected_read, connected_write);
-
-            let (mut stream_read, mut stream_write) = opener.open().await.unwrap();
-
-            // Drain the stream read half in the background so flow-control ACKs keep
-            // moving and the writer does not stall. Parked for the bulk window; the
-            // owning JoinSet aborts it at scope end.
-            submit_test_task(
-                &task_tx,
-                Box::pin(async move {
-                    let mut buf = vec![0u8; 8 * 1024];
-                    while let Ok(n) = stream_read.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                }),
-            );
-
-            let payload = cyclic_payload(CHUNK);
-            let start = Instant::now();
-            let stop = Arc::new(AtomicBool::new(false));
-            while !stop.load(Ordering::Relaxed) {
-                if start.elapsed() >= BULK_WINDOW {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-                match stream_write.write_all(&payload[..CHUNK]).await {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-            }
-            let elapsed = start.elapsed();
-            let delivered_at_window = delivered.load(Ordering::Relaxed);
-            let _ = stream_write.shutdown();
-
-            // End the client session so the server-side sink stops counting before
-            // the pair is stopped. The required drain task completes (unobserved)
-            // once the session ends, after the raced body returned; if the session
-            // has not ended yet, scope drop aborts it. That is outside the raced
-            // body, so it is not an early exit.
-            drop(opener);
-            pair.stop();
-
-            let total = delivered.load(Ordering::Relaxed);
-            (elapsed, delivered_at_window, total)
-        })
-        .await;
-
-    let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
-    let mibps_window =
-        delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
-    eprintln!(
-        "[v4 {label}] delivered={total}B (at-window={delivered_at_window}B) \
-         elapsed={elapsed:?} bulk={mibps:.3} MiB/s bulk-window={mibps_window:.3} MiB/s",
-    );
-    total
-}
 
 /// Open a raw `rtp` connection through a `NetemPair` and pump the same
 /// deterministic cyclic payload for `BULK_WINDOW`.
@@ -198,34 +82,11 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
     total
 }
 
-/// Build a clean delay-only link profile used by the `v4_clean_*` probes.
-fn clean_link(owd: Duration, seed: u64) -> NetemConfig {
-    NetemConfig {
-        latency: owd,
-        seed,
-        ..NetemConfig::default()
-    }
-}
-
 // ────────────────────────────── report-only probes ───────────────────────────
 
-/// `v4` bulk lane over Gilbert-Elliott 5% burst loss vs raw `rtp` on the same
-/// seeded link (c2s seed 33, s2c seed 44).
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
-async fn v4_ge5_muxbulk() {
-    with_timeout(
-        Duration::from_secs(120),
-        "v4 ge5 muxbulk",
-        run_muxbulk(
-            "ge5 muxbulk",
-            burst_loss_link(5.0, 3.0, Duration::from_millis(50), 33),
-            burst_loss_link(5.0, 3.0, Duration::from_millis(50), 44),
-        ),
-    )
-    .await;
-}
-
+/// Raw `rtp` bulk lane over Gilbert-Elliott 5% burst loss (c2s seed 33, s2c
+/// seed 44) — the raw half of the A/B comparison with the mux crate's
+/// `v4_ge5_muxbulk` arm on identically-seeded links.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn v4_ge5_rawbulk() {
@@ -241,23 +102,9 @@ async fn v4_ge5_rawbulk() {
     .await;
 }
 
-/// `v4` bulk lane on a clean 50 ms RTT link vs raw `rtp` on the same seeded
-/// link (c2s seed 11, s2c seed 22).
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
-async fn v4_clean_muxbulk() {
-    with_timeout(
-        Duration::from_secs(120),
-        "v4 clean muxbulk",
-        run_muxbulk(
-            "clean muxbulk",
-            clean_link(Duration::from_millis(50), 11),
-            clean_link(Duration::from_millis(50), 22),
-        ),
-    )
-    .await;
-}
-
+/// Raw `rtp` bulk lane on a clean 50 ms RTT link (c2s seed 11, s2c seed 22) —
+/// the raw half of the A/B comparison with the mux crate's `v4_clean_muxbulk`
+/// arm on identically-seeded links.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "DualMux-v4 bulk-lane A/B report-only probe; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn v4_clean_rawbulk() {
@@ -266,8 +113,8 @@ async fn v4_clean_rawbulk() {
         "v4 clean rawbulk",
         run_rawbulk(
             "clean rawbulk",
-            clean_link(Duration::from_millis(50), 11),
-            clean_link(Duration::from_millis(50), 22),
+            clean_delay_link(Duration::from_millis(50), 11),
+            clean_delay_link(Duration::from_millis(50), 22),
         ),
     )
     .await;

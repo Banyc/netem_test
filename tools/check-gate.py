@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Verify the netem_test scenario gate manifest in tests/GATE.md.
+"""Verify a scenario gate manifest (per-crate).
 
-`cargo test -p tests` silently skips every `#[ignore]`d scenario, so the set of
-opt-in scenarios and their tiers is recorded in tests/GATE.md. This script
-re-derives that set from the compiled test binaries and exits non-zero when the
-manifest and reality disagree, so a scenario can never be added, removed, or
-re-ignored without the gate documentation being updated.
+`cargo test` silently skips every `#[ignore]`d scenario, so the set of
+opt-in scenarios and their tiers is recorded in a crate's `GATE.md`. This
+script re-derives that set from the compiled test binaries and exits non-zero
+when the manifest and reality disagree, so a scenario can never be added,
+removed, or re-ignored without the gate documentation being updated.
 
 It also enforces the `gate-default-required` block: the asserting scenarios
 that MUST run in the default (`cargo test`, non-`#[ignore]`d) tier. The default
@@ -32,36 +32,42 @@ checker therefore also builds a crate-local call graph (regex + brace counting,
 no Rust parser) from every `perf` scenario and requires every asserting
 function it can reach to be declared in the `gate-perf-guard-helpers` block,
 with its assertion-token count. The graph follows the `pub use` shim views in
-`tests/tests/support/**` into the kit sources they re-export -- the harness kit
-(`netem-test/src/kit/**`, behind the `test-kit` feature) and the rtp layer kit
-(`rtp/src/testkit/**`, behind rtp's `testing` feature) -- so a perf scenario's
+the scenario crate's `support/**` (harness mode) and the direct kit imports
+into the kit sources they re-export -- the harness kit
+(`netem-test/src/kit/**`, behind the `test-kit` feature), the rtp layer kit
+(`rtp/src/testkit/**`, behind rtp's `testing` feature), and the mux layer kit
+(`mux/src/testkit/**`, behind mux's `testing` feature) -- so a perf scenario's
 reach into the relocated helpers is still declared. An unrecorded asserting
 helper, a changed token count, or a stale entry is an error.
 
-It also checks the perf-loop lane roles in the `gate-lane-roles` block against
-`perf_loop.lane_classification`, the function that stamps `link_role` into a
-run's `run.json`. A lane is either a verdict instrument or diagnostic-only; a
-verdict lane mis-declared as diagnostic (or the reverse), an unlisted lane, or
-a `hostile` lane that is no longer diagnostic-only is an error. `hostile`
-returned `not_ready` (`within_run_phase_not_stable`) in all 70 recorded runs, so
-it must never be read as a verdict.
+In harness mode (no `--crate`) it also checks the perf-loop lane roles in the
+`gate-lane-roles` block against `perf_loop.lane_classification`, the function
+that stamps `link_role` into a run's `run.json`. A lane is either a verdict
+instrument or diagnostic-only; a verdict lane mis-declared as diagnostic (or
+the reverse), an unlisted lane, or a `hostile` lane that is no longer
+diagnostic-only is an error. `hostile` returned `not_ready`
+(`within_run_phase_not_stable`) in all 70 recorded runs, so it must never be
+read as a verdict. Per-crate mode (mux and friends) has no perf-loop lanes;
+the lane-roles check stays with the harness.
 
 Usage:
     python3 tools/check-gate.py
+    # netem_test harness: scenarios in tests/tests, manifest tests/GATE.md
+    python3 tools/check-gate.py --crate <root> <package> <dir> <GATE.md>
+    # e.g. mux: python3 tools/check-gate.py \
+    #   --crate ../mux mux tests GATE.md   (from the netem_test root)
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-MANIFEST = REPO / "tests" / "GATE.md"
-PERF_LOOP = Path(__file__).resolve().parent / "perf_loop.py"
-TEST_DIR = REPO / "tests" / "tests"
 TIERS = {"standard", "full", "perf"}
 LANE_ROLES = {"verdict", "diagnostic"}
 ASSERTING_TIERS = {"standard", "full"}
@@ -72,33 +78,79 @@ FN_RE = re.compile(
     r"\b(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\("
 )
 CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
-SUPPORT_DIR = TEST_DIR / "support"
-PKG_DIR = REPO / "tests"
-# The harness kit sources: the generic scenario helpers moved out of
-# `tests/tests/support/**` into the leaf harness crate behind the `test-kit`
-# feature (`netem-test/src/kit/**`). The support modules are now `pub use`
-# shim views of these files, so the call graph must reach into them to keep
-# the perf tier's transitive assertion scan honest.
-KIT_DIR = REPO / "netem-test" / "src" / "kit"
-# The rtp layer kit: the rtp echo/connect/sink/frame/perf-trace scaffolding
-# relocated into the owning crate behind its `testing` feature
-# (`rtp/src/testkit/**`), reachable from the scenario crate through the
-# `support/rtp.rs`, `support/frame.rs` shims. `tests` already path-depends on
-# the sibling `rtp` checkout (Cargo cannot build the suite without it), so
-# scanning its kit source adds no new coupling.
-RTP_KIT_DIR = REPO.parent / "rtp" / "src" / "testkit"
+
+
+@dataclass(frozen=True)
+class CrateLayout:
+    """One crate's gate layout: where cargo runs and where the scenarios live.
+
+    ``root`` is the crate workspace root (the `cargo test -p <package>` cwd);
+    ``package`` the package name whose test binaries are enumerated; ``dir``
+    the scenario target directory (each `*.rs` is one integration target);
+    ``manifest`` the `GATE.md` that records the tiers. ``crates_root`` is the
+    shared parent of the sibling crate checkouts (`crates/`), which anchors
+    the kit-source identities (`mux/src/testkit/…`) equally in every mode.
+    Harness mode (`is_harness`) additionally enables the `support/**` shim
+    scan and the perf-loop lane-role check.
+    """
+
+    root: Path
+    package: str
+    dir: Path
+    manifest: Path
+    crates_root: Path
+    is_harness: bool = False
+
+    @property
+    def support_dir(self) -> Path:
+        return self.dir / "support"
+
+    @property
+    def kit_dir(self) -> Path:
+        return self.crates_root / "netem_test" / "netem-test" / "src" / "kit"
+
+    @property
+    def rtp_kit_dir(self) -> Path:
+        return self.crates_root / "rtp" / "src" / "testkit"
+
+    @property
+    def mux_kit_dir(self) -> Path:
+        return self.crates_root / "mux" / "src" / "testkit"
+
+
+def harness_layout(script_dir: Path) -> CrateLayout:
+    """The default layout: the netem_test `tests` package."""
+    repo = script_dir.parent
+    return CrateLayout(
+        root=repo,
+        package="tests",
+        dir=repo / "tests" / "tests",
+        manifest=repo / "tests" / "GATE.md",
+        crates_root=repo.parent,
+        is_harness=True,
+    )
+
+
+PERF_LOOP = Path(__file__).resolve().parent / "perf_loop.py"
 # Bare `use` first segments that name external crate roots in the scanned
-# sources: `netem_test::kit::…` and `rtp::testkit::…` from the shims and the
-# rtp kit, plus `tokio`/`std` imports. Everything else resolves like rustc
-# does for a bare `use` path: against the current module's scope (the kit's
-# `pub use task_scope::…` sibling re-exports), so an in-crate bare path is
-# never mistaken for an external crate.
-EXTERNAL_ROOT_STEMS = {"netem_test", "rtp", "tokio", "std"}
+# sources: `netem_test::kit::…`, `rtp::testkit::…` and `mux::testkit::…` from
+# the kit sources and the shims, plus `tokio`/`std` imports. Everything else
+# resolves like rustc does for a bare `use` path: against the current
+# module's scope (the kit's `pub use task_scope::…` sibling re-exports), so
+# an in-crate bare path is never mistaken for an external crate.
+EXTERNAL_ROOT_STEMS = {"netem_test", "rtp", "mux", "tokio", "std"}
+
+LAYOUT: CrateLayout | None = None
+
+
+def layout() -> CrateLayout:
+    assert LAYOUT is not None, "layout() called before main() set it"
+    return LAYOUT
 
 
 def manifest_block(name: str) -> str | None:
     """Return the body of the ```<name> fenced block, or None."""
-    text = MANIFEST.read_text(encoding="utf-8")
+    text = layout().manifest.read_text(encoding="utf-8")
     block = re.search(rf"```{re.escape(name)}\n(.*?)```", text, re.S)
     return block.group(1) if block else None
 
@@ -106,7 +158,7 @@ def manifest_block(name: str) -> str | None:
 def manifest_entries() -> dict[str, str]:
     block = manifest_block("gate-manifest")
     if block is None:
-        sys.exit(f"{MANIFEST}: no ```gate-manifest block found")
+        sys.exit(f"{layout().manifest}: no ```gate-manifest block found")
     entries: dict[str, str] = {}
     for raw in block.splitlines():
         line = raw.strip()
@@ -115,9 +167,9 @@ def manifest_entries() -> dict[str, str]:
         name, _, tier = line.partition(" = ")
         name, tier = name.strip(), tier.strip()
         if tier not in TIERS:
-            sys.exit(f"{MANIFEST}: {name} has unknown tier {tier!r}")
+            sys.exit(f"{layout().manifest}: {name} has unknown tier {tier!r}")
         if name in entries:
-            sys.exit(f"{MANIFEST}: duplicate entry {name}")
+            sys.exit(f"{layout().manifest}: duplicate entry {name}")
         entries[name] = tier
     return entries
 
@@ -138,7 +190,7 @@ def asserting_entries() -> list[str]:
     """`target::test` names recorded as asserting a gate property."""
     block = manifest_block("gate-asserting")
     if block is None:
-        sys.exit(f"{MANIFEST}: no ```gate-asserting block found")
+        sys.exit(f"{layout().manifest}: no ```gate-asserting block found")
     return [
         line.strip()
         for line in block.splitlines()
@@ -148,7 +200,7 @@ def asserting_entries() -> list[str]:
 
 def test_bodies(target: str) -> dict[str, str]:
     """Map each top-level `fn NAME` to its brace-balanced body."""
-    text = (TEST_DIR / f"{target}.rs").read_text(encoding="utf-8")
+    text = (layout().dir / f"{target}.rs").read_text(encoding="utf-8")
     bodies: dict[str, str] = {}
     for match in FN_RE.finditer(text):
         start = text.find("{", match.end())
@@ -183,19 +235,21 @@ def body_asserts(target: str, name: str, bodies: dict[str, str]) -> bool:
 def source_module(path: Path) -> str | None:
     """Rust module path of a source file, or None when it is not scanned.
 
-    Scenario targets and the tests crate's `support/**` modules keep the
-    historical `""` / `support`-prefixed names. The harness kit sources
-    (`netem-test/src/kit/**`) and the rtp layer kit sources
-    (`rtp/src/testkit/**`) are registered under their crate-qualified module
-    names so the call graph can follow a `pub use` shim view into the kit
-    files.
+    Scenario targets keep the historical `""` module name. In harness mode the
+    `tests` crate's `support/**` modules keep their `support`-prefixed names.
+    The harness kit sources (`netem-test/src/kit/**`), the rtp layer kit
+    sources (`rtp/src/testkit/**`) and the mux layer kit sources
+    (`mux/src/testkit/**`) are registered under their crate-qualified module
+    names so the call graph can follow a `pub use` shim view or a direct kit
+    import into the kit files.
     """
     try:
-        parts = path.relative_to(TEST_DIR).parts
+        parts = path.relative_to(layout().dir).parts
     except ValueError:
         for base, prefix in (
-            (RTP_KIT_DIR, "rtp::testkit"),
-            (KIT_DIR, "netem_test::kit"),
+            (layout().rtp_kit_dir, "rtp::testkit"),
+            (layout().kit_dir, "netem_test::kit"),
+            (layout().mux_kit_dir, "mux::testkit"),
         ):
             try:
                 kit_parts = path.relative_to(base).parts
@@ -208,7 +262,11 @@ def source_module(path: Path) -> str | None:
         return None
     if len(parts) == 1:
         return ""
-    if len(parts) == 2 and parts[0] == "support":
+    if (
+        layout().is_harness
+        and len(parts) == 2
+        and parts[0] == "support"
+    ):
         stem = parts[1][:-3]
         return "support" if stem == "mod" else f"support::{stem}"
     return None
@@ -217,16 +275,22 @@ def source_module(path: Path) -> str | None:
 def source_identity(path: Path) -> str:
     """Stable identity prefix for a scanned source file.
 
-    Files inside the tests package keep their historical package-relative
-    identity (`tests/<file>.rs`, `tests/support/<file>.rs`) so recorded
-    manifest entries stay stable across the kit relocation; kit sources are
-    identified relative to the workspace family root
-    (`netem-test/src/kit/<file>.rs`, `rtp/src/testkit/<file>.rs`).
+    In harness mode files inside the `tests` package keep their historical
+    package-relative identity (`tests/<file>.rs`, `tests/support/<file>.rs`)
+    so recorded manifest entries stay stable; kit sources are identified
+    relative to the shared crates root (`netem-test/src/kit/<file>.rs`,
+    `rtp/src/testkit/<file>.rs`, `mux/src/testkit/<file>.rs`). In per-crate
+    mode every scanned file — the crate's own scenario targets and the kit
+    sources it reaches — is identified relative to the shared crates root
+    (`mux/tests/<file>.rs`, `mux/src/testkit/<file>.rs`), so entries in the
+    crate's own `GATE.md` never collide with the harness's.
     """
-    try:
-        return str(path.relative_to(PKG_DIR))
-    except ValueError:
-        return str(path.relative_to(REPO.parent))
+    if layout().is_harness:
+        try:
+            return str(path.relative_to(layout().root / layout().package))
+        except ValueError:
+            pass
+    return str(path.relative_to(layout().crates_root))
 
 
 class SourceFunction:
@@ -286,7 +350,8 @@ def normalize_module(base: str, current_module: str) -> str:
     (resolved like rustc does: against the current module's scope, which is
     how the kit's ``pub use task_scope::…`` sibling re-exports work), and bare
     paths whose first segment names an external crate root
-    (``netem_test::kit::…``, ``rtp::testkit::…``) for the `pub use` shim views.
+    (``netem_test::kit::…``, ``rtp::testkit::…``, ``mux::testkit::…``) for the
+    `pub use` shim views and the scenarios' direct kit imports.
     """
     segments = [segment for segment in base.split("::") if segment]
     if not segments:
@@ -351,21 +416,23 @@ def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[
 
 
 def target_source_files(target: str) -> list[Path]:
-    """Source files compiled into the ``tests/<target>.rs`` integration target.
+    """Source files compiled into the ``<dir>/<target>.rs`` integration target.
 
-    The target includes the crate-local `support/**` modules it declares plus
-    the kit source files behind the shim views: the harness kit
-    (`netem-test/src/kit/**`) and the rtp layer kit (`rtp/src/testkit/**`).
+    In harness mode the target includes the crate-local `support/**` modules it
+    declares. The kit source files behind the shim views / direct imports are
+    always scanned: the harness kit (`netem-test/src/kit/**`), the rtp layer
+    kit (`rtp/src/testkit/**`) and the mux layer kit (`mux/src/testkit/**`).
     The kit files belong to other crates but are scanned so the report-only
-    perf tier's reach into them stays declared; `tests` already path-depends
-    on the sibling `rtp` checkout, so Cargo assumes exactly that layout.
+    perf tier's reach into them stays declared; every crate shares the sibling
+    checkout layout, so Cargo assumes exactly that layout.
     """
-    files = [TEST_DIR / f"{target}.rs"]
+    files = [layout().dir / f"{target}.rs"]
     text = files[0].read_text(encoding="utf-8")
-    if re.search(r"^mod support;", text, re.M):
-        files.extend(sorted(SUPPORT_DIR.glob("*.rs")))
-    files.extend(sorted(KIT_DIR.glob("*.rs")))
-    files.extend(sorted(RTP_KIT_DIR.glob("*.rs")))
+    if layout().is_harness and re.search(r"^mod support;", text, re.M):
+        files.extend(sorted(layout().support_dir.glob("*.rs")))
+    files.extend(sorted(layout().kit_dir.glob("*.rs")))
+    files.extend(sorted(layout().rtp_kit_dir.glob("*.rs")))
+    files.extend(sorted(layout().mux_kit_dir.glob("*.rs")))
     return [path for path in files if path.exists()]
 
 
@@ -439,11 +506,12 @@ class TargetGraph:
         """Resolve ``name`` visible in ``module`` through its re-export views.
 
         A support shim (`support::stats`) is a `pub use` view of a kit module
-        (`netem_test::kit::stats`) and the kit module itself re-exports from
-        its children (`pub use task_scope::…`), so a name imported into a view
-        resolves several hops away even though each view defines nothing. The
-        lookup follows the view's own imports and globs, cycle-guarded, so the
-        graph does not dead-end at the shim.
+        (`netem_test::kit::stats`) or the mux kit (`mux::testkit::stats`) and
+        the kit module itself re-exports from its children
+        (`pub use task_scope::…`), so a name imported into a view resolves
+        several hops away even though each view defines nothing. The lookup
+        follows the view's own imports and globs, cycle-guarded, so the graph
+        does not dead-end at the shim.
         """
         if module in seen:
             return []
@@ -499,7 +567,7 @@ def helper_scan(manifest: dict[str, str]) -> tuple[dict[str, int], dict[str, lis
         graph = TargetGraph(target_functions(paths), paths)
         seeds = []
         for test in tests:
-            ident = f"tests/{target}.rs::{test}"
+            ident = f"{source_identity(layout().dir / f'{target}.rs')}::{test}"
             if ident in graph.functions:
                 seeds.append(ident)
             else:
@@ -522,7 +590,7 @@ def recorded_perf_guard_helpers() -> dict[str, int]:
     """`RELATIVE_PATH::fn = assertion_count` entries from GATE.md."""
     block = manifest_block("gate-perf-guard-helpers")
     if block is None:
-        sys.exit(f"{MANIFEST}: no ```gate-perf-guard-helpers block found")
+        sys.exit(f"{layout().manifest}: no ```gate-perf-guard-helpers block found")
     recorded: dict[str, int] = {}
     for raw in block.splitlines():
         line = raw.strip()
@@ -533,9 +601,9 @@ def recorded_perf_guard_helpers() -> dict[str, int]:
         try:
             parsed = int(count)
         except ValueError:
-            sys.exit(f"{MANIFEST}: malformed perf guard helper entry: {line!r}")
+            sys.exit(f"{layout().manifest}: malformed perf guard helper entry: {line!r}")
         if ident in recorded:
-            sys.exit(f"{MANIFEST}: duplicate perf guard helper {ident}")
+            sys.exit(f"{layout().manifest}: duplicate perf guard helper {ident}")
         recorded[ident] = parsed
     return recorded
 
@@ -552,7 +620,7 @@ def lane_role_entries() -> dict[str, str]:
     """`lane = role` entries from the ```gate-lane-roles block in GATE.md."""
     block = manifest_block("gate-lane-roles")
     if block is None:
-        sys.exit(f"{MANIFEST}: no ```gate-lane-roles block found")
+        sys.exit(f"{layout().manifest}: no ```gate-lane-roles block found")
     roles: dict[str, str] = {}
     for raw in block.splitlines():
         line = raw.strip()
@@ -561,9 +629,9 @@ def lane_role_entries() -> dict[str, str]:
         lane, _, role = line.partition(" = ")
         lane, role = lane.strip(), role.strip()
         if role not in LANE_ROLES:
-            sys.exit(f"{MANIFEST}: lane {lane} has unknown role {role!r}")
+            sys.exit(f"{layout().manifest}: lane {lane} has unknown role {role!r}")
         if lane in roles:
-            sys.exit(f"{MANIFEST}: duplicate lane entry {lane}")
+            sys.exit(f"{layout().manifest}: duplicate lane entry {lane}")
         roles[lane] = role
     return roles
 
@@ -605,14 +673,16 @@ def check_lane_roles() -> tuple[dict[str, str], list[str]]:
 
 
 def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
-    cmd = ["cargo", "test", "-p", "tests", "--test", target, "--", "--list"]
+    cmd = [
+        "cargo", "test", "-p", layout().package, "--test", target, "--", "--list",
+    ]
     if ignored:
         cmd.append("--ignored")
-    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=layout().root, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         mode = " --list --ignored" if ignored else " --list"
-        sys.exit(f"cargo test --test {target}{mode} failed")
+        sys.exit(f"cargo test -p {layout().package} --test {target}{mode} failed")
     found: set[str] = set()
     for line in proc.stdout.splitlines():
         match = re.match(r"(.+): test$", line)
@@ -632,8 +702,39 @@ def ignored_scenarios(target: str) -> set[str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--crate",
+        nargs=4,
+        metavar=("ROOT", "PACKAGE", "DIR", "GATE_MD"),
+        help="check <PACKAGE>'s gate in <ROOT> with scenarios in <DIR> and "
+        "manifest <GATE_MD> (omitted: the netem_test harness layout)",
+    )
+    args = parser.parse_args()
+
+    global LAYOUT
+    if args.crate is not None:
+        root, package, dir_name, manifest = args.crate
+        root = Path(root).resolve()
+        LAYOUT = CrateLayout(
+            root=root,
+            package=package,
+            dir=root / dir_name if not Path(dir_name).is_absolute() else Path(dir_name),
+            manifest=root / manifest if not Path(manifest).is_absolute() else Path(manifest),
+            crates_root=root.parent.resolve(),
+            is_harness=False,
+        )
+        for required, what in (
+            (LAYOUT.dir.is_dir(), f"scenario directory {LAYOUT.dir}"),
+            (LAYOUT.manifest.is_file(), f"manifest {LAYOUT.manifest}"),
+        ):
+            if not required:
+                sys.exit(f"{what} does not exist")
+    else:
+        LAYOUT = harness_layout(Path(__file__).resolve().parent)
+
     manifest = manifest_entries()
-    targets = sorted(p.stem for p in TEST_DIR.glob("*.rs"))
+    targets = sorted(p.stem for p in layout().dir.glob("*.rs"))
     actual: set[str] = set()
     for target in targets:
         actual |= ignored_scenarios(target)
@@ -696,7 +797,7 @@ def main() -> int:
             print(
                 f"ASSERTING scenario in report-only perf tier "
                 f"(re-tier to standard/full/default or make it report-only): {name} "
-                f"[file tests/{target}.rs, token(s): "
+                f"[file {layout().dir / f'{target}.rs'}, token(s): "
                 f"{', '.join(sorted(set(found_tokens(bodies.get(test)))))}]"
             )
             bad = True
@@ -737,16 +838,20 @@ def main() -> int:
     # The perf-loop lane roles: a lane is either a verdict instrument or
     # diagnostic-only. The documented roles must match
     # `perf_loop.lane_classification` exactly, and `hostile` must stay
-    # diagnostic-only (70/70 `not_ready` in the recorded runs).
-    lane_roles, lane_errors = check_lane_roles()
-    for error in lane_errors:
-        print(error)
-        bad = True
+    # diagnostic-only (70/70 `not_ready` in the recorded runs). The lane roles
+    # stay with the harness; per-crate gates (mux and friends) have no lanes.
+    if layout().is_harness:
+        lane_roles, lane_errors = check_lane_roles()
+        for error in lane_errors:
+            print(error)
+            bad = True
+    else:
+        lane_roles = {}
 
     if bad:
         print(
             f"\nmanifest has {len(manifest)} entries, binaries report "
-            f"{len(actual)} ignored scenarios; update tests/GATE.md",
+            f"{len(actual)} ignored scenarios; update {layout().manifest}",
             file=sys.stderr,
         )
         return 1
@@ -763,11 +868,12 @@ def main() -> int:
         f"  gate-perf-guard-helpers: {len(derived_helpers)} asserting helper(s) "
         f"reachable from the perf tier"
     )
-    diagnostic = sum(1 for role in lane_roles.values() if role == "diagnostic")
-    print(
-        f"  gate-lane-roles: {len(lane_roles)} perf-loop lane(s), "
-        f"{diagnostic} diagnostic-only"
-    )
+    if layout().is_harness:
+        diagnostic = sum(1 for role in lane_roles.values() if role == "diagnostic")
+        print(
+            f"  gate-lane-roles: {len(lane_roles)} perf-loop lane(s), "
+            f"{diagnostic} diagnostic-only"
+        )
     return 0
 
 
