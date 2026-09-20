@@ -185,6 +185,7 @@ rtp_mux_jitter::jitter_burst_loss_arms = perf
 rtp_mux_jitter::jitter_cellular_timeline_arms = perf
 rtp_mux_jitter::jitter_decomposition = perf
 rtp_mux_jitter::jitter_duallane_arms = perf
+rtp_mux_jitter::jitter_duallane_constitution_gate = full
 rtp_mux_jitter::jitter_fec_arms_2pct = perf
 rtp_mux_jitter::jitter_fec_arms_6pct = perf
 rtp_mux_jitter::jitter_frame_reorder_decomposition = perf
@@ -309,6 +310,7 @@ rtp_mux::rtp_mux_explorer_relays_onto_better_path
 rtp_mux::rtp_mux_recycle_migrates_live_streams
 rtp_mux::rtp_mux_response_migration_offloads_download
 rtp_mux::rtp_mux_survives_independent_impaired_lanes
+rtp_mux_jitter::jitter_duallane_constitution_gate
 rtp_padding_bench::ack_padding_hides_ack_packets_among_data
 rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
 rtp_padding_bench::unpadded_wire_sizes_stay_multimodal

@@ -1815,6 +1815,10 @@ impl DualImpairment {
 /// FEC evidence) plus the bulk lane's wire load and sink goodput.
 struct DualRun {
     run: JitterRun,
+    /// Interactive-lane client->server wire bytes forwarded by the impairment
+    /// proxy: the interactive lane's own offered wire (data + repairs +
+    /// control) — the wire-budget evidence for the constitution gate.
+    int_c2s_wire_bytes: u64,
     /// Bulk-lane client->server wire bytes forwarded by the impairment proxy:
     /// the offered bulk load, i.e. the matched-load check across the two
     /// interactive frame modes.
@@ -2029,6 +2033,7 @@ async fn run_duallane_links_shaped(
 
             tokio::time::sleep(GRACE).await;
             let int_counters = int_pair.stats();
+            let int_c2s_wire_bytes = int_pair.stats_c2s().forwarded_bytes;
             let bulk_counters = bulk_pair.stats();
             let bulk_wire_bytes = bulk_pair.stats_c2s().forwarded_bytes;
             let mut samples = Vec::new();
@@ -2083,6 +2088,7 @@ async fn run_duallane_links_shaped(
                     rtx,
                     timeline,
                 },
+                int_c2s_wire_bytes,
                 bulk_wire_bytes,
                 bulk_sink_bytes,
                 bulk_counters,
@@ -2230,6 +2236,64 @@ async fn jitter_duallane_arms() {
         &strict[3].1.run,
     );
     print_duallane_loads("duallane-strict-fec", &strict_view);
+}
+
+/// for the interactive lane's client→server wire
+/// versus the offered interactive payload (see
+/// [`jitter_duallane_constitution_gate`]). Measured overhead on the seeded
+/// `both` arm is ~3.7× the offered payload (RTP/mux framing + control + the
+/// repair traffic the 2 % loss needs); 6× leaves ~1.6× headroom while a
+/// duplication or redundancy inflation of +50 % still trips it.
+const INTERACTIVE_WIRE_BUDGET_X: u64 = 6;
+
+/// The interactive-lane constitution gate: the deployment topology's outcome
+/// criteria — the interactive lane keeps `delivery == 1.000` and its
+/// client→server wire stays within a fixed budget of the offered payload —
+/// asserted on the production `both` dual-lane arm (frame mode + fast-forward
+/// + prompt FEC interactive lane at 2 % loss, separate strict bulk lane at the
+/// matched 2 MiB / 3 s load). Both quantities are counts over the seeded,
+/// deterministic impairment link, so the gate is deterministic: a redundancy
+/// ladder that eats the interactive lane's own goodput (delivery falling
+/// below `1.000`) or a wire that inflates without bound fails here instead of
+/// being a human-read table row. Delivery is additionally the README
+/// constitution's first criterion; the wire budget is the second (redundancy
+/// may use *some* wire, never unboundedly). Latency is deliberately not
+/// asserted here — the p99 floor is the median-of-3 constitution gate that
+/// follows this one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns threads and binds ephemeral ports; ~35 s dual-lane constitution run; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn jitter_duallane_constitution_gate() {
+    let label = "duallane_constitution/both";
+    let run = with_timeout(
+        Duration::from_secs(120),
+        label,
+        run_duallane(label, true, DualImpairment::Both),
+    )
+    .await;
+    let summary = &run.run.summary;
+    assert_sane(label, summary);
+    // The offered interactive payload: `sent` messages of `MSG_BYTES` bytes.
+    let offered = summary.sent * MSG_BYTES as u64;
+    let wire = run.int_c2s_wire_bytes;
+    assert_eq!(
+        summary.received, summary.sent,
+        "[{label}] interactive delivery must be exactly 1.000: {}/{} messages delivered ({:.3}), the interactive lane ate its own goodput",
+        summary.received, summary.sent, summary.delivery_pct,
+    );
+    assert!(
+        wire <= offered * INTERACTIVE_WIRE_BUDGET_X,
+        "[{label}] interactive c2s wire {wire} bytes exceeds the {INTERACTIVE_WIRE_BUDGET_X}x offered-payload budget ({} bytes): redundant wire must not inflate unboundedly (measured {:.2}x)",
+        offered * INTERACTIVE_WIRE_BUDGET_X,
+        wire as f64 / offered as f64,
+    );
+    eprintln!(
+        "[{label}] constitution OK: delivery {:.3}, c2s wire {wire} bytes = {:.2}x offered {offered} bytes, p50 {:.1} p99 {:.1} max {:.1} ms",
+        summary.delivery_pct,
+        wire as f64 / offered as f64,
+        summary.p50,
+        summary.p99,
+        summary.max,
+    );
 }
 
 /// Print one burst-loss arm's interactive-latency percentiles (p99.9 beside
