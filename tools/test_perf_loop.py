@@ -34,7 +34,25 @@ class PerfLoopTest(unittest.TestCase):
         (workspace / "tests").mkdir(parents=True)
         (workspace / "Cargo.toml").write_text("[package]\nname = 'x'\n", encoding="utf-8")
         (workspace / "tests" / "Cargo.toml").write_text("", encoding="utf-8")
+        self.make_probe_component(root)
         return workspace
+
+    def make_probe_component(self, root):
+        """Create the sibling suite component that owns the probe's code.
+
+        `probe_component_workspace` builds `perf_probe` from the exported
+        `mux` tree beside the netem_test workspace, so the fixture must carry
+        that component (with the probe target in it) for any build path.
+        """
+        component = root / LOOP.PROBE_COMPONENT
+        (component / "tests").mkdir(parents=True, exist_ok=True)
+        (component / "Cargo.toml").write_text(
+            f"[package]\nname = '{LOOP.PROBE_PACKAGE}'\n", encoding="utf-8"
+        )
+        (component / "tests" / f"{LOOP.PROBE_TARGET}.rs").write_text(
+            "", encoding="utf-8"
+        )
+        return component
 
     def test_seed_parser_and_safe_output_boundary(self):
         self.assertEqual(LOOP.parse_seeds("11, 21"), (11, 21))
@@ -227,7 +245,7 @@ class PerfLoopTest(unittest.TestCase):
 
             def fake_snapshot(component_source, component_output, revision):
                 snapshot_calls.append((component_output.name, revision))
-                component_output.mkdir(parents=True)
+                component_output.mkdir(parents=True, exist_ok=True)
                 if component_output.name == "netem_test":
                     self.make_workspace(component_output.parent, "netem_test")
                 return {
@@ -966,6 +984,73 @@ class PerfLoopTest(unittest.TestCase):
             self.assertEqual(calls[0]["env"]["RUSTC_WRAPPER"], "")
             self.assertEqual(calls[0]["env"]["RUSTFLAGS"], "")
 
+
+    def test_probe_is_built_from_the_component_that_owns_its_code(self):
+        """The probe's code is in `mux`, so the frozen build runs there.
+
+        A `--component-revision mux=<commit>` pin selects that component's
+        exported tree; building the probe anywhere else would compile the pin
+        against nothing and report the two roles as identical. The build
+        command, the build cwd, and the probe-source check all name the owning
+        component, so the binding cannot be satisfied by a component that does
+        not carry the probe.
+        """
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            workspace = self.make_workspace(root, "netem_test")
+            output_root = root / "out"
+            output_root.mkdir()
+            executable = root / "mux-target" / "release" / "deps" / "perf_probe-mux"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            calls = []
+
+            def fake_run(command, cwd=None, env=None, stdout=None, stderr=None):
+                calls.append({"command": command, "cwd": cwd})
+                stdout.write(
+                    json.dumps(
+                        {
+                            "reason": "compiler-artifact",
+                            "target": {"name": "perf_probe", "kind": ["test"]},
+                            "filenames": [str(executable)],
+                        }
+                    ).encode()
+                    + b"\n"
+                )
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            with mock.patch.object(LOOP.subprocess, "run", fake_run):
+                LOOP.build_probe(workspace, "baseline", output_root, release=True)
+
+            self.assertEqual(LOOP.PROBE_COMPONENT, "rtp_mux")
+            self.assertEqual(LOOP.PROBE_PACKAGE, "rtp_mux")
+            probe_workspace = LOOP.probe_component_workspace(workspace)
+            self.assertEqual(probe_workspace, (root / "rtp_mux").resolve())
+            self.assertEqual(len(calls), 1)
+            command = calls[0]["command"]
+            self.assertEqual(command[command.index("-p") + 1], "rtp_mux")
+            self.assertEqual(Path(calls[0]["cwd"]).resolve(), probe_workspace)
+
+    def test_probe_component_must_carry_the_probe_source(self):
+        """Vacuity guard: a component without the probe target is refused.
+
+        The probe's tooling is meaningless against a tree that does not carry
+        it: the pin would select no probe code. Naming the harness package (the
+        pre-move binding) must therefore fail loudly instead of silently
+        building whatever probe happens to be there.
+        """
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            workspace = self.make_workspace(root, "netem_test")
+            (root / "rtp_mux" / "tests" / f"{LOOP.PROBE_TARGET}.rs").unlink()
+            with self.assertRaises(ValueError) as caught:
+                LOOP.probe_component_workspace(workspace)
+            self.assertIn(f"{LOOP.PROBE_TARGET}.rs", str(caught.exception))
+            with mock.patch.object(LOOP, "PROBE_COMPONENT", "netem_test"):
+                with self.assertRaises(ValueError) as caught:
+                    LOOP.probe_component_workspace(workspace)
+            self.assertIn(f"{LOOP.PROBE_TARGET}.rs", str(caught.exception))
 
     def test_build_probe_preserves_roles_when_cargo_reuses_one_artifact_path(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:

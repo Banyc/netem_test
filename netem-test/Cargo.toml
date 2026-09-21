@@ -18,8 +18,9 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", 
 test-kit = ["dep:tokio"]
 
 [dev-dependencies]
-# Self dev-dependency, mirroring rtp's `rtp = { path = ".", features =
-# ["testing"] }` pattern: the library's own test targets are built with the
+# Self dev-dependency, mirroring the same self-dev-dependency pattern the
+# sibling layer crates use (`<crate> = { path = ".", features =
+# ["<kit-feature>"] }`): the library's own test targets are built with the
 # `test-kit` feature enabled, so the kit's unit tests run in the harness's
 # default test invocation (`cargo test -p netem-test`, and therefore the
 # `--workspace` gate) instead of only under an explicit

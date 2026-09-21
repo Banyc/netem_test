@@ -86,6 +86,16 @@ def lane_classification(profile):
 
 
 COMPONENTS = ("netem_test", "rtp", "mux", "rtp_mux", "tokio_udp", "udp_listener")
+# The suite component whose tree owns the perf-loop probe's code. The probe
+# drives `mux`-over-`rtp` lanes - the `rtp`+`mux` cooperation - and lives in
+# `rtp_mux`'s own test targets, so the frozen suite builds it from the exported
+# `rtp_mux` tree: the same tree a `--component-revision rtp_mux=<commit>` pin
+# selects. Building it from the harness instead would compile the instrument's
+# conformance package and make that pin select no probe code at all: a silent
+# false negative.
+PROBE_COMPONENT = "rtp_mux"
+PROBE_PACKAGE = "rtp_mux"
+PROBE_TARGET = "perf_probe"
 SUITE_REVISION_MANIFEST = "suite-revisions.json"
 SUITE_REVISION_MANIFEST_SCHEMA = 2
 PROBE_SOURCE_MANIFEST_SCHEMA = 1
@@ -155,6 +165,31 @@ def safe_output_dir(requested=None):
         raise ValueError(f"performance output must remain beneath {safe_root}")
     resolved.mkdir(parents=True, exist_ok=False)
     return resolved
+
+
+def probe_component_workspace(workspace):
+    """The suite component that owns the perf-loop probe's code.
+
+    The probe is a `mux` test target beside the harness workspace, so it is
+    built from the `PROBE_COMPONENT` sibling of the named netem_test workspace
+    (mutable or frozen). The probe's source file must exist there: a probe
+    built from a component that does not carry it cannot reflect that
+    component's revision, and the run would report the pin against nothing.
+    """
+    probe_workspace = Path(workspace).parent / PROBE_COMPONENT
+    if not (probe_workspace / "Cargo.toml").is_file():
+        raise ValueError(
+            f"the perf-loop probe is built from the {PROBE_COMPONENT!r} suite "
+            f"component, whose workspace {probe_workspace} has no Cargo.toml"
+        )
+    source = probe_workspace / "tests" / f"{PROBE_TARGET}.rs"
+    if not source.is_file():
+        raise ValueError(
+            f"the perf-loop probe source {source} does not exist: the "
+            f"{PROBE_TARGET!r} target belongs to another suite component than "
+            f"{PROBE_COMPONENT!r}"
+        )
+    return probe_workspace
 
 
 def safe_build_dir(requested, workspace, profile):
@@ -1138,7 +1173,9 @@ def stream_build_command(role, workspace, build_root, build_log, *, release=True
     """Run the frozen ``cargo test --no-run`` build once for one role,
     streaming JSON diagnostics into ``build-ROLE.log``.
 
-    ``toolchain`` is the invocation-site rustup pin captured by
+    The build runs in the suite component that owns the probe's code
+    ([`probe_component_workspace`]), so each role compiles its own exported
+    `mux` tree. ``toolchain`` is the invocation-site rustup pin captured by
     [`command_run`] (see [`effective_toolchain_pin`]); when present it is
     exported as `RUSTUP_TOOLCHAIN` for the build so the frozen probe is
     compiled with the same toolchain the source tree's gates resolve.
@@ -1155,12 +1192,13 @@ def stream_build_command(role, workspace, build_root, build_log, *, release=True
     if release:
         command.append("--release")
     command += [
-        "-p", "tests", "--test", "perf_probe", "--no-run",
+        "-p", PROBE_PACKAGE, "--test", PROBE_TARGET, "--no-run",
         "--message-format=json-render-diagnostics",
     ]
+    probe_workspace = probe_component_workspace(workspace)
     with build_log.open("wb") as log:
         completed = subprocess.run(
-            command, cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT
+            command, cwd=probe_workspace, env=env, stdout=log, stderr=subprocess.STDOUT
         )
     return completed
 

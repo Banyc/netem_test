@@ -4,34 +4,41 @@ This package (`tests`) is the **impairment harness**, not the owner of any
 application performance contract. It consumes the `netem-test` instrument (the
 kernel-faithful `NetemPair`/`NetemConfig` impairment plumbing and the
 `test-kit` generic helpers) and hosts the instrument's own conformance suite
-(`netem_scenarios`, `raw_netem_pair`, the `perf_probe` probes and seeding
-tests, `contested_latency`, `hol_verify4`, `shared_bottleneck`).
+(`netem_scenarios`, `raw_netem_pair`).
 
-The rtp-owned scenario suites relocated into the `rtp` crate with step 5 of
-the relocation (`rtp_bufferbloat`, `rtp_burst_loss`, `rtp_fec`, `rtp_gentle`,
-`rtp_liveness`, `rtp_loss`, `rtp_mss`, `rtp_padding_bench`; see
-`rtp/GATE.md`), the `mux` suites into `mux` (step 3) and the `rtp_mux` suites
-into `rtp_mux` (step 4). Their gates and the tri-mandate constitution live
-**in those crates**, so every mandate has exactly one asserting authority —
-see `tests/GATE.md` for the manifest/tier mechanics of THIS package only.
+Every application scenario relocated out of this package into the crate whose
+code it exercises, together with its tier, its assertions, and its gate
+records:
 
-## The tri-mandate constitution: one authority per mandate
+| suite | now in | gate |
+| --- | --- | --- |
+| `rtp_bufferbloat`, `rtp_burst_loss`, `rtp_fec`, `rtp_gentle`, `rtp_liveness`, `rtp_loss`, `rtp_mss`, `rtp_padding_bench` | `rtp/tests` | `rtp/GATE.md` |
+| `hol_verify4` (raw `rtp` arms), `shared_bottleneck` | `rtp/tests` | `rtp/GATE.md` |
+| `contested_latency`, `perf_probe` | `rtp_mux/tests` | `rtp_mux/GATE.md` |
+| `mux_over_rtp`, `mux_over_rtp_perf`, `rtp_and_mux`, `mux_bulk_clean_stall`, `mux_stream_fairness`, `hol_verify4` (mux bulk arms) | `mux/tests` | `mux/GATE.md` |
+| `dynamic_contested`, `hol_probe`, `rtp_longrun`, `rtp_mux_jitter`, `dual_lane_mandates`, `rtp_mux`, `explorer`, … | `rtp_mux/tests` | `rtp_mux/GATE.md` |
 
-| mandate | asserted by (crate) | gate | run (M1/M3 opt-in `full`; M2 default) |
-| --- | --- | --- | --- |
-| **M1** low latency of the interactive lane (p99 floor + zero >250 ms spikes, median-of-3) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate_p99` | `cargo test --release -p rtp_mux --test rtp_mux_jitter -- --ignored jitter_duallane_constitution_gate_p99 --nocapture --test-threads=1` |
-| **M2** reasonable goodput of the interactive lane (`delivery == 1.000` + own-wire ≤ 6× offered) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate` (default tier — runs on every `cargo test -p rtp_mux`; deterministic counts) | `cargo test -p rtp_mux` |
-| **M3** high goodput of the bulk lane (≥ 0.35 × configured link rate, median-of-3) | `rtp_mux` | `dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction` | `cargo test --release -p rtp_mux --test dual_lane_mandates -- --ignored bulk_lane_goodput_stays_above_capacity_fraction --nocapture --test-threads=1` |
+Each mandate has exactly one asserting authority, so the tri-mandate
+constitution (low interactive-lane latency, interactive goodput without wire
+inflation, high bulk-lane goodput) lives in the owning crate's `GATE.md` and is
+never restated here. See `tests/GATE.md` for the manifest/tier mechanics of
+THIS package, and each owning crate's `GATE.md` for the floors.
 
-The bounds and their derivations, and the interactive scaling boundary
-(`hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery`), are stated in
-`rtp_mux/GATE.md` ("Performance") and module-level in
-`rtp_mux/tests/dual_lane_mandates.rs` — never restated here. The mux layer's
-per-stream contributions are in `mux/GATE.md` (default tier: delivered == the
-offered payload; standard tier: loopback bulk ceilings; full tier: fairness
-floors). The harness tooling gates stay with the tooling: `perf-loop run|analyze
---fail-on-phase-drift` and `--fail-on-wakes-cap` (see
-`tools/PERF_LOOP.md`).
+## One authority per mandate
+
+| mandate | asserted by (crate) | gate |
+| --- | --- | --- |
+| **M1** low latency of the interactive lane (p99 floor + zero >250 ms spikes, median-of-3) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate_p99` |
+| **M2** reasonable goodput of the interactive lane (`delivery == 1.000` + own-wire ≤ 6× offered) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate` (default tier) |
+| **M3** high goodput of the bulk lane (≥ 0.35 × configured link rate, median-of-3) | `rtp_mux` | `dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction` |
+
+The bounds and their derivations are stated in `rtp_mux/GATE.md`
+("Performance") and module-level in `rtp_mux/tests/dual_lane_mandates.rs` —
+never restated here. The mux layer's per-stream contributions are in
+`mux/GATE.md` (default tier: delivered == the offered payload; standard tier:
+loopback bulk ceilings; full tier: fairness floors). The harness tooling gates
+stay with the tooling: `perf-loop run|analyze --fail-on-phase-drift` and
+`--fail-on-wakes-cap` (see `tools/PERF_LOOP.md`).
 
 ## Running the gate
 
@@ -44,6 +51,17 @@ python3 ../netem_test/tools/check-gate.py --crate . rtp tests GATE.md
 python3 ../netem_test/tools/check-gate.py --crate . mux tests GATE.md
 python3 ../netem_test/tools/check-gate.py --crate . rtp_mux tests GATE.md
 ```
+
+## The perf-loop probe is rtp_mux's
+
+`tools/perf-loop` builds its probe with `cargo test -p rtp_mux --test
+perf_probe` from the frozen suite's exported **`rtp_mux`** component, because
+the probe's code lives in `rtp_mux/tests/perf_probe.rs` and drives
+`mux`-over-`rtp` lanes — the `rtp`+`mux` cooperation that only `rtp_mux` may
+hold. The harness owns the tooling and the lane taxonomy; a
+`--component-revision rtp_mux=<commit>` pin therefore selects the probe that
+runs, and a component without the probe target is refused rather than silently
+built from elsewhere.
 
 ## Perf-loop lane roles: verdict vs diagnostic
 
@@ -66,30 +84,10 @@ machine-checked by `python3 tools/check-gate.py` against
 `perf_loop.lane_classification`, so a verdict lane cannot be mis-declared
 diagnostic (or the reverse) without the checker failing.
 
-## The rtp-side in-process oracle
-
-The `rtp` crate carries its own deterministic in-process oracles for the
-per-packet interactive repair path (faster and lower-noise than the netem
-harness, and they read the sender/receiver FEC counters directly):
-
-- `src/socket/stream.rs::probe_single_symbol_interactive_fec_repair` — the
-  single-symbol interactive repair path for the depth-1 `interactive_prompt`
-  preset vs depth-3 `max_diversity`.
-- `src/socket/stream.rs::probe_fresh_tail_armor_latency` — the fresh-tail armor
-  duplicate's repair latency vs the ARQ fallback.
-
-```sh
-cargo test --lib probe_ -- --ignored --nocapture   # from crates/rtp
-```
-
-Use these to attribute a repair-latency change before/after a fix; the
-end-to-end dual-lane latency/throughput constitution gates live in `rtp_mux`
-(pointer table above), not here.
-
 ## Notes
 
 - The harness holds only the instrument and its own conformance tests; every
   rtp/mux/rtp_mux floor is asserted by the owning crate's gate and stated in
-  that crate's `GATE.md` (the constitution is never restated here).
-- FEC/redundancy counters and per-lane wire counters are printed per arm for
-  attribution by the `rtp_mux_jitter` arms, which now run from `rtp_mux`.
+  that crate's `GATE.md`.
+- `netem-test` is a leaf crate: a pinned harness revision cannot put two
+  versions of the harness in one dependency graph.

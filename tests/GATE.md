@@ -1,17 +1,29 @@
 # The netem_test validation gate
 
-This file is the authoritative scope of the scenario gate. `cargo test -p tests`
-silently skips every `#[ignore]`d scenario, so the gate is defined in tiers and
-the `gate-manifest` block below names every opt-in scenario and its tier. The
-manifest is machine-checked by `python3 tools/check-gate.py`, which fails if a
-scenario is added or removed without the manifest being updated, making an
-unnoticed `#[ignore]` skip impossible.
+This file is the authoritative scope of the harness's own scenario gate. It
+covers the `tests` package's remaining targets — the `netem-test` instrument's
+conformance suite — and the perf-loop lane roles, which belong to the harness
+tooling. `cargo test -p tests` silently skips every `#[ignore]`d scenario, so
+the gate is defined in tiers and the `gate-manifest` block below names every
+opt-in scenario and its tier. The manifest is machine-checked by
+`python3 tools/check-gate.py`, which fails if a scenario is added or removed
+without the manifest being updated, making an unnoticed `#[ignore]` skip
+impossible.
 
 Run the checker after adding, removing, or re-tiering any scenario:
 
 ```sh
 python3 tools/check-gate.py
 ```
+
+The application scenarios that consume `rtp`, `mux` or `rtp_mux` are asserted
+by **those crates'** own gates, never here: the harness keeps the impairment
+instrument and its conformance suite, and each layer's floors are stated and
+checked in the crate that owns the code they exercise
+(`rtp/GATE.md`, `mux/GATE.md`, `rtp_mux/GATE.md`), each with
+`python3 ../netem_test/tools/check-gate.py --crate . <crate> tests GATE.md`.
+`netem_test` itself consumes none of `rtp`/`mux`/`rtp_mux`, so a pinned harness
+revision cannot put two versions of the harness in one graph.
 
 ## Tiers
 
@@ -30,9 +42,7 @@ python3 tools/check-gate.py
   check that never runs is not coverage. It must also not reach an assertion
   through a helper: the checker derives the crate-local call-graph closure of
   every `perf` scenario and requires every asserting helper it reaches to be
-  declared report-only in the `gate-perf-guard-helpers` block. Do not treat a
-  perf target's absence from a run as coverage of the property. The`contested_latency`/`hol_verify4` report-only arms call shared helpers whose
-  assertions are setup/sanity guards, not gates.
+  declared report-only in the `gate-perf-guard-helpers` block.
 
 The long-running `perf-loop` battery (`tools/perf-loop`, lanes `clean`,
 `controller-fat-pipe`, `hostile`, `lossy-400kib`, `hostile-fat-pipe`) is a
@@ -44,40 +54,14 @@ skim past (see `tools/PERF_LOOP.md`, "Rendered graph evidence (mandatory)").
 ## Default tier (runs in `cargo test -p tests`)
 
 `netem_scenarios` and `raw_netem_pair` are the instrument's own conformance
-suite (every impairment knob fires, the four-state loss model matches the
-`sch_netem` semantics, the pair echoes and reports), plus the two `perf_probe`
-seeding tests (fixed-shaping / deterministic-loss profiles assert their
-classification, not a wall-clock) and the un-ignored `shared_bottleneck`
-resynchronisation tests. The rtp-owned floor tests that used to live here
-(`rtp_clean`, `rtp_loss`, `rtp_mss`, the default-FEC recovery case, the
-padding distribution/ACK-hiding trio, the `rtp_liveness` unit test) moved to
-the owning crate with the relocation's step 5: they now run in
-`cargo test -p rtp` and are pinned in `rtp/GATE.md` (`gate-default-required`),
-checked with `python3 ../netem_test/tools/check-gate.py --crate . rtp tests
-GATE.md`.
+suite: every impairment knob fires, the four-state loss model matches the
+`sch_netem` semantics, and the pair echoes, applies observable latency, and
+reports its counters. Nothing else lives here — the layer scenarios are in the
+crates that own the code they exercise.
 
-The mux-owned scenarios (the clean/latency `mux_over_rtp` echoes,
-`mux_over_rtp_perf`'s lossy smoke / contended transfer / small-before-bulk
-fairness, the reassigned `rtp_and_mux` smoke trio, and the
-`mux_bulk_clean_stall` progress + teardown gates) moved to the owning crate
-with the mux layer kit: they now run in `cargo test -p mux` and are recorded
-in `mux/GATE.md` (checked with `python3 ../netem_test/tools/check-gate.py
---crate . mux tests GATE.md`).
-
-The rtp_mux-owned scenarios (the `dynamic_contested` battery, the `hol_probe`
-head-of-line battery, `rtp_longrun`, the `rtp_mux` explorer/migration suite,
-the `rtp_mux_jitter` oracle with its two constitution gates, and the new
-`dual_lane_mandates` bulk-lane constitution gate) moved to the owning crate
-with the rtp_mux layer kit (`support/{dual,rtp_mux}.rs` →
-`rtp_mux/src/testkit/`): they now run in `cargo test -p rtp_mux` and are
-recorded in `rtp_mux/GATE.md`, which states the tri-mandate constitution
-(one authority per mandate). The two `hol_probe` seeding tests and the
-`hol_rtt100_ge5_four_interactive_frame_delivery` scaling gate moved with the
-rest of the target.
-
-The `gate-default-required` block names the asserting scenarios that must stay in
-this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
-`gate-asserting` block records the full report-only/asserting split.
+The `gate-default-required` block names the asserting scenarios that must stay
+in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
+`gate-asserting` block records the report-only/asserting split.
 
 ```gate-default-required
 netem_scenarios::netem_delay_adds_latency
@@ -88,37 +72,20 @@ netem_scenarios::netem_rate_limit_throttles_burst
 netem_scenarios::netem_reorder_with_rate_jumps_ahead
 netem_scenarios::netem_drops_all_with_max_random_loss
 netem_scenarios::netem_snapshot_reports_queue_and_stats
-perf_probe::controller_fat_pipe_has_only_fixed_shaping
-perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
 raw_netem_pair::netem_pair_raw_udp_echo_clean_link
 raw_netem_pair::netem_pair_raw_udp_latency_is_observable
-shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse
-shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
 ```
 
 ## Opt-in manifest
 
 Each line is `target::test_name = tier`. The set must equal the set of
 non-`support` tests reported by `cargo test -p tests --test <target> -- --list
---ignored`.
+--ignored`. The harness has no opt-in scenarios of its own left to classify:
+every opt-in scenario it used to host moved to the owning crate's gate
+(`rtp/GATE.md`, `mux/GATE.md`, `rtp_mux/GATE.md`), together with its tier and
+its assertions.
 
 ```gate-manifest
-contested_latency::contested_capped_clean = full
-contested_latency::contested_capped_jitter_loss = perf
-contested_latency::contested_hostile = perf
-hol_verify4::v4_clean_rawbulk = perf
-hol_verify4::v4_ge5_rawbulk = perf
-perf_probe::probe_hostile_goodput_30s = full
-perf_probe::probe_hostile_message_latency = full
-perf_probe::probe_rtp_echo_4mib_direct = standard
-perf_probe::probe_rtp_echo_4mib_mss8k = standard
-shared_bottleneck::shared_bneck_fairness_longrun = full
-shared_bottleneck::shared_bneck_fairness_sweep = full
-shared_bottleneck::shared_bneck_late_joiner_fairness = full
-shared_bottleneck::shared_bneck_reorder_tolerant_fairness = full
-shared_bottleneck::shared_bneck_rr_under_bulk_10mbps = full
-shared_bottleneck::shared_bneck_rr_under_bulk_2mbps = full
-shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps = full
 ```
 
 The `gate-asserting` block below records the report-only/asserting split. It
@@ -133,7 +100,6 @@ body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
 (an asserting check filed under the report-only tier would never run).
 
 ```gate-asserting
-contested_latency::contested_capped_clean
 netem_scenarios::netem_delay_adds_latency
 netem_scenarios::netem_duplicate_produces_extra_packets
 netem_scenarios::netem_four_state_loss_drops_some
@@ -142,24 +108,11 @@ netem_scenarios::netem_rate_limit_throttles_burst
 netem_scenarios::netem_reorder_with_rate_jumps_ahead
 netem_scenarios::netem_drops_all_with_max_random_loss
 netem_scenarios::netem_snapshot_reports_queue_and_stats
-perf_probe::probe_hostile_goodput_30s
-perf_probe::probe_hostile_message_latency
-perf_probe::probe_rtp_echo_4mib_direct
-perf_probe::probe_rtp_echo_4mib_mss8k
-perf_probe::controller_fat_pipe_has_only_fixed_shaping
-perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss
 raw_netem_pair::netem_pair_raw_udp_echo_clean_link
 raw_netem_pair::netem_pair_raw_udp_latency_is_observable
-shared_bottleneck::shared_bneck_fairness_longrun
-shared_bottleneck::shared_bneck_fairness_sweep
-shared_bottleneck::shared_bneck_late_joiner_fairness
-shared_bottleneck::shared_bneck_reorder_tolerant_fairness
-shared_bottleneck::shared_bneck_rr_under_bulk_10mbps
-shared_bottleneck::shared_bneck_rr_under_bulk_2mbps
-shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps
-shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse
-shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
 ```
+
+## Perf-tier reach into asserting helpers
 
 The direct-body scan only sees assertions in a `perf` scenario's own body, so
 it would miss an assertion moved one call away into a helper. The
@@ -167,28 +120,22 @@ it would miss an assertion moved one call away into a helper. The
 tool can. For every `perf` scenario the checker builds a crate-local call graph
 (functions in `tests/<target>.rs` and the `support/**` modules it includes; a
 call is resolved against the caller file's `use` declarations first, then the
-caller's own module, then a bare-name fallback, so `support::stats::summarize`
-and `support::contested::summarize` are not confused) and takes the transitive
-closure. A call that still cannot be narrowed keeps every same-named candidate,
-so the graph over-approximates rather than dropping a direct call. Every
-asserting function the closure reaches must be listed here as
+caller's own module, then a bare-name fallback) and takes the transitive
+closure. Every asserting function the closure reaches must be listed here as
 `RELATIVE_PATH::fn = assertion-token-count`, together with the number of
 `assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!` tokens in its body
 (the debug-only `debug_assert!`/`debug_assert_eq!`/`debug_assert_ne!` forms
-count as assertion tokens too).
-The checker fails when a reachable asserting helper is unrecorded, when a
-recorded helper's token count changes, when a recorded helper is no longer
-reachable, or when a `perf` scenario's own body cannot be located in its source
-file (e.g. it is macro-generated, so neither scan can see it).
+count as assertion tokens too). The checker fails when a reachable asserting
+helper is unrecorded, when a recorded helper's token count changes, when a
+recorded helper is no longer reachable, or when a `perf` scenario's own body
+cannot be located in its source file.
 
-Every entry is a report-only harness guard, not a gate: finalize/setup helpers
-that abort on harness malfunction (`with_timeout`, `submit_test_task`,
-`submit_test_task_required`, `spawn_required`, the `spawn_*_server_core`
-helpers, `try_send_observation`), argument validation (`percentile`,
-`gilbert_elliott_loss`) and the sparse-ping frame encoder's setup guard
-(`send_timestamped_messages`). The rtp padding A/B benches that used to be
-gated here relocated with the rest of the rtp scenarios into `rtp/GATE.md`
-(step 5); the harness no longer hosts them.
+The harness has no `perf`-tier scenario left, so the block is empty: every
+report-only scenario, and every asserting helper one reached, now live in the
+owning crate's gate. The kit sources the closure used to follow
+(`netem-test/src/kit/**`, `rtp/src/testkit/**`, `mux/src/testkit/**`,
+`rtp_mux/src/testkit/**`) are still scanned per target, so a `perf` scenario
+added here cannot silently reach an undeclared asserting helper.
 
 Residual limitations, stated so they are not mistaken for coverage. The graph
 is name-based and over-approximates whenever a call cannot be narrowed, so a
@@ -198,52 +145,13 @@ cannot see an edge created by passing a function by name (e.g.
 an assertion reached only through such an indirection is invisible to the scan.
 It records a guard helper's assertion *token count*, not the text of the
 assertions, so replacing an assertion in a recorded guard with a different
-assertion of the same token count is not detected. The plain tokens match
-inside the debug-only forms as substrings, so `debug_assert!` was never fully
-invisible to the scan, but the set now names the three debug forms explicitly
-(`debug_assert!`/`debug_assert_eq!`/`debug_assert_ne!`) and the error messages
-report the exact token found instead of a bare count. A debug-only assertion
-is inert in a release build of the scenario that carries it, so under
-`--release` it would not even execute; the gate treats its presence in the
-report-only tier as a violation regardless of build profile. The residual
-indirection limits from the previous paragraph still apply: an assertion
-reached only by passing a function by name, through a trait object, or
-through a macro alias remains invisible to the graph.
-
-Since the shared scaffolding relocated into the harness `test-kit` feature
-the helpers that used to live in `tests/tests/support/**` are no longer
-inlined in the scenario crate: `with_timeout`, `gilbert_elliott_loss`,
-`percentile`, `try_send_observation`, and the `TestScope` reaper machinery
-now live in `netem-test/src/kit/**` (behind `netem_test::kit`), the rtp
-echo/connect/sink/frame/perf-trace scaffolding lives in
-`rtp/src/testkit/**` behind rtp's `testing` feature, the mux-over-rtp
-scaffolding in `mux/src/testkit/**` behind mux's `testing`, and the
-dual-lane server/connector plumbing in `rtp_mux/src/testkit/**` behind
-rtp_mux's `testing` (the rtp_mux kit moved with the rtp_mux scenarios, so
-this harness is left with the rtp/rtp kit + mux kit views). The checker
-follows the `pub use` shim views in `support/**` into the kit source sets,
-so the reachable asserting helpers below are declared exactly as they were
-before the relocation. What remains genuinely outside the scan: assertions
-inside the `netem-test` library itself (e.g. `NetemPair` internals) and
-rtp's own lib internals (e.g. `crate::metrics`), which the scenario crate
-can reach but whose sources belong to other crates and are not parsed here -
-the same boundary the scan always had. The perf tier's kit-home helpers keep
-their report-only role, and the kit unit tests that enforce them run in the
-harness's own default test invocation via the `test-kit` self dev-dependency.
+assertion of the same token count is not detected. Assertions inside the
+`netem-test` library itself (e.g. `NetemPair` internals) remain outside the
+scan: the scenario crate can reach them but their sources are not parsed here.
+The kit unit tests that enforce the helpers run in the harness's own default
+test invocation via the `test-kit` self dev-dependency.
 
 ```gate-perf-guard-helpers
-mux/src/testkit/mux.rs::mux_client_connect_core = 1
-mux/src/testkit/mux.rs::spawn_mux_over_rtp_server_core = 1
-netem_test/netem-test/src/kit/mod.rs::try_send_observation = 1
-netem_test/netem-test/src/kit/payload.rs::with_timeout = 1
-netem_test/netem-test/src/kit/presets.rs::gilbert_elliott_loss = 2
-netem_test/netem-test/src/kit/stats.rs::percentile = 1
-netem_test/netem-test/src/kit/task_scope.rs::run = 1
-netem_test/netem-test/src/kit/task_scope.rs::spawn_required = 1
-netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
-netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
-rtp/src/testkit/rtp.rs::send_timestamped_messages = 1
-rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 ```
 
 ## Perf-loop lane roles
@@ -293,6 +201,12 @@ hostile-periodic-bottleneck-20ms = verdict
 hostile-periodic-bottleneck-100ms = verdict
 hostile-periodic-bottleneck-300ms = verdict
 ```
+
+The perf-loop probe itself is an **rtp_mux** target: `tools/perf-loop` builds
+`cargo test -p rtp_mux --test perf_probe` from the frozen `rtp_mux` component,
+because the battery lanes it drives are `mux`-over-`rtp` sessions — the
+`rtp`+`mux` cooperation that only `rtp_mux` may hold — and the probe's code is
+`rtp_mux`'s. The harness owns the tooling and its lane taxonomy, not the probe.
 
 ### Midpoint phase assertion (time-to-steady)
 

@@ -2,25 +2,29 @@
 
 A reusable, deterministic in-process UDP proxy that applies `sch_netem`-style
 impairment (delay, jitter, loss, duplication, reordering, rate-limiting,
-queue limit) to forwarded datagrams, plus application-specific integration
-scenarios consuming `netem-test`, `rtp`, and `mux`.
+queue limit) to forwarded datagrams, plus the paired performance-capture
+instrument whose probe and lanes are hosted by the crates they measure.
 
 ## Layout
 
 - `netem-test/` — the generic harness crate (`NetemConfig`, `NetemLink`,
-  `NetemPair`, `RndState`/`CorRng`, `LossModel`, `UdpTransport`, counters).
-- `tests/` — application-specific scenarios for the harness, `rtp` and
-  `rtp_mux` (`rtp_loss`, `rtp_fec`, `rtp_mss`, `netem_scenarios`,
-  `perf_probe`, `rtp_mux_jitter`, `hol_probe`, …). The mux-owned scenarios
-  (`mux_over_rtp`, `mux_over_rtp_perf`, `rtp_and_mux`, `mux_bulk_clean_stall`,
-  `mux_stream_fairness`, the `probe_mux_*` ceilings and the v4 mux bulk-lane
-  probes) relocated into the owning crate (`mux/tests`, `mux/GATE.md`) with
-  the mux layer kit (`mux::testkit`, behind mux's `testing` feature); the
-  harness reaches the same single authority through the `support/{mux,stats}.rs`
-  shim views. `netem-test` stays a leaf: it consumes none of `rtp`/`mux`/`rtp_mux`.
-- `tools/` — performance capture and comparison tooling
-  (`perf-loop`, `perf_loop.py`, `rtp_trace_compare.py`,
-  `rtp_trace_report.py`, `samply_hotspots.py`, `calib.py`, …).
+  `NetemPair`, `RndState`/`CorRng`, `LossModel`, `UdpTransport`, counters,
+  and the `test-kit` scenario helpers).
+- `tests/` — the harness's own conformance suite (`netem_scenarios`,
+  `raw_netem_pair`): every impairment knob fires, the four-state loss model
+  matches `sch_netem`, and the pair echoes, delays, and reports. The
+  application scenarios that consume `rtp`, `mux` or `rtp_mux` live in those
+  crates' own test targets, where the code they exercise lives; the harness
+  depends on none of them.
+- `tools/` — the performance capture and comparison tooling (`perf-loop`,
+  `perf_loop.py`, `check-gate.py`, `render_graph.py`, `rtp_trace_compare.py`,
+  `rtp_trace_report.py`, `samply_hotspots.py`, `calib.py`, …). The tooling
+  stays here; the probe it drives is `rtp_mux/tests/perf_probe.rs`, so
+  `--component-revision rtp_mux=<commit>` selects the probe that runs.
+
+The harness is a leaf: `netem-test` depends only on `dfsql`, `serde`,
+`parking_lot`, and optionally `tokio`, and the `tests` package only on
+`netem-test` and `tokio`.
 
 ## Performance quick path
 
@@ -63,19 +67,17 @@ When a performance comparison is part of a conclusion, report:
 
 ## Testing
 
-`cargo test -p tests` runs only the default tier: the harness and support unit
-tests plus the seeded sub-second scenarios (netem behaviour, clean/loss/FEC/MSS/
-interactive-lane delivery). The mux scenarios run in the owning crate
-(`cargo test -p mux`, gate recorded in `mux/GATE.md`). Every other scenario is
-`#[ignore]`d, and its name and tier are recorded in `tests/GATE.md`; the
-per-crate checker (`tools/check-gate.py`, parameterized with `--crate <root>
-<package> <dir> <GATE.md>`) fails if a scenario is not classified, so an
-unnoticed skip cannot happen.
+`cargo test -p tests` runs the harness's default tier: the instrument's own
+conformance scenarios. Every scenario that needs `rtp`/`mux`/`rtp_mux` runs in
+the crate that owns it and is gated there (`rtp/GATE.md`, `mux/GATE.md`,
+`rtp_mux/GATE.md`), each checked with the parameterized
+`tools/check-gate.py --crate <root> <package> <dir> GATE.md`; the harness's own
+gate is `tests/GATE.md`. An unnoticeable skip cannot happen: the checker fails
+if a scenario is not classified.
 
 ```sh
 cargo test -p netem-test        # harness unit tests
 cargo test -p tests             # default gate (see tests/GATE.md)
-cargo test -p tests -- --ignored --test-threads=1   # opt-in standard/full tiers
-cargo test -p tests --test perf_probe -- --ignored --nocapture   # perf probes
 python3 tools/check-gate.py     # verify the gate manifest matches reality
+python3 -m pytest tools/ -q     # verify the tooling
 ```

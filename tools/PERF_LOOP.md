@@ -255,10 +255,14 @@ isolates endpoint and host throughput from proxy overhead.
 ## Frozen executables and counterbalanced order
 
 Both roles are prebuilt once, baseline before candidate
-(`cargo test -j1 [--release] -p tests --test perf_probe --no-run
+(`cargo test -j1 [--release] -p rtp_mux --test perf_probe --no-run
 --message-format=json-render-diagnostics` per role, streamed to
-`build-ROLE.log`) before any timed run. Every build runs with
-`CARGO_TARGET_DIR` set to a canonical hash-suffixed directory beneath
+`build-ROLE.log`) before any timed run. The build runs in the suite component
+that owns the probe's code — the exported `rtp_mux` tree beside the netem_test
+workspace, so a `--component-revision rtp_mux=<commit>` pin selects exactly the
+probe that runs; a component that does not carry `tests/perf_probe.rs` is
+refused instead of silently building another tree's probe. Every build runs
+with `CARGO_TARGET_DIR` set to a canonical hash-suffixed directory beneath
 `$TMPDIR` whose final path component is literally `target`, and with
 `RUST_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_WRAPPER`, and `RUSTFLAGS`
 cleared so sccache or other inherited compiler wrappers or flags cannot
@@ -752,7 +756,10 @@ invalid evidence.
   debug/release evidence must not be mixed.
 - A frozen workspace has a `netem_test/` checkout with sibling `rtp`, `mux`,
   `rtp_mux`, `tokio_udp`, and `udp_listener` repositories; each component's
-  jj revision is recorded in the manifest.
+  jj revision is recorded in the manifest. The probe's code is an `rtp_mux`
+  test target, so the `rtp_mux` sibling is the component the
+  `--component-revision rtp_mux=<commit>` pin selects and the one the probe is
+  compiled from.
 
 ## Re-running analysis on a preserved result
 
