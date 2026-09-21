@@ -6,13 +6,13 @@ license.workspace = true
 
 [dev-dependencies]
 netem-test = { path = "../netem-test", features = ["test-kit"] }
-rtp = { path = "../../rtp", features = ["testing"] }
-# rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.88" }
-# mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.28" }
+rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.90", features = ["testing"] }
+# rtp = { path = "../../rtp", features = ["testing"] }
 # The mux layer kit (`mux::testkit`) is consumed through the `support/mux.rs`
 # shim by the scenarios that stay in the harness, so mux's `testing` feature
 # must be enabled here.
-mux = { path = "../../mux", features = ["testing"] }
+mux = { git = "https://github.com/Banyc/mux.git", tag = "v0.0.29", features = ["testing"] }
+# mux = { path = "../../mux", features = ["testing"] }
 # The rtp_mux scenarios relocated into the owning crate with the rtp_mux
 # layer kit (step 4 of the relocation); the harness no longer consumes
 # rtp_mux, so the local dev-dependency is commented out to keep the harness
