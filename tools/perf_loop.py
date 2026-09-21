@@ -15,11 +15,13 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import statistics
 import subprocess
 import sys
 import tarfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 SAFE_TEMP_ROOT = Path.home() / "code" / "tmp"
@@ -300,6 +302,626 @@ def snapshot_component(source, destination, revision):
     return identity
 
 
+# Every component's committed manifests name their sibling components through
+# published git tags.  A tree exported exactly as committed therefore fetches
+# the *tagged* sibling instead of the sibling exported beside it, so
+# `--component-revision rtp=<commit>` selects no code at all and a paired run
+# compares the tag against itself: a silent false negative.  `snapshot`
+# rewrites each inter-component source locator to the exported sibling's
+# relative path, so the pinned revision is what compiles and runs.  The
+# component trees stay byte-exact exports of their committed revisions; only
+# the frozen build recipe changes, and every rewrite is recorded in
+# `suite-revisions.json`.  A dependency edge that names a suite component in a
+# shape this rewrite does not model is refused, never left to resolve from its
+# tag.
+DEPENDENCY_TABLE_KINDS = (
+    "dependencies",
+    "dev-dependencies",
+    "build-dependencies",
+)
+# The keys that name a dependency's *source*; one of them decides whether a
+# frozen edge resolves to an exported sibling or to a published tag.
+DEPENDENCY_SOURCE_KEYS = ("git", "path", "workspace")
+DEPENDENCY_GIT_TAG_KEYS = ("git", "tag", "rev", "branch")
+_TOML_ASSIGNMENT = re.compile(
+    r'^(?P<key>[A-Za-z0-9_.-]+|"[^"]*"|\'[^\']*\')[ \t]*(?P<equals>=)'
+)
+
+
+def _toml_unquote(text):
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def _split_top_level(text, separator):
+    """Split on `separator`, ignoring separators inside strings/brackets."""
+    parts = []
+    stack = []
+    quote = None
+    start = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote is not None:
+            if character == "\\" and quote == '"':
+                index += 2
+                continue
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character in "{[(":
+            stack.append(character)
+        elif character in "}])":
+            if stack:
+                stack.pop()
+        elif character == separator and not stack:
+            parts.append(text[start:index])
+            start = index + 1
+        index += 1
+    parts.append(text[start:])
+    return parts
+
+
+def _toml_table_path(header):
+    """The dotted key path of a `[table]` header line, or None for arrays."""
+    stripped = header.strip()
+    if not stripped.startswith("[") or stripped.startswith("[["):
+        return None
+    closing = stripped.rfind("]")
+    if closing <= 0:
+        return None
+    return tuple(
+        _toml_unquote(part)
+        for part in _split_top_level(stripped[1:closing], ".")
+    )
+
+
+def _toml_value_end(text, start):
+    """The offset just past the TOML value that begins at `start`."""
+    if start >= len(text):
+        return start
+    opener = text[start]
+    if opener in "{[":
+        depth = 0
+        quote = None
+        index = start
+        while index < len(text):
+            character = text[index]
+            if quote is not None:
+                if character == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if character == quote:
+                    quote = None
+            elif character in "\"'":
+                quote = character
+            elif character in "{[":
+                depth += 1
+            elif character in "}]":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+            index += 1
+        raise ValueError("unterminated TOML inline value")
+    if opener in "\"'":
+        quote = opener
+        index = start + 1
+        while index < len(text):
+            if text[index] == "\\" and quote == '"':
+                index += 2
+                continue
+            if text[index] == quote:
+                return index + 1
+            index += 1
+        raise ValueError("unterminated TOML string")
+    end = start
+    while end < len(text) and text[end] not in "\n#":
+        end += 1
+    return end
+
+
+def _toml_entries(text):
+    """`(table, key, key_start, line_start, value, value_start, value_end)`
+    for every key/value assignment of a TOML document, in document order.
+
+    A dependency value may span lines (an inline table holding a multi-line
+    array), so each value is consumed in full before the scan advances to the
+    next line.
+    """
+    entries = []
+    table = ()
+    position = 0
+    length = len(text)
+    while position < length:
+        line_end = text.find("\n", position)
+        if line_end == -1:
+            line_end = length
+        line = text[position:line_end]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            position = line_end + 1
+            continue
+        if stripped.startswith("["):
+            table = _toml_table_path(stripped) or ()
+            position = line_end + 1
+            continue
+        match = _TOML_ASSIGNMENT.match(line)
+        if match is None:
+            position = line_end + 1
+            continue
+        value_start = position + match.end("equals")
+        while value_start < length and text[value_start] in " \t":
+            value_start += 1
+        value_end = _toml_value_end(text, value_start)
+        entries.append(
+            (
+                table,
+                _toml_unquote(match.group("key")),
+                position + match.start("key"),
+                position,
+                text[value_start:value_end],
+                value_start,
+                value_end,
+            )
+        )
+        following = text.find("\n", value_end)
+        position = length if following == -1 else following + 1
+    return entries
+
+
+def _inline_table_fields(value, base):
+    """The declared fields of an inline table, keyed by field name."""
+    body_start = value.find("{") + 1
+    body_end = value.rfind("}")
+    body = value[body_start:body_end]
+    fields = {}
+    offset = 0
+    for chunk in _split_top_level(body, ","):
+        chunk_start = base + body_start + offset
+        offset += len(chunk) + 1
+        if not chunk.strip():
+            continue
+        key, separator, _ = chunk.partition("=")
+        if not separator:
+            raise ValueError(
+                f"unrecognised inline dependency field: {chunk.strip()!r}"
+            )
+        value_offset = chunk.index("=") + 1
+        raw_value = chunk[value_offset:]
+        stripped_value = raw_value.strip()
+        leading = len(raw_value) - len(raw_value.lstrip(" \t"))
+        fields[_toml_unquote(key)] = {
+            "value": stripped_value,
+            "value_start": chunk_start + value_offset + leading,
+            "value_end": chunk_start + value_offset + leading + len(stripped_value),
+            "key_start": chunk_start,
+            "line_start": None,
+            "raw": chunk.strip(),
+        }
+    return fields
+
+
+def _frozen_dependency_edges(text):
+    """Every dependency a manifest declares, grouped by `(table, crate)`.
+
+    Both the inline form (`rtp = { git = ..., tag = ... }`) and the expanded
+    form (`[dependencies.rtp]` followed by `git = ...`, or a dotted
+    `rtp.workspace = true`) are read into the same shape, so the rewrite sees
+    the same edges cargo would resolve.
+    """
+
+    def field(value, value_start, value_end, key_start, line_start, raw=None):
+        return {
+            "value": value,
+            "value_start": value_start,
+            "value_end": value_end,
+            "key_start": key_start,
+            "line_start": line_start,
+            "raw": raw,
+        }
+
+    edges = {}
+    for table, key, key_start, line_start, value, value_start, value_end in _toml_entries(text):
+        if table and table[-1] in DEPENDENCY_TABLE_KINDS:
+            crate, separator, dotted = key.partition(".")
+            edge = edges.setdefault(
+                (table, crate),
+                {"table": table, "crate": crate, "style": None, "span": None, "fields": {}},
+            )
+            if separator:
+                edge["style"] = "expanded"
+                edge["fields"][dotted] = field(
+                    value, value_start, value_end, key_start, line_start
+                )
+                continue
+            if edge["span"] is not None:
+                raise ValueError(f"duplicate dependency entry for {crate!r}")
+            edge["span"] = (value_start, value_end)
+            edge["style"] = "inline" if value.startswith("{") else "scalar"
+            if edge["style"] == "inline":
+                edge["fields"] = _inline_table_fields(value, value_start)
+            else:
+                edge["fields"] = {
+                    "version": field(value, value_start, value_end, key_start, line_start)
+                }
+        elif len(table) >= 2 and table[-2] in DEPENDENCY_TABLE_KINDS:
+            edge = edges.setdefault(
+                (table[:-1], table[-1]),
+                {
+                    "table": table[:-1],
+                    "crate": table[-1],
+                    "style": "expanded",
+                    "span": None,
+                    "fields": {},
+                },
+            )
+            edge["fields"][key] = field(
+                value, value_start, value_end, key_start, line_start
+            )
+    return list(edges.values())
+
+
+def _declared_dependencies(document):
+    """`(table, crate) -> declared field names` from a parsed manifest.
+
+    The parsed view is the authority the scanner is asserted against: a
+    dependency shape the scanner does not model would otherwise be dropped
+    silently, taking its sibling pin with it.
+    """
+    declared = {}
+
+    def collect(table, entries):
+        if not isinstance(entries, dict):
+            return
+        for crate, spec in entries.items():
+            declared[(table, crate)] = set(spec) if isinstance(spec, dict) else {"version"}
+
+    for kind in DEPENDENCY_TABLE_KINDS:
+        collect((kind,), document.get(kind))
+    targets = document.get("target")
+    if isinstance(targets, dict):
+        for target, tables in targets.items():
+            if not isinstance(tables, dict):
+                continue
+            for kind in DEPENDENCY_TABLE_KINDS:
+                collect(("target", target, kind), tables.get(kind))
+    workspace = document.get("workspace")
+    if isinstance(workspace, dict):
+        collect(("workspace", "dependencies"), workspace.get("dependencies"))
+    return declared
+
+
+def assert_dependency_inventory(manifest, text):
+    """Refuse a manifest whose dependency shapes the rewrite does not model."""
+    declared = _declared_dependencies(tomllib.loads(text))
+    scanned = {
+        (edge["table"], edge["crate"]): set(edge["fields"])
+        for edge in _frozen_dependency_edges(text)
+    }
+    if declared != scanned:
+        raise ValueError(
+            f"frozen manifest {manifest} declares dependency shapes the "
+            "inter-component rewrite does not model "
+            f"(unscanned={sorted(str(key) for key in declared.keys() - scanned.keys())}, "
+            f"unknown={sorted(str(key) for key in scanned.keys() - declared.keys())}, "
+            f"fields={sorted(str(key) for key in declared.keys() & scanned.keys() if declared[key] != scanned[key])}); "
+            "refusing to snapshot a suite whose sibling pin could be "
+            "silently ignored"
+        )
+
+
+def dependency_repository_component(url):
+    """The suite component a git URL names, or None.
+
+    Only `Banyc`'s own repositories are the suite's published siblings.  A
+    repository that merely shares a component's name (a fork, another host)
+    is a different source and is never silently redirected to the export.
+    """
+    parts = [part for part in re.split(r"[/:]", url.strip().rstrip("/")) if part]
+    if len(parts) < 2 or parts[-2].lower() != "banyc":
+        return None
+    name = parts[-1].removesuffix(".git").replace("-", "_").lower()
+    return name if name in COMPONENTS else None
+
+
+def _toml_string(value, manifest):
+    try:
+        parsed = tomllib.loads(f"value = {value}\n")["value"]
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(
+            f"cannot read a dependency field of {manifest}: {value!r}"
+        ) from error
+    if not isinstance(parsed, str):
+        raise ValueError(f"dependency field of {manifest} is not a string: {value!r}")
+    return parsed
+
+
+def _frozen_manifests(component_root):
+    component_root = Path(component_root)
+    if not component_root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in component_root.rglob("Cargo.toml")
+        if not {"target", ".git"} & set(path.relative_to(component_root).parts)
+    )
+
+
+def frozen_suite_crates(export_root):
+    """`crate name -> (component, crate directory)` for an exported suite."""
+    crates = {}
+    for component in COMPONENTS:
+        for manifest in _frozen_manifests(Path(export_root) / component):
+            document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            name = (document.get("package") or {}).get("name")
+            if not isinstance(name, str):
+                continue
+            existing = crates.get(name)
+            if existing is not None:
+                raise ValueError(
+                    f"two exported components provide the crate {name!r}: "
+                    f"{existing[0]} and {component}"
+                )
+            crates[name] = (component, manifest.parent)
+    return crates
+
+
+def _apply_replacements(text, replacements):
+    ordered = sorted(replacements, key=lambda item: item[0])
+    for previous, current in zip(ordered, ordered[1:]):
+        if current[0] < previous[1]:
+            raise ValueError("overlapping frozen manifest dependency rewrites")
+    for start, end, value in reversed(ordered):
+        text = text[:start] + value + text[end:]
+    return text
+
+
+def _source_locator_replacements(text, edge, fields, relative):
+    """Replace a dependency's published-git locator with the sibling path."""
+    quoted = json.dumps(relative)
+    if edge["style"] != "expanded":
+        retained = [
+            field["raw"]
+            for name, field in fields.items()
+            if name not in DEPENDENCY_GIT_TAG_KEYS and field["raw"]
+        ]
+        value = "{ path = " + quoted + "".join(
+            f", {raw}" for raw in retained
+        ) + " }"
+        return [(edge["span"][0], edge["span"][1], value)]
+    replacements = [
+        (
+            fields["git"]["key_start"],
+            fields["git"]["value_end"],
+            "path = " + quoted,
+        )
+    ]
+    for name in ("tag", "rev", "branch"):
+        field = fields.get(name)
+        if field is None:
+            continue
+        line_start = field["line_start"]
+        line_end = text.find("\n", field["value_end"])
+        replacements.append(
+            (line_start, len(text) if line_end == -1 else line_end + 1, "")
+        )
+    return replacements
+
+
+def _require_exported_sibling_path(manifest, value, export_root):
+    resolved = (manifest.parent / value).resolve()
+    if not resolved.is_dir():
+        raise ValueError(
+            f"frozen manifest {manifest} declares the path dependency "
+            f"{value!r}, which does not exist in the export"
+        )
+    if not resolved.is_relative_to(export_root):
+        raise ValueError(
+            f"frozen manifest {manifest} declares the path dependency "
+            f"{value!r}, which escapes the frozen suite"
+        )
+    return resolved
+
+
+def _assert_no_patched_suite_source(manifest, text):
+    """Refuse a patch/replace entry that re-sources a suite crate from git."""
+    for table, key, _key_start, _line_start, value, _value_start, _value_end in _toml_entries(text):
+        if not table or table[0] not in ("patch", "replace"):
+            continue
+        if value.startswith("{"):
+            raw = (_inline_table_fields(value, 0).get("git") or {}).get("value")
+        elif key == "git" and len(table) >= 3:
+            # The expanded `[patch."<url>".<crate>]` form.
+            raw = value
+        else:
+            continue
+        if raw is None:
+            continue
+        if dependency_repository_component(_toml_string(raw, manifest)) is not None:
+            raise ValueError(
+                f"frozen manifest {manifest} patches a suite crate onto a "
+                f"git repository ({raw}); refusing to snapshot a suite whose "
+                "sibling pin could be silently ignored"
+            )
+
+
+def _edge_table_label(table):
+    return ".".join(table)
+
+
+def rewrite_frozen_manifest_dependencies(manifest, export_root, crates):
+    """Point one frozen manifest's suite edges at the exported sibling trees."""
+    manifest = Path(manifest)
+    text = manifest.read_text(encoding="utf-8")
+    assert_dependency_inventory(manifest, text)
+    _assert_no_patched_suite_source(manifest, text)
+    relative_manifest = manifest.relative_to(Path(export_root)).as_posix()
+    replacements = []
+    records = []
+    for edge in _frozen_dependency_edges(text):
+        fields = edge["fields"]
+        crate = edge["crate"]
+        base = crate.split(".", 1)[0]
+        named_source = next(
+            (key for key in DEPENDENCY_SOURCE_KEYS if key in fields), None
+        )
+        if named_source == "git":
+            url = _toml_string(fields["git"]["value"], manifest)
+            component = dependency_repository_component(url)
+            if component is not None:
+                sibling = crates.get(base)
+                if sibling is None or sibling[0] != component:
+                    raise ValueError(
+                        f"frozen manifest {manifest} names the suite crate "
+                        f"{crate!r} from the {component!r} repository, which "
+                        "this rewrite cannot map to an exported sibling crate; "
+                        "refusing to snapshot a suite whose sibling pin could "
+                        "be silently ignored"
+                    )
+                relative = Path(os.path.relpath(sibling[1], manifest.parent)).as_posix()
+                records.append(
+                    {
+                        "manifest": relative_manifest,
+                        "table": _edge_table_label(edge["table"]),
+                        "crate": crate,
+                        "from": {
+                            key: _toml_string(fields[key]["value"], manifest)
+                            for key in DEPENDENCY_GIT_TAG_KEYS
+                            if key in fields
+                        },
+                        "to": {"path": relative},
+                    }
+                )
+                replacements.extend(
+                    _source_locator_replacements(text, edge, fields, relative)
+                )
+                continue
+            if base in crates:
+                raise ValueError(
+                    f"frozen manifest {manifest} sources the suite crate "
+                    f"{base!r} from {url} instead of the exported sibling; "
+                    "refusing to snapshot a suite whose sibling pin could be "
+                    "silently ignored"
+                )
+            continue
+        if named_source == "path":
+            _require_exported_sibling_path(
+                manifest,
+                _toml_string(fields["path"]["value"], manifest),
+                Path(export_root),
+            )
+            continue
+        if named_source == "workspace":
+            if base in crates:
+                raise ValueError(
+                    f"frozen manifest {manifest} inherits the suite crate "
+                    f"{base!r} from a workspace dependency, whose source this "
+                    "rewrite cannot see; refusing to snapshot a suite whose "
+                    "sibling pin could be silently ignored"
+                )
+            continue
+        if base in crates:
+            raise ValueError(
+                f"frozen manifest {manifest} declares the suite crate "
+                f"{base!r} without a git or path source ({fields.get('version', {}).get('value')!r}); "
+                "refusing to snapshot a suite whose sibling pin could be "
+                "silently ignored"
+            )
+    if replacements:
+        manifest.write_text(_apply_replacements(text, replacements), encoding="utf-8")
+    rewritten = manifest.read_text(encoding="utf-8")
+    assert_dependency_inventory(manifest, rewritten)
+    rewritten_edges = {
+        (_edge_table_label(edge["table"]), edge["crate"]): edge
+        for edge in _frozen_dependency_edges(rewritten)
+    }
+    for record in records:
+        edge = rewritten_edges.get((record["table"], record["crate"]))
+        declared = None
+        if edge is not None and "path" in edge["fields"]:
+            declared = _toml_string(edge["fields"]["path"]["value"], manifest)
+        if declared != record["to"]["path"]:
+            raise ValueError(
+                f"frozen manifest {manifest} did not rewrite {record['crate']!r} "
+                f"to the exported sibling path {record['to']['path']!r} "
+                f"(found {declared!r} instead)"
+            )
+    residual = sorted(
+        edge["crate"]
+        for edge in _frozen_dependency_edges(rewritten)
+        if "git" in edge["fields"]
+        and dependency_repository_component(
+            _toml_string(edge["fields"]["git"]["value"], manifest)
+        )
+        is not None
+    )
+    if residual:
+        raise ValueError(
+            f"frozen manifest {manifest} still resolves {residual} from a "
+            "suite repository after the rewrite"
+        )
+    return records
+
+
+def rewrite_frozen_suite_dependencies(export_root):
+    """Make a frozen suite build the sibling trees exported beside it.
+
+    Returns the recorded rewrites, sorted; raises when a manifest names a
+    suite component in a shape the rewrite does not model, so a pin that
+    could be silently ignored can never produce a snapshot.
+    """
+    export_root = Path(export_root).resolve()
+    crates = frozen_suite_crates(export_root)
+    records = []
+    for component in COMPONENTS:
+        for manifest in _frozen_manifests(export_root / component):
+            records.extend(
+                rewrite_frozen_manifest_dependencies(manifest, export_root, crates)
+            )
+    return sorted(
+        records, key=lambda record: (
+            record["manifest"], record["table"], record["crate"]
+        )
+    )
+
+
+def assert_frozen_suite_builds_exported_siblings(workspace):
+    """Refuse a frozen suite whose suite edges still resolve from tags.
+
+    A snapshot materialised before the rewrite carries no rewrite record and
+    resolves its siblings from their published tags, so a
+    `--component-revision` pin would select no code and the comparison would
+    report the tag against itself.  Fail loudly instead of reporting that.
+    """
+    workspace = Path(workspace)
+    export_root = workspace.parent
+    if not (export_root / SUITE_REVISION_MANIFEST).is_file():
+        return []
+    residual = []
+    for component in COMPONENTS:
+        for manifest in _frozen_manifests(export_root / component):
+            text = manifest.read_text(encoding="utf-8")
+            assert_dependency_inventory(manifest, text)
+            for edge in _frozen_dependency_edges(text):
+                raw = (edge["fields"].get("git") or {}).get("value")
+                if raw is None:
+                    continue
+                if dependency_repository_component(_toml_string(raw, manifest)) is not None:
+                    residual.append(
+                        f"{manifest.relative_to(export_root).as_posix()} ({edge['crate']})"
+                    )
+    if residual:
+        raise ValueError(
+            f"frozen suite {export_root} resolves suite components from git "
+            "tags, so a component pin would silently select no code: "
+            + ", ".join(sorted(residual))
+        )
+    return []
+
+
 def command_snapshot(args):
     source = validate_workspace(Path(args.source), "source")
     output_root = safe_output_dir(Path(args.output) if args.output else None)
@@ -313,7 +935,8 @@ def command_snapshot(args):
     (_ for _ in ()).throw(ValueError(f"suite component is missing: {missing}")) if missing is not None else None
     components = {component: snapshot_component(source_root / component, output_root / component, component_revisions.get(component, args.revision)) for component in COMPONENTS}
     validate_workspace(output_root / "netem_test", "snapshot")
-    manifest = {"schema": SUITE_REVISION_MANIFEST_SCHEMA, "source": str(source), "requested_revision": args.revision, "component_revision_overrides": dict(sorted(component_revisions.items())), "components": dict(sorted(components.items()))}
+    frozen_dep_rewrites = rewrite_frozen_suite_dependencies(output_root)
+    manifest = {"schema": SUITE_REVISION_MANIFEST_SCHEMA, "source": str(source), "requested_revision": args.revision, "component_revision_overrides": dict(sorted(component_revisions.items())), "components": dict(sorted(components.items())), "frozen_dep_rewrites": frozen_dep_rewrites}
     (output_root / SUITE_REVISION_MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output_root)
     return 0
@@ -1252,6 +1875,11 @@ def command_run(args):
         raise argparse.ArgumentTypeError("-mss-bytes must be positive")
     baseline = validate_workspace(Path(args.baseline), "baseline")
     candidate = validate_workspace(Path(args.candidate), "candidate")
+    # A frozen suite is only a pin if its siblings resolve to the exported
+    # trees; a suite whose sibling edges still point at published tags would
+    # build the tag for both roles and report it against itself.
+    assert_frozen_suite_builds_exported_siblings(baseline)
+    assert_frozen_suite_builds_exported_siblings(candidate)
     treatment = bool(args.same_workspace_treatment)
     # Pin the frozen probe builds to the toolchain the invocation site
     # resolves (see [`effective_toolchain_pin`]): the snapshot workspaces

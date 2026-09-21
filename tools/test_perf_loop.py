@@ -285,6 +285,266 @@ class PerfLoopTest(unittest.TestCase):
                 finally:
                     shutil.rmtree(reject_output, ignore_errors=True)
 
+    def frozen_suite_fixture(self, root):
+        """A minimal frozen suite export with one edge per supported shape.
+
+        Every component that owns a crate the suite can pin is present, so
+        the rewrite maps crates to their exported directories the way the
+        real export does (including netem_test's crate living in a
+        subdirectory).
+        """
+        manifests = {
+            "netem_test/Cargo.toml": (
+                "[workspace]\nresolver = \"3\"\nmembers = [\"netem-test\", \"tests\"]\n"
+            ),
+            "netem_test/netem-test/Cargo.toml": (
+                "[package]\nname = \"netem-test\"\nversion = \"0.1.0\"\n"
+            ),
+            "netem_test/tests/Cargo.toml": (
+                "[package]\nname = \"tests\"\nversion = \"0.1.0\"\n\n"
+                "[dev-dependencies]\n"
+                "netem-test = { path = \"../netem-test\", features = [\"test-kit\"] }\n"
+                "rtp = { git = \"https://github.com/Banyc/rtp.git\", tag = \"v0.0.90\", features = [\n"
+                "    \"testing\",\n"
+                "] }\n"
+                "mux = { git = \"https://github.com/Banyc/mux.git\", tag = \"v0.0.29\" }\n"
+            ),
+            "rtp/Cargo.toml": (
+                "[package]\nname = \"rtp\"\nversion = \"0.1.0\"\n\n"
+                "[dependencies]\n"
+                "primitive = { git = \"https://github.com/Banyc/primitive.git\", tag = \"v0.0.59\" }\n"
+                "tokio_udp = { git = \"https://github.com/Banyc/tokio_udp.git\", tag = \"v0.0.4\" }\n"
+                "udp_listener = { git = \"https://github.com/Banyc/udp_listener.git\", tag = \"v0.0.18\" }\n"
+                "\n[dependencies.netem-test]\n"
+                "git = \"https://github.com/Banyc/netem_test.git\"\n"
+                "tag = \"v0.0.1\"\n"
+                "optional = true\n"
+                "\n[target.'cfg(unix)'.build-dependencies]\n"
+                "rtp_mux = { git = \"https://github.com/Banyc/rtp_mux.git\", tag = \"v0.0.5\" }\n"
+            ),
+            "mux/Cargo.toml": (
+                "[package]\nname = \"mux\"\nversion = \"0.1.0\"\n\n"
+                "[dependencies]\n"
+                "rtp = { git = \"https://github.com/Banyc/rtp.git\", tag = \"v0.0.90\", features = [\"testing\"], optional = true }\n"
+                "\n[dev-dependencies]\n"
+                "netem-test = { git = \"https://github.com/Banyc/netem_test.git\", tag = \"v0.0.1\", features = [\"test-kit\"] }\n"
+            ),
+            "rtp_mux/Cargo.toml": (
+                "[package]\nname = \"rtp_mux\"\nversion = \"0.1.0\"\n"
+            ),
+            "tokio_udp/Cargo.toml": (
+                "[package]\nname = \"tokio_udp\"\nversion = \"0.1.0\"\n"
+            ),
+            "udp_listener/Cargo.toml": (
+                "[package]\nname = \"udp_listener\"\nversion = \"0.1.0\"\n\n"
+                "[dependencies]\n"
+                "tokio_udp = { git = \"https://github.com/Banyc/tokio_udp.git\", tag = \"v0.0.4\" }\n"
+            ),
+        }
+        for relative, text in manifests.items():
+            path = Path(root) / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return Path(root)
+
+    def test_frozen_manifest_rewrite_points_suite_edges_at_the_export(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = self.frozen_suite_fixture(Path(directory) / "suite")
+            records = LOOP.rewrite_frozen_suite_dependencies(root)
+            self.assertEqual(
+                [
+                    (record["manifest"], record["table"], record["crate"], record["to"]["path"])
+                    for record in records
+                ],
+                [
+                    ("mux/Cargo.toml", "dependencies", "rtp", "../rtp"),
+                    ("mux/Cargo.toml", "dev-dependencies", "netem-test", "../netem_test/netem-test"),
+                    ("netem_test/tests/Cargo.toml", "dev-dependencies", "mux", "../../mux"),
+                    ("netem_test/tests/Cargo.toml", "dev-dependencies", "rtp", "../../rtp"),
+                    ("rtp/Cargo.toml", "dependencies", "netem-test", "../netem_test/netem-test"),
+                    ("rtp/Cargo.toml", "dependencies", "tokio_udp", "../tokio_udp"),
+                    ("rtp/Cargo.toml", "dependencies", "udp_listener", "../udp_listener"),
+                    ("rtp/Cargo.toml", "target.cfg(unix).build-dependencies", "rtp_mux", "../rtp_mux"),
+                    ("udp_listener/Cargo.toml", "dependencies", "tokio_udp", "../tokio_udp"),
+                ],
+            )
+            tests = (root / "netem_test" / "tests" / "Cargo.toml").read_text(encoding="utf-8")
+            # The inline table keeps its other fields verbatim, including the
+            # multi-line feature list, and drops the published tag.
+            self.assertIn(
+                'rtp = { path = "../../rtp", features = [\n    "testing",\n] }\n',
+                tests,
+            )
+            self.assertIn('mux = { path = "../../mux" }\n', tests)
+            self.assertIn('netem-test = { path = "../netem-test", features = ["test-kit"] }\n', tests)
+            self.assertNotIn("github.com/Banyc/rtp", tests)
+            self.assertNotIn("github.com/Banyc/mux", tests)
+            rtp = (root / "rtp" / "Cargo.toml").read_text(encoding="utf-8")
+            # A non-suite Banyc crate keeps its published source.
+            self.assertIn(
+                'primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }',
+                rtp,
+            )
+            # The expanded table drops its tag line and keeps its other keys.
+            self.assertIn(
+                "[dependencies.netem-test]\npath = \"../netem_test/netem-test\"\noptional = true\n",
+                rtp,
+            )
+            self.assertNotIn("tag = \"v0.0.1\"", rtp)
+            self.assertNotIn("github.com/Banyc/netem_test", rtp)
+            # Rewriting is idempotent: the second pass has nothing left to do.
+            self.assertEqual(LOOP.rewrite_frozen_suite_dependencies(root), [])
+
+    def test_frozen_manifest_rewrite_refuses_unmodelled_suite_edges(self):
+        cases = (
+            (
+                "registry source",
+                "[dependencies]\nrtp = { version = \"0.1\", features = [\"testing\"] }\n",
+                "without a git or path source",
+            ),
+            (
+                "mismatched repository",
+                "[dependencies]\nrtp = { git = \"https://github.com/Banyc/mux.git\", tag = \"v0.0.29\" }\n",
+                "cannot map to an exported sibling crate",
+            ),
+            (
+                "renamed crate",
+                "[dependencies]\nmy_rtp = { package = \"rtp\", git = \"https://github.com/Banyc/rtp.git\", tag = \"v0.0.90\" }\n",
+                "cannot map to an exported sibling crate",
+            ),
+            (
+                "non-Banyc fork",
+                "[dependencies]\nrtp = { git = \"https://github.com/elsewhere/rtp.git\", tag = \"v0.0.90\" }\n",
+                "instead of the exported sibling",
+            ),
+            (
+                "workspace inheritance",
+                "[dependencies]\nrtp.workspace = true\n",
+                "inherits the suite crate",
+            ),
+            (
+                "patched suite source",
+                "[patch.crates-io]\nrtp = { git = \"https://github.com/Banyc/rtp.git\", tag = \"v0.0.90\" }\n",
+                "patches a suite crate",
+            ),
+        )
+        for label, header, message in cases:
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+                    root = self.frozen_suite_fixture(Path(directory) / "suite")
+                    (root / "mux" / "Cargo.toml").write_text(
+                        "[package]\nname = \"mux\"\nversion = \"0.1.0\"\n\n" + header,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        LOOP.rewrite_frozen_suite_dependencies(root)
+
+    def test_frozen_suite_guard_refuses_tag_resolved_siblings(self):
+        suite = (
+            "[package]\nname = \"tests\"\nversion = \"0.1.0\"\n\n"
+            "[dev-dependencies]\n"
+            "rtp = { git = \"https://github.com/Banyc/rtp.git\", tag = \"v0.0.90\" }\n"
+        )
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = self.frozen_suite_fixture(Path(directory) / "suite")
+            workspace = root / "netem_test"
+            # A live workspace is not a frozen suite: no guard, no rewrite.
+            self.assertEqual(LOOP.assert_frozen_suite_builds_exported_siblings(workspace), [])
+            (root / LOOP.SUITE_REVISION_MANIFEST).write_text("{}\n", encoding="utf-8")
+            LOOP.rewrite_frozen_suite_dependencies(root)
+            self.assertEqual(LOOP.assert_frozen_suite_builds_exported_siblings(workspace), [])
+            # A snapshot whose sibling edges still resolve from tags cannot be
+            # a pin, so it is refused instead of compared against itself.
+            (root / "netem_test" / "tests" / "Cargo.toml").write_text(suite, encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "resolves suite components from git tags"
+            ):
+                LOOP.assert_frozen_suite_builds_exported_siblings(workspace)
+
+    def test_frozen_snapshot_records_and_applies_dependency_rewrites(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            source = self.make_workspace(root / "source", "netem_test")
+            for component in LOOP.COMPONENTS:
+                (root / "source" / component).mkdir(parents=True, exist_ok=True)
+            output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-rewrite-{os.getpid()}"
+            fixture = self.frozen_suite_fixture(Path(directory) / "fixture")
+
+            def fake_snapshot(component_source, component_output, revision):
+                for relative, text in (
+                    (path.relative_to(fixture), path.read_text(encoding="utf-8"))
+                    for path in fixture.rglob("Cargo.toml")
+                ):
+                    target = component_output.parent / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(text, encoding="utf-8")
+                return {
+                    "commit_id": component_output.name[0].encode().hex().ljust(40, "0")[:40],
+                    "change_id": component_output.name[0].ljust(32, "x"),
+                }
+
+            try:
+                with mock.patch.object(LOOP, "snapshot_component", fake_snapshot):
+                    self.assertEqual(
+                        LOOP.command_snapshot(
+                            argparse.Namespace(
+                                source=str(source),
+                                revision="@-",
+                                component_revision=[("rtp", "a" * 40)],
+                                output=str(output),
+                            )
+                        ),
+                        0,
+                    )
+                manifest = json.loads(
+                    (output / LOOP.SUITE_REVISION_MANIFEST).read_text(encoding="utf-8")
+                )
+                rewrites = manifest["frozen_dep_rewrites"]
+                self.assertTrue(
+                    {
+                        ("netem_test/tests/Cargo.toml", "dev-dependencies", "rtp"),
+                        ("netem_test/tests/Cargo.toml", "dev-dependencies", "mux"),
+                        ("rtp/Cargo.toml", "dependencies", "tokio_udp"),
+                    }
+                    <= {
+                        (record["manifest"], record["table"], record["crate"])
+                        for record in rewrites
+                    }
+                )
+                self.assertEqual(
+                    len(rewrites),
+                    len({
+                        (record["manifest"], record["table"], record["crate"])
+                        for record in rewrites
+                    }),
+                )
+                for record in rewrites:
+                    self.assertTrue(
+                        (output / record["manifest"])
+                        .parent.joinpath(record["to"]["path"])
+                        .resolve()
+                        .is_dir(),
+                        record,
+                    )
+                self.assertEqual(
+                    next(
+                        record
+                        for record in rewrites
+                        if record["crate"] == "rtp"
+                        and record["table"] == "dev-dependencies"
+                    )["from"],
+                    {"git": "https://github.com/Banyc/rtp.git", "tag": "v0.0.90"},
+                )
+                # The frozen build recipe, not the recorded revision, is what
+                # names the sibling now.
+                frozen = (output / "netem_test" / "tests" / "Cargo.toml").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn('rtp = { path = "../../rtp", features = [\n', frozen)
+                self.assertEqual(LOOP.assert_frozen_suite_builds_exported_siblings(output / "netem_test"), [])
+            finally:
+                shutil.rmtree(output, ignore_errors=True)
+
     def test_same_binary_control_calibration_detects_false_changes(self):
         comparison = {
             "verdict": "no_material_change",

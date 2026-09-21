@@ -26,6 +26,24 @@ revision, `component_revision_overrides`, and each component's exact
 archived trees remain revision-identifiable even though they are
 deliberately not mutable JJ workspaces.
 
+A component's committed manifests name its siblings through their published
+git tags, so an exported tree compiled as committed would build the *tagged*
+sibling rather than the sibling exported beside it and a component pin would
+select no code. `snapshot` therefore rewrites each inter-component source
+locator in the frozen manifests to the exported sibling's relative path: the
+tagged sibling is replaced by `path = "../<component>"` (or
+`../netem_test/netem-test` for the harness crate). The component trees stay
+byte-exact exports of their committed revisions; only the frozen build recipe
+changes, and each rewrite is recorded in `suite-revisions.json` under
+`frozen_dep_rewrites` as `{manifest, table, crate, from: {git, tag}, to:
+{path}}`. A dependency edge naming a suite component in a shape the rewrite
+does not model - an unmodelled dependency table, a registry or
+workspace-inherited source, a renamed crate, a fork, or a `[patch]` entry
+onto a git repository - fails the snapshot instead of silently resolving from
+a tag. `run` refuses a frozen suite whose sibling edges still resolve from
+git tags, so a snapshot taken before the rewrite cannot report a comparison
+of the tag against itself.
+
 ## Default hostile command
 
 ```sh
