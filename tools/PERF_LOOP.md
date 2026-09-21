@@ -650,16 +650,17 @@ python3 tools/render_graph.py $TMPDIR/<run-output>/comparison.html \
 
 The tool extracts every `<svg>` panel, asserts that at least one panel was
 produced, asserts that every panel carries series data (a polyline with at
-least two points, a non-empty `<path>`, or a bar rect - an empty chart with
-only axes and a background is rejected), writes each panel as a standalone SVG,
-and prints the panel count. A panel spans from its own opening tag to its own
-close tag: when a close is removed mid-document, the next panel's close must
-not be allowed to terminate it, so the damaged panel is reported as truncated
-instead of being emitted as a concatenation of two charts. **A graph that
-cannot be produced is an error, not
-an empty file to skim past:** with no `<svg>` panel, a truncated or
-concatenated panel, or a missing/empty input, the tool exits non-zero and
-names the problem instead of reporting success.
+least two points, a non-empty `<path>`, or a drawable bar rect - one that is
+not the plot background and carries a positive, numeric width and height - an
+empty chart with only axes and a background is rejected), writes each panel as
+a standalone SVG, and prints the panel count. A panel spans from its own
+opening tag to its own close tag: when a close is removed mid-document, the
+next panel's close must not be allowed to terminate it, so the damaged panel
+is reported as truncated instead of being emitted as a concatenation of two
+charts. **A graph that cannot be produced is an error, not an empty file to
+skim past:** with no `<svg>` panel, a truncated or concatenated panel, or a
+missing/empty input, the tool exits non-zero and names the problem instead of
+reporting success.
 
 Rasterization to PNG needs an external headless browser (Chrome/Chromium). The
 SVG extraction and verification run fully in-repo and do not need one. When

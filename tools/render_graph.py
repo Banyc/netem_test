@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -47,6 +48,7 @@ SVG_CLOSE = "</svg>"
 POLYLINE_RE = re.compile(r"<polyline\b[^>]*\bpoints=\"([^\"]*)\"")
 PATH_RE = re.compile(r"<path\b[^>]*\bd=\"([^\"]*)\"")
 RECT_RE = re.compile(r"<rect\b[^>]*>")
+RECT_DIMENSION_RE = re.compile(r'(?<=\s)(width|height)="([^"]*)"')
 WIDTH_ATTR_RE = re.compile(r'\s+width="[^"]*"')
 HEIGHT_ATTR_RE = re.compile(r'\s+height="[^"]*"')
 
@@ -114,11 +116,32 @@ def _polyline_point_count(points_attr: str) -> int:
     return len([point for point in points_attr.split() if point.strip()])
 
 
+def _rect_is_drawable(rect: str) -> bool:
+    """Return True when this ``<rect>`` is a bar that would paint something.
+
+    A bar renders only when it is not the plot background and carries both a
+    width and a height that are present, numeric, and strictly positive. A
+    geometry-less ``<rect/>`` (no ``x``/``y``/``width``/``height``) paints
+    nothing, and neither does a zero-sized or unparseable one; a malformed
+    length is treated as non-drawable rather than as an error, the way a
+    browser ignores an attribute value it cannot parse.
+    """
+    if "plot-bg" in rect:
+        return False
+    dimensions = dict(RECT_DIMENSION_RE.findall(rect))
+    try:
+        width = float(dimensions["width"])
+        height = float(dimensions["height"])
+    except (KeyError, ValueError):
+        return False
+    return math.isfinite(width) and math.isfinite(height) and width > 0 and height > 0
+
+
 def panel_series_count(panel: str) -> int:
     """Count drawable data series in one SVG panel.
 
     A polyline needs at least two points to draw a segment, a ``<path>`` needs
-    a non-empty ``d``, and a bar is a ``<rect>`` that is not the plot
+    a non-empty ``d``, and a bar is a drawable ``<rect>`` that is not the plot
     background. A panel with only axes, gridlines, and a background therefore
     counts zero series and is treated as an empty chart.
     """
@@ -130,7 +153,7 @@ def panel_series_count(panel: str) -> int:
         if d.strip():
             series += 1
     for rect in RECT_RE.findall(panel):
-        if "plot-bg" not in rect:
+        if _rect_is_drawable(rect):
             series += 1
     return series
 

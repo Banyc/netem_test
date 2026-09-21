@@ -38,6 +38,52 @@ DEGENERATE_POLYLINE_PANEL = (
     '<polyline points="60.0,200.0" fill="none" stroke="#1f77b4"/>'
     "</svg>"
 )
+# A geometry-less <rect/> paints nothing: this panel has an axis but no data.
+GEOMETRYLESS_RECT_PANEL = (
+    '<svg viewBox="0 0 960 300" role="img">'
+    "<rect/>"
+    '<line x1="60" y1="30" x2="60" y2="260" class="grid"/>'
+    "</svg>"
+)
+# Zero-sized rects paint nothing either, whatever fill they carry.
+ZERO_SIZED_RECT_PANEL = (
+    '<svg viewBox="0 0 960 300" role="img">'
+    '<rect x="60" y="30" width="0" height="230" fill="#2563eb"/>'
+    '<rect x="60" y="30" width="850" height="0.0" fill="#2563eb"/>'
+    "</svg>"
+)
+# A size a browser cannot parse is not drawable, and must not crash the tool.
+MALFORMED_SIZE_RECT_PANEL = (
+    '<svg viewBox="0 0 960 300" role="img">'
+    '<rect x="60" y="30" width="wide" height="230" fill="#2563eb"/>'
+    "</svg>"
+)
+# A rect without its own width paints nothing; a stroke-width attribute is not
+# a geometry width and must not be mistaken for one.
+STROKE_WIDTH_ONLY_RECT_PANEL = (
+    '<svg viewBox="0 0 960 300" role="img">'
+    '<rect x="60" y="30" height="230" stroke-width="3" fill="#2563eb"/>'
+    "</svg>"
+)
+# A real bar, with the attribute form rtp_trace_report.svg_histogram emits.
+REAL_BAR_PANEL = (
+    '<svg viewBox="0 0 960 300" role="img">'
+    '<rect x="60" y="30" width="850" height="230" class="plot-bg"/>'
+    '<rect x="60.0" y="100.0" width="18.7" height="130.0" fill="#2563eb"/>'
+    "</svg>"
+)
+# A histogram as the report generates it: a background, one maximum-height
+# bar, and zero-height bars for empty buckets. The maximum-height bar makes
+# the panel data-bearing even though the empty buckets draw nothing.
+REAL_HISTOGRAM_PANEL = (
+    '<svg viewBox="0 0 960 300" role="img">'
+    '<rect x="60" y="30" width="850" height="230" class="plot-bg"/>'
+    '<rect x="60.0" y="30.0" width="16.7" height="230.0" fill="#2563eb"/>'
+    '<rect x="76.7" y="260.0" width="16.7" height="0.0" fill="#2563eb"/>'
+    '<rect x="93.4" y="180.0" width="16.7" height="80.0" fill="#2563eb"/>'
+    '<text x="480" y="295" text-anchor="middle">raw RTT (ms); 48 equal-width bins</text>'
+    "</svg>"
+)
 
 
 # A panel truncated before its close tag (no </svg>).
@@ -156,6 +202,52 @@ class RenderGraphTest(unittest.TestCase):
 
     def test_series_count_is_zero_for_a_one_point_polyline(self):
         self.assertEqual(RENDER.panel_series_count(DEGENERATE_POLYLINE_PANEL), 0)
+
+    def test_series_count_is_zero_for_a_geometryless_rect(self):
+        self.assertEqual(RENDER.panel_series_count(GEOMETRYLESS_RECT_PANEL), 0)
+
+    def test_series_count_is_zero_for_a_zero_sized_rect(self):
+        self.assertEqual(RENDER.panel_series_count(ZERO_SIZED_RECT_PANEL), 0)
+
+    def test_series_count_is_zero_for_an_unparseable_rect_size(self):
+        self.assertEqual(RENDER.panel_series_count(MALFORMED_SIZE_RECT_PANEL), 0)
+
+    def test_series_count_ignores_a_stroke_width_as_a_geometry_width(self):
+        self.assertEqual(RENDER.panel_series_count(STROKE_WIDTH_ONLY_RECT_PANEL), 0)
+
+    def test_series_count_is_positive_for_a_drawable_bar(self):
+        self.assertEqual(RENDER.panel_series_count(REAL_BAR_PANEL), 1)
+
+    def test_series_count_is_positive_for_a_generated_histogram(self):
+        self.assertGreater(RENDER.panel_series_count(REAL_HISTOGRAM_PANEL), 0)
+
+    def test_validate_panel_names_a_geometryless_rect_panel(self):
+        problems = RENDER.validate_panel(1, GEOMETRYLESS_RECT_PANEL)
+        self.assertTrue(any("panel 1" in problem for problem in problems))
+        self.assertTrue(any("empty chart" in problem for problem in problems))
+
+    def test_geometryless_rect_panel_fails_the_whole_render(self):
+        html = self.write_html(
+            healthy_html(1) + f"<section>{GEOMETRYLESS_RECT_PANEL}</section>"
+        )
+        message = self.assertRaisesMessage(
+            RENDER.RenderGraphError,
+            "empty chart",
+            RENDER.render_panels,
+            html,
+            self.root / "out",
+            rasterize=False,
+        )
+        self.assertIn("panel 1", message)
+
+    def test_main_returns_one_and_names_a_geometryless_rect_panel(self):
+        html = self.write_html(f"<html><body>{GEOMETRYLESS_RECT_PANEL}</body></html>")
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = RENDER.main([str(html), "--no-rasterize", "--out", str(self.root / "out")])
+        self.assertEqual(code, 1)
+        self.assertIn("panel 0", stderr.getvalue())
+        self.assertIn("empty chart", stderr.getvalue())
 
     def test_validate_panel_passes_a_real_panel(self):
         self.assertEqual(RENDER.validate_panel(0, HEALTHY_PANEL), [])
