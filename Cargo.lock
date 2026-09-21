@@ -481,10 +481,11 @@ dependencies = [
 [[package]]
 name = "mux"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/mux.git?tag=v0.0.29#127fb82edccb76e07ddd5576a38d0dc428fe54d2"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
- "netem-test",
+ "netem-test 0.1.0 (git+https://github.com/Banyc/netem_test.git?tag=v0.0.1)",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
  "rtp",
  "tokio",
@@ -497,7 +498,18 @@ name = "netem-test"
 version = "0.1.0"
 dependencies = [
  "dfsql",
- "netem-test",
+ "netem-test 0.1.0",
+ "parking_lot 0.12.5",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "netem-test"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/netem_test.git?tag=v0.0.1#b345b927ca87e2b1eec72207eca2cceca18976bc"
+dependencies = [
+ "dfsql",
  "parking_lot 0.12.5",
  "serde",
  "tokio",
@@ -843,6 +855,7 @@ checksum = "1e0e61cd21fbddd85fbd9367b775660a01d388c08a61c6d2824af480b0309bb9"
 [[package]]
 name = "rtp"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/rtp.git?tag=v0.0.90#4bb0481588e94f44568da4eed5dfe06672304b5c"
 dependencies = [
  "async-trait",
  "async_async_io",
@@ -851,7 +864,7 @@ dependencies = [
  "dre",
  "fec",
  "mpudp",
- "netem-test",
+ "netem-test 0.1.0 (git+https://github.com/Banyc/netem_test.git?tag=v0.0.1)",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
  "rand 0.10.2",
  "self_assign",
@@ -862,7 +875,7 @@ dependencies = [
  "tokio-util",
  "tokio_chacha20",
  "tokio_udp",
- "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.17)",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.18)",
 ]
 
 [[package]]
@@ -1006,7 +1019,7 @@ name = "tests"
 version = "0.1.0"
 dependencies = [
  "mux",
- "netem-test",
+ "netem-test 0.1.0",
  "rtp",
  "tokio",
 ]
@@ -1091,7 +1104,7 @@ dependencies = [
 [[package]]
 name = "tokio_udp"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/tokio_udp.git?tag=v0.0.3#bfedecde1d4a7beb45733a20eeed283b525c02d4"
+source = "git+https://github.com/Banyc/tokio_udp.git?tag=v0.0.4#11f6760a6bd75f8fe09a4321824b3af60bb1b256"
 dependencies = [
  "bytes",
  "socket2",
@@ -1142,7 +1155,7 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.17#6457402c0de6f2c042e923c33f75738bca49b3f7"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.18#3e7a53a688e6c996ba87ad25d55386b8c557a8e0"
 dependencies = [
  "bytes",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
