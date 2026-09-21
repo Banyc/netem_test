@@ -78,9 +78,9 @@ raw_netem_pair::netem_pair_raw_udp_latency_is_observable
 
 ## Opt-in manifest
 
-Each line is `target::test_name = tier`. The set must equal the set of
-non-`support` tests reported by `cargo test -p tests --test <target> -- --list
---ignored`. The harness has no opt-in scenarios of its own left to classify:
+Each line is `target::test_name = tier`. The set must equal the set of tests
+reported by `cargo test -p tests --test <target> -- --list --ignored`. The
+harness has no opt-in scenarios of its own left to classify:
 every opt-in scenario it used to host moved to the owning crate's gate
 (`rtp/GATE.md`, `mux/GATE.md`, `rtp_mux/GATE.md`), together with its tier and
 its assertions.
@@ -118,7 +118,7 @@ The direct-body scan only sees assertions in a `perf` scenario's own body, so
 it would miss an assertion moved one call away into a helper. The
 `gate-perf-guard-helpers` block below closes that hole as far as a regex-level
 tool can. For every `perf` scenario the checker builds a crate-local call graph
-(functions in `tests/<target>.rs` and the `support/**` modules it includes; a
+(functions in `tests/<target>.rs` and the kit sources the target imports; a
 call is resolved against the caller file's `use` declarations first, then the
 caller's own module, then a bare-name fallback) and takes the transitive
 closure. Every asserting function the closure reaches must be listed here as

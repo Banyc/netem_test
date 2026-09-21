@@ -31,9 +31,9 @@ call away, into a helper the scenario calls, would escape that scan. The
 checker therefore also builds a crate-local call graph (regex + brace counting,
 no Rust parser) from every `perf` scenario and requires every asserting
 function it can reach to be declared in the `gate-perf-guard-helpers` block,
-with its assertion-token count. The graph follows the `pub use` shim views in
-the scenario crate's `support/**` (harness mode) and the direct kit imports
-into the kit sources they re-export -- the harness kit
+with its assertion-token count. The graph follows each `pub use` re-export view
+and the direct kit imports through them into the kit sources those views
+re-export -- the harness kit
 (`netem-test/src/kit/**`, behind the `test-kit` feature), the rtp layer kit
 (`rtp/src/testkit/**`, behind rtp's `testing` feature), and the mux layer kit
 (`mux/src/testkit/**`, behind mux's `testing` feature) -- so a perf scenario's
@@ -90,8 +90,8 @@ class CrateLayout:
     ``manifest`` the `GATE.md` that records the tiers. ``crates_root`` is the
     shared parent of the sibling crate checkouts (`crates/`), which anchors
     the kit-source identities (`mux/src/testkit/…`) equally in every mode.
-    Harness mode (`is_harness`) additionally enables the `support/**` shim
-    scan and the perf-loop lane-role check.
+    Harness mode (`is_harness`) additionally enables the perf-loop lane-role
+    check.
 
     In per-crate mode the checked crate's own layer kit is read from the
     checked root (`<root>/src/testkit`), never from the crates-root sibling:
@@ -146,10 +146,6 @@ class CrateLayout:
                 dirs.append((kit_dir, prefix))
                 seen_dirs.add(kit_dir)
         return dirs
-
-    @property
-    def support_dir(self) -> Path:
-        return self.dir / "support"
 
     @property
     def kit_dir(self) -> Path:
@@ -286,9 +282,8 @@ def body_asserts(target: str, name: str, bodies: dict[str, str]) -> bool:
 def source_module(path: Path) -> str | None:
     """Rust module path of a source file, or None when it is not scanned.
 
-    Scenario targets keep the historical `""` module name. In harness mode the
-    `tests` crate's `support/**` modules keep their `support`-prefixed names.
-    The harness kit sources (`netem-test/src/kit/**`), the rtp layer kit
+    Scenario targets keep the historical `""` module name. The harness kit
+    sources (`netem-test/src/kit/**`), the rtp layer kit
     sources (`rtp/src/testkit/**`), the mux layer kit sources
     (`mux/src/testkit/**`) and the rtp_mux layer kit sources
     (`rtp_mux/src/testkit/**`) are registered under their crate-qualified
@@ -310,13 +305,6 @@ def source_module(path: Path) -> str | None:
         return None
     if len(parts) == 1:
         return ""
-    if (
-        layout().is_harness
-        and len(parts) == 2
-        and parts[0] == "support"
-    ):
-        stem = parts[1][:-3]
-        return "support" if stem == "mod" else f"support::{stem}"
     return None
 
 
@@ -324,7 +312,7 @@ def source_identity(path: Path) -> str:
     """Stable identity prefix for a scanned source file.
 
     In harness mode files inside the `tests` package keep their historical
-    package-relative identity (`tests/<file>.rs`, `tests/support/<file>.rs`)
+    package-relative identity (`tests/<file>.rs`)
     so recorded manifest entries stay stable. Kit sources are identified
     relative to the shared crates root (`netem-test/src/kit/<file>.rs`,
     `rtp/src/testkit/<file>.rs`, `mux/src/testkit/<file>.rs`,
@@ -461,9 +449,9 @@ def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[
             if not item:
                 continue
             if item == "*" or item.endswith("::*"):
-                # Brace-form globs (`use support::{*, …}`) carry their base
-                # module in `base_module`; the shim views use the non-brace
-                # star form (`pub use netem_test::kit::payload::*`), where the
+                # Brace-form globs (`use view::{*, …}`) carry their base
+                # module in `base_module`; the non-brace star form
+                # (`pub use netem_test::kit::payload::*`), where the
                 # whole item is the glob path. The `::*` suffix is three
                 # characters; a `[:-2]` strip would leave a trailing `:` that
                 # no longer matches any registered module.
@@ -489,19 +477,15 @@ def parse_imports(text: str, current_module: str) -> tuple[dict[str, str], list[
 def target_source_files(target: str) -> list[Path]:
     """Source files compiled into the ``<dir>/<target>.rs`` integration target.
 
-    In harness mode the target includes the crate-local `support/**` modules it
-    declares. The kit source files behind the shim views / direct imports are
-    always scanned: the harness kit (`netem-test/src/kit/**`), the rtp layer
-    kit (`rtp/src/testkit/**`), the mux layer kit (`mux/src/testkit/**`) and
-    the rtp_mux layer kit (`rtp_mux/src/testkit/**`).
+    The kit source files behind the direct imports are always scanned: the
+    harness kit (`netem-test/src/kit/**`), the rtp layer kit
+    (`rtp/src/testkit/**`), the mux layer kit (`mux/src/testkit/**`) and the
+    rtp_mux layer kit (`rtp_mux/src/testkit/**`).
     The kit files belong to other crates but are scanned so the report-only
     perf tier's reach into them stays declared; every crate shares the sibling
     checkout layout, so Cargo assumes exactly that layout.
     """
     files = [layout().dir / f"{target}.rs"]
-    text = files[0].read_text(encoding="utf-8")
-    if layout().is_harness and re.search(r"^mod support;", text, re.M):
-        files.extend(sorted(layout().support_dir.glob("*.rs")))
     for kit_dir, _ in layout().kit_source_dirs():
         files.extend(sorted(kit_dir.glob("*.rs")))
     return [path for path in files if path.exists()]
@@ -519,8 +503,8 @@ class TargetGraph:
 
     Edges are resolved with the caller file's ``use`` declarations before falling
     back to a bare-name match, so same-named functions in different modules are
-    not confused (e.g. ``support::stats::summarize`` vs
-    ``support::contested::summarize``). A call whose target still cannot be
+    not confused (e.g. ``kit::stats::summarize`` vs
+    ``kit::contested::summarize``). A call whose target still cannot be
     narrowed (no local definition, no import, several same-named functions) keeps
     every candidate, so the graph over-approximates rather than dropping a direct
     call. It cannot see an edge created by passing a function by name, through a
@@ -554,11 +538,11 @@ class TargetGraph:
             found = self.by_module_name.get((target_module, name))
             if found:
                 return found
-            # A qualified path into a `pub use` shim view (`support::mux::…`,
-            # `support::rtp::…`) names a module that defines nothing; follow
+            # A qualified path into a `pub use` re-export view (`view::mux::…`)
+            # names a module that defines nothing; follow
             # the view's own re-exports before scattering over every
             # same-named function, so two kits defining the same helper cannot
-            # both be dragged into the closure by one shim call.
+            # both be dragged into the closure by one view call.
             found = self._through_views(target_module, name, set())
             if found:
                 return found
@@ -584,13 +568,13 @@ class TargetGraph:
     def _through_views(self, module: str, name: str, seen: set[str]) -> list[str]:
         """Resolve ``name`` visible in ``module`` through its re-export views.
 
-        A support shim (`support::stats`) is a `pub use` view of a kit module
+        A `pub use` re-export view (`view::stats`) is a view of a kit module
         (`netem_test::kit::stats`) or the mux kit (`mux::testkit::stats`) and
         the kit module itself re-exports from its children
         (`pub use task_scope::…`), so a name imported into a view resolves
         several hops away even though each view defines nothing. The lookup
         follows the view's own imports and globs, cycle-guarded, so the graph
-        does not dead-end at the shim.
+        does not dead-end at the view.
         """
         if module in seen:
             return []
@@ -768,8 +752,9 @@ def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
         if not match:
             continue
         name = match.group(1)
-        # `support` is shared test scaffolding compiled into every target; its
-        # unit tests are not scenarios and are not gated.
+        # A `support` module compiled into a per-crate scenario target is
+        # shared test scaffolding; its unit tests are not scenarios and are not
+        # gated. The harness itself no longer carries one.
         if "::support::" in name or name.startswith("support::"):
             continue
         found.add(f"{target}::{name}")

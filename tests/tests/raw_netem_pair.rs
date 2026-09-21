@@ -14,24 +14,23 @@
 use std::time::Duration;
 
 use netem_test::NetemPair;
-use support::payload::with_timeout;
-use support::presets::{clean, latency};
-use support::stats::combined_stats;
+use netem_test::kit::payload::with_timeout;
+use netem_test::kit::presets::{clean, latency};
+use netem_test::kit::stats::combined_stats;
+use netem_test::kit::{TEST_TASK_QUEUE_BOUND, TestScope, submit_test_task};
 use tokio::net::UdpSocket;
-
-mod support;
 
 /// Sanity check: raw UDP echo through the bidirectional proxy works on a
 /// clean link.
 #[tokio::test(flavor = "multi_thread")]
 async fn netem_pair_raw_udp_echo_clean_link() {
-    let mut tasks = support::TestScope::new();
-    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     let stats = tasks
         .run(async {
             let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let echo_addr = echo.local_addr().unwrap();
-            support::submit_test_task(
+            submit_test_task(
                 &task_tx,
                 Box::pin(async move {
                     let mut buf = [0u8; 64];
@@ -68,13 +67,13 @@ async fn netem_pair_raw_udp_echo_clean_link() {
 /// directions, so roughly `2 * latency`).
 #[tokio::test(flavor = "multi_thread")]
 async fn netem_pair_raw_udp_latency_is_observable() {
-    let mut tasks = support::TestScope::new();
-    let task_tx = tasks.submitter(support::TEST_TASK_QUEUE_BOUND);
+    let mut tasks = TestScope::new();
+    let task_tx = tasks.submitter(TEST_TASK_QUEUE_BOUND);
     tasks
         .run(async {
             let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let echo_addr = echo.local_addr().unwrap();
-            support::submit_test_task(
+            submit_test_task(
                 &task_tx,
                 Box::pin(async move {
                     let mut buf = [0u8; 64];

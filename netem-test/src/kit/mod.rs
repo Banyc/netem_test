@@ -5,9 +5,7 @@
 //!
 //! This is the single home for the shared scaffolding: the application
 //! scenario packages depend on the harness by local path and consume the kit
-//! through `netem_test::kit`; the crate-local `support` modules in their
-//! scenario targets are thin re-export views of this authority and are
-//! removed as the scenarios relocate into their owning crates.
+//! through `netem_test::kit` directly, importing the helpers each target uses.
 //!
 //! The kit exists behind the `test-kit` feature so a plain library build of
 //! the leaf harness does not pull in tokio.

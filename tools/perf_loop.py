@@ -1856,7 +1856,7 @@ def role_fec_configuration(args, role):
 # The FEC data envelope prepended to each data packet; it shifts the
 # packet-keyed netem loss key on the FEC-on arm of the paired-saturated lane.
 # Must match `FEC_DATA_ENVELOPE_BYTES` in
-# `tests/tests/support/presets.rs::fec_paired_saturated_bottleneck`.
+# `netem-test/src/kit/presets.rs::fec_paired_saturated_bottleneck`.
 FEC_DATA_ENVELOPE_BYTES = 10
 
 # Lanes whose netem loss is keyed to the logical RTP sequence and therefore
