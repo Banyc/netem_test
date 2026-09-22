@@ -15,7 +15,7 @@ Freeze the current completed suite without creating additional JJ workspaces:
 The snapshot exports the exact committed tree of every sibling component
 (`jj --no-pager log -r <revision>` resolving the 40-character `commit_id`
 plus `change_id`) into its own directory beneath the output, never the
-mutable working copy. `--source-revision` (default `-`) is resolved
+mutable working copy. `--source-revision` (default `@-`) is resolved
 independently in every component; repeat `--component-revision
 COMPONENT=REVISION` to pin individual components (duplicates and unknown
 component names are rejected). When supplied, `--output` must resolve

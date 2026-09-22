@@ -2646,8 +2646,11 @@ def build_parser():
     snapshot.add_argument(
         "--source-revision",
         dest="revision",
-        default="-",
-        help="jj revision resolved independently in every component (default: -)",
+        default="@-",
+        help=(
+            "jj revision resolved independently in every component "
+            "(default: %(default)s)"
+        ),
     )
     snapshot.add_argument(
         "--component-revision",

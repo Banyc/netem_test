@@ -306,6 +306,36 @@ class PerfLoopTest(unittest.TestCase):
                 finally:
                     shutil.rmtree(reject_output, ignore_errors=True)
 
+    def test_snapshot_source_revision_default_resolves_as_a_jj_revset(self):
+        """Omitting --source-revision must not reach jj as an unparsable revset.
+
+        The documented default is `@-`; a placeholder such as `-` is handed
+        straight to `jj log -r -`, which is a revset syntax error, so the
+        default has to be a revision jj actually accepts.
+        """
+        parser = LOOP.build_parser()
+        args = parser.parse_args(
+            ["snapshot", "--source", "suite/netem_test", "--output", "/safe/snapshot"]
+        )
+        self.assertEqual(args.revision, "@-")
+        if shutil.which("jj") is None:
+            self.skipTest("jj is not installed")
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            init = subprocess.run(
+                ["jj", "--no-pager", "git", "init", str(repo)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(init.returncode, 0, init.stderr)
+            identity = LOOP.jj_identity(repo, args.revision)
+            self.assertEqual(len(identity["commit_id"]), 40)
+            self.assertEqual(len(identity["change_id"]), 32)
+            with self.assertRaisesRegex(ValueError, "Syntax error"):
+                LOOP.jj_identity(repo, "-")
+
     def snapshot_under_test_fixture(self, root, name):
         """A netem_test workspace whose directory is not named after its component."""
         source = root / name
