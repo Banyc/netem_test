@@ -5,6 +5,7 @@ import importlib.util
 import io
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -90,6 +91,26 @@ REAL_HISTOGRAM_PANEL = (
 UNTERMINATED_PANEL = (
     '<svg viewBox="0 0 960 300" role="img">'
     '<polyline points="60.0,200.0 900.0,120.0" fill="none" stroke="#1f77b4"/>'
+)
+
+# A <path> whose `d` is blank draws nothing, exactly like a one-point
+# polyline; the panel therefore carries no series and is an empty chart.
+EMPTY_PATH_PANEL = (
+    '<svg viewBox="0 0 960 300" role="img">'
+    '<rect x="60" y="30" width="850" height="230" class="plot-bg"/>'
+    '<path d="   " fill="none" stroke="#1f77b4"/>'
+    "</svg>"
+)
+
+# A non-PNG blob long enough for the IHDR field reads to succeed.
+NOT_A_PNG = b"X" * 24
+
+# A well-formed-enough PNG whose IHDR declares a 0x0 image.
+DEGENERATE_PNG = (
+    RENDER.PNG_SIGNATURE
+    + b"\x00" * 8
+    + b"\x00\x00\x00\x00"
+    + b"\x00\x00\x00\x00"
 )
 
 
@@ -397,6 +418,54 @@ class RenderGraphTest(unittest.TestCase):
 
     def test_png_dimensions_reads_ihdr(self):
         self.assertEqual(RENDER.png_dimensions(ONE_PIXEL_PNG), (1, 1))
+
+    def test_series_count_is_zero_for_an_empty_path(self):
+        self.assertEqual(RENDER.panel_series_count(EMPTY_PATH_PANEL), 0)
+
+    def test_empty_path_panel_fails_the_whole_render(self):
+        html = self.write_html(EMPTY_PATH_PANEL)
+        self.assertRaisesMessage(
+            RENDER.RenderGraphError,
+            "empty chart",
+            RENDER.render_panels,
+            html,
+            self.root / "out",
+            rasterize=False,
+        )
+
+    def test_png_signature_is_verified_before_accepting_an_image(self):
+        """A non-PNG file of IHDR length must not count as a verified PNG."""
+        self.assertIsNone(RENDER.png_dimensions(NOT_A_PNG))
+        html = self.write_html(healthy_html(1))
+        browser = self.write_browser(FAKE_BROWSER.format(png=NOT_A_PNG))
+        self.assertRaisesMessage(
+            RENDER.RenderGraphError,
+            "did not produce a valid PNG",
+            RENDER.render_panels,
+            html,
+            self.root / "out",
+            rasterize=True,
+            browser=browser,
+        )
+
+    def test_rasterize_rejects_a_degenerate_zero_sized_png(self):
+        html = self.write_html(healthy_html(1))
+        browser = self.write_browser(FAKE_BROWSER.format(png=DEGENERATE_PNG))
+        message = self.assertRaisesMessage(
+            RENDER.RenderGraphError,
+            "degenerate PNG",
+            RENDER.render_panels,
+            html,
+            self.root / "out",
+            rasterize=True,
+            browser=browser,
+        )
+        self.assertIn("0x0", message)
+
+    def test_find_browser_honours_the_env_override(self):
+        override = Path(sys.executable)
+        with mock.patch.dict(os.environ, {RENDER.BROWSER_ENV: str(override)}):
+            self.assertEqual(RENDER.find_browser(), str(override))
 
     # -- CLI ---------------------------------------------------------------
 

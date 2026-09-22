@@ -216,6 +216,43 @@ class TraceReportTest(unittest.TestCase):
             REPORT.render_report(trace_dir, output)
             self.assertIn("packets/s", output.read_text(encoding="utf-8"))
 
+    def test_scheduled_drain_uses_the_final_snapshot_per_direction(self):
+        """Netem counters are cumulative snapshots: the per-direction summary
+        must read the last row, never the first (which is stale or zero)."""
+        rows = [
+            {
+                "direction": "c2s",
+                "scheduled_drain_batches": "3",
+                "scheduled_drain_packets": "12",
+                "scheduled_drain_max_packets": "4",
+            },
+            {
+                "direction": "c2s",
+                "scheduled_drain_batches": "5",
+                "scheduled_drain_packets": "20",
+                "scheduled_drain_max_packets": "7",
+            },
+        ]
+        summary = REPORT.scheduled_drain_summary(rows)
+        self.assertEqual(summary["c2s"]["scheduled_drain_batches"], 5.0)
+        self.assertEqual(summary["c2s"]["scheduled_drain_packets"], 20.0)
+        self.assertEqual(summary["c2s"]["scheduled_drain_max_packets"], 7.0)
+
+    def test_timeline_prefers_trace_elapsed_over_legacy_offset(self):
+        """A row carrying trace_elapsed_us must be plotted at that time, not
+        realigned through the legacy elapsed_us plus the manifest offset."""
+        manifest = {"measurement_start_trace_elapsed_us": "5000000"}
+        self.assertEqual(
+            REPORT.timeline_seconds(
+                {"trace_elapsed_us": "7000000", "elapsed_us": "100000"}, manifest
+            ),
+            7.0,
+        )
+        self.assertEqual(
+            REPORT.timeline_seconds({"elapsed_us": "100000"}, manifest),
+            5.1,
+        )
+
     @staticmethod
     def write_csv(path, *rows):
         if len(rows) == 1 and rows[0] and isinstance(rows[0][0], (list, tuple)):

@@ -2769,6 +2769,160 @@ class PerfLoopTest(unittest.TestCase):
         )
         self.assertEqual(run_with({}, missing=True), 2)
 
+    def test_snapshot_guard_verifies_every_exported_component_against_its_tree(self):
+        """The gate must compare each export to the recorded tree, not skip it.
+
+        `assert_snapshot_matches_sources` composes the recorded revision's
+        identity check with the per-component exported-blob comparison. A guard
+        that resolves identities but never compares an export to its recorded
+        tree would accept a tampered or mis-archived snapshot whenever the
+        identities happen to agree, so the composition itself must be pinned.
+        """
+        source = Path("/tmp/example/netem_test_change")
+        output_root = Path("/tmp/example/out")
+        components = {
+            component: {"commit_id": f"{index + 1:040d}", "change_id": "b" * 32}
+            for index, component in enumerate(LOOP.COMPONENTS)
+        }
+
+        def fake_identity(directory, revision):
+            directory = Path(directory)
+            name = "netem_test" if directory == source else directory.name
+            return components[name]
+
+        verified = []
+
+        def fake_assert(authoritative, export, component, recorded):
+            verified.append((Path(authoritative), Path(export), component, recorded))
+
+        with (
+            mock.patch.object(LOOP, "jj_identity", fake_identity),
+            mock.patch.object(LOOP, "assert_export_matches_revision", fake_assert),
+        ):
+            LOOP.assert_snapshot_matches_sources(
+                source, "netem_test", {}, "@-", components, output_root
+            )
+        self.assertEqual(len(verified), len(LOOP.COMPONENTS))
+        for authoritative, export, component, recorded in verified:
+            expected_source = (
+                source if component == "netem_test" else source.parent / component
+            )
+            self.assertEqual(authoritative, expected_source)
+            self.assertEqual(export, output_root / component)
+            self.assertEqual(recorded, components[component])
+
+    def test_frozen_suite_manifest_requires_exactly_the_suite_components(self):
+        """A manifest naming a different component set must not be trusted.
+
+        `jj_revision` reads component revisions out of a frozen manifest, so a
+        stale manifest that is missing (or carries an extra) component would
+        otherwise pin a revision the export does not correspond to.
+        """
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            component = root / "netem_test"
+            component.mkdir()
+            manifest_path = root / LOOP.SUITE_REVISION_MANIFEST
+            good = {
+                "schema": LOOP.SUITE_REVISION_MANIFEST_SCHEMA,
+                "components": {
+                    name: {"commit_id": "a" * 40, "change_id": "b" * 32}
+                    for name in LOOP.COMPONENTS
+                },
+            }
+            manifest_path.write_text(json.dumps(good), encoding="utf-8")
+            self.assertIsNotNone(LOOP.frozen_suite_manifest(component))
+
+            missing = json.loads(json.dumps(good))
+            del missing["components"]["rtp"]
+            manifest_path.write_text(json.dumps(missing), encoding="utf-8")
+            self.assertIsNone(LOOP.frozen_suite_manifest(component))
+
+            extra = json.loads(json.dumps(good))
+            extra["components"]["stranger"] = {
+                "commit_id": "c" * 40,
+                "change_id": "d" * 32,
+            }
+            manifest_path.write_text(json.dumps(extra), encoding="utf-8")
+            self.assertIsNone(LOOP.frozen_suite_manifest(component))
+
+    def test_safe_output_dir_refuses_an_existing_path(self):
+        """An existing output directory must never be reused.
+
+        `snapshot` writes suite-revisions.json and the comparison tools write
+        comparison.json into the output; reusing an existing directory would
+        mix a previous run's artifacts into the new evidence.
+        """
+        existing = LOOP.SAFE_TEMP_ROOT / f"perf-output-exists-{os.getpid()}"
+        created = LOOP.safe_output_dir(str(existing))
+        try:
+            with self.assertRaises(FileExistsError):
+                LOOP.safe_output_dir(str(existing))
+        finally:
+            shutil.rmtree(created, ignore_errors=True)
+
+    def test_safe_build_dir_requires_the_scratch_root_and_a_target_component(self):
+        """Both target-dir guards must fire independently.
+
+        A path beneath the scratch root but not ending in `target`, and a path
+        ending in `target` but outside the scratch root, each violate a
+        distinct rule; neither guard may be the only reason the other is not
+        reached.
+        """
+        inside_root = LOOP.SAFE_TEMP_ROOT / f"perf-build-wrong-name-{os.getpid()}"
+        try:
+            with self.assertRaisesRegex(ValueError, "final 'target'"):
+                LOOP.safe_build_dir(
+                    str(inside_root / "not-target"), LOOP.SAFE_TEMP_ROOT, "release"
+                )
+        finally:
+            shutil.rmtree(inside_root, ignore_errors=True)
+        outside_root = Path.home() / "code" / "net" / f"perf-build-outside-{os.getpid()}"
+        try:
+            with self.assertRaisesRegex(ValueError, "beneath"):
+                LOOP.safe_build_dir(
+                    str(outside_root / "target"), LOOP.SAFE_TEMP_ROOT, "release"
+                )
+        finally:
+            shutil.rmtree(outside_root, ignore_errors=True)
+
+    def test_cargo_test_executable_requires_the_probe_target_and_a_test_kind(self):
+        """Only a `perf_probe` artifact whose kind includes `test` qualifies.
+
+        Accepting another target's test executable, or a `perf_probe` library
+        that cannot be run as a test, would measure the wrong binary.
+        """
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            def write_log(name, records):
+                path = Path(directory) / name
+                path.write_text(
+                    "\n".join(json.dumps(record) for record in records) + "\n",
+                    encoding="utf-8",
+                )
+                return path
+
+            other_target = write_log(
+                "other-target.log",
+                [
+                    {
+                        "reason": "compiler-artifact",
+                        "target": {"name": "netem_test", "kind": ["test"]},
+                        "filenames": ["/tmp/netem_test-abc123"],
+                    }
+                ],
+            )
+            self.assertIsNone(LOOP.cargo_test_executable(other_target))
+            non_test_kind = write_log(
+                "non-test-kind.log",
+                [
+                    {
+                        "reason": "compiler-artifact",
+                        "target": {"name": "perf_probe", "kind": ["lib"]},
+                        "filenames": ["/tmp/libperf_probe.rlib"],
+                    }
+                ],
+            )
+            self.assertIsNone(LOOP.cargo_test_executable(non_test_kind))
 
 
 if __name__ == "__main__":

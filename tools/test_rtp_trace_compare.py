@@ -1875,6 +1875,62 @@ class TraceCompareTest(unittest.TestCase):
             content = (output / "comparison.html").read_text(encoding="utf-8")
             self.assertIn("<svg", content)
 
+    def test_bulk_mixed_material_deltas_are_mixed_results(self):
+        """A pair set split between material improvement and regression is
+        mixed, never no_material_change, however large the two deltas are."""
+
+        def pair(delta):
+            return {
+                "baseline": {"manifest": {"scenario": "bulk_clean"}},
+                "metrics": {
+                    "goodput_mib_per_second": {"delta_percent": delta},
+                },
+            }
+
+        pairs = [pair(50.0), pair(-50.0)]
+        self.assertEqual(COMPARE.classify_bulk_scenario(pairs), "mixed_results")
+        self.assertEqual(COMPARE.classify(pairs), "mixed_results")
+
+    def test_message_mixed_wire_with_unchanged_tail_is_mixed_results(self):
+        """A wire-byte series that moved both ways is a material tradeoff, not
+        a likely regression, when the latency tail did not move."""
+
+        def pair(wire):
+            return {
+                "baseline": {
+                    "manifest": {"scenario": "mux_over_rtp_hostile_message_latency"}
+                },
+                "metrics": {
+                    "message_latency_p95_ms": {"delta_percent": 1.0},
+                    "message_latency_p99_ms": {"delta_percent": -1.0},
+                    "wire_bytes_per_delivered_byte": {"delta_percent": wire},
+                    "goodput_mib_per_second": {"delta_percent": 0.0},
+                },
+            }
+
+        pairs = [pair(15.0), pair(-15.0)]
+        self.assertEqual(COMPARE.classify(pairs), "mixed_results")
+
+    def test_message_regressed_tail_with_improved_wire_is_mixed_results(self):
+        """A latency-regressed / overhead-improved tradeoff is mixed_results,
+        never a likely regression."""
+
+        def pair(p95, p99, wire):
+            return {
+                "baseline": {
+                    "manifest": {"scenario": "mux_over_rtp_hostile_message_latency"}
+                },
+                "metrics": {
+                    "message_latency_p95_ms": {"delta_percent": p95},
+                    "message_latency_p99_ms": {"delta_percent": p99},
+                    "wire_bytes_per_delivered_byte": {"delta_percent": wire},
+                    "goodput_mib_per_second": {"delta_percent": 0.0},
+                },
+            }
+
+        pairs = [pair(25.0, 30.0, -15.0), pair(20.0, 22.0, -18.0)]
+        self.assertEqual(COMPARE.classify(pairs), "mixed_results")
+
 
 if __name__ == "__main__":
     unittest.main()
