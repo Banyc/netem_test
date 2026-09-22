@@ -252,16 +252,31 @@ straight to the probe server and the trace records zero-valued netem
 placeholders, so artifacts stay schema-compatible while the measurement
 isolates endpoint and host throughput from proxy overhead.
 
-## Impairment-regime profiles (harness presets, not selectable lanes yet)
+## Impairment-regime lanes
 
-Two harness presets exist for the regimes the battery's lanes cannot reach.
-They are defined in `netem-test/src/kit/presets.rs` and measured by
-`tests/tests/lane_regime_coverage.rs`. `perf_loop.LINK_PROFILES` and the
-probe's `NETEM_PERF_LINK_PROFILE` allowlist do **not** carry their names: the
-probe is `rtp_mux`'s target (`rtp_mux/tests/perf_probe.rs`), and those two
-lists are what make a profile selectable by `--link-profile`. Until both carry
-the name, the preset is reachable from any `netem-test` scenario (and from the
-scenario crates that consume the kit) but not from `perf-loop run`.
+Two lanes reach the jitter and thin-link regimes the shaped, zero-jitter lanes
+cannot. They are defined in `netem-test/src/kit/presets.rs`, measured by
+`tests/tests/lane_regime_coverage.rs`, and selectable by `--link-profile`:
+
+```sh
+./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
+--link-profile jittery-short-rtt --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30
+```
+
+```sh
+./tools/perf-loop run --baseline <workspace>/netem_test --candidate . \
+--link-profile high-rtt-low-rate-bottleneck --mss-bytes 8192 \
+--seeds 11,21 --window-seconds 30
+```
+
+The name is carried by `perf_loop.LINK_PROFILES` and by the probe's
+`NETEM_PERF_LINK_PROFILE` allowlist and match arm
+(`rtp_mux/tests/perf_probe.rs`); both are what make a profile selectable by
+`--link-profile`, and a name in one list but not the other is rejected by the
+probe. `high-rtt-low-rate-bottleneck` is a verdict lane;
+`jittery-short-rtt` is diagnostic-only (`gate-lane-roles` in `tests/GATE.md`),
+because its same-binary control is phase-unstable.
 
 ### `jittery_short_rtt_link`
 
@@ -280,8 +295,22 @@ no loss, seed 4. A round trip is triangular on `[10 ms, 70 ms]`, mean 40 ms.
   and on both battery lanes every variant arms, so those lanes cannot tell the
   two apart.
 - **What it cannot see.** Rate-shaped throughput behaviour (no rate is
-  configured), loss recovery (no loss), and any queue-limit regime (35 ms of
-  delay never fills the queue).
+  configured), loss recovery (no loss), any queue-limit regime (35 ms of
+  delay never fills the queue), and a goodput verdict: with no rate the link
+  is host-limited, so the goodput is not phase-stable enough to attribute a
+  delta to a candidate.
+- **Battery-measured shape.** A four-seed same-binary control (30 s window,
+  MSS 8192) measured RTT p50 36.8 ms, p90 54.0 ms, p99 65.1 ms, max 75.7 ms
+  over 21,433 samples; the RTO stayed on the 1 s `MIN_RTO` floor for all
+  4,771 samples (the raw `srtt + 4 * rttvar` is below the floor, so the
+  fast-loss gate's disarm is not visible in the RTO); the sender armed its
+  reorder deadline 132,403 times (`retransmission_reorder_reason`) against
+  14,387 fast-loss arms. The netem `reordered` counter stayed 0: it records
+  the gap-based reorder *feature*, not jitter-induced inversions.
+- **Its control is unstable.** Two independent four-seed controls both returned
+  `mixed_results` (`not_ready`, `within_run_phase_not_stable`), with per-pair
+  goodput moving 11–14 % in one and up to 32 % in the other, so the lane is
+  diagnostic-only.
 - **Why it must leave `rate` unset.** With a rate and no reorder gap, the
   send-time shaper schedules each packet at `max(now + delay, previous_send) +
   serialization`, so the deadlines are monotone and the lane cannot reorder
@@ -301,11 +330,20 @@ seed 4.
   max 14.14 s, `srtt` 11.88 s, max raw RTO **22.18 s**.
 - **What it cannot see.** Jitter or reordering (none configured) and
   production goodput (the link delivers 25 KB/s).
+- **Battery-measured shape.** A four-seed same-binary control (30 s window,
+  MSS 8192) measured RTT p50 19.27 s, p90 30.11 s, p99 32.35 s, max 32.70 s;
+  the RFC 6298 RTO p50 28.09 s and max **40.70 s** (0 of 3,294 samples on the
+  floor), with a 17.14 s maximum packet RTO overdue. This is the
+  tens-of-seconds RTO read from the transport's own trace, not the estimator
+  arithmetic.
+- **Its control is stable.** The same four-seed control was `ready` with
+  `no_material_change`, a 0.006 % median absolute goodput delta, no false
+  material change, and stable phase, so the lane can carry a verdict.
 - **The negative control.** The `controller-fat-pipe` lane fed the identical
   burst kept its round trip at 302 ms and its RTO on the 1 s `MIN_RTO` floor
   for all 40 samples, so the same estimator arithmetic is unobservable there.
 
-### Measured blind spots of the two verdict lanes
+### Measured blind spots of the shaped verdict lanes
 
 On 200 echoes through `controller-fat-pipe` and
 `deterministic-iid-loss-fat-pipe`:

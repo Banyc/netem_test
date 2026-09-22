@@ -51,6 +51,8 @@ LINK_PROFILES = (
     "hostile-fat-pipe",
     "controller-fat-pipe",
     "deterministic-iid-loss-fat-pipe",
+    "jittery-short-rtt",
+    "high-rtt-low-rate-bottleneck",
     "clean",
     "direct",
     "hostile-bottleneck-20ms",
@@ -71,10 +73,14 @@ LINK_PROFILES = (
 # baseline/candidate control tree) returned `not_ready`
 # (`within_run_phase_not_stable`), and the spread was the lane's own stochastic
 # phase variance rather than a candidate effect, so the lane cannot produce a
-# verdict.  The role of every lane is documented in tests/GATE.md
-# (`gate-lane-roles`) and machine-checked by tools/check-gate.py against
-# `lane_classification`, so a lane cannot be mis-declared verdict or diagnostic.
-DIAGNOSTIC_LANES = ("hostile",)
+# verdict.  `jittery-short-rtt` is diagnostic-only for the same reason: its
+# four-seed same-binary control returned `mixed_results` (`not_ready`,
+# `within_run_phase_not_stable`) with three of four pairs moving 11-14 %, so the
+# unshaped lane's host-limited goodput cannot be attributed to a candidate.  The
+# role of every lane is documented in tests/GATE.md (`gate-lane-roles`) and
+# machine-checked by tools/check-gate.py against `lane_classification`, so a
+# lane cannot be mis-declared verdict or diagnostic.
+DIAGNOSTIC_LANES = ("hostile", "jittery-short-rtt")
 
 
 def lane_classification(profile):

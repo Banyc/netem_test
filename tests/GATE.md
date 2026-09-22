@@ -173,6 +173,21 @@ was the lane's own stochastic first/second-half goodput phase variance, not a
 candidate effect. Its numbers stay useful as a diagnostic, but it cannot
 attribute a delta to a candidate, so it must never be read as a verdict.
 
+Two lanes reach impairment regimes the shaped, zero-jitter lanes cannot:
+`jittery-short-rtt` (unshaped, 20 ms one-way, ±15 ms uniform jitter) is the
+only lane that reorders, so its `4 * rttvar` can exceed `srtt / 4` and disarm
+the fast-loss gate, and `high-rtt-low-rate-bottleneck` (200 kbit/s, 400 ms
+one-way, 128-packet queue) can hold a round trip long enough for RFC 6298's
+`srtt + 4 * rttvar` to reach the tens of seconds. The jitter lane is
+**diagnostic-only**: its four-seed same-binary control returned `mixed_results`
+(`not_ready`, `within_run_phase_not_stable`, three of four pairs moving 11–14 %)
+because an unshaped lane's goodput is host-limited rather than link-limited, so
+a goodput delta cannot be attributed to a candidate. The thin-link lane is a
+verdict lane: its four-seed same-binary control was `ready` with
+`no_material_change`, a 0.006 % median absolute goodput delta, and stable
+phase. Each lane's measured shape and blind spots are recorded in
+`tools/PERF_LOOP.md`.
+
 The `gate-lane-roles` block below records every lane's role. It is
 machine-checked by `tools/check-gate.py` against `perf_loop.lane_classification`
 — the same function that stamps `link_role` into `run.json` — so a lane cannot
@@ -194,6 +209,8 @@ lossy-400kib = verdict
 hostile-fat-pipe = verdict
 controller-fat-pipe = verdict
 deterministic-iid-loss-fat-pipe = verdict
+jittery-short-rtt = diagnostic
+high-rtt-low-rate-bottleneck = verdict
 clean = verdict
 direct = verdict
 hostile-bottleneck-20ms = verdict
