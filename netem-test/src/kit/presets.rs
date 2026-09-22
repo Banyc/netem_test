@@ -114,6 +114,70 @@ pub fn deterministic_iid_loss_fat_pipe() -> NetemConfig {
     }
 }
 
+/// A short-RTT, jitter-dominated link: 20 ms one-way with +/-15 ms of uniform
+/// per-packet jitter, no rate shaping, no loss, and a 1024-packet queue
+/// (kernel `sch_netem`'s default).
+///
+/// The lane exists because jitter is the one impairment no other preset can
+/// realize. Every other lane either configures zero jitter
+/// ([`controller_fat_pipe`], [`deterministic_iid_loss_fat_pipe`], the clean and
+/// `*bottleneck` lanes), or configures a rate: with a rate and no reorder gap,
+/// the send-time shaper schedules each packet at `max(now + delay,
+/// previous_send) + serialization`, so a packet can never leave before the one
+/// ahead of it and the sampled jitter is realized only as a running maximum,
+/// never as reordering. A zero-jitter lane has monotonic deadlines too. So on
+/// every lane that configures a rate *or* zero jitter the delivered order equals
+/// the sent order and the receiver's RTT variance is whatever queue noise the
+/// endpoint itself creates; this lane is the only one that reorders.
+///
+/// Shape: unshaped, 20 ms one-way, +/-15 ms uniform jitter, 1024-packet queue,
+/// no loss or duplication. `sample_delay` spreads uniformly over
+/// `latency +/- jitter`, so one-way delay is uniform on `[5 ms, 35 ms]` and a
+/// round trip is triangular on `[10 ms, 70 ms]`, mean 40 ms. Seeded, so the
+/// delay stream is reproducible: one `CorRng` value per delayed packet from
+/// the Tausworthe generator seeded with [`NetemConfig::seed`].
+pub fn jittery_short_rtt_link() -> NetemConfig {
+    NetemConfig {
+        latency: Duration::from_millis(20),
+        jitter: Duration::from_millis(15),
+        queue_limit_pkts: 1024,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
+/// A high-RTT, thin-link bottleneck: 200 kbit/s, 400 ms one-way delay, and a
+/// 128-packet queue, with no loss, duplication, jitter, or reordering.
+///
+/// The rate is far below anything an endpoint can send, so the sender's whole
+/// excess builds as a standing queue in the delay heap. The arithmetic, for
+/// the 8192-byte datagrams the bulk probe uses: `serialization_delay(8192,
+/// 200_000) = 327.68 ms`, so a full 128-packet queue is `128 * 327.68 ms =
+/// 41.9 s` on top of the 800 ms round-trip floor. Only one direction's
+/// serialization is realized: the c2s shaper spaces the datagrams at exactly
+/// that step, so the return path never builds a backlog of its own. RFC
+/// 6298's `srtt + 4 * rttvar` therefore reaches tens of seconds from the link
+/// alone, with no host pause and no lost packet.
+///
+/// On the 100 Mbit/s fat pipes the same 8192-byte datagram serializes in
+/// 0.66 ms, and a sender that cannot out-run the link never builds the
+/// backlog: their measured round trip stays within a millisecond of the 300 ms
+/// floor. That is why an RTO inflation of tens of seconds is not measurable
+/// there.
+///
+/// The send-time shaper only delays packets (`link_free_at` is a serialization
+/// clock), so this lane's drops come from the `queue_limit_pkts` tail-drop,
+/// never from the shaper. Seeded.
+pub fn high_rtt_low_rate_bottleneck() -> NetemConfig {
+    NetemConfig {
+        rate: 200 * 1000,
+        latency: Duration::from_millis(400),
+        queue_limit_pkts: 128,
+        seed: 4,
+        ..NetemConfig::default()
+    }
+}
+
 /// Two-state Gilbert-Elliott loss model on top of the four-state `sch_netem`
 /// representation.
 ///
@@ -316,4 +380,147 @@ pub fn hostile_periodic_bottleneck_100ms() -> NetemConfig {
 
 pub fn hostile_periodic_bottleneck_300ms() -> NetemConfig {
     hostile_periodic_bottleneck_at(Duration::from_millis(300))
+}
+
+/// The default [`NetemConfig::seed`], spelled out so a change to the default
+/// cannot silently re-seed a preset that leaves it unset.
+#[cfg(test)]
+const DEFAULT_SEED: u64 = 0xC0FF_EEBE_EFC0_FFEE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shaper::serialization_delay;
+
+    /// The battery lanes are the regression baseline for every recorded
+    /// verdict, so their impairment parameters are frozen field by field: an
+    /// edit that moves one of these shapes fails here instead of quietly
+    /// invalidating the historical comparisons it is measured against.
+    #[test]
+    fn battery_lane_shapes_are_frozen() {
+        let clean = clean();
+        assert_eq!(clean.rate, 0, "clean lane must stay unshaped");
+        assert_eq!(clean.latency, Duration::ZERO);
+        assert_eq!(clean.jitter, Duration::ZERO);
+        assert_eq!(clean.queue_limit_pkts, 0);
+        assert_eq!(clean.loss, 0);
+        assert_eq!(clean.seed, DEFAULT_SEED);
+
+        for (name, config) in [
+            ("controller-fat-pipe", controller_fat_pipe()),
+            (
+                "deterministic-iid-loss-fat-pipe",
+                deterministic_iid_loss_fat_pipe(),
+            ),
+        ] {
+            assert_eq!(config.rate, 100 * 1000 * 1000, "{name}: rate");
+            assert_eq!(
+                config.latency,
+                Duration::from_millis(150),
+                "{name}: latency"
+            );
+            assert_eq!(config.jitter, Duration::ZERO, "{name}: jitter");
+            assert_eq!(config.queue_limit_pkts, 16 * 1024, "{name}: queue limit");
+            assert_eq!(config.reorder, 0, "{name}: reorder");
+            assert_eq!(config.reorder_gap_pkts, 0, "{name}: reorder gap");
+        }
+
+        for (name, config, seed) in [
+            ("hostile-fat-pipe", hostile_fat_pipe(), 4u64),
+            ("lossy-400kib", lossy_400kib_per_sec(), 4u64),
+            ("hostile", hostile_real_link(), 4u64),
+        ] {
+            assert_eq!(config.seed, seed, "{name}: seed");
+        }
+
+        let hostile_fat_pipe = hostile_fat_pipe();
+        assert_eq!(hostile_fat_pipe.rate, 100 * 1000 * 1000);
+        assert_eq!(hostile_fat_pipe.latency, Duration::from_millis(150));
+        assert_eq!(hostile_fat_pipe.jitter, Duration::from_millis(30));
+        assert_eq!(hostile_fat_pipe.queue_limit_pkts, 16 * 1024);
+        assert_eq!(
+            hostile_fat_pipe.loss_model,
+            gilbert_elliott_loss(2.0, 4.0),
+            "hostile-fat-pipe must keep the 2 % / 4-packet Gilbert-Elliott model"
+        );
+
+        let lossy = lossy_400kib_per_sec();
+        assert_eq!(lossy.rate, 400 * 1024 * 8);
+        assert_eq!(lossy.latency, Duration::from_millis(5));
+        assert_eq!(lossy.jitter, Duration::from_millis(2));
+        assert_eq!(lossy.loss, u32::MAX / 100);
+
+        let hostile = hostile_real_link();
+        assert_eq!(hostile.rate, 0);
+        assert_eq!(hostile.latency, Duration::from_millis(300));
+        assert_eq!(hostile.jitter, Duration::from_millis(500));
+        assert_eq!(hostile.loss, u32::MAX / 100 * 15);
+    }
+
+    /// The jitter lane is a controlled contrast against the battery lanes:
+    /// the only delay property that moves is the jitter, and it is the only
+    /// lane that leaves `rate` unset, because a configured rate's send-time
+    /// shaper would monotone the deadlines and realize the jitter as a running
+    /// maximum instead of reordering.
+    #[test]
+    fn jittery_short_rtt_lane_is_unshaped_and_only_the_delay_shape_moves() {
+        let lane = jittery_short_rtt_link();
+        let controller = controller_fat_pipe();
+        assert_eq!(lane.rate, 0, "a configured rate would suppress reordering");
+        assert_eq!(lane.loss, controller.loss);
+        assert_eq!(lane.loss_model, controller.loss_model);
+        assert_eq!(lane.reorder_gap_pkts, controller.reorder_gap_pkts);
+
+        assert_eq!(lane.latency, Duration::from_millis(20));
+        assert_eq!(lane.jitter, Duration::from_millis(15));
+        assert_ne!(lane.jitter, Duration::ZERO, "the lane must jitter");
+        // `sample_delay` spreads uniformly over `latency +/- jitter`, so the
+        // sampled one-way delay spans exactly this window.
+        assert_eq!(lane.latency - lane.jitter, Duration::from_millis(5));
+        assert_eq!(lane.latency + lane.jitter, Duration::from_millis(35));
+        assert_eq!(
+            lane.queue_limit_pkts, 1024,
+            "the lane must stay bounded at the kernel's default queue"
+        );
+        assert_eq!(lane.seed, 4, "the lane must be seeded explicitly");
+    }
+
+    /// The low-rate lane is only meaningful if its link can hold a round trip
+    /// long enough to inflate RFC 6298's `srtt + 4 * rttvar` into the tens of
+    /// seconds. That is a property of the configured rate and queue, so it is
+    /// checked here against the same serialization arithmetic the link uses.
+    #[test]
+    fn high_rtt_low_rate_lane_reaches_a_tens_of_seconds_round_trip() {
+        const BULK_MSS_BYTES: usize = 8192;
+        let lane = high_rtt_low_rate_bottleneck();
+        assert_eq!(lane.rate, 200 * 1000);
+        assert_eq!(lane.latency, Duration::from_millis(400));
+        assert_eq!(lane.queue_limit_pkts, 128);
+        assert_eq!(
+            lane.jitter,
+            Duration::ZERO,
+            "the regime lane is deterministic"
+        );
+        assert_eq!(lane.loss, 0);
+        assert_eq!(lane.seed, 4);
+
+        let per_datagram =
+            serialization_delay(BULK_MSS_BYTES, lane.rate).expect("a configured rate serializes");
+        assert_eq!(per_datagram, Duration::from_nanos(327_680_000));
+        // One serialization per queued datagram: the c2s shaper spaces the
+        // datagrams at exactly that step, so the return path never builds a
+        // backlog of its own.
+        let reachable = lane.latency * 2 + per_datagram * lane.queue_limit_pkts as u32;
+        assert!(
+            reachable >= Duration::from_secs(40),
+            "a full queue must hold a tens-of-seconds round trip, got {reachable:?}"
+        );
+
+        // The contrast is the serialization step, not the queue count: at 100
+        // Mbit/s the same datagram serializes 500x faster, so a sender that
+        // the link cannot out-run never grows this backlog at all.
+        let fat_pipe_step = serialization_delay(BULK_MSS_BYTES, 100 * 1000 * 1000)
+            .expect("a configured rate serializes");
+        assert_eq!(per_datagram, fat_pipe_step * 500);
+    }
 }

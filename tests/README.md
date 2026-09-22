@@ -4,7 +4,9 @@ This package (`tests`) is the **impairment harness**, not the owner of any
 application performance contract. It consumes the `netem-test` instrument (the
 kernel-faithful `NetemPair`/`NetemConfig` impairment plumbing and the
 `test-kit` generic helpers) and hosts the instrument's own conformance suite
-(`netem_scenarios`, `raw_netem_pair`).
+(`netem_scenarios`, `raw_netem_pair`) plus the impairment-regime suite
+(`lane_regime_coverage`) that measures the jitter and thin-link presets the
+perf battery's lanes cannot reach.
 
 Every application scenario relocated out of this package into the crate whose
 code it exercises, together with its tier, its assertions, and its gate

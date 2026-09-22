@@ -13,6 +13,9 @@ instrument whose probe and lanes are hosted by the crates they measure.
 - `tests/` — the harness's own conformance suite (`netem_scenarios`,
   `raw_netem_pair`): every impairment knob fires, the four-state loss model
   matches `sch_netem`, and the pair echoes, delays, and reports. The
+  impairment-regime suite (`lane_regime_coverage`) measures the two presets
+  that reach the jitter and thin-link regimes the perf battery's lanes cannot,
+  and asserts that each separates a decision those lanes cannot separate. The
   application scenarios that consume `rtp`, `mux` or `rtp_mux` live in those
   crates' own test targets, where the code they exercise lives; the harness
   depends on none of them.

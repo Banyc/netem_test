@@ -56,8 +56,12 @@ skim past (see `tools/PERF_LOOP.md`, "Rendered graph evidence (mandatory)").
 `netem_scenarios` and `raw_netem_pair` are the instrument's own conformance
 suite: every impairment knob fires, the four-state loss model matches the
 `sch_netem` semantics, and the pair echoes, applies observable latency, and
-reports its counters. Nothing else lives here — the layer scenarios are in the
-crates that own the code they exercise.
+reports its counters. `lane_regime_coverage` is the impairment-regime suite: it
+measures the two presets (`jittery_short_rtt_link`,
+`high_rtt_low_rate_bottleneck`) that reach the jitter and thin-link regimes the
+perf battery's lanes cannot, and asserts that each lane separates a decision the
+battery lanes cannot separate. Nothing else lives here — the layer scenarios are
+in the crates that own the code they exercise.
 
 The `gate-default-required` block names the asserting scenarios that must stay
 in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
@@ -74,18 +78,17 @@ netem_scenarios::netem_drops_all_with_max_random_loss
 netem_scenarios::netem_snapshot_reports_queue_and_stats
 raw_netem_pair::netem_pair_raw_udp_echo_clean_link
 raw_netem_pair::netem_pair_raw_udp_latency_is_observable
+lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot
+lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
 ```
 
 ## Opt-in manifest
 
 Each line is `target::test_name = tier`. The set must equal the set of tests
-reported by `cargo test -p tests --test <target> -- --list --ignored`. The
-harness has no opt-in scenarios of its own left to classify:
-every opt-in scenario it used to host moved to the owning crate's gate
-(`rtp/GATE.md`, `mux/GATE.md`, `rtp_mux/GATE.md`), together with its tier and
-its assertions.
+reported by `cargo test -p tests --test <target> -- --list --ignored`.
 
 ```gate-manifest
+lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot = standard
 ```
 
 The `gate-asserting` block below records the report-only/asserting split. It
@@ -110,6 +113,9 @@ netem_scenarios::netem_drops_all_with_max_random_loss
 netem_scenarios::netem_snapshot_reports_queue_and_stats
 raw_netem_pair::netem_pair_raw_udp_echo_clean_link
 raw_netem_pair::netem_pair_raw_udp_latency_is_observable
+lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot
+lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
+lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot
 ```
 
 ## Perf-tier reach into asserting helpers

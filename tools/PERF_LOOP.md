@@ -252,6 +252,72 @@ straight to the probe server and the trace records zero-valued netem
 placeholders, so artifacts stay schema-compatible while the measurement
 isolates endpoint and host throughput from proxy overhead.
 
+## Impairment-regime profiles (harness presets, not selectable lanes yet)
+
+Two harness presets exist for the regimes the battery's lanes cannot reach.
+They are defined in `netem-test/src/kit/presets.rs` and measured by
+`tests/tests/lane_regime_coverage.rs`. `perf_loop.LINK_PROFILES` and the
+probe's `NETEM_PERF_LINK_PROFILE` allowlist do **not** carry their names: the
+probe is `rtp_mux`'s target (`rtp_mux/tests/perf_probe.rs`), and those two
+lists are what make a profile selectable by `--link-profile`. Until both carry
+the name, the preset is reachable from any `netem-test` scenario (and from the
+scenario crates that consume the kit) but not from `perf-loop run`.
+
+### `jittery_short_rtt_link`
+
+Unshaped, 20 ms one-way, +/-15 ms uniform per-packet jitter, 1024-packet queue,
+no loss, seed 4. A round trip is triangular on `[10 ms, 70 ms]`, mean 40 ms.
+
+- **What it can see.** The reorder-vs-fast-loss decision, and the jitter half
+  of `rtp`'s fast-loss arming gate (`RtxTimer::fast_loss_armed`, i.e.
+  `4 * rttvar < srtt / 4`). Measured on 200 echoes: 141-145 inverted
+  deliveries, `rttvar` 7.4-8.7 ms, `4 * rttvar` 29.7-34.8 ms against
+  `srtt / 4` 12.4-12.5 ms, so the gate is **unarmed** — a verdict the two
+  battery lanes cannot produce, since both measured `rttvar` below 0.5 ms and
+  `4 * rttvar` below 2.0 ms against `srtt / 4` above 75 ms. The same samples
+  also separate a gate that drops the RFC 6298 `K` factor (`rttvar <
+  srtt / 4`): that variant arms here (7.4 < 12.4) while the real gate does not,
+  and on both battery lanes every variant arms, so those lanes cannot tell the
+  two apart.
+- **What it cannot see.** Rate-shaped throughput behaviour (no rate is
+  configured), loss recovery (no loss), and any queue-limit regime (35 ms of
+  delay never fills the queue).
+- **Why it must leave `rate` unset.** With a rate and no reorder gap, the
+  send-time shaper schedules each packet at `max(now + delay, previous_send) +
+  serialization`, so the deadlines are monotone and the lane cannot reorder
+  however much jitter it configures. The same delay sampling with a 100 Mbit/s
+  rate measured 0 inverted deliveries and a 6.5 ms interquartile round-trip
+  spread, against 141-145 inversions and 15-17 ms unshaped.
+
+### `high_rtt_low_rate_bottleneck`
+
+200 kbit/s, 400 ms one-way, 128-packet queue, no loss, jitter, or reordering,
+seed 4.
+
+- **What it can see.** RFC 6298 RTO growth into the tens of seconds from the
+  link alone. `serialization_delay(8192, 200_000) = 327.68 ms` per queued
+  datagram, so a full queue holds `128 * 327.68 ms = 41.9 s` on top of the
+  800 ms round-trip floor. Measured on a 40-datagram burst: RTT p50 7.96 s,
+  max 14.14 s, `srtt` 11.88 s, max raw RTO **22.18 s**.
+- **What it cannot see.** Jitter or reordering (none configured) and
+  production goodput (the link delivers 25 KB/s).
+- **The negative control.** The `controller-fat-pipe` lane fed the identical
+  burst kept its round trip at 302 ms and its RTO on the 1 s `MIN_RTO` floor
+  for all 40 samples, so the same estimator arithmetic is unobservable there.
+
+### Measured blind spots of the two verdict lanes
+
+On 200 echoes through `controller-fat-pipe` and
+`deterministic-iid-loss-fat-pipe`:
+
+- neither lane reordered (0 inverted deliveries of 200) — with zero jitter the
+  deadlines are monotonic, and a configured rate's shaper would monotone them
+  anyway;
+- neither lane's round trip left the 300 ms floor (max 301.6 ms and 304.0 ms);
+- the whole `srtt + 4 * rttvar` expression stayed below the 1 s `MIN_RTO`
+  floor (max raw RTO 902 ms), so every RTO sample those lanes can produce is
+  the floor itself: the expression is unobservable there.
+
 ## Frozen executables and counterbalanced order
 
 Both roles are prebuilt once, baseline before candidate
