@@ -178,9 +178,10 @@ impl<T: UdpTransport + ?Sized> UdpTransport for Arc<T> {
 ///
 /// Receive timeouts are serialized through a [`ParkingMutex`]-protected
 /// [`ReceiveTimeoutState`] so that repeated receives with the already-
-/// installed timeout perform no syscall, and temporary timeouts used by
-/// [`recv_from_timeout`](UdpTransport::recv_from_timeout) restore the
-/// configured default afterwards.
+/// installed timeout perform no syscall. Every receive entry point installs
+/// the timeout *it* needs before its own `recv`, so a temporary timeout used
+/// by [`recv_from_timeout`](UdpTransport::recv_from_timeout) stays installed
+/// until the next receive asks for something else; there is no restore call.
 #[derive(Debug)]
 pub struct StdUdpTransport {
     sock: std::net::UdpSocket,
@@ -272,14 +273,16 @@ impl UdpTransport for StdUdpTransport {
     ) -> io::Result<(usize, SocketAddr)> {
         let mut state = self.receive_timeout.lock();
         self.install_receive_timeout(&mut state, Some(timeout))?;
-        let res = if let Some(peer) = self.connected_peer.get().copied() {
+        // The requested timeout stays installed: `recv_from` (and the next
+        // `recv_from_timeout`) installs whatever it needs before its own
+        // `recv`, so restoring `state.configured` here would only spend an
+        // extra `setsockopt` on every scheduled receive. The installed value
+        // at each `recv` is unchanged either way.
+        if let Some(peer) = self.connected_peer.get().copied() {
             self.sock.recv(buf).map(|len| (len, peer))
         } else {
             self.sock.recv_from(buf)
-        };
-        let configured = state.configured;
-        self.install_receive_timeout(&mut state, configured)?;
-        res
+        }
     }
 
     fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
@@ -3863,10 +3866,343 @@ mod tests {
         drop(heap_sent);
     }
 
-    /// The standard transport must skip redundant read-timeout installs and
-    /// restore the configured default after a temporary timeout receive.
+    /// The seeded [`RndState`] advanced by exactly `draws` draws.
+    fn rng_after(seed: u64, draws: usize) -> RndState {
+        let mut state = RndState::seed(seed);
+        for _ in 0..draws {
+            state.next_u32();
+        }
+        state
+    }
+
+    fn assert_rng_advanced_by(actual: RndState, seed: u64, draws: usize, what: &str) {
+        let expected = rng_after(seed, draws);
+        assert_eq!(
+            (actual.s1, actual.s2, actual.s3, actual.s4),
+            (expected.s1, expected.s2, expected.s3, expected.s4),
+            "{what}: the packet must consume exactly {draws} PRNG draw(s)"
+        );
+    }
+
+    /// First draw of `seed` as the uncorrelated threshold this pipeline
+    /// compares against (`*_corr == 0` makes `CorRng::next` return
+    /// `RndState::next_u32()` unchanged).
+    fn first_draw(seed: u64) -> u32 {
+        RndState::seed(seed).next_u32()
+    }
+
+    /// The kernel comparisons are inclusive: `reorder >= get_crandom()`,
+    /// `duplicate >= get_crandom()` and `loss >= get_crandom()` all fire when
+    /// the threshold *equals* the draw. A strict `>` would silently drop one
+    /// boundary packet of every 2^32, which no ordinary seeded scenario can
+    /// hope to hit — so pin each boundary directly, with a below-boundary
+    /// control proving the assertion is not vacuous.
     #[test]
-    fn std_udp_transport_skips_redundant_timeout_installs_and_restores_default() {
+    fn inclusive_thresholds_fire_at_the_exact_draw() {
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234));
+        // Any seed whose first draw is non-zero works: `threshold - 1` must be
+        // a distinct, smaller value for the below-boundary control.
+        let seed = (1u64..)
+            .find(|seed| first_draw(*seed) != 0)
+            .expect("a seed with a non-zero first draw exists");
+        let exact = first_draw(seed);
+
+        // ── reorder: `reorder >= draw` reorders the packet immediately ──
+        let reorder_config = NetemConfig {
+            reorder: exact,
+            reorder_gap_pkts: 1,
+            seed,
+            ..NetemConfig::default()
+        };
+        let (runner, sent) = one_packet_runner(b"at-boundary", from, reorder_config);
+        assert_rng_advanced_by(runner.pipeline.rng, seed, 1, "reorder == draw");
+        assert_eq!(runner.pipeline.stats.snapshot().reordered, 1);
+        assert_eq!(runner.pipeline.stats.snapshot().delayed, 0);
+        assert!(sent.sent.lock().unwrap().is_empty());
+        drop(sent);
+        let below_config = NetemConfig {
+            reorder: exact - 1,
+            reorder_gap_pkts: 1,
+            seed,
+            ..NetemConfig::default()
+        };
+        let (below, sent) = one_packet_runner(b"below-boundary", from, below_config);
+        assert_rng_advanced_by(below.pipeline.rng, seed, 1, "reorder < draw");
+        assert_eq!(below.pipeline.stats.snapshot().reordered, 0);
+        assert_eq!(below.pipeline.stats.snapshot().delayed, 0);
+        drop(sent);
+
+        // ── duplicate: `duplicate >= draw` duplicates the packet ──
+        let dup_config = NetemConfig {
+            duplicate: exact,
+            seed,
+            ..NetemConfig::default()
+        };
+        let (runner, sent) = one_packet_runner(b"at-boundary", from, dup_config);
+        assert_rng_advanced_by(runner.pipeline.rng, seed, 1, "duplicate == draw");
+        assert_eq!(runner.pipeline.stats.snapshot().duplicated, 1);
+        assert_eq!(runner.pipeline.stats.snapshot().dropped, 0);
+        drop(sent);
+        let below_config = NetemConfig {
+            duplicate: exact - 1,
+            seed,
+            ..NetemConfig::default()
+        };
+        let (below, sent) = one_packet_runner(b"below-boundary", from, below_config);
+        assert_rng_advanced_by(below.pipeline.rng, seed, 1, "duplicate < draw");
+        assert_eq!(below.pipeline.stats.snapshot().duplicated, 0);
+        drop(sent);
+
+        // ── loss: `loss >= draw` drops the packet ──
+        let loss_config = NetemConfig {
+            loss: exact,
+            loss_model: LossModel::Random,
+            seed,
+            ..NetemConfig::default()
+        };
+        let (runner, sent) = one_packet_runner(b"at-boundary", from, loss_config);
+        assert_rng_advanced_by(runner.pipeline.rng, seed, 1, "loss == draw");
+        assert_eq!(runner.pipeline.stats.snapshot().dropped, 1);
+        assert_eq!(runner.pipeline.stats.snapshot().duplicated, 0);
+        drop(sent);
+        let below_config = NetemConfig {
+            loss: exact - 1,
+            loss_model: LossModel::Random,
+            seed,
+            ..NetemConfig::default()
+        };
+        let (below, sent) = one_packet_runner(b"below-boundary", from, below_config);
+        assert_rng_advanced_by(below.pipeline.rng, seed, 1, "loss < draw");
+        assert_eq!(below.pipeline.stats.snapshot().dropped, 0);
+        drop(sent);
+    }
+
+    /// Compact, deterministic rendering of one datagram's counter deltas: only
+    /// the counters that moved are printed, in a fixed field order.
+    fn counter_delta(before: Counters, after: Counters) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        macro_rules! deltas {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if after.$field != before.$field {
+                        parts.push(format!(
+                            "{}={}",
+                            stringify!($field),
+                            after.$field.wrapping_sub(before.$field)
+                        ));
+                    }
+                )+
+            };
+        }
+        deltas!(
+            delayed,
+            dropped,
+            duplicated,
+            reordered,
+            rate_limited,
+            forwarded,
+            received,
+            forwarded_bytes,
+            received_bytes,
+            overflow_dropped,
+            scheduled_drain_batches,
+            scheduled_drain_packets,
+            scheduled_drain_max_packets,
+        );
+        if parts.is_empty() {
+            "-".to_owned()
+        } else {
+            parts.join(",")
+        }
+    }
+
+    /// The recorded wire-visible result of one datagram fed through the scripted
+    /// replay: every counter that moved, plus the payloads the runner put on
+    /// the wire (tag and length) in send order.
+    fn decision_replay_recording() -> String {
+        // Every impairment the harness implements is armed at once: latency and
+        // jitter (delay draws + delay correlation), random loss and duplication
+        // (draw order), reorder-gap scheduling, send-time rate shaping, a queue
+        // limit (tail drop) and the deterministic max-datagram-size filter. One
+        // stray or missing PRNG draw, one flipped comparison, or one moved
+        // queue-eviction rule changes this recording.
+        let config = NetemConfig {
+            latency: Duration::from_millis(10),
+            jitter: Duration::from_millis(3),
+            delay_corr: 0x4000_0000,
+            loss: 0x1800_0000,
+            loss_corr: 0x2000_0000,
+            duplicate: 0x3000_0000,
+            dup_corr: 0x0400_0000,
+            reorder: 0x3000_0000,
+            reorder_corr: 0x1000_0000,
+            reorder_gap_pkts: 3,
+            loss_model: LossModel::Random,
+            rate: 8_000_000,
+            seed: 0xA5A5_1234,
+            queue_limit_pkts: 6,
+            max_datagram_size: 64,
+        };
+        assert!(
+            !config.latency.is_zero()
+                && !config.jitter.is_zero()
+                && config.loss != 0
+                && config.duplicate != 0
+                && config.reorder_gap_pkts != 0
+                && config.rate != 0
+                && config.queue_limit_pkts != 0
+                && config.max_datagram_size != 0,
+            "the replay config must arm every impairment, or the recording is not discriminating"
+        );
+        assert!(
+            config.queue_limit_pkts < 8,
+            "the scripted 4-datagrams-per-round growth must be able to exceed the packet limit"
+        );
+        let (mut runner, sent) = mock_runner(config);
+        let clock = sent.clock();
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234));
+
+        let mut out = String::new();
+        let mut before = runner.pipeline.stats.snapshot();
+        let mut sent_index = 0usize;
+        // 6 rounds x 4 datagrams = 24 datagrams. Sizes alternate around the
+        // 64-byte size filter, which deterministically drops the oversized
+        // ones before any PRNG draw.
+        const SIZES: [usize; 4] = [20, 80, 48, 8];
+        for round in 0..6usize {
+            for (slot, &len) in SIZES.iter().enumerate() {
+                let index = round * 4 + slot;
+                let mut payload = vec![index as u8; len];
+                if len > 1 {
+                    payload[1] = len as u8;
+                }
+                runner.handle_datagram(&payload, from, clock.now());
+                let after = runner.pipeline.stats.snapshot();
+                let wire = {
+                    let recorded = sent.sent.lock().unwrap();
+                    let mut wire = String::new();
+                    for (data, _dst) in &recorded[sent_index..] {
+                        wire.push_str(&format!(
+                            "{}:{}",
+                            data.first().copied().unwrap_or(0),
+                            data.len()
+                        ));
+                        wire.push(' ');
+                    }
+                    sent_index = recorded.len();
+                    if wire.is_empty() {
+                        "[]".to_owned()
+                    } else {
+                        format!("[{}]", wire.trim_end())
+                    }
+                };
+                out.push_str(&format!(
+                    "{:02} len={:02} {}\n",
+                    index,
+                    len,
+                    counter_delta(before, after)
+                ));
+                out.push_str(&format!("     wire={wire}\n"));
+                before = after;
+                clock.advance(Duration::from_millis(1));
+            }
+            // Partial drain (fewer milliseconds than the shortest delayed
+            // deadline) keeps the queue growing; a round is flushed only every
+            // third round, so the packet limit bites on the middle round of each
+            // group and the long advance then flushes everything due.
+            clock.advance(Duration::from_millis(5));
+            runner.drain_ready(clock.now());
+            let after = runner.pipeline.stats.snapshot();
+            let wire = {
+                let recorded = sent.sent.lock().unwrap();
+                let mut wire = String::new();
+                for (data, _dst) in &recorded[sent_index..] {
+                    wire.push_str(&format!(
+                        "{}:{}",
+                        data.first().copied().unwrap_or(0),
+                        data.len()
+                    ));
+                    wire.push(' ');
+                }
+                sent_index = recorded.len();
+                if wire.is_empty() {
+                    "[]".to_owned()
+                } else {
+                    format!("[{}]", wire.trim_end())
+                }
+            };
+            out.push_str(&format!(
+                "r{round} partial-drain {}\n",
+                counter_delta(before, after)
+            ));
+            out.push_str(&format!("     wire={wire}\n"));
+            before = after;
+            if round % 3 == 2 {
+                clock.advance(Duration::from_millis(20));
+                runner.drain_ready(clock.now());
+                let after = runner.pipeline.stats.snapshot();
+                let wire = {
+                    let recorded = sent.sent.lock().unwrap();
+                    let mut wire = String::new();
+                    for (data, _dst) in &recorded[sent_index..] {
+                        wire.push_str(&format!(
+                            "{}:{}",
+                            data.first().copied().unwrap_or(0),
+                            data.len()
+                        ));
+                        wire.push(' ');
+                    }
+                    sent_index = recorded.len();
+                    if wire.is_empty() {
+                        "[]".to_owned()
+                    } else {
+                        format!("[{}]", wire.trim_end())
+                    }
+                };
+                out.push_str(&format!(
+                    "r{round} flush {}\n",
+                    counter_delta(before, after)
+                ));
+                out.push_str(&format!("     wire={wire}\n"));
+                before = after;
+            }
+        }
+        out.push_str(&format!("final {:?}\n", runner.pipeline.stats.snapshot()));
+        out
+    }
+
+    #[test]
+    fn decision_replay_matches_recorded_sequence_for_fixed_config_and_seed() {
+        let replay = decision_replay_recording();
+        if DECISION_REPLAY_GOLDEN.is_empty() {
+            // Capture mode: print the recording so it can be pasted verbatim
+            // into DECISION_REPLAY_GOLDEN (which is then a frozen expectation).
+            println!("DECISION_REPLAY_GOLDEN<<<\n{replay}>>>");
+            return;
+        }
+        // Recorded expectation, captured from the pristine decision pipeline.
+        assert_eq!(
+            replay, DECISION_REPLAY_GOLDEN,
+            "the fixed-config replay must reproduce the recorded per-datagram decision sequence, wire order and counters"
+        );
+        // Fixed-seed determinism: a second fresh replay must be byte-identical.
+        assert_eq!(
+            decision_replay_recording(),
+            replay,
+            "two replays of the same config and seed must record identically"
+        );
+    }
+
+    /// Frozen recording of [`decision_replay_recording`], captured from the
+    /// pristine decision pipeline. Regenerate only when the impairment
+    /// semantics are *intentionally* changed, and say so in the commit message.
+    const DECISION_REPLAY_GOLDEN: &str = include_str!("../tests/decision_replay_golden.txt");
+
+    /// The standard transport must skip redundant read-timeout installs and
+    /// must install the timeout each receive needs exactly once (no restore
+    /// syscall after a temporary-timeout receive).
+    #[test]
+    fn std_udp_transport_skips_redundant_timeout_installs() {
         let bind = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
         let transport = StdUdpTransport::bind(bind).unwrap();
         let installs = || transport.receive_timeout_installs.load(Ordering::Relaxed);
@@ -3879,21 +4215,29 @@ mod tests {
         // A different timeout installs exactly once.
         transport.set_recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(installs(), 1);
-        // A temporary timeout receive installs the temporary value and then
-        // restores the configured default: two more installs.
+        // A temporary timeout receive installs the temporary value exactly
+        // once: no restore syscall follows it.
         let mut buf = [0u8; 16];
         let _ = transport.recv_from_timeout(&mut buf, Duration::from_millis(1));
+        assert_eq!(installs(), 2);
+        // A second temporary receive with a *different* timeout installs
+        // exactly one more timeout, not two. This is the per-receive syscall
+        // count the scheduled (FIFO/heap) runner pays while a lane stays
+        // backlogged: install + recv, never install + recv + restore.
+        let _ = transport.recv_from_timeout(&mut buf, Duration::from_millis(2));
         assert_eq!(installs(), 3);
+        // The configured timeout is still what `recv_timeout` reports.
         assert_eq!(
             transport.recv_timeout().unwrap(),
             Some(Duration::from_secs(2))
         );
-        // A plain receive sees the configured default already effective.
+        // A plain receive reinstalls the configured default before its own
+        // recv, so a plain receive still observes the configured timeout.
         let _ = transport.recv_from(&mut buf);
-        assert_eq!(installs(), 3);
+        assert_eq!(installs(), 4);
         // Duration::ZERO disables the timeout (configured None).
         transport.set_recv_timeout(Duration::ZERO).unwrap();
-        assert_eq!(installs(), 4);
+        assert_eq!(installs(), 5);
         assert_eq!(transport.recv_timeout().unwrap(), None);
         drop(transport);
     }

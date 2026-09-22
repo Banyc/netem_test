@@ -1,0 +1,65 @@
+00 len=20 delayed=1,rate_limited=1,received=1,received_bytes=20
+     wire=[]
+01 len=80 dropped=1,received=1,received_bytes=80
+     wire=[]
+02 len=48 delayed=1,rate_limited=1,received=1,received_bytes=48
+     wire=[]
+03 len=08 reordered=1,received=1,received_bytes=8
+     wire=[]
+r0 partial-drain forwarded=1,forwarded_bytes=8,scheduled_drain_batches=1,scheduled_drain_packets=1,scheduled_drain_max_packets=1
+     wire=[3:8]
+04 len=20 delayed=1,rate_limited=1,received=1,received_bytes=20
+     wire=[]
+05 len=80 dropped=1,received=1,received_bytes=80
+     wire=[]
+06 len=48 delayed=2,duplicated=1,rate_limited=2,received=1,received_bytes=48
+     wire=[]
+07 len=08 delayed=1,rate_limited=1,received=1,received_bytes=8
+     wire=[]
+r1 partial-drain forwarded=2,forwarded_bytes=68,scheduled_drain_batches=1,scheduled_drain_packets=2,scheduled_drain_max_packets=1
+     wire=[0:20 2:48]
+08 len=20 delayed=1,duplicated=1,reordered=1,rate_limited=1,received=1,received_bytes=20
+     wire=[]
+09 len=80 dropped=1,received=1,received_bytes=80
+     wire=[]
+10 len=48 received=1,received_bytes=48,overflow_dropped=1
+     wire=[]
+11 len=08 received=1,received_bytes=8,overflow_dropped=1
+     wire=[]
+r2 partial-drain forwarded=5,forwarded_bytes=144,scheduled_drain_batches=1,scheduled_drain_packets=5,scheduled_drain_max_packets=3
+     wire=[8:20 4:20 6:48 6:48 7:8]
+r2 flush forwarded=1,forwarded_bytes=20,scheduled_drain_batches=1,scheduled_drain_packets=1
+     wire=[8:20]
+12 len=20 delayed=1,rate_limited=1,received=1,received_bytes=20
+     wire=[]
+13 len=80 dropped=1,received=1,received_bytes=80
+     wire=[]
+14 len=48 delayed=1,rate_limited=1,received=1,received_bytes=48
+     wire=[]
+15 len=08 delayed=1,rate_limited=1,received=1,received_bytes=8
+     wire=[]
+r3 partial-drain -
+     wire=[]
+16 len=20 delayed=1,rate_limited=1,received=1,received_bytes=20
+     wire=[]
+17 len=80 dropped=1,received=1,received_bytes=80
+     wire=[]
+18 len=48 delayed=2,duplicated=1,rate_limited=2,received=1,received_bytes=48
+     wire=[]
+19 len=08 received=1,received_bytes=8,overflow_dropped=1
+     wire=[]
+r4 partial-drain forwarded=4,forwarded_bytes=96,scheduled_drain_batches=1,scheduled_drain_packets=4
+     wire=[12:20 14:48 15:8 16:20]
+20 len=20 delayed=1,rate_limited=1,received=1,received_bytes=20
+     wire=[]
+21 len=80 dropped=1,received=1,received_bytes=80
+     wire=[]
+22 len=48 delayed=1,rate_limited=1,received=1,received_bytes=48
+     wire=[]
+23 len=08 delayed=1,rate_limited=1,received=1,received_bytes=8
+     wire=[]
+r5 partial-drain forwarded=3,forwarded_bytes=116,scheduled_drain_batches=1,scheduled_drain_packets=3
+     wire=[18:48 18:48 20:20]
+r5 flush forwarded=2,forwarded_bytes=56,scheduled_drain_batches=1,scheduled_drain_packets=2
+     wire=[22:48 23:8]
+final Counters { delayed: 16, dropped: 6, duplicated: 3, reordered: 2, rate_limited: 16, forwarded: 18, received: 24, forwarded_bytes: 508, received_bytes: 936, overflow_dropped: 3, scheduled_drain_batches: 7, scheduled_drain_packets: 18, scheduled_drain_max_packets: 5 }
