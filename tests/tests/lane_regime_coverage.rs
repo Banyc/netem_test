@@ -234,7 +234,7 @@ impl RtoRecurrence {
                 self.rttvar = rtt / 2;
             }
             Some(srtt) => {
-                let deviation = if srtt > rtt { srtt - rtt } else { rtt - srtt };
+                let deviation = srtt.abs_diff(rtt);
                 self.rttvar = self.rttvar.mul_f64(0.75) + deviation.mul_f64(0.25);
                 self.srtt = Some(srtt.mul_f64(0.875) + rtt.mul_f64(0.125));
             }
