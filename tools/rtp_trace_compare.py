@@ -2004,14 +2004,30 @@ def classify(valid_pairs):
 
 
 # Bulk-latency materiality. The RTT percentiles are quantiles of thousands
-# of samples, so their paired movement is far narrower than goodput's: on the
-# harness's own same-binary controls the median paired relative movement is
-# <= 0.64% on the fat-pipe lanes and <= 1.97% on the hostile lane, with a
-# 4.92% worst case at two pairs whose other percentiles stay flat. A
+# of samples, so their paired movement is far narrower than goodput's: over
+# the eight preserved same-binary controls the median paired relative movement
+# is <= 0.64% on the fat-pipe lanes and <= 1.97% on the hostile lane, with a
+# 4.92% worst case at a two-pair control whose other percentiles stay flat. A
 # percentage alone cannot carry the axis, because the `clean` lane's RTT is
 # about 0.076 ms and its seed-to-seed movement is scheduler jitter of at most
 # 0.082 ms; LATENCY_MATERIAL_MS is the absolute floor below which a movement
 # is host jitter rather than transport latency.
+#
+# Re-measured 2026-09-23 on the same trunk and host with byte-identical
+# executables, four seeds (11/21/31/41), a 30 s window, a 20 s warmup and an
+# 8192 B MSS: the worst per-percentile median was 0.075% on
+# deterministic-iid-loss-fat-pipe, 0.273% on controller-fat-pipe and 0.915% on
+# high-rtt-low-rate-bottleneck, and the widest single pair was 1.633%
+# (controller-fat-pipe rtt_p99). Every control reported `latency_direction`
+# unchanged, so the 5% rule still clears the fat-pipe lanes by 18x
+# (controller-fat-pipe) to 67x (deterministic-iid-loss-fat-pipe) and the
+# slowest lane by 5.5x. The high-rtt-low-rate-bottleneck control was unstable
+# on its phase axis (the window's second half delivered nothing in six of its
+# eight runs, and 32 KiB in the other two), not on latency.
+#
+# The rule tests `ranking_delta_percent`, which scales by the larger endpoint,
+# so the exact firing boundary is +5.263% baseline-relative for a rise and
+# -5.000% for a fall.
 LATENCY_MATERIAL_PERCENT = 5.0
 LATENCY_MATERIAL_MS = 1.0
 BULK_LATENCY_METRICS = ("rtt_p50_ms", "rtt_p90_ms", "rtt_p99_ms")

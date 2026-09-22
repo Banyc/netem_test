@@ -336,9 +336,21 @@ seed 4.
   floor), with a 17.14 s maximum packet RTO overdue. This is the
   tens-of-seconds RTO read from the transport's own trace, not the estimator
   arithmetic.
-- **Its control is stable.** The same four-seed control was `ready` with
-  `no_material_change`, a 0.006 % median absolute goodput delta, no false
-  material change, and stable phase, so the lane can carry a verdict.
+- **Its control has not reproduced.** The four-seed control recorded when the
+  lane landed was `ready` with `no_material_change`, a 0.006 % median absolute
+  goodput delta, no false material change, and stable phase. A 2026-09-23
+  re-measurement on the same trunk (seeds 11/21/31/41, 30 s window, 20 s
+  warmup, 8192 B MSS, byte-identical executables) returned `not_ready`
+  (`trace_evidence_not_healthy`, `within_run_phase_not_stable`) with an
+  `unstable` `control_calibration` and a 3.85 % median absolute goodput delta:
+  all eight runs delivered about 384 KiB at the link rate during the window's
+  first half and then stalled, six of them delivering nothing at all in the
+  second half, with both arms' sinks ending in `read_error/BrokenPipe` and
+  failing `endpoint_lifecycle_accounted`. The earlier control's warmup is not
+  recorded, so the two measurements are not directly comparable. The lane's
+  latency axis stayed quiet (worst per-percentile median 0.91 %, worst single
+  pair 1.31 %), so its goodput/phase evidence is not attributable to a
+  candidate until a stable control is re-established.
 - **The negative control.** The `controller-fat-pipe` lane fed the identical
   burst kept its round trip at 302 ms and its RTO on the 1 s `MIN_RTO` floor
   for all 40 samples, so the same estimator arithmetic is unobservable there.
@@ -568,7 +580,17 @@ carries no `latency_direction` and is not treated as material.
 into every `run.json`: it compares each run's first-half and second-half
 goodput at the exact midpoint, marking a `material_phase_drift` whenever one
 half differs from the other by at least `MATERIAL_PHASE_DRIFT_PERCENT`
-(20%). A same-binary pair whose paired deltas are all under 10% is still
+(20%). Only runs whose two halves both delivered a positive rate enter the
+analysis: a run whose second half delivered nothing at all is dropped rather
+than scored as maximal drift, because on a bounded-transfer lane a finished
+probe and a stalled transport are indistinguishable from the half totals
+alone. The role summaries can therefore carry fewer runs than the pair set,
+and a pair set whose every run stalls in its second half reaches
+`insufficient_evidence` instead of `unstable_phase_drift`; the dead half is
+still reported by the trace-health check that feeds `comparison_readiness`,
+because a bulk run whose sink ends in `read_error/BrokenPipe` has no
+`running` endpoint outcome and fails `endpoint_lifecycle_accounted`. A
+same-binary pair whose paired deltas are all under 10% is still
 rejected as a control when either arm changed controller phase between its
 halves, because the delta can no longer be attributed to a stationary
 baseline. The same analysis includes `by_role.baseline` and
