@@ -121,11 +121,11 @@ series_map = load(csv_name)
 # Ridgeline CSVs
 ridgeline_csvs = [
     "dyn_single_mux__A_.csv",
-    "dyn_dual_auto_small_first_B_.csv",
-    "dyn_dual_auto_small_first_migrating_B_mig_.csv",
-    "dyn_dual_auto_big_first_C_.csv",
-    "dyn_dual_auto_big_first_migrating_C_mig_.csv",
-    "dyn_dual_hint_static_E_.csv",
+    "dyn_dual_auto_small_first__B_.csv",
+    "dyn_dual_auto_small_first_migrating__B_mig_.csv",
+    "dyn_dual_auto_big_first__C_.csv",
+    "dyn_dual_auto_big_first_migrating__C_mig_.csv",
+    "dyn_dual_hint_static__E_.csv",
 ]
 ridgeline_groups = OrderedDict()
 for rc in ridgeline_csvs:
@@ -145,7 +145,13 @@ def svg_axis(x_min, x_max, y_min, y_max, width, height, pad, x_label="", y_label
 
     def scale_x(v):
         if log_x:
-            return x0 + (math.log10(max(v, 0.001)) - math.log10(max(x_min, 0.001))) / (math.log10(max(x_max, 0.001)) - math.log10(max(x_min, 0.001))) * plot_w
+            lo = math.log10(max(x_min, 0.001))
+            hi = math.log10(max(x_max, 0.001))
+            if hi == lo:
+                return x0 + plot_w / 2
+            return x0 + (math.log10(max(v, 0.001)) - lo) / (hi - lo) * plot_w
+        if x_max == x_min:
+            return x0 + plot_w / 2
         return x0 + (v - x_min) / (x_max - x_min) * plot_w
 
     def scale_y(v):
@@ -195,7 +201,7 @@ def polyline(points, scale_x, scale_y, color, stroke_width=1.5, dash=""):
 def fill_between(xs, y_low, y_high, scale_x, scale_y, color, opacity=0.15):
     pts = " ".join(f"{scale_x(x)},{scale_y(y_low[i])}" for i, x in enumerate(xs))
     pts += " "
-    pts += " ".join(f"{scale_x(x)},{scale_y(y_high[i])}" for i, x in enumerate(reversed(xs)))
+    pts += " ".join(f"{scale_x(x)},{scale_y(y_high[len(xs) - 1 - i])}" for i, x in enumerate(reversed(xs)))
     return f'<polygon points="{pts}" fill="{color}" opacity="{opacity}"/>'
 
 # ── Build figures ─────────────────────────────────────────────────────────────
@@ -255,7 +261,7 @@ if series_map:
         shift_max += margin
 
         fig3_parts = [f'<div class="figure"><h3>Figure 3: Shift function ({keys[1]} − {keys[0]})</h3><svg width="{W}" height="{H}" xmlns="http://www.w3.org/2000/svg">']
-        ax, sx, sy = svg_axis(0, 1, shift_min, shift_max, W, H, PAD, x_label="Percentile", y_label="Difference (ms)")
+        ax, sx, sy = svg_axis(0, 100, shift_min, shift_max, W, H, PAD, x_label="Percentile", y_label="Difference (ms)")
         fig3_parts.append(ax)
 
         p_vals = [p * 100 for p in ps]
