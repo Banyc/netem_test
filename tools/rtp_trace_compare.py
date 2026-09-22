@@ -7,6 +7,30 @@ seed identity, calculates candidate-versus-baseline metric deltas, and
 classifies the result.  The verdict is a consistency label, not statistical
 confidence or causality; every source hint carries a does_not_prove
 constraint and no hint identifies a specific branch as causal.
+
+The wire price is reported per direction.  The netem byte counters measure
+the UDP payload the proxy was handed, so their ratios are named for that
+payload and never for the framed bytes:
+`udp_payload_bytes_per_delivered_byte` is the window total over the window's
+delivered bytes, `forward_udp_payload_bytes_per_delivered_byte` and
+`reverse_udp_payload_bytes_per_delivered_byte` are its two directions, and
+`reverse_udp_payload_share_percent` says how much of the total is the reverse
+direction's acknowledgement traffic.  `derived_ipv4_udp_header_bytes_*` adds
+the 28-byte IPv4+UDP header each forwarded datagram costs as a named
+estimate, and `netem_forwarded_bytes_window_relative` records whether the
+capture's counters were rebased to the measurement boundary at all -- an
+unrebased capture charges its unmeasured warmup to the window.
+
+Resolution: the wire ratios divide by the delivered bytes over exactly the
+span their numerator covers, which removes a bias of up to one netem tick.
+What remains is the run-to-run spread of the ratio within one lane: measured
+0.010-0.101 percentage points across the `controller-fat-pipe` lanes and
+1.208-1.881 pp across the `deterministic-iid-loss-fat-pipe` lanes of the
+harness's own bulk battery (30 s window, 20 s warmup, 8192 B MSS, 4 seeds x 2
+roles per lane).  The window-edge in-flight bytes and the retransmissions paid
+inside the window move it, not the denominator, so a delta below roughly 0.1 pp
+on `controller-fat-pipe` and 1 pp on `deterministic-iid-loss-fat-pipe` is not
+signal.
 """
 
 import argparse
@@ -606,6 +630,102 @@ def _per_gib(value, delivered_bytes):
     return value * 1024 ** 3 / delivered_bytes
 
 
+# The netem proxy measures the datagram payload it is handed, so its byte
+# counters exclude the IP and UDP headers that carry each datagram. A 20-byte
+# IPv4 header plus an 8-byte UDP header is the L3/L4 cost of one forwarded
+# datagram; the header term derived from it is an estimate under that named
+# assumption, never a measurement.
+IPV4_UDP_HEADER_BYTES_PER_DATAGRAM = 28
+
+
+def _per_delivered_byte(value, delivered_bytes):
+    """Normalize a byte count by the window's delivered application bytes.
+
+    None whenever either side is missing or the window delivered nothing, so
+    an absent counter never reads as a free transfer."""
+    if value is None or delivered_bytes is None or delivered_bytes <= 0:
+        return None
+    return value / delivered_bytes
+
+
+def wire_payload_directions(final_netem):
+    """Split the recorded directions into the application side and the reverse.
+
+    A two-sided tunnel writes one row set per direction. The side that
+    forwarded more bytes over the window is the one carrying the application
+    payload, because the reverse side carries acknowledgement and control
+    traffic: at most on the order of one such datagram per data datagram, and
+    far smaller ones. The ranking is what the forward/reverse names would
+    otherwise hide, so the reported reverse-share percentage is what a reader
+    checks before trusting it. A lane that carried comparable application
+    payload in both directions would show a share near 50 %, and then neither
+    label means anything. With a single direction the split is unavailable and
+    the reverse side is reported as None rather than invented.
+    """
+    ranked = sorted(
+        (
+            (direction["forwarded_bytes"], name)
+            for name, direction in final_netem.items()
+        ),
+        reverse=True,
+    )
+    if len(ranked) < 2:
+        return (ranked[0][1] if ranked else None), None
+    return ranked[0][1], ranked[1][1]
+
+
+def wire_window_delivered(progress, netem, manifest_delivered):
+    """Delivered bytes over exactly the span the wire numerator covers.
+
+    The netem counters span first..last in-window sample. netem.csv and
+    progress.csv are written from one observation list, so when the two files
+    carry the same samples the paired progress rows give the delivered-byte
+    count at those same instants and both sides of the ratio land on one span.
+    Without a confirmable pairing the manifest's whole-window
+    `delivered_bytes` is the denominator; `source` names which one was used so
+    a reader never has to infer it.
+    """
+    if (
+        manifest_delivered is not None
+        and len(progress) >= 2
+        and netem
+        and len(netem) % 2 == 0
+        and len(progress) == len(netem) // 2
+    ):
+        last_netem_us = metric_number(netem[-1].get("elapsed_us"))
+        last_progress_us = metric_number(progress[-1][0])
+        if (
+            last_netem_us is not None
+            and last_progress_us is not None
+            and abs(last_netem_us - last_progress_us * 1_000_000.0) < 0.5
+        ):
+            return progress[-1][1] - progress[0][1], "netem_tick_span"
+    return manifest_delivered, "manifest_window"
+
+
+def netem_forwarded_bytes_window_relative(netem):
+    """Whether this capture's netem counters start at the measurement window.
+
+    Rebased counters write each direction's first in-window sample as zero,
+    because that sample is the baseline every later row is expressed against.
+    A first sample that already carries traffic comes from a writer that never
+    rebased, so every wire ratio read from it charges the unmeasured warmup to
+    the window. This is structural evidence, not proof: a measured phase that
+    saw no traffic at all would also start at zero.
+    """
+    if not netem:
+        return None
+    seen = set()
+    for row in netem:
+        direction = REPORT.field(row, "direction")
+        if not direction or direction in seen:
+            continue
+        seen.add(direction)
+        if metric_number(netem_field(row, "forwarded_bytes"), 0.0) != 0.0:
+            return False
+    return bool(seen)
+
+
 def action_streak_max_ms(state, action):
     """Longest observed continuous run of one controller action.
 
@@ -851,6 +971,11 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         "forwarded_bytes" in row or " forwarded_bytes" in row for row in netem
     )
     forwarded_bytes_total = None
+    payload_direction = None
+    reverse_direction = None
+    forward_payload_bytes = None
+    reverse_payload_bytes = None
+    forwarded_datagrams = None
     if has_wire_bytes:
         forwarded_bytes_values = [
             direction["forwarded_bytes"]
@@ -860,6 +985,28 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
         forwarded_bytes_total = (
             sum(forwarded_bytes_values) if forwarded_bytes_values else 0.0
         )
+        payload_direction, reverse_direction = wire_payload_directions(final_netem)
+        if payload_direction is not None:
+            forward_payload_bytes = final_netem[payload_direction][
+                "forwarded_bytes"
+            ]
+        if reverse_direction is not None:
+            reverse_payload_bytes = final_netem[reverse_direction][
+                "forwarded_bytes"
+            ]
+        # `forwarded` counts the datagrams this direction put on the wire; the
+        # `received` counter also counts what a loss decision discarded, which
+        # never reaches the wire and so carries no header cost.
+        if any("forwarded" in row for row in netem):
+            forwarded_datagrams = sum(
+                direction["forwarded"] for direction in final_netem.values()
+            )
+    wire_window_delivered_bytes, wire_window_source = wire_window_delivered(
+        progress, netem, delivered_bytes
+    )
+    wire_window_relative = (
+        netem_forwarded_bytes_window_relative(netem) if has_wire_bytes else None
+    )
     has_scheduled_drain = any(
         "scheduled_drain_packets" in row for row in netem
     )
@@ -1071,12 +1218,52 @@ def summarize_run(manifest, state, peer_state, rtt, peer_rtt, netem, progress, r
             for reason in ACK_FLUSH_REASONS
         },
         "final_netem_counters": final_netem,
-        "wire_bytes_per_delivered_byte": (
-            forwarded_bytes_total / delivered_bytes
-            if forwarded_bytes_total is not None
-            and delivered_bytes is not None
-            and delivered_bytes > 0
+        # The measured wire quantity is the UDP payload the proxy forwarded.
+        # It is reported per direction, with the total named as a total, so
+        # the reverse direction's acknowledgement traffic is visible instead
+        # of hidden inside a sum divided by one direction's delivered bytes.
+        "wire_payload_direction": payload_direction,
+        "wire_window_delivered_bytes": wire_window_delivered_bytes,
+        "wire_window_source": wire_window_source,
+        "netem_forwarded_bytes_window_relative": wire_window_relative,
+        "udp_payload_bytes_per_delivered_byte": _per_delivered_byte(
+            forwarded_bytes_total, wire_window_delivered_bytes
+        ),
+        "forward_udp_payload_bytes_per_delivered_byte": _per_delivered_byte(
+            forward_payload_bytes, wire_window_delivered_bytes
+        ),
+        "reverse_udp_payload_bytes_per_delivered_byte": _per_delivered_byte(
+            reverse_payload_bytes, wire_window_delivered_bytes
+        ),
+        "reverse_udp_payload_share_percent": (
+            100.0 * reverse_payload_bytes / forwarded_bytes_total
+            if reverse_payload_bytes is not None and forwarded_bytes_total
             else None
+        ),
+        # Derived, not measured: one 20-byte IPv4 header plus one 8-byte UDP
+        # header per datagram this window forwarded.
+        "derived_ipv4_udp_header_bytes_per_datagram": (
+            IPV4_UDP_HEADER_BYTES_PER_DATAGRAM
+            if forwarded_datagrams is not None
+            else None
+        ),
+        "derived_ipv4_udp_header_bytes_per_delivered_byte": _per_delivered_byte(
+            (
+                forwarded_datagrams * IPV4_UDP_HEADER_BYTES_PER_DATAGRAM
+                if forwarded_datagrams is not None
+                else None
+            ),
+            wire_window_delivered_bytes,
+        ),
+        "derived_ipv4_udp_bytes_per_delivered_byte": _per_delivered_byte(
+            (
+                forwarded_bytes_total
+                + forwarded_datagrams * IPV4_UDP_HEADER_BYTES_PER_DATAGRAM
+                if forwarded_bytes_total is not None
+                and forwarded_datagrams is not None
+                else None
+            ),
+            wire_window_delivered_bytes,
         ),
         "scheduled_drain_batches": scheduled_drain_batches_total,
         "scheduled_drain_packets": scheduled_drain_packets_total,
@@ -1416,7 +1603,14 @@ METRICS = (
     "message_delivery_percent",
     "rtt_p90_ms",
     "rtt_p99_ms",
-    "wire_bytes_per_delivered_byte",
+    # The wire-price family: the measured UDP-payload total and the two
+    # components that are not restatements of it. The per-direction forward
+    # term tracks the total to within the reverse share and the reverse share
+    # is the reverse term rescaled, so both stay in each run's summary rather
+    # than crowding the five guidance hints with collinear copies.
+    "udp_payload_bytes_per_delivered_byte",
+    "reverse_udp_payload_bytes_per_delivered_byte",
+    "derived_ipv4_udp_header_bytes_per_delivered_byte",
     "scheduled_drain_batches",
     "scheduled_drain_packets",
     "scheduled_drain_max_packets",
@@ -1467,7 +1661,9 @@ LOWER_IS_BETTER_METRICS = {
     "message_latency_p50_ms",
     "message_latency_p95_ms",
     "message_latency_p99_ms",
-    "wire_bytes_per_delivered_byte",
+    "udp_payload_bytes_per_delivered_byte",
+    "reverse_udp_payload_bytes_per_delivered_byte",
+    "derived_ipv4_udp_header_bytes_per_delivered_byte",
     "congestion_bandwidth_probe_before_feedback_percent",
     "low_send_rate_occupancy",
     "outage_recovery_occupancy",
@@ -1831,9 +2027,13 @@ def classify_message_scenario(valid_pairs):
     ]
     wire_direction = _material_direction(
         [
-            pair["metrics"]["wire_bytes_per_delivered_byte"]["delta_percent"]
+            pair["metrics"]["udp_payload_bytes_per_delivered_byte"][
+                "delta_percent"
+            ]
             for pair in valid_pairs
-            if pair["metrics"]["wire_bytes_per_delivered_byte"]["delta_percent"]
+            if pair["metrics"]["udp_payload_bytes_per_delivered_byte"][
+                "delta_percent"
+            ]
             is not None
         ]
     )

@@ -652,8 +652,24 @@ fabricated zero, so a treatment with FEC on must show real `parity_sent`
 work and, under erasure lanes, positive `recovered_symbols`. Sparse-message
 lanes additionally carry `message_latency_p50_ms`/`p95`/`p99`,
 `message_delivery_percent`, and `delivered_bytes`, with the netem
-`forwarded_bytes`/`received_bytes` totals letting the comparison price the
-wire cost per delivered byte. Inspect the trace health, the paired deltas,
+`forwarded_bytes` totals pricing the wire cost per delivered byte:
+`udp_payload_bytes_per_delivered_byte` is the measured UDP-payload total over
+the window's delivered bytes, split into
+`forward_udp_payload_bytes_per_delivered_byte` and
+`reverse_udp_payload_bytes_per_delivered_byte` with
+`reverse_udp_payload_share_percent` naming how much of it is the reverse
+direction's acknowledgement traffic, and
+`derived_ipv4_udp_header_bytes_per_delivered_byte` adding the 28-byte IPv4+UDP
+header each forwarded datagram costs on the wire as an estimate.
+`netem_forwarded_bytes_window_relative` says whether those counters were
+rebased to the measurement boundary, and `wire_window_source` names the
+denominator's span. Both sides of every wire ratio are span-matched to the
+netem tick window, which removes a bias of up to one tick; the residual
+run-to-run spread of the ratio within one lane is 0.010-0.101 pp on the
+`controller-fat-pipe` lanes and 1.208-1.881 pp on the
+`deterministic-iid-loss-fat-pipe` lanes, so a delta below roughly 0.1 pp on
+`controller-fat-pipe` and 1 pp on `deterministic-iid-loss-fat-pipe` is not
+signal. Inspect the trace health, the paired deltas,
 and the one largest material change before trusting any `does_not_prove`-
 bounded verdict.
 

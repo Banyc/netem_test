@@ -1191,7 +1191,7 @@ class TraceCompareTest(unittest.TestCase):
             [{"direction": "c2s", "received": "10", "forwarded": "9"}],
             [], [], [],
         )
-        self.assertIsNone(no_wire["wire_bytes_per_delivered_byte"])
+        self.assertIsNone(no_wire["udp_payload_bytes_per_delivered_byte"])
         with_wire = COMPARE.summarize_run(
             manifest, [], [], [], [],
             [
@@ -1213,9 +1213,175 @@ class TraceCompareTest(unittest.TestCase):
             [], [], [],
         )
         self.assertEqual(
-            with_wire["wire_bytes_per_delivered_byte"], 8000.0 / (1024 ** 3)
+            with_wire["udp_payload_bytes_per_delivered_byte"],
+            8000.0 / (1024 ** 3),
         )
         self.assertEqual(with_wire["scheduled_drain_packets"], 10.0)
+
+    def test_wire_price_is_direction_honest_and_names_its_denominator(self):
+        """The window price must be readable per direction, with the reverse
+        direction's share visible instead of folded into one unlabelled sum
+        over a denominator that counts a single direction's application
+        bytes."""
+        gib = 1024 ** 3
+        summary = COMPARE.summarize_run(
+            {"delivered_bytes": str(gib)},
+            [], [], [], [],
+            [
+                {
+                    "direction": "c2s",
+                    "forwarded": "100",
+                    "forwarded_bytes": "500000",
+                },
+                {
+                    "direction": "s2c",
+                    "forwarded": "20",
+                    "forwarded_bytes": "1000",
+                },
+            ],
+            [], [], [],
+        )
+        # The single legacy key summed both directions while the denominator
+        # counted one direction's application bytes; it must not survive under
+        # a name that a stale consumer could read as a different quantity.
+        self.assertNotIn("wire_bytes_per_delivered_byte", summary)
+        self.assertEqual(summary["wire_payload_direction"], "c2s")
+        self.assertAlmostEqual(
+            summary["forward_udp_payload_bytes_per_delivered_byte"],
+            500000.0 / gib,
+        )
+        self.assertAlmostEqual(
+            summary["reverse_udp_payload_bytes_per_delivered_byte"],
+            1000.0 / gib,
+        )
+        self.assertAlmostEqual(
+            summary["udp_payload_bytes_per_delivered_byte"],
+            501000.0 / gib,
+        )
+        self.assertAlmostEqual(
+            summary["reverse_udp_payload_share_percent"],
+            100.0 * 1000.0 / 501000.0,
+        )
+        # The measured quantity is the UDP payload the proxy was handed. The
+        # IP+UDP header cost is a separate estimate and says so: it names its
+        # per-datagram constant and never borrows a measured name.
+        self.assertEqual(
+            summary["derived_ipv4_udp_header_bytes_per_datagram"], 28
+        )
+        self.assertAlmostEqual(
+            summary["derived_ipv4_udp_header_bytes_per_delivered_byte"],
+            28.0 * 120 / gib,
+        )
+        self.assertAlmostEqual(
+            summary["derived_ipv4_udp_bytes_per_delivered_byte"],
+            (501000.0 + 28.0 * 120) / gib,
+        )
+        # One direction only: the reverse side stays unavailable rather than
+        # being invented as zero.
+        single = COMPARE.summarize_run(
+            {"delivered_bytes": "1000"},
+            [], [], [], [],
+            [{"direction": "c2s", "forwarded": "1", "forwarded_bytes": "1000"}],
+            [], [], [],
+        )
+        self.assertEqual(single["wire_payload_direction"], "c2s")
+        self.assertIsNone(single["reverse_udp_payload_bytes_per_delivered_byte"])
+        self.assertIsNone(single["reverse_udp_payload_share_percent"])
+        self.assertEqual(single["udp_payload_bytes_per_delivered_byte"], 1.0)
+
+    def test_wire_window_price_denominator_matches_the_tick_span(self):
+        """netem.csv and progress.csv are written from one observation list,
+        so the wire numerator's span is the tick span and its denominator must
+        be the delivered bytes over that same span, not the manifest's whole
+        window."""
+        netem = [
+            {"elapsed_us": "0", "direction": "c2s", "forwarded": "1",
+             "forwarded_bytes": "0"},
+            {"elapsed_us": "0", "direction": "s2c", "forwarded": "1",
+             "forwarded_bytes": "0"},
+            {"elapsed_us": "20000000", "direction": "c2s", "forwarded": "10",
+             "forwarded_bytes": "81920"},
+            {"elapsed_us": "20000000", "direction": "s2c", "forwarded": "10",
+             "forwarded_bytes": "640"},
+        ]
+        summary = COMPARE.summarize_run(
+            {"delivered_bytes": "90000"},
+            [], [], [], [],
+            netem,
+            [(0.0, 4096.0), (20.0, 80000.0)],
+            [], [],
+        )
+        self.assertEqual(summary["wire_window_source"], "netem_tick_span")
+        self.assertEqual(
+            summary["wire_window_delivered_bytes"], 80000.0 - 4096.0
+        )
+        self.assertNotEqual(
+            summary["wire_window_delivered_bytes"], summary["delivered_bytes"]
+        )
+        self.assertAlmostEqual(
+            summary["udp_payload_bytes_per_delivered_byte"],
+            82560.0 / (80000.0 - 4096.0),
+        )
+
+    def test_wire_window_denominator_falls_back_and_reports_its_source(self):
+        """Without a confirmable netem/progress pairing the manifest window is
+        the denominator, the source field says so, and a capture whose counters
+        still carry the unmeasured warmup is flagged instead of trusted."""
+        unpaired = COMPARE.summarize_run(
+            {"delivered_bytes": "90000"},
+            [], [], [], [],
+            [
+                {"elapsed_us": "0", "direction": "c2s", "forwarded": "1",
+                 "forwarded_bytes": "0"},
+                {"elapsed_us": "20000000", "direction": "c2s",
+                 "forwarded": "10", "forwarded_bytes": "81920"},
+            ],
+            [(0.0, 4096.0)],
+            [], [],
+        )
+        self.assertEqual(unpaired["wire_window_source"], "manifest_window")
+        self.assertEqual(unpaired["wire_window_delivered_bytes"], 90000.0)
+        self.assertTrue(unpaired["netem_forwarded_bytes_window_relative"])
+        warmup_charged = COMPARE.summarize_run(
+            {"delivered_bytes": "90000"},
+            [], [], [], [],
+            [
+                {"elapsed_us": "0", "direction": "c2s", "forwarded": "999",
+                 "forwarded_bytes": "8000000"},
+                {"elapsed_us": "20000000", "direction": "c2s",
+                 "forwarded": "1000", "forwarded_bytes": "8010000"},
+            ],
+            [(0.0, 0.0), (20.0, 90000.0)],
+            [], [],
+        )
+        self.assertFalse(
+            warmup_charged["netem_forwarded_bytes_window_relative"]
+        )
+        # A capture that never recorded the column reports nothing rather
+        # than a fabricated zero or a fabricated marker.
+        absent = COMPARE.summarize_run(
+            {"delivered_bytes": "1000"},
+            [], [], [], [],
+            [{"direction": "c2s", "forwarded": "1"}],
+            [], [], [],
+        )
+        self.assertIsNone(absent["netem_forwarded_bytes_window_relative"])
+        self.assertIsNone(absent["udp_payload_bytes_per_delivered_byte"])
+
+    def test_wire_metrics_are_compared_and_lower_is_better(self):
+        """The direction-honest components are first-class comparison
+        metrics: a reader sees their paired change, and a rise in any of them
+        reads as worse rather than as an unclassified change."""
+        for metric in (
+            "udp_payload_bytes_per_delivered_byte",
+            "reverse_udp_payload_bytes_per_delivered_byte",
+            "derived_ipv4_udp_header_bytes_per_delivered_byte",
+        ):
+            self.assertIn(metric, COMPARE.METRICS)
+            self.assertIn(metric, COMPARE.LOWER_IS_BETTER_METRICS)
+            self.assertEqual(COMPARE.metric_direction(metric, 1.0), "worse")
+            self.assertEqual(COMPARE.metric_direction(metric, -1.0), "better")
+        self.assertNotIn("wire_bytes_per_delivered_byte", COMPARE.METRICS)
 
     def add_fec_snapshot(self, trace_dir, parity, recovered):
         """Add trace-schema-32 FEC snapshot columns to both endpoint RTP CSVs.
@@ -1504,7 +1670,9 @@ class TraceCompareTest(unittest.TestCase):
                 "metrics": {
                     "message_latency_p95_ms": {"delta_percent": p95},
                     "message_latency_p99_ms": {"delta_percent": p99},
-                    "wire_bytes_per_delivered_byte": {"delta_percent": wire},
+                    "udp_payload_bytes_per_delivered_byte": {
+                        "delta_percent": wire
+                    },
                     "goodput_mib_per_second": {"delta_percent": goodput_delta},
                 },
             }
@@ -1903,7 +2071,9 @@ class TraceCompareTest(unittest.TestCase):
                 "metrics": {
                     "message_latency_p95_ms": {"delta_percent": 1.0},
                     "message_latency_p99_ms": {"delta_percent": -1.0},
-                    "wire_bytes_per_delivered_byte": {"delta_percent": wire},
+                    "udp_payload_bytes_per_delivered_byte": {
+                        "delta_percent": wire
+                    },
                     "goodput_mib_per_second": {"delta_percent": 0.0},
                 },
             }
@@ -1923,7 +2093,9 @@ class TraceCompareTest(unittest.TestCase):
                 "metrics": {
                     "message_latency_p95_ms": {"delta_percent": p95},
                     "message_latency_p99_ms": {"delta_percent": p99},
-                    "wire_bytes_per_delivered_byte": {"delta_percent": wire},
+                    "udp_payload_bytes_per_delivered_byte": {
+                        "delta_percent": wire
+                    },
                     "goodput_mib_per_second": {"delta_percent": 0.0},
                 },
             }
