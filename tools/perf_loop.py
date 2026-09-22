@@ -957,19 +957,281 @@ def assert_frozen_suite_builds_exported_siblings(workspace):
     return []
 
 
+# A component's path name and the crate it ships differ only by '-' versus
+# '_' (`netem_test` provides the `netem-test` crate), and a jj workspace of
+# one component may be checked out under any directory name, so the crate
+# names a workspace declares are read rather than inferred from its path.
+def _manifest_component_names(manifest):
+    """Every suite component any crate declared by `manifest` can name."""
+    try:
+        document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return set()
+    declared = []
+    package = document.get("package")
+    if isinstance(package, dict):
+        declared.append(package.get("name"))
+    workspace = document.get("workspace")
+    if isinstance(workspace, dict) and isinstance(workspace.get("members"), list):
+        for member in workspace["members"]:
+            if not isinstance(member, str):
+                continue
+            member_manifest = manifest.parent / member / "Cargo.toml"
+            if not member_manifest.is_file():
+                continue
+            try:
+                member_document = tomllib.loads(
+                    member_manifest.read_text(encoding="utf-8")
+                )
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            member_package = member_document.get("package")
+            if isinstance(member_package, dict):
+                declared.append(member_package.get("name"))
+    names = set()
+    for name in declared:
+        if not isinstance(name, str):
+            continue
+        component = name.replace("-", "_").lower()
+        if component in COMPONENTS:
+            names.add(component)
+    return names
+
+
+def _candidate_source_revisions(source, revision, *components):
+    """`(claim, commit_id)` for every directory that could own the source.
+
+    Used only on a failure path, so it may resolve the same revision in
+    several places to show the caller exactly which candidates disagree.
+    """
+    source = Path(source)
+    directories = [(f"the source workspace {source}", source)]
+    for component in sorted(set(components) | set(COMPONENTS)):
+        directories.append(
+            (
+                f"the sibling {source.parent / component}",
+                source.parent / component,
+            )
+        )
+    resolved = []
+    seen = set()
+    for claim, directory in directories:
+        if not directory.is_dir() or directory in seen:
+            continue
+        seen.add(directory)
+        try:
+            identity = jj_identity(directory, revision)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            continue
+        resolved.append((claim, identity["commit_id"]))
+    return resolved
+
+
+def source_workspace_component(source, revision):
+    """Which suite component the `--source` workspace is.
+
+    The workspace's own directory name and the crate names in its
+    `Cargo.toml` are independent evidence.  When both speak they must agree;
+    when neither does, the snapshot would have to guess which component the
+    workspace under test is, so it refuses and names the candidates rather
+    than exporting a tree that happens to share the canonical name.
+    """
+    source = Path(source)
+    by_name = source.name if source.name in COMPONENTS else None
+    by_manifest = sorted(_manifest_component_names(source / "Cargo.toml"))
+    if len(by_manifest) > 1:
+        raise ValueError(
+            f"source workspace {source} declares more than one suite component "
+            f"({', '.join(by_manifest)}), so the component whose revision it "
+            f"supplies is ambiguous"
+        )
+    by_manifest = by_manifest[0] if by_manifest else None
+    if by_name is not None and by_manifest is not None and by_name != by_manifest:
+        candidates = _candidate_source_revisions(
+            source, revision, by_name, by_manifest
+        )
+        raise ValueError(
+            f"source workspace {source} is ambiguous: its directory names the "
+            f"component {by_name!r} while its Cargo.toml names {by_manifest!r}; "
+            "candidate revisions are "
+            + ", ".join(
+                f"{claim} = {commit_id}" for claim, commit_id in candidates
+            )
+        )
+    if by_name is None and by_manifest is None:
+        candidates = _candidate_source_revisions(source, revision)
+        raise ValueError(
+            f"cannot derive which suite component the source workspace {source} "
+            f"is: its directory name is not one of {', '.join(COMPONENTS)} and "
+            f"its Cargo.toml declares none of them; name the workspace after its "
+            f"component or point --source at the component checkout; "
+            "candidate revisions are "
+            + ", ".join(
+                f"{claim} = {commit_id}" for claim, commit_id in candidates
+            )
+        )
+    return by_name or by_manifest
+
+
+def snapshot_component_sources(source, source_component):
+    """The directory each suite component is exported from.
+
+    The workspace under test is authoritative for its own component: it is
+    the tree the caller named, and a sibling directory that merely shares the
+    canonical component name is a *different* checkout whose revision must
+    not silently replace it.  Every other component still comes from its
+    canonical sibling, and a missing sibling is refused.
+    """
+    source = Path(source)
+    sources = {}
+    for component in COMPONENTS:
+        if component == source_component:
+            sources[component] = source
+            continue
+        sibling = source.parent / component
+        if not sibling.is_dir():
+            raise ValueError(f"suite component is missing: {sibling}")
+        sources[component] = sibling
+    return sources
+
+
+def _git_store(directory):
+    result = subprocess.run(
+        ["jj", "--no-pager", "git", "root"],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown JJ error"
+        raise ValueError(f"cannot locate Git store for {directory}: {detail}")
+    return result.stdout.strip()
+
+
+def _tracked_blob_map(store, commit_id):
+    """`relative path -> (git mode, blob id)` for every blob in a commit."""
+    result = subprocess.run(
+        [
+            "git",
+            f"--git-dir={store}",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            commit_id,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
+        raise ValueError(f"cannot list the tree of {commit_id}: {detail}")
+    entries = {}
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition("\t")
+        if not separator:
+            raise ValueError(f"cannot parse a tree entry of {commit_id}: {record!r}")
+        mode, kind, object_id = metadata.split(" ", 2)
+        if kind != "blob":
+            # A gitlink names another repository and contributes no archived
+            # content, so it has no exported counterpart to compare.
+            continue
+        entries[path] = (mode, object_id)
+    return entries
+
+
+def _exported_blob_map(destination):
+    """`relative path -> (git mode, blob id)` for every file `destination` holds."""
+    destination = Path(destination)
+    entries = {}
+    for path in sorted(destination.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        data = path.read_bytes()
+        digest = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+        entries[path.relative_to(destination).as_posix()] = (mode, digest)
+    return entries
+
+
+def assert_export_matches_revision(source, destination, component, identity):
+    """Refuse an exported tree that is not the recorded revision's content.
+
+    `snapshot_component` archives one commit into one directory; this
+    recomputes every blob id from the files on disk and compares them with
+    that commit's own tree, so a mis-archived, truncated, or otherwise
+    mismatched export can never be recorded as the revision it claims.
+    """
+    commit_id = identity["commit_id"]
+    expected = _tracked_blob_map(_git_store(source), commit_id)
+    actual = _exported_blob_map(destination)
+    if expected == actual:
+        return
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    differing = sorted(
+        path for path in set(expected) & set(actual) if expected[path] != actual[path]
+    )
+    detail = []
+    if missing:
+        detail.append(f"missing {missing[:3]}")
+    if extra:
+        detail.append(f"unexpected {extra[:3]}")
+    if differing:
+        detail.append(f"content differs at {differing[:3]}")
+    raise ValueError(
+        f"exported {component} tree {destination} does not match the recorded "
+        f"revision {commit_id}: " + "; ".join(detail)
+    )
+
+
+def assert_snapshot_matches_sources(source, source_component, component_revisions, requested_revision, components, output_root):
+    """Refuse a snapshot whose recorded revision is not the tree under test.
+
+    A recorded revision is only trustworthy if it is the revision the
+    *source under test* resolves: the workspace itself for its own
+    component, the canonical sibling for every other.  Comparing the export
+    against that resolution - and every blob against the recorded commit's
+    own tree - is what makes a snapshot that exported the sibling trunk while
+    naming it the workspace impossible to record.
+    """
+    source = Path(source)
+    for component in COMPONENTS:
+        recorded = components[component]
+        authoritative = (
+            source if component == source_component else source.parent / component
+        )
+        revision = component_revisions.get(component, requested_revision)
+        resolved = jj_identity(authoritative, revision)
+        if resolved["commit_id"] != recorded["commit_id"]:
+            raise ValueError(
+                f"snapshot recorded the {component} revision "
+                f"{recorded['commit_id']} but the tree under test "
+                f"({authoritative}) resolves {revision!r} to "
+                f"{resolved['commit_id']}"
+            )
+        assert_export_matches_revision(
+            authoritative, Path(output_root) / component, component, recorded
+        )
+
+
 def command_snapshot(args):
     source = validate_workspace(Path(args.source), "source")
     output_root = safe_output_dir(Path(args.output) if args.output else None)
-    source_root = source.parent
+    source_component = source_workspace_component(source, args.revision)
     pairs = list(args.component_revision)
     component_revisions = dict(pairs)
     (_ for _ in ()).throw(ValueError("duplicate component revision")) if len(component_revisions) != len(pairs) else None
     unknown = sorted(set(component_revisions) - set(COMPONENTS))
     (_ for _ in ()).throw(ValueError(f"unknown component revision overrides: {', '.join(unknown)}")) if unknown else None
-    missing = next((source_root / component for component in COMPONENTS if not (source_root / component).is_dir()), None)
-    (_ for _ in ()).throw(ValueError(f"suite component is missing: {missing}")) if missing is not None else None
-    components = {component: snapshot_component(source_root / component, output_root / component, component_revisions.get(component, args.revision)) for component in COMPONENTS}
+    component_sources = snapshot_component_sources(source, source_component)
+    components = {component: snapshot_component(component_sources[component], output_root / component, component_revisions.get(component, args.revision)) for component in COMPONENTS}
     validate_workspace(output_root / "netem_test", "snapshot")
+    assert_snapshot_matches_sources(source, source_component, component_revisions, args.revision, components, output_root)
     frozen_dep_rewrites = rewrite_frozen_suite_dependencies(output_root)
     manifest = {"schema": SUITE_REVISION_MANIFEST_SCHEMA, "source": str(source), "requested_revision": args.revision, "component_revision_overrides": dict(sorted(component_revisions.items())), "components": dict(sorted(components.items())), "frozen_dep_rewrites": frozen_dep_rewrites}
     (output_root / SUITE_REVISION_MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

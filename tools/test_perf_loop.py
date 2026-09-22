@@ -253,7 +253,10 @@ class PerfLoopTest(unittest.TestCase):
                     "change_id": component_output.name[0].ljust(32, "x"),
                 }
 
-            with mock.patch.object(LOOP, "snapshot_component", fake_snapshot):
+            with (
+                mock.patch.object(LOOP, "snapshot_component", fake_snapshot),
+                mock.patch.object(LOOP, "assert_snapshot_matches_sources"),
+            ):
                 args = argparse.Namespace(
                     source=str(source),
                     revision="@-",
@@ -302,6 +305,187 @@ class PerfLoopTest(unittest.TestCase):
                         )
                 finally:
                     shutil.rmtree(reject_output, ignore_errors=True)
+
+    def snapshot_under_test_fixture(self, root, name):
+        """A netem_test workspace whose directory is not named after its component."""
+        source = root / name
+        (source / "netem-test").mkdir(parents=True)
+        (source / "tests").mkdir(parents=True)
+        (source / "Cargo.toml").write_text(
+            "[workspace]\nresolver = \"3\"\nmembers = [\"netem-test\", \"tests\"]\n",
+            encoding="utf-8",
+        )
+        (source / "netem-test" / "Cargo.toml").write_text(
+            "[package]\nname = \"netem-test\"\nversion = \"0.1.0\"\n",
+            encoding="utf-8",
+        )
+        (source / "tests" / "Cargo.toml").write_text(
+            "[package]\nname = \"tests\"\nversion = \"0.1.0\"\n", encoding="utf-8"
+        )
+        for component in LOOP.COMPONENTS:
+            (root / component).mkdir(parents=True, exist_ok=True)
+        return source
+
+    def test_snapshot_exports_the_workspace_under_test_for_its_own_component(self):
+        """The source workspace, not the sibling named after its component.
+
+        Regression: `snapshot` derived every component from `source.parent`,
+        so a netem_test workspace checked out beside the canonical
+        `netem_test` directory exported the *sibling* trunk and recorded its
+        revision - a candidate snapshot identical to trunk that only a
+        hand-grep of the exported tree could detect.
+        """
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            source = self.snapshot_under_test_fixture(root, "netem_test_change")
+            output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-under-test-{os.getpid()}"
+            snapshot_calls = {}
+
+            def fake_snapshot(component_source, component_output, revision):
+                snapshot_calls[component_output.name] = Path(component_source)
+                component_output.mkdir(parents=True, exist_ok=True)
+                if component_output.name == "netem_test":
+                    self.make_workspace(component_output.parent, "netem_test")
+                return {
+                    "commit_id": component_output.name[0].encode().hex().ljust(40, "0")[:40],
+                    "change_id": component_output.name[0].ljust(32, "x"),
+                }
+
+            try:
+                with (
+                    mock.patch.object(LOOP, "snapshot_component", fake_snapshot),
+                    mock.patch.object(LOOP, "assert_snapshot_matches_sources"),
+                ):
+                    self.assertEqual(
+                        LOOP.command_snapshot(
+                            argparse.Namespace(
+                                source=str(source),
+                                revision="@-",
+                                component_revision=[],
+                                output=str(output),
+                            )
+                        ),
+                        0,
+                    )
+                self.assertEqual(snapshot_calls["netem_test"], source)
+                for component in LOOP.COMPONENTS:
+                    if component == "netem_test":
+                        continue
+                    self.assertEqual(
+                        snapshot_calls[component], source.parent / component
+                    )
+            finally:
+                shutil.rmtree(output, ignore_errors=True)
+
+    def test_snapshot_guard_refuses_a_revision_not_resolved_from_the_under_test_tree(self):
+        """The guard fails when the recorded revision is the sibling's."""
+        source = Path("/tmp/example/netem_test_change")
+        recorded = {
+            component: {"commit_id": "a" * 40, "change_id": "b" * 32}
+            for component in LOOP.COMPONENTS
+        }
+        sibling_revision = "c" * 40
+        source_revision = "d" * 40
+
+        def fake_identity(directory, revision):
+            if Path(directory) == source:
+                return {"commit_id": source_revision, "change_id": "e" * 32}
+            return {"commit_id": recorded["rtp"]["commit_id"], "change_id": "b" * 32}
+
+        components = dict(recorded)
+        components["netem_test"] = {
+            "commit_id": sibling_revision,
+            "change_id": "f" * 32,
+        }
+        with (
+            mock.patch.object(LOOP, "jj_identity", fake_identity),
+            mock.patch.object(LOOP, "assert_export_matches_revision"),
+        ):
+            with self.assertRaisesRegex(ValueError, "netem_test") as caught:
+                LOOP.assert_snapshot_matches_sources(
+                    source, "netem_test", {}, "@-", components, Path("/tmp/example/out")
+                )
+        self.assertIn(sibling_revision, str(caught.exception))
+        self.assertIn(source_revision, str(caught.exception))
+
+    def test_snapshot_guard_refuses_an_export_that_is_not_the_recorded_tree(self):
+        """The guard fails when the exported files are not the recorded tree."""
+        identity = {"commit_id": "a" * 40, "change_id": "b" * 32}
+        with (
+            mock.patch.object(LOOP, "_git_store", return_value="/tmp/example/git"),
+            mock.patch.object(
+                LOOP,
+                "_tracked_blob_map",
+                return_value={"src/lib.rs": ("100644", "1" * 40)},
+            ),
+            mock.patch.object(
+                LOOP,
+                "_exported_blob_map",
+                return_value={"src/lib.rs": ("100644", "1" * 40)},
+            ),
+        ):
+            LOOP.assert_export_matches_revision(
+                Path("/tmp/example/source"), Path("/tmp/example/out/netem_test"), "netem_test", identity
+            )
+        with (
+            mock.patch.object(LOOP, "_git_store", return_value="/tmp/example/git"),
+            mock.patch.object(
+                LOOP,
+                "_tracked_blob_map",
+                return_value={"src/lib.rs": ("100644", "1" * 40)},
+            ),
+            mock.patch.object(
+                LOOP,
+                "_exported_blob_map",
+                return_value={"src/lib.rs": ("100644", "2" * 40)},
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "does not match the recorded revision") as caught:
+                LOOP.assert_export_matches_revision(
+                    Path("/tmp/example/source"), Path("/tmp/example/out/netem_test"), "netem_test", identity
+                )
+        self.assertIn("src/lib.rs", str(caught.exception))
+
+    def test_snapshot_refuses_an_ambiguous_source_workspace(self):
+        """A name that contradicts the manifest names both candidates."""
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            source = root / "rtp"
+            (source / "tests").mkdir(parents=True)
+            (source / "Cargo.toml").write_text(
+                "[workspace]\nmembers = [\"netem-test\", \"tests\"]\n",
+                encoding="utf-8",
+            )
+            (source / "netem-test").mkdir()
+            (source / "netem-test" / "Cargo.toml").write_text(
+                "[package]\nname = \"netem-test\"\nversion = \"0.1.0\"\n",
+                encoding="utf-8",
+            )
+            (source / "tests" / "Cargo.toml").write_text("", encoding="utf-8")
+            (root / "netem_test").mkdir()
+            revisions = {"rtp": "1" * 40, "netem_test": "2" * 40}
+
+            def fake_identity(directory, revision):
+                return {
+                    "commit_id": revisions.get(Path(directory).name, "3" * 40),
+                    "change_id": "c" * 32,
+                }
+
+            with mock.patch.object(LOOP, "jj_identity", fake_identity):
+                with self.assertRaisesRegex(ValueError, "ambiguous") as caught:
+                    LOOP.source_workspace_component(source, "@-")
+            message = str(caught.exception)
+            self.assertIn("rtp", message)
+            self.assertIn("netem_test", message)
+            self.assertIn("1" * 40, message)
+            self.assertIn("2" * 40, message)
+
+    def test_snapshot_refuses_a_missing_suite_component(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            source = self.make_workspace(root, "netem_test")
+            with self.assertRaisesRegex(ValueError, "suite component is missing"):
+                LOOP.snapshot_component_sources(source, "netem_test")
 
     def frozen_suite_fixture(self, root):
         """A minimal frozen suite export with one edge per supported shape.
@@ -502,7 +686,10 @@ class PerfLoopTest(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(LOOP, "snapshot_component", fake_snapshot):
+                with (
+                    mock.patch.object(LOOP, "snapshot_component", fake_snapshot),
+                    mock.patch.object(LOOP, "assert_snapshot_matches_sources"),
+                ):
                     self.assertEqual(
                         LOOP.command_snapshot(
                             argparse.Namespace(
