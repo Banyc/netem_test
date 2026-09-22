@@ -8,6 +8,16 @@ classifies the result.  The verdict is a consistency label, not statistical
 confidence or causality; every source hint carries a does_not_prove
 constraint and no hint identifies a specific branch as causal.
 
+A bulk pair set is classified on two axes, goodput and latency, so a
+movement on either one can be named. Goodput keeps its paired 10% rule.
+Latency is the consensus of the RTT p50/p90/p99 percentiles, each material
+only when its median paired movement is at least `LATENCY_MATERIAL_PERCENT`
+*and* at least `LATENCY_MATERIAL_MS`; a pure latency movement is
+`latency_improvement` or `latency_regression` (never `no_material_change`),
+and an axis pair in which one side improved while the other regressed is
+`mixed_results`. When no valid pair carries an RTT percentile the axis has
+no evidence and the verdict falls back to the goodput-only rule.
+
 The wire price is reported per direction.  The netem byte counters measure
 the UDP payload the proxy was handed, so their ratios are named for that
 payload and never for the framed bytes:
@@ -43,7 +53,7 @@ import statistics
 import sys
 from pathlib import Path
 
-COMPARISON_SCHEMA_VERSION = 38
+COMPARISON_SCHEMA_VERSION = 39
 
 GENTLE_EXIT_CAUSES = ("loss", "gate_open", "drain_guard", "outage_reset")
 
@@ -1993,7 +2003,103 @@ def classify(valid_pairs):
     return classify_bulk_scenario(valid_pairs)
 
 
+# Bulk-latency materiality. The RTT percentiles are quantiles of thousands
+# of samples, so their paired movement is far narrower than goodput's: on the
+# harness's own same-binary controls the median paired relative movement is
+# <= 0.64% on the fat-pipe lanes and <= 1.97% on the hostile lane, with a
+# 4.92% worst case at two pairs whose other percentiles stay flat. A
+# percentage alone cannot carry the axis, because the `clean` lane's RTT is
+# about 0.076 ms and its seed-to-seed movement is scheduler jitter of at most
+# 0.082 ms; LATENCY_MATERIAL_MS is the absolute floor below which a movement
+# is host jitter rather than transport latency.
+LATENCY_MATERIAL_PERCENT = 5.0
+LATENCY_MATERIAL_MS = 1.0
+BULK_LATENCY_METRICS = ("rtt_p50_ms", "rtt_p90_ms", "rtt_p99_ms")
+
+
+def _goodput_direction(deltas, threshold=10.0):
+    """Paired direction of bulk goodput, which is higher-is-better."""
+    if all(value <= -threshold for value in deltas):
+        return "regressed"
+    if all(value >= threshold for value in deltas):
+        return "improved"
+    if all(-threshold < value < threshold for value in deltas):
+        return "unchanged"
+    return "mixed"
+
+
+def _median_paired_movement(valid_pairs, metric):
+    """Median (relative, absolute) candidate-minus-baseline movement for one
+    metric over the pairs that carry it, or (None, None) when none do."""
+    relative = []
+    absolute = []
+    for pair in valid_pairs:
+        values = pair["metrics"].get(metric)
+        if values is None:
+            continue
+        candidate = values.get("candidate")
+        baseline = values.get("baseline")
+        if candidate is None or baseline is None:
+            continue
+        delta = ranking_delta_percent(candidate, baseline)
+        if delta is None:
+            continue
+        relative.append(delta)
+        absolute.append(candidate - baseline)
+    if not relative:
+        return None, None
+    return statistics.median(relative), statistics.median(absolute)
+
+
+def _latency_metric_direction(valid_pairs, metric):
+    """Material direction of one RTT percentile. Latency is lower-is-better,
+    so a fall is an improvement, and a movement counts only when its median
+    is material both relatively and in absolute milliseconds."""
+    relative, absolute = _median_paired_movement(valid_pairs, metric)
+    if relative is None:
+        return None
+    if (
+        relative <= -LATENCY_MATERIAL_PERCENT
+        and absolute <= -LATENCY_MATERIAL_MS
+    ):
+        return "improved"
+    if (
+        relative >= LATENCY_MATERIAL_PERCENT
+        and absolute >= LATENCY_MATERIAL_MS
+    ):
+        return "regressed"
+    return "unchanged"
+
+
+def latency_direction(valid_pairs):
+    """Consensus direction across the RTT percentiles, or None when no valid
+    pair carries any RTT percentile and the axis has no evidence. Percentiles
+    that moved materially in opposite directions are 'mixed'."""
+    directions = {}
+    for metric in BULK_LATENCY_METRICS:
+        direction = _latency_metric_direction(valid_pairs, metric)
+        if direction is not None:
+            directions[metric] = direction
+    if not directions:
+        return None
+    material = {
+        direction
+        for direction in directions.values()
+        if direction in ("improved", "regressed")
+    }
+    if len(material) > 1:
+        return "mixed"
+    if not material:
+        return "unchanged"
+    return material.pop()
+
+
 def classify_bulk_scenario(valid_pairs):
+    """Classify a bulk pair set on two axes: goodput under the paired 10%
+    rule, and latency under the RTT-percentile materiality rule. A change
+    that moves only latency is named for the axis it moved
+    (`latency_improvement` / `latency_regression`) rather than flattened into
+    `no_material_change`, and a cross-axis trade stays `mixed_results`."""
     deltas = [
         pair["metrics"]["goodput_mib_per_second"]["delta_percent"]
         for pair in valid_pairs
@@ -2001,12 +2107,22 @@ def classify_bulk_scenario(valid_pairs):
     deltas = [value for value in deltas if value is not None]
     if not deltas:
         return "insufficient_evidence"
-    if all(value <= -10.0 for value in deltas):
+    goodput = _goodput_direction(deltas)
+    latency = latency_direction(valid_pairs)
+    if latency is None:
+        latency = "unchanged"
+    if goodput == "mixed" or latency == "mixed":
+        return "mixed_results"
+    if goodput == "unchanged":
+        if latency == "unchanged":
+            return "no_material_change"
+        if latency == "improved":
+            return "latency_improvement"
+        return "latency_regression"
+    if latency == "unchanged" or latency == goodput:
+        if goodput == "improved":
+            return "likely_improvement"
         return "likely_regression"
-    if all(value >= 10.0 for value in deltas):
-        return "likely_improvement"
-    if all(-10.0 < value < 10.0 for value in deltas):
-        return "no_material_change"
     return "mixed_results"
 
 
@@ -2159,6 +2275,20 @@ def guidance_hints(pairs, verdict):
                 ),
             }
         )
+    if verdict in ("latency_improvement", "latency_regression"):
+        hints.append(
+            {
+                "metric": "verdict",
+                "direction": verdict,
+                "delta_percent": None,
+                "does_not_prove": (
+                    "The RTT percentiles moved materially while paired goodput "
+                    "did not, so the verdict names the latency axis alone; it "
+                    "does_not_prove which branch produced the movement and does "
+                    "not claim the throughput axis moved."
+                ),
+            }
+        )
     if not pairs:
         hints.append(
             {
@@ -2239,6 +2369,7 @@ def build_comparison(
     return {
         "schema_version": COMPARISON_SCHEMA_VERSION,
         "verdict": verdict,
+        "latency_direction": latency_direction(valid_pairs),
         "valid_pairs": len(valid_pairs),
         "total_pairs": len(pairs),
         "evidence_quality": _overall_quality(runs),

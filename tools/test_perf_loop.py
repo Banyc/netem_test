@@ -780,6 +780,54 @@ class PerfLoopTest(unittest.TestCase):
             finally:
                 shutil.rmtree(output, ignore_errors=True)
 
+    def test_fail_on_regression_covers_the_latency_axis(self):
+        """--fail-on-regression asserts on a material latency regression as
+        well as a goodput one, and stays quiet on an improvement."""
+        self.assertEqual(
+            LOOP.REGRESSION_VERDICTS, ("likely_regression", "latency_regression")
+        )
+
+        def run_with(verdict):
+            with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+                root = Path(directory)
+                output_root = root / "out"
+                args = argparse.Namespace(
+                    mss_bytes=8192,
+                    output=str(output_root),
+                    baseline=[["11", str(root / "b")]],
+                    candidate=[["11", str(root / "c")]],
+                    fail_on_regression=True,
+                    fail_on_phase_drift=False,
+                )
+
+                def fake_call_compare(
+                    baseline_dirs,
+                    candidate_dirs,
+                    output_root,
+                    allowed_config_mismatches=(),
+                    allowed_config_fields=None,
+                ):
+                    (Path(output_root) / "comparison.json").write_text(
+                        json.dumps(
+                            {
+                                "verdict": verdict,
+                                "evidence_quality": "healthy",
+                                "valid_pairs": 2,
+                                "total_pairs": 2,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess([], 0, b"", b"")
+
+                with mock.patch.object(LOOP, "call_compare", fake_call_compare):
+                    return LOOP.command_compare(args)
+
+        self.assertEqual(run_with("latency_regression"), 3)
+        self.assertEqual(run_with("likely_regression"), 3)
+        self.assertEqual(run_with("latency_improvement"), 0)
+        self.assertEqual(run_with("no_material_change"), 0)
+
     def test_same_binary_control_calibration_detects_false_changes(self):
         comparison = {
             "verdict": "no_material_change",
@@ -1731,6 +1779,51 @@ class PerfLoopTest(unittest.TestCase):
             calibration["within_run_phase_analysis"]["classification"],
             "unstable_phase_drift",
         )
+
+    def test_control_calibration_counts_a_latency_false_material_change(self):
+        """A same-binary control whose RTT percentiles moved materially is a
+        false material change on the latency axis, so it cannot bound the
+        lane's latency noise even when every goodput delta is flat. An
+        artifact from before the axis existed carries no field and is not
+        material."""
+
+        def comparison(latency_direction):
+            payload = {
+                "verdict": "no_material_change",
+                "evidence_quality": "healthy",
+                "pairs": [
+                    {
+                        "valid": True,
+                        "metrics": {
+                            "goodput_mib_per_second": {"delta_percent": 0.4}
+                        },
+                    },
+                    {
+                        "valid": True,
+                        "metrics": {
+                            "goodput_mib_per_second": {"delta_percent": -0.6}
+                        },
+                    },
+                ],
+                "runs": [],
+            }
+            if latency_direction is not None:
+                payload["latency_direction"] = latency_direction
+            return payload
+
+        stable = LOOP.control_calibration(comparison(None))
+        self.assertEqual(stable["classification"], "stable")
+        self.assertIsNone(stable["latency_direction"])
+        self.assertFalse(stable["latency_material"])
+        for direction in ("improved", "regressed", "mixed"):
+            material = LOOP.control_calibration(comparison(direction))
+            self.assertEqual(material["classification"], "unstable", direction)
+            self.assertEqual(material["paired_classification"], "stable")
+            self.assertTrue(material["latency_material"], direction)
+            self.assertEqual(material["latency_direction"], direction)
+        unchanged = LOOP.control_calibration(comparison("unchanged"))
+        self.assertEqual(unchanged["classification"], "stable")
+        self.assertFalse(unchanged["latency_material"])
 
     def test_role_local_phase_drift_is_reported_for_both_roles(self):
         comparison = {

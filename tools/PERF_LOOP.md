@@ -453,10 +453,14 @@ Both flags are opt-in and meant for the deterministic lane; stochastic lanes
 permits identical resolved workspaces; the resolved executable paths must
 also match) to calibrate run-to-run variance. `run.json` then records
 `control_calibration`, classified stable only when every absolute valid
-paired goodput delta is below 10% AND the within-run phase analysis is not
-`unstable_phase_drift` — with the median/maximum absolute delta and the
-number of pairs that crossed the material-change threshold (false material
-changes on an identical binary). `within_run_phase_analysis` is also written
+paired goodput delta is below 10%, the comparison's `latency_direction` is
+not material, AND the within-run phase analysis is not
+`unstable_phase_drift` — with the median/maximum absolute delta, the number
+of pairs that crossed the material-change threshold (false material changes
+on an identical binary), and the recorded `latency_direction` /
+`latency_material` pair. An artifact written before the latency axis existed
+carries no `latency_direction` and is not treated as material.
+`within_run_phase_analysis` is also written
 into every `run.json`: it compares each run's first-half and second-half
 goodput at the exact midpoint, marking a `material_phase_drift` whenever one
 half differs from the other by at least `MATERIAL_PHASE_DRIFT_PERCENT`
@@ -729,7 +733,8 @@ The `perf-loop` subcommands:
   comparison tool itself failed, or no valid paired evidence remains
   (verdict `insufficient_evidence`, including zero seed pairs or a trace
   excluded for a malformed CSV field).
-- `3` — only with `--fail-on-regression` and a `likely_regression` verdict.
+- `3` — only with `--fail-on-regression` and a `likely_regression` or
+  `latency_regression` verdict.
 - `4` — only with `--fail-on-control-instability` and an unstable
   same-binary `control_calibration`.
 
@@ -743,6 +748,16 @@ to accept those artifacts and exit `0` anyway. `perf_loop.call_compare` always
 passes `--report-only` because the loop inspects the written `comparison.json`
 and enforces (and names) the evidence contract itself, so its own exit codes
 and reasons are unchanged.
+
+A bulk pair set is classified on two axes, goodput and latency. Goodput
+keeps the paired 10% rule. Latency is the consensus of the RTT p50/p90/p99
+percentiles, each material only when its median paired movement is at least
+5% *and* at least 1 ms; the 1 ms floor is what keeps the `clean` lane's
+sub-millisecond scheduler jitter out of the verdict. A movement on only the
+latency axis is `latency_improvement` or `latency_regression`, never
+`no_material_change`; a pair that improved on one axis while regressing on
+the other is `mixed_results`; and a pair set with no RTT percentile falls
+back to the goodput-only verdict.
 
 The verdict is a consistency label over valid seed-paired evidence only; it
 is not statistical confidence or causality. Every agent hint carries a

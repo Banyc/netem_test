@@ -28,6 +28,9 @@ SAFE_TEMP_ROOT = Path.home() / "code" / "tmp"
 DEFAULT_SEEDS = (11, 21)
 DEFAULT_WARMUP_SECONDS = 5.0
 MATERIAL_PHASE_DRIFT_PERCENT = 20.0
+# Verdicts that name a material regression on one axis; both fail an asserting
+# battery under --fail-on-regression.
+REGRESSION_VERDICTS = ("likely_regression", "latency_regression")
 PERF_TEST = "probe_hostile_goodput_30s"
 # Executable probes driven by the perf loop. The bulk goodput probe covers
 # the hostile-steady bottleneck, recoverable, gaming, and paired-saturated
@@ -1908,8 +1911,18 @@ def control_calibration(comparison):
     absolute = [abs(value) for value in deltas if value is not None]
     phase_stability = within_run_phase_analysis(comparison)
     paired_stable = len(absolute) > 0 and all(value < 10.0 for value in absolute)
-    stable = paired_stable and phase_stability["classification"] != "unstable_phase_drift"
-    return {"classification": "stable" if stable else "unstable", "paired_classification": "stable" if paired_stable else "unstable", "valid_pairs": len(absolute), "median_absolute_delta_percent": statistics.median(absolute) if absolute else None, "max_absolute_delta_percent": max(absolute) if absolute else None, "false_material_change_count": sum(1 for value in absolute if value >= 10.0), "within_run_phase_analysis": phase_stability}
+    # The verdict has a latency axis too, so a same-binary control whose RTT
+    # percentiles moved materially is a false material change on that axis and
+    # cannot bound the lane's latency noise. An absent field (an artifact from
+    # before the axis existed) is not material.
+    latency = comparison.get("latency_direction")
+    latency_material = latency in ("improved", "regressed", "mixed")
+    stable = (
+        paired_stable
+        and phase_stability["classification"] != "unstable_phase_drift"
+        and not latency_material
+    )
+    return {"classification": "stable" if stable else "unstable", "paired_classification": "stable" if paired_stable else "unstable", "valid_pairs": len(absolute), "median_absolute_delta_percent": statistics.median(absolute) if absolute else None, "max_absolute_delta_percent": max(absolute) if absolute else None, "false_material_change_count": sum(1 for value in absolute if value >= 10.0), "latency_direction": latency, "latency_material": latency_material, "within_run_phase_analysis": phase_stability}
 
 
 def execution_order_analysis(comparison, runs):
@@ -2567,7 +2580,7 @@ def command_run(args):
             file=sys.stderr,
         )
         return 2
-    if args.fail_on_regression and verdict == "likely_regression":
+    if args.fail_on_regression and verdict in REGRESSION_VERDICTS:
         return 3
     phase_failure = phase_drift_failure(readiness, args.link_profile)
     if args.fail_on_phase_drift and phase_failure is not None:
@@ -2624,7 +2637,7 @@ def command_compare(args):
             file=sys.stderr,
         )
         return 2
-    if args.fail_on_regression and comparison.get("verdict") == "likely_regression":
+    if args.fail_on_regression and comparison.get("verdict") in REGRESSION_VERDICTS:
         return 3
     return 0
 

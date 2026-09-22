@@ -308,7 +308,7 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 38)
+            self.assertEqual(comparison["schema_version"], 39)
             self.assertEqual(comparison["valid_pairs"], 1)
             self.assertEqual(comparison["total_pairs"], 1)
             self.assertEqual(comparison["verdict"], "likely_improvement")
@@ -578,7 +578,7 @@ class TraceCompareTest(unittest.TestCase):
             comparison = json.loads(
                 (output / "comparison.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(comparison["schema_version"], 38)
+            self.assertEqual(comparison["schema_version"], 39)
             self.assertEqual(comparison["evidence_quality"], "healthy")
             for run in comparison["runs"]:
                 self.assertEqual(run["evidence_quality"], "healthy")
@@ -2058,6 +2058,126 @@ class TraceCompareTest(unittest.TestCase):
         pairs = [pair(50.0), pair(-50.0)]
         self.assertEqual(COMPARE.classify_bulk_scenario(pairs), "mixed_results")
         self.assertEqual(COMPARE.classify(pairs), "mixed_results")
+
+    def bulk_pair(
+        self,
+        goodput_percent,
+        rtt_p50=None,
+        rtt_p90=None,
+        rtt_p99=None,
+    ):
+        """One valid bulk pair. Goodput is given as a delta, RTT percentiles
+        as raw (baseline_ms, candidate_ms) endpoints -- endpoints rather than
+        deltas so the absolute-millisecond floor is exercised exactly as the
+        classifier reads it. A None percentile is absent from the pair."""
+
+        def endpoint(baseline, candidate):
+            return {
+                "baseline": baseline,
+                "candidate": candidate,
+                "difference": candidate - baseline,
+                "delta_percent": (candidate - baseline) / abs(baseline) * 100.0,
+            }
+
+        metrics = {
+            "goodput_mib_per_second": endpoint(
+                100.0, 100.0 * (1.0 + goodput_percent / 100.0)
+            ),
+        }
+        metrics["goodput_mib_per_second"]["delta_percent"] = goodput_percent
+        for name, points in (
+            ("rtt_p50_ms", rtt_p50),
+            ("rtt_p90_ms", rtt_p90),
+            ("rtt_p99_ms", rtt_p99),
+        ):
+            if points is not None:
+                metrics[name] = endpoint(*points)
+        return {
+            "baseline": {"manifest": {"scenario": "bulk_clean"}},
+            "metrics": metrics,
+        }
+
+    def test_bulk_shifted_rtt_with_flat_goodput_is_not_neutral(self):
+        """A CDF that separates into two clusters while goodput stays flat is
+        a material latency improvement, never no_material_change. The numbers
+        are the preserved baseline-redesign pair: p50 343->324 ms, p90
+        383->347 ms, p99 392->354 ms, goodput -0.8%."""
+        pairs = [
+            self.bulk_pair(-0.84, (343.2, 324.2), (382.5, 346.5), (392.5, 353.5)),
+            self.bulk_pair(-0.77, (344.5, 324.3), (382.6, 348.0), (392.4, 353.7)),
+        ]
+        verdict = COMPARE.classify_bulk_scenario(pairs)
+        self.assertEqual(verdict, "latency_improvement")
+        self.assertNotEqual(verdict, "no_material_change")
+        self.assertNotEqual(verdict, "likely_regression")
+
+    def test_bulk_goodput_only_change_keeps_its_verdict(self):
+        """A flat RTT CDF must leave the throughput axis alone: the goodput
+        verdicts and the mixed split survive unchanged."""
+        flat = ((350.0, 351.0), (383.0, 384.0), (393.0, 394.0))
+        moved = [
+            self.bulk_pair(15.0, *flat),
+            self.bulk_pair(22.0, *flat),
+        ]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(moved), "likely_improvement"
+        )
+        regressed = [
+            self.bulk_pair(-15.0, *flat),
+            self.bulk_pair(-22.0, *flat),
+        ]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(regressed), "likely_regression"
+        )
+        split = [self.bulk_pair(50.0, *flat), self.bulk_pair(-50.0, *flat)]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(split), "mixed_results"
+        )
+        unchanged = [self.bulk_pair(1.0, *flat), self.bulk_pair(-1.0, *flat)]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(unchanged), "no_material_change"
+        )
+
+    def test_bulk_rtt_regression_is_flagged_not_ignored(self):
+        """The same materiality rule fires in the other direction with a flat
+        goodput, and a cross-axis trade is mixed rather than either
+        likely_improvement or likely_regression."""
+        regressed = [
+            self.bulk_pair(-0.5, (343.0, 372.0), (383.0, 415.0), (393.0, 425.0)),
+            self.bulk_pair(0.4, (344.0, 371.0), (382.0, 414.0), (392.0, 424.0)),
+        ]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(regressed), "latency_regression"
+        )
+        # Goodput improves materially while the CDF moves the wrong way.
+        trade = [
+            self.bulk_pair(15.0, (343.0, 372.0), (383.0, 415.0), (393.0, 425.0)),
+            self.bulk_pair(18.0, (344.0, 371.0), (382.0, 414.0), (392.0, 424.0)),
+        ]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(trade), "mixed_results"
+        )
+
+    def test_bulk_movement_inside_the_measured_spread_stays_neutral(self):
+        """Neither a sub-threshold relative movement nor a percentage that
+        crosses the threshold on a sub-millisecond `clean`-lane RTT is
+        material: the relative rule alone would fire on scheduler jitter."""
+        below_percent = [
+            self.bulk_pair(0.2, (343.0, 356.0), (383.0, 397.0), (393.0, 407.0)),
+            self.bulk_pair(-0.3, (344.0, 357.0), (382.0, 396.0), (392.0, 406.0)),
+        ]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(below_percent),
+            "no_material_change",
+        )
+        clean_jitter = [
+            self.bulk_pair(0.1, (0.0760, 0.0800), (0.1160, 0.1330), (0.1897, 0.3778)),
+            self.bulk_pair(-0.2, (0.0770, 0.0770), (0.1160, 0.1123), (0.2310, 0.2065)),
+        ]
+        self.assertEqual(
+            COMPARE.classify_bulk_scenario(clean_jitter), "no_material_change"
+        )
+        self.assertEqual(COMPARE.latency_direction(clean_jitter), "unchanged")
 
     def test_message_mixed_wire_with_unchanged_tail_is_mixed_results(self):
         """A wire-byte series that moved both ways is a material tradeoff, not
