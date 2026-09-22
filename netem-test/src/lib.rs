@@ -3416,6 +3416,41 @@ mod tests {
         drop(sent);
     }
 
+    /// The stochastic direct path must honor the blackout gate exactly like
+    /// the clean direct and queued paths: the packet is counted received and
+    /// dropped, gated before any duplicate or loss draw, and nothing reaches
+    /// the wire.
+    #[test]
+    fn stochastic_direct_path_honors_blackout() {
+        let config = NetemConfig {
+            duplicate: u32::MAX,
+            seed: 5,
+            ..NetemConfig::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        assert!(
+            runner.pipeline.direct_stochastic,
+            "a duplicate-only config must take the stochastic direct path"
+        );
+        runner.pipeline.blackout.store(true, Ordering::Relaxed);
+        let dst = Some(sent.local_addr().unwrap());
+        assert!(
+            runner
+                .pipeline
+                .forward_stochastic_direct(b"gated", dst, &*sent)
+        );
+        let stats = runner.pipeline.stats.snapshot();
+        assert_eq!(stats.received, 1);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(
+            stats.duplicated, 0,
+            "blackout must gate before the duplicate draw"
+        );
+        assert_eq!(stats.forwarded, 0);
+        assert!(sent.sent.lock().unwrap().is_empty());
+        drop(sent);
+    }
+
     #[test]
     fn impaired_config_stays_on_the_queue_path() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
@@ -3770,6 +3805,281 @@ mod tests {
         drop(queued_sent);
     }
 
+    /// Duplication is drawn before loss, and a packet selected by both leaves
+    /// exactly one copy on the wire: the loss consumes one of the two
+    /// duplication slots. `loss = draw_1` and `duplicate = draw_0` fire both
+    /// decisions on the same packet at their exact inclusive boundaries.
+    #[test]
+    fn duplicated_then_lost_packet_yields_one_survivor() {
+        let seed = (1u64..)
+            .find(|seed| nth_draw(*seed, 0) != 0 && nth_draw(*seed, 1) != 0)
+            .expect("a seed whose first two draws are non-zero exists");
+        let config = NetemConfig {
+            duplicate: nth_draw(seed, 0),
+            loss: nth_draw(seed, 1),
+            loss_model: LossModel::Random,
+            seed,
+            ..NetemConfig::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        let dst = Some(sent.local_addr().unwrap());
+        runner
+            .pipeline
+            .forward_stochastic_direct(b"both", dst, &*sent);
+        let stats = runner.pipeline.stats.snapshot();
+        assert_eq!(stats.duplicated, 1, "the duplicate draw must fire");
+        assert_eq!(stats.dropped, 1, "the loss draw must fire");
+        assert_eq!(
+            stats.forwarded, 1,
+            "a duplicated-then-lost packet leaves exactly one copy"
+        );
+        assert_eq!(sent.sent.lock().unwrap().len(), 1);
+        drop(sent);
+    }
+
+    /// A non-`Random` loss model is stochastic work even when the `loss` field
+    /// is zero: `Periodic` and `PeriodicSpread` ignore `loss`, and `FourState`
+    /// carries its own probabilities. Treating such a config as clean would
+    /// take the direct path, forward every packet, and never consult the
+    /// model at all.
+    #[test]
+    fn non_random_loss_model_selects_the_stochastic_path() {
+        let cases = [
+            (
+                LossModel::Periodic {
+                    period: 2,
+                    losses: 1,
+                },
+                Some(4u64),
+            ),
+            (
+                LossModel::PeriodicSpread {
+                    period: 2,
+                    losses: 1,
+                },
+                Some(4u64),
+            ),
+            (
+                LossModel::FourState(FourStateLoss {
+                    p14: u32::MAX / 2,
+                    p13: u32::MAX / 2,
+                    p31: u32::MAX / 2,
+                    p32: u32::MAX / 2,
+                    p23: u32::MAX / 2,
+                }),
+                None,
+            ),
+        ];
+        for (model, expected_drops) in cases {
+            let config = NetemConfig {
+                loss: 0,
+                loss_model: model,
+                seed: 11,
+                ..NetemConfig::default()
+            };
+            let (mut runner, sent) = mock_runner(config);
+            assert!(
+                runner.pipeline.direct_stochastic,
+                "a non-Random loss model is stochastic work even with loss == 0"
+            );
+            assert!(
+                !runner.pipeline.direct_forward,
+                "a non-Random loss model must not take the clean direct path"
+            );
+            let dst = Some(sent.local_addr().unwrap());
+            for i in 0..8u32 {
+                let payload = i.to_le_bytes();
+                // The dispatch `LinkRunner::run` performs for a no-scheduling
+                // config, driven here because the runner's loop owns a socket.
+                if runner.pipeline.direct_stochastic {
+                    runner
+                        .pipeline
+                        .forward_stochastic_direct(&payload, dst, &*sent);
+                } else if runner.pipeline.direct_forward {
+                    runner.pipeline.forward_direct(&payload, dst, &*sent);
+                } else {
+                    runner
+                        .pipeline
+                        .handle_datagram(&payload, sent.clock().now(), dst);
+                }
+            }
+            let stats = runner.pipeline.stats.snapshot();
+            match expected_drops {
+                Some(expected) => assert_eq!(stats.dropped, expected),
+                None => assert!(
+                    stats.dropped > 0,
+                    "the four-state model must still drop packets"
+                ),
+            }
+            drop(sent);
+        }
+    }
+
+    /// The FIFO path tail-drops once `queue_limit_pkts` packets are held, so
+    /// the queue never exceeds the configured depth.
+    #[test]
+    fn fifo_queue_limit_tail_drops_at_the_configured_depth() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(10),
+            queue_limit_pkts: 3,
+            ..NetemConfig::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        assert!(
+            runner.pipeline.uses_fifo_scheduling(),
+            "a latency-only config must select the FIFO path"
+        );
+        let clock = sent.clock();
+        let mut fifo = FifoQueue::default();
+        for i in 0..6u32 {
+            runner.pipeline.handle_datagram_fifo(
+                &i.to_le_bytes(),
+                clock.now(),
+                Some(server_addr),
+                &mut fifo,
+            );
+        }
+        assert_eq!(
+            fifo.packets.len(),
+            3,
+            "the FIFO must hold exactly queue_limit_pkts packets"
+        );
+        assert_eq!(runner.pipeline.stats.snapshot().overflow_dropped, 3);
+        drop(sent);
+    }
+
+    /// A datagram of exactly `max_datagram_size` bytes must pass every path;
+    /// one byte more must be dropped. The size filter is compared with a
+    /// strict `>`, so the boundary belongs on the forwarding side.
+    #[test]
+    fn max_datagram_size_admits_exactly_the_limit_on_every_path() {
+        const LIMIT: usize = 64;
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let at_limit = [0u8; LIMIT];
+        let over_limit = [0u8; LIMIT + 1];
+
+        let (mut heap, heap_sent) = mock_runner(NetemConfig {
+            max_datagram_size: LIMIT,
+            latency: Duration::from_millis(1),
+            ..NetemConfig::default()
+        });
+        heap.handle_datagram(&at_limit, server_addr, heap_sent.clock().now());
+        assert_eq!(
+            heap.pipeline.stats.snapshot().dropped,
+            0,
+            "a datagram exactly max_datagram_size must pass the heap path"
+        );
+        heap.handle_datagram(&over_limit, server_addr, heap_sent.clock().now());
+        assert_eq!(heap.pipeline.stats.snapshot().dropped, 1);
+        drop(heap_sent);
+
+        let (direct, direct_sent) = mock_runner(NetemConfig {
+            max_datagram_size: LIMIT,
+            ..NetemConfig::default()
+        });
+        assert!(direct.pipeline.direct_forward);
+        assert!(
+            direct
+                .pipeline
+                .forward_direct(&at_limit, Some(server_addr), &*direct_sent)
+        );
+        let stats = direct.pipeline.stats.snapshot();
+        assert_eq!(
+            (stats.received, stats.dropped, stats.forwarded),
+            (1, 0, 1),
+            "a datagram exactly max_datagram_size must forward on the clean direct path"
+        );
+        assert!(
+            direct
+                .pipeline
+                .forward_direct(&over_limit, Some(server_addr), &*direct_sent)
+        );
+        assert_eq!(direct.pipeline.stats.snapshot().dropped, 1);
+        drop(direct_sent);
+
+        let (mut stochastic, stochastic_sent) = mock_runner(NetemConfig {
+            max_datagram_size: LIMIT,
+            duplicate: u32::MAX,
+            ..NetemConfig::default()
+        });
+        assert!(stochastic.pipeline.direct_stochastic);
+        stochastic.pipeline.forward_stochastic_direct(
+            &at_limit,
+            Some(server_addr),
+            &*stochastic_sent,
+        );
+        assert_eq!(
+            stochastic.pipeline.stats.snapshot().dropped,
+            0,
+            "a datagram exactly max_datagram_size must pass the stochastic direct path"
+        );
+        stochastic.pipeline.forward_stochastic_direct(
+            &over_limit,
+            Some(server_addr),
+            &*stochastic_sent,
+        );
+        assert_eq!(stochastic.pipeline.stats.snapshot().dropped, 1);
+        drop(stochastic_sent);
+    }
+
+    /// Packets with equal deadlines must drain in arrival (FIFO) order. The
+    /// `Queued` insertion sequence is the tiebreaker that keeps the min-heap
+    /// from returning equal-timestamp packets in arbitrary order, which would
+    /// reorder the byte stream. Every deadline here is exactly `now`, so the
+    /// tiebreak is the only thing under test.
+    #[test]
+    fn heap_drain_preserves_fifo_order_for_equal_deadlines() {
+        let (mut runner, sent) = mock_runner(NetemConfig::default());
+        let clock = sent.clock();
+        let dst = sent.local_addr().unwrap();
+        const PACKETS: u8 = 8;
+        for i in 0..PACKETS {
+            runner.handle_datagram(&[i], dst, clock.now());
+        }
+        assert_eq!(runner.pipeline.queue.len(), PACKETS as usize);
+        runner.drain_ready(clock.now());
+        let order: Vec<u8> = sent
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(data, _)| data[0])
+            .collect();
+        assert_eq!(
+            order,
+            (0..PACKETS).collect::<Vec<u8>>(),
+            "equal deadlines must drain in arrival order"
+        );
+        drop(sent);
+    }
+
+    /// The heap's drained-payload pool is bounded at exactly
+    /// `MAX_REUSED_PACKET_BUFFERS`; recycling one extra would grow the cache
+    /// past its documented bound.
+    #[test]
+    fn heap_drain_recycles_at_most_the_count_bound() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let (mut runner, sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(1),
+            ..NetemConfig::default()
+        });
+        let clock = sent.clock();
+        let packets = MAX_REUSED_PACKET_BUFFERS + 8;
+        for i in 0..packets {
+            runner.handle_datagram(&[i as u8], server_addr, clock.now());
+        }
+        assert_eq!(runner.pipeline.queue.len(), packets);
+        clock.advance(Duration::from_millis(2));
+        runner.drain_ready(clock.now());
+        assert_eq!(
+            runner.pipeline.reused_packet_buffers.len(),
+            MAX_REUSED_PACKET_BUFFERS,
+            "the heap recycle pool must hold exactly MAX_REUSED_PACKET_BUFFERS buffers"
+        );
+        drop(sent);
+    }
+
     /// The FIFO path must schedule, order, and count packets exactly like the
     /// delay heap for an identical latency + shared-shaper config.
     #[test]
@@ -3866,6 +4176,168 @@ mod tests {
         drop(heap_sent);
     }
 
+    /// Run one four-state decision from `state_in` with `p` and the seed's
+    /// first draw (`CorRng::new(0)` passes the raw draw through), returning
+    /// `(lost, state_after)`.
+    fn four_state_probe(
+        p: FourStateLoss,
+        state_in: FourStateState,
+        seed: u64,
+    ) -> (bool, FourStateState) {
+        let model = LossModel::FourState(p);
+        let mut state = state_in;
+        let mut cor = CorRng::new(0);
+        let mut rng = RndState::seed(seed);
+        let mut packet_index = 0;
+        let lost = model.loss(
+            &mut state,
+            &mut cor,
+            &mut rng,
+            0,
+            &mut packet_index,
+            &[],
+            &mut PacketKeyedLossState::default(),
+        );
+        (lost, state)
+    }
+
+    /// `loss_4state` compares every transition draw with a strict `<`, so a
+    /// probability exactly equal to the draw must *not* fire. Flipping one
+    /// `<` to `<=` changes only the single draw equal to the probability and
+    /// is therefore invisible to any statistical scenario; pin each of the
+    /// five comparisons (plus the stay-lost-in-burst transition) at the exact
+    /// draw instead. The `d`-draw probe and the `d + 1` probe together bracket
+    /// the boundary, so a test that could not fail would show up as the two
+    /// expectations collapsing.
+    #[test]
+    fn four_state_loss_transitions_fire_only_above_the_exact_draw() {
+        let seed = (1u64..)
+            .find(|seed| first_draw(*seed) != 0 && first_draw(*seed) != u32::MAX)
+            .expect("a seed with an interior first draw exists");
+        let d = first_draw(seed);
+        let zero = FourStateLoss::default();
+
+        // p14: gap-Tx -> isolated loss.
+        let p = FourStateLoss { p14: d, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::TxInGap, seed),
+            (false, FourStateState::TxInGap),
+            "rnd == p14 must not fire; `<=` would lose by p14"
+        );
+        let p = FourStateLoss { p14: d + 1, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::TxInGap, seed),
+            (true, FourStateState::LostInGap)
+        );
+
+        // p13 (with p14 zero): gap-Tx -> burst-Tx as isolated loss.
+        let p = FourStateLoss { p13: d, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::TxInGap, seed),
+            (false, FourStateState::TxInGap),
+            "rnd == p13 must not fire; `<=` would lose by p13"
+        );
+        let p = FourStateLoss { p13: d + 1, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::TxInGap, seed),
+            (true, FourStateState::LostInBurst)
+        );
+
+        // p23: burst-Tx -> burst loss.
+        let p = FourStateLoss { p23: d, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::TxInBurst, seed),
+            (false, FourStateState::TxInBurst),
+            "rnd == p23 must not fire; `<=` would lose by p23"
+        );
+        let p = FourStateLoss { p23: d + 1, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::TxInBurst, seed),
+            (true, FourStateState::LostInBurst)
+        );
+
+        // p32: burst loss -> burst-Tx. At the draw both `p32` and `p31 + p32`
+        // (with p31 zero) miss, so the packet stays lost in burst.
+        let p = FourStateLoss { p32: d, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::LostInBurst, seed),
+            (true, FourStateState::LostInBurst),
+            "rnd == p32 must not recover; `<=` would move to burst-Tx"
+        );
+        let p = FourStateLoss { p32: d + 1, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::LostInBurst, seed),
+            (false, FourStateState::TxInBurst)
+        );
+
+        // p31: burst loss -> gap-Tx, with the same strict comparison.
+        let p = FourStateLoss { p31: d, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::LostInBurst, seed),
+            (true, FourStateState::LostInBurst),
+            "rnd == p31 must stay lost in burst; `<=` would recover to gap-Tx"
+        );
+        let p = FourStateLoss { p31: d + 1, ..zero };
+        assert_eq!(
+            four_state_probe(p, FourStateState::LostInBurst, seed),
+            (false, FourStateState::TxInGap)
+        );
+    }
+
+    /// `loss_4state` draws exactly one `u32` per packet regardless of state
+    /// (the lost-in-gap arm draws too). An extra or missing draw silently
+    /// reshapes every seeded four-state scenario, so pin the count against the
+    /// raw seed state.
+    #[test]
+    fn four_state_loss_consumes_exactly_one_draw_per_packet() {
+        let seed = 0x5EED_1234_5678_9ABCu64;
+        let config = NetemConfig {
+            loss_model: LossModel::FourState(FourStateLoss::default()),
+            seed,
+            ..NetemConfig::default()
+        };
+        let from = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234));
+        let (runner, sent) = one_packet_runner(b"one-draw", from, config);
+        assert_rng_advanced_by(runner.pipeline.rng, seed, 1, "four-state loss");
+        drop(sent);
+    }
+
+    /// A zero period means the deterministic schedules are disabled, not a
+    /// divide-by-zero. `slot = packet_index % period` would panic for period
+    /// zero if the guard were dropped.
+    #[test]
+    fn periodic_loss_models_with_a_zero_period_never_drop() {
+        for model in [
+            LossModel::Periodic {
+                period: 0,
+                losses: 7,
+            },
+            LossModel::PeriodicSpread {
+                period: 0,
+                losses: 7,
+            },
+        ] {
+            let mut state = FourStateState::default();
+            let mut cor = CorRng::new(0);
+            let mut rng = RndState::seed(1);
+            let mut packet_index = 0;
+            for _ in 0..64 {
+                assert!(
+                    !model.loss(
+                        &mut state,
+                        &mut cor,
+                        &mut rng,
+                        u32::MAX,
+                        &mut packet_index,
+                        &[],
+                        &mut PacketKeyedLossState::default(),
+                    ),
+                    "a zero period must disable the schedule, not divide by zero"
+                );
+            }
+        }
+    }
+
     /// The seeded [`RndState`] advanced by exactly `draws` draws.
     fn rng_after(seed: u64, draws: usize) -> RndState {
         let mut state = RndState::seed(seed);
@@ -3889,6 +4361,137 @@ mod tests {
     /// `RndState::next_u32()` unchanged).
     fn first_draw(seed: u64) -> u32 {
         RndState::seed(seed).next_u32()
+    }
+
+    /// The `n`th (0-based) draw of `seed`.
+    fn nth_draw(seed: u64, n: usize) -> u32 {
+        let mut state = RndState::seed(seed);
+        let mut value = state.next_u32();
+        for _ in 0..n {
+            value = state.next_u32();
+        }
+        value
+    }
+
+    /// The packet-keyed model selects a packet when the 32-bit hash of its
+    /// identity is at or below `loss` (`loss >= (mixed >> 32)`), so
+    /// `loss == threshold` is the inclusive boundary a strict `>` would move.
+    /// The threshold below was recorded from this exact seed/identity mix and
+    /// pins the comparison; the `THRESHOLD - 1` control proves the assertion
+    /// is not vacuous.
+    #[test]
+    fn packet_keyed_loss_threshold_is_inclusive() {
+        const THRESHOLD: u32 = 1_582_167_354;
+        let seed = 0x0BEE_F123_4567_89ABu64;
+        let model = LossModel::PacketKeyed { key_offset: 1 };
+        let packet = |key: u64| {
+            let mut packet = vec![7u8];
+            packet.extend_from_slice(&key.to_be_bytes());
+            packet
+        };
+        let drops = |loss: u32| {
+            let mut state = FourStateState::default();
+            let mut cor = CorRng::new(0);
+            let mut rng = RndState::seed(seed);
+            let mut packet_index = 0;
+            model.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                loss,
+                &mut packet_index,
+                &packet(42),
+                &mut PacketKeyedLossState::default(),
+            )
+        };
+        assert!(drops(u32::MAX), "full loss must select every identity");
+        assert!(
+            drops(THRESHOLD),
+            "loss == hash threshold must drop (inclusive `>=`)"
+        );
+        assert!(
+            !drops(THRESHOLD - 1),
+            "loss below the hash threshold must forward"
+        );
+    }
+
+    /// Seeded reproducibility is the harness's whole value: the packet-keyed
+    /// model mixes the identity (key XOR rotated command byte) with the
+    /// per-direction seed, so a changed mix silently reshapes every seeded
+    /// keyed scenario. Record which of the first 64 identities a fixed
+    /// seed/loss selects.
+    #[test]
+    fn packet_keyed_loss_pattern_is_seed_stable() {
+        const EXPECTED: [u64; 14] = [7, 8, 10, 12, 15, 18, 23, 38, 52, 53, 54, 59, 61, 63];
+        let seed = 0x0BEE_F123_4567_89ABu64;
+        let model = LossModel::PacketKeyed { key_offset: 1 };
+        let mut state = FourStateState::default();
+        let mut cor = CorRng::new(0);
+        let mut rng = RndState::seed(seed);
+        let mut packet_index = 0;
+        let mut keyed = PacketKeyedLossState::default();
+        let mut dropped = Vec::new();
+        for key in 0u64..64 {
+            let mut packet = vec![7u8];
+            packet.extend_from_slice(&key.to_be_bytes());
+            if model.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                u32::MAX / 4,
+                &mut packet_index,
+                &packet,
+                &mut keyed,
+            ) {
+                dropped.push(key);
+            }
+        }
+        assert_eq!(dropped, EXPECTED);
+    }
+
+    /// The remembered-identity set is bounded at exactly the documented
+    /// capacity. Retaining one fewer silently forgets the oldest first
+    /// transmission, so its retransmission is dropped a second time.
+    #[test]
+    fn packet_keyed_history_remembers_exactly_the_capacity() {
+        const CAPACITY: u64 = 65_536;
+        let model = LossModel::PacketKeyed { key_offset: 1 };
+        let mut state = FourStateState::default();
+        let mut cor = CorRng::new(0);
+        let mut rng = RndState::seed(0x1234_5678_9ABC_DEF0);
+        let mut packet_index = 0;
+        let mut keyed = PacketKeyedLossState::default();
+        let packet = |key: u64| {
+            let mut packet = vec![3u8];
+            packet.extend_from_slice(&key.to_be_bytes());
+            packet
+        };
+        for key in 0..CAPACITY {
+            assert!(
+                model.loss(
+                    &mut state,
+                    &mut cor,
+                    &mut rng,
+                    u32::MAX,
+                    &mut packet_index,
+                    &packet(key),
+                    &mut keyed,
+                ),
+                "first sighting {key} must be dropped"
+            );
+        }
+        assert!(
+            !model.loss(
+                &mut state,
+                &mut cor,
+                &mut rng,
+                u32::MAX,
+                &mut packet_index,
+                &packet(0),
+                &mut keyed,
+            ),
+            "the oldest identity must still be remembered at exactly the capacity"
+        );
     }
 
     /// The kernel comparisons are inclusive: `reorder >= get_crandom()`,
@@ -4605,6 +5208,57 @@ mod tests {
             );
             len = len.wrapping_mul(2) % 90 + 10;
         }
+    }
+
+    /// `backlog_bytes + len == limit_bytes` must be admitted: the shaper
+    /// rejects only what does not fit, and one byte past the limit must drop.
+    /// The random sweep above almost never lands on exact equality, so this
+    /// pins the boundary directly, both in the division-free predicate and
+    /// through the shaper's own serialization clock.
+    #[test]
+    fn shaper_byte_limit_admits_exactly_at_the_limit() {
+        // 8 Gbit/s == 1 byte per nanosecond, so 100 ns of backlog is exactly
+        // 100 bytes.
+        assert!(
+            !exceeds_byte_limit(150, 100, 8_000_000_000, 50),
+            "backlog + len == limit must be admitted"
+        );
+        assert!(
+            exceeds_byte_limit(149, 100, 8_000_000_000, 50),
+            "one byte over the limit must be dropped"
+        );
+
+        let shaper = BottleneckShaper::new(8_000_000_000, 150);
+        let base = Instant::now();
+        assert!(shaper.schedule(base, 100).is_some());
+        assert_eq!(shaper.backlog_bytes(base), 100);
+        assert!(
+            shaper.schedule(base, 50).is_some(),
+            "exactly filling the shared buffer must be admitted"
+        );
+        assert_eq!(shaper.dropped(), 0);
+        assert!(
+            shaper.schedule(base, 1).is_none(),
+            "one byte past the shared buffer must be dropped"
+        );
+        assert_eq!(shaper.dropped(), 1);
+    }
+
+    /// Serialization is eight bits per byte: 1000 B at 8 Mbit/s is exactly
+    /// 1 ms, and 1 B at 8 bit/s is exactly 1 s. A rate of zero disables
+    /// shaping entirely instead of dividing by zero.
+    #[test]
+    fn serialization_delay_is_eight_bits_per_byte() {
+        assert_eq!(
+            serialization_delay(1000, 8_000_000),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(serialization_delay(1, 8), Some(Duration::from_secs(1)));
+        assert_eq!(
+            serialization_delay(1234, 0),
+            None,
+            "rate 0 must disable shaping"
+        );
     }
 
     /// Concurrent callers must serialize exactly once per packet: the shared
