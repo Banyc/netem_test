@@ -234,6 +234,23 @@ time), but it is a deterministic lane rather than a retention gate; follow a
 retained recovery change with the stochastic `hostile-fat-pipe` and
 adversarial `hostile` lanes.
 
+For a floor-scaled queue tolerance this lane is the opposite of
+`jittery-short-rtt`: on four paired seeds (30 s window, 20 s warmup, 8192 B
+MSS) the gate allowance (`congestion_queue_tolerance_us`) measured 75.5 ms in
+the `f = 0.25` tree and 37.7 ms in the `f = 0.125` tree, and the floor-scaled
+term `floor * f` was the allowance in **all 2,359 sampled rows** of the four
+`0.25` runs — the path's own `2 * rttvar` is under 2 ms against a 302 ms floor
+— while in the `0.125` runs it held 1,593 of 2,359 rows with the remaining 766
+held by that `2 * rttvar`. This is the band where a floor-scaled allowance
+decides the gate, and it is why halving it shows up here as a latency change:
+median paired movement `rtt_p50_ms` -6.2 %, `rtt_p90_ms` -9.6 %,
+`rtt_p99_ms` -10.0 % for -0.87 % goodput, with `congestion_delay_drains` up
+38 % at the median paired seed and `retransmission_rto_reason` at 0 in all
+eight runs. The two retransmission reasons swap work rather than grow it:
+attempts stayed flat (449/484/454/434 -> 443/480/453/427) while
+fast-loss-attributed arms fell 1,377 -> 1,249 and reorder-attributed arms rose
+445 -> 556.
+
 ## Clean lane
 
 ```sh
@@ -289,7 +306,7 @@ no loss, seed 4. A round trip is triangular on `[10 ms, 70 ms]`, mean 40 ms.
   of `rtp`'s fast-loss arming gate (`RtxTimer::fast_loss_armed`, i.e.
   `4 * rttvar < srtt / 4`). Measured on 200 echoes: 141-145 inverted
   deliveries, `rttvar` 7.4-8.7 ms, `4 * rttvar` 29.7-34.8 ms against
-  `srtt / 4` 12.4-12.5 ms, so the gate is **unarmed** — a verdict the two
+  `srtt / 4` 12.4-12.5 ms, so that half is **unarmed** — a verdict the two
   battery lanes cannot produce, since both measured `rttvar` below 0.5 ms and
   `4 * rttvar` below 2.0 ms against `srtt / 4` above 75 ms. The same samples
   also separate a gate that drops the RFC 6298 `K` factor (`rttvar <
@@ -297,10 +314,63 @@ no loss, seed 4. A round trip is triangular on `[10 ms, 70 ms]`, mean 40 ms.
   and on both battery lanes every variant arms, so those lanes cannot tell the
   two apart.
 - **What it cannot see.** Rate-shaped throughput behaviour (no rate is
-  configured), loss recovery (no loss), any queue-limit regime (35 ms of
-  delay never fills the queue), and a goodput verdict: with no rate the link
+  configured), loss recovery as a *controlled* variable (the preset configures
+  no loss, but a battery run of the lane is not loss-free — see below), a
+  queue-limit regime as a tunable, and a goodput verdict: with no rate the link
   is host-limited, so the goodput is not phase-stable enough to attribute a
   delta to a candidate.
+- **The 1024-packet queue does fill.** Over eight 30 s runs at battery power
+  (four seeds x two roles, 20 s warmup, 8192 B MSS) the c2s delay heap reached
+  its 1024-packet limit in *every* run (`queue_len` maximum exactly 1024, p50
+  275-350) and its tail-drop discarded 13.8-15.8 % of the direction's packets
+  (`overflow_dropped` 101,879-122,825 against 707,204-785,794 received, while
+  `dropped` stayed 0 because the lane configures no loss). The preset's own
+  arithmetic allows it: the host sustains 23.6-26.2 k packets/s and the sampled
+  one-way delay reaches 35 ms, so the in-flight delay heap alone reaches
+  820-920 packets and burstiness carries it past the limit. This lane is
+  therefore not a loss-free bench for a *spurious* fast-loss study: 14-16 % of
+  the direction's packets are genuinely lost, so a fast-loss arm counted here
+  may be repairing a tail-dropped packet, and the reason counters cannot
+  separate that from an arm that raced a late arrival.
+- **What a per-candidate comparison on it can attribute.** The lane reaches the
+  fast-loss machinery the shaped lanes cannot, but not a floor-scaled term of
+  the queue tolerance. On the same eight runs, `rtp`'s gate allowance
+  (`congestion_queue_tolerance_us`, i.e. `max(2 * rttvar, 5 ms, floor * f)`)
+  measured a p50 of 19.9-20.5 ms in one tree and 20.5-21.1 ms in the other, and
+  the floor-scaled term `floor * f` was the allowance in **1 of 4,773 sampled
+  rows** (a single row of one run, at `f = 0.25`): the allowance is the gate's
+  own jitter estimate, about 20.2 ms against a windowed floor of 25.6-27.6 ms,
+  so `allowance / floor` is about 0.78 and neither 0.25 nor 0.125 competes with
+  it. Re-scaling `f` alone is therefore invisible here: the arming expression
+  is unchanged and the allowance it consumes is unmoved, and the four paired
+  seeds correspondingly moved `retransmission_fast_loss_reason` by +2.6 % in
+  total
+  with an inconsistent sign (+6.6/-9.3/-3.1/+18.5 %, median +1.7 %, against a
+  within-arm seed spread of 11,799-14,404), `retransmission_reorder_reason` by
+  +2.1 %, and `rtt_p50_ms` / `rtt_p90_ms` / `rtt_p99_ms` by +0.91 % / +0.48 % /
+  +0.16 % median paired movement — all under the bulk-latency materiality
+  rule, with no `retransmission_rto_reason` arm and no pre-outage arm in any of
+  the eight runs. Re-scaling `f` becomes visible to the predicate only in the
+  band `floor / 8 <= 2 * rttvar < floor / 4`, where the allowance falls from
+  `floor / 4` to `2 * rttvar`; no lane in this battery occupies that band — the
+  fat pipes sit far below it and this lane far above.
+- **The arming predicate itself is satisfied here, in both trees.** The
+  min-RTT rescue arms when `rttvar < min_rtt` **and**
+  `srtt > min_rtt + max(2 * rttvar, 5 ms, min_rtt * f)`. `min_rtt` measured
+  10.2-10.6 ms and `srtt` 36.9-37.4 ms, so the elevation is about 27 ms, while
+  the lane's `rttvar` measured 7.4-8.7 ms makes `2 * rttvar` 14.8-17.4 ms and
+  the floor-scaled term `min_rtt * f` only 1.3 ms (0.125) or 2.6 ms (0.25):
+  the elevation clears the margin, and the term `f` scales is 6-13x smaller
+  than the term that decides it, so halving `f` cannot move the predicate here.
+  The rescue therefore arms on a path whose only configured impairment is
+  jitter, and 12.7-14.4 k of the 122.8-145.2 k window retransmission attempts
+  per run are attributed to `retransmission_fast_loss_reason`. That elevation
+  is the jitter's own mean-minus-minimum spread rather than queueing: the
+  premise holds whenever `mean - min > 2 * MAD`, which is a property of the
+  delay distribution, not of a standing queue. The srtt-relative half of the
+  gate stays disarmed throughout — `4 * rttvar` is 29.7 ms or more against
+  `srtt / 4` of 9-12 ms — so on this lane the min-RTT rescue is the half that
+  decides, not the gate the shaped lanes measure.
 - **Battery-measured shape.** A four-seed same-binary control (30 s window,
   MSS 8192) measured RTT p50 36.8 ms, p90 54.0 ms, p99 65.1 ms, max 75.7 ms
   over 21,433 samples; the RTO stayed on the 1 s `MIN_RTO` floor for all
