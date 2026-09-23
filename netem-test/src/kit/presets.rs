@@ -167,7 +167,29 @@ pub fn jittery_short_rtt_link() -> NetemConfig {
 ///
 /// The send-time shaper only delays packets (`link_free_at` is a serialization
 /// clock), so this lane's drops come from the `queue_limit_pkts` tail-drop,
-/// never from the shaper. Seeded.
+/// never from the shaper.
+///
+/// That tail-drop also starves the peer's ACKs, which is what makes the lane
+/// unusable for a goodput verdict. The 128-packet limit is already reached at
+/// the first sample of a run (the sender offers ~27–30 packets per second
+/// against a 3.05 pkt/s drain), and from then on every packet the sender
+/// offers is dropped — data *and* the ACKs the peer is waiting for — while the
+/// queue head keeps delivering data. Over 32 recorded 30 s-window runs,
+/// `forwarded_bytes / forwarded` on this direction is 8191.0 in 29 and 8111.6
+/// in the other three (a single small packet slips through in those), while
+/// the arrival mix implies ~72–100 ACK packets per window. The peer's
+/// peer-liveness `no_response` watchdog is refreshed only by an ACK, so it
+/// fires 30 s after the last ACK that got through (t ~ 35.0–35.9 s) and
+/// terminates the session, leaving the mux sink with `read_error/BrokenPipe`
+/// and a dead second half in any measurement window that spans that moment.
+/// The deadline lands 0.0–0.9 s after the end of a 5 s-warmup / 30 s-window
+/// run, so the whole margin between a usable window and a broken one is one
+/// second of warmup. The client's own application write does not observe the
+/// teardown until ~17 s later (t ~ 53 s), where it ends in `bulk pump failed:
+/// BrokenPipe`, so a run long enough to reach that point fails the probe
+/// outright. The lane is therefore **diagnostic-only** in the perf battery
+/// (`tests/GATE.md`, `gate-lane-roles`); the tens-of-seconds RTO regime it
+/// exists to reach is still measured by `lane_regime_coverage`. Seeded.
 pub fn high_rtt_low_rate_bottleneck() -> NetemConfig {
     NetemConfig {
         rate: 200 * 1000,

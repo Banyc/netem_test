@@ -182,11 +182,24 @@ one-way, 128-packet queue) can hold a round trip long enough for RFC 6298's
 **diagnostic-only**: its four-seed same-binary control returned `mixed_results`
 (`not_ready`, `within_run_phase_not_stable`, three of four pairs moving 11–14 %)
 because an unshaped lane's goodput is host-limited rather than link-limited, so
-a goodput delta cannot be attributed to a candidate. The thin-link lane is a
-verdict lane: its four-seed same-binary control was `ready` with
-`no_material_change`, a 0.006 % median absolute goodput delta, and stable
-phase. Each lane's measured shape and blind spots are recorded in
-`tools/PERF_LOOP.md`.
+a goodput delta cannot be attributed to a candidate. The thin-link lane is
+**diagnostic-only** too, for a third reason: its transport session
+deterministically tears down about 36 s into every run. The 200 kbit/s
+direction's 128-packet queue is already at its limit at the first sample of a
+run, and its tail-drop then discards every packet the client sends — including
+the ACKs the server is waiting for — while the queue head keeps delivering
+data. The server's peer-liveness `no_response` watchdog is refreshed only by an
+ACK, so it fires 30 s after the last ACK that got through and terminates the
+session with `proactive_stall`, leaving the mux sink with
+`read_error/BrokenPipe` and a dead second half in any window that spans that
+moment. The teardown deadline lands within 0.9 s *after* the end of the 5 s
+warmup / 30 s window control that first justified `verdict`, so that control is
+`ready` with stable phase; one second more warmup puts the same deadline
+0.1–1.0 s *inside* the window, and the lane is then `not_ready` on
+`trace_evidence_not_healthy` alone. A lane whose usable window is a sub-second
+knife-edge on the warmup — and whose teardown time is set by the ACK dynamics a
+candidate can move — cannot carry a verdict. Each lane's measured shape and
+blind spots are recorded in `tools/PERF_LOOP.md`.
 
 The `gate-lane-roles` block below records every lane's role. It is
 machine-checked by `tools/check-gate.py` against `perf_loop.lane_classification`
@@ -210,7 +223,7 @@ hostile-fat-pipe = verdict
 controller-fat-pipe = verdict
 deterministic-iid-loss-fat-pipe = verdict
 jittery-short-rtt = diagnostic
-high-rtt-low-rate-bottleneck = verdict
+high-rtt-low-rate-bottleneck = diagnostic
 clean = verdict
 direct = verdict
 hostile-bottleneck-20ms = verdict

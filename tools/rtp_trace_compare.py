@@ -2023,7 +2023,10 @@ def classify(valid_pairs):
 # (controller-fat-pipe) to 67x (deterministic-iid-loss-fat-pipe) and the
 # slowest lane by 5.5x. The high-rtt-low-rate-bottleneck control was unstable
 # on its phase axis (the window's second half delivered nothing in six of its
-# eight runs, and 32 KiB in the other two), not on latency.
+# eight runs, and 32 KiB in the other two), not on latency: that lane's session
+# deterministically tears down about 36 s into every run
+# (`proactive_stall`/`no_response`, because its full 128-packet queue
+# tail-drops the peer's ACKs), which is why the lane is diagnostic-only.
 #
 # The rule tests `ranking_delta_percent`, which scales by the larger endpoint,
 # so the exact firing boundary is +5.263% baseline-relative for a rise and

@@ -274,9 +274,11 @@ The name is carried by `perf_loop.LINK_PROFILES` and by the probe's
 `NETEM_PERF_LINK_PROFILE` allowlist and match arm
 (`rtp_mux/tests/perf_probe.rs`); both are what make a profile selectable by
 `--link-profile`, and a name in one list but not the other is rejected by the
-probe. `high-rtt-low-rate-bottleneck` is a verdict lane;
-`jittery-short-rtt` is diagnostic-only (`gate-lane-roles` in `tests/GATE.md`),
-because its same-binary control is phase-unstable.
+probe. Both regime lanes are diagnostic-only (`gate-lane-roles` in
+`tests/GATE.md`): `jittery-short-rtt` because an unshaped lane's goodput is
+host-limited rather than link-limited, and `high-rtt-low-rate-bottleneck`
+because its transport session deterministically tears down about 36 s into a
+run (see below).
 
 ### `jittery_short_rtt_link`
 
@@ -336,21 +338,57 @@ seed 4.
   floor), with a 17.14 s maximum packet RTO overdue. This is the
   tens-of-seconds RTO read from the transport's own trace, not the estimator
   arithmetic.
-- **Its control has not reproduced.** The four-seed control recorded when the
-  lane landed was `ready` with `no_material_change`, a 0.006 % median absolute
-  goodput delta, no false material change, and stable phase. A 2026-09-23
-  re-measurement on the same trunk (seeds 11/21/31/41, 30 s window, 20 s
-  warmup, 8192 B MSS, byte-identical executables) returned `not_ready`
-  (`trace_evidence_not_healthy`, `within_run_phase_not_stable`) with an
-  `unstable` `control_calibration` and a 3.85 % median absolute goodput delta:
-  all eight runs delivered about 384 KiB at the link rate during the window's
-  first half and then stalled, six of them delivering nothing at all in the
-  second half, with both arms' sinks ending in `read_error/BrokenPipe` and
-  failing `endpoint_lifecycle_accounted`. The earlier control's warmup is not
-  recorded, so the two measurements are not directly comparable. The lane's
-  latency axis stayed quiet (worst per-percentile median 0.91 %, worst single
-  pair 1.31 %), so its goodput/phase evidence is not attributable to a
-  candidate until a stable control is re-established.
+- **Its session deterministically tears down about 36 s into a run, so it is
+  diagnostic-only.** The 200 kbit/s direction's 128-packet queue is already at
+  its limit at the first sample of a run (the client offers ~27–30 packets per
+  second against a 3.05 pkt/s drain), and from then on its tail-drop discards
+  every packet the client sends — *including the ACKs the server is waiting
+  for*. Over 32 recorded 30 s-window runs, `forwarded_bytes / forwarded` on
+  that direction is 8191.0 in 29 and 8111.6 in the other three — a single small
+  packet slips through in those — while the arrival mix (`received_bytes /
+  received` ~ 7.4 kB) implies ~72–100 ACK packets per window. The queue head
+  still delivers data, so the server keeps receiving (its
+  `next_receive_sequence` reaches 105–111) while its peer-liveness
+  `no_response` watchdog — refreshed only by a peer ACK (`pkt_send_space.rs`,
+  `if !peer_response { return; }`) — counts down from the last ACK that got
+  through, ~5–6 s into the run. It fires at `min_no_response` = 30 s, i.e. at
+  t ~ 35.0–35.9 s, and terminates the session with
+  `proactive_stall`/`no_response`/`broken_pipe`; the mux sink then reads
+  `read_error/BrokenPipe` and its `delivered` counter freezes. Eight runs at a
+  20 s warmup all terminated inside a 0.85 s band, and the teardown deadline
+  reconstructed from a 5 s-warmup run falls in the same band, so it is a
+  wall-clock event and not load-dependent.
+- **The `verdict` classification was a sub-second knife-edge on the warmup.**
+  The four-seed control recorded when the lane landed used the 5 s default
+  warmup (30 s window), so each run ended at t = 35.0 s and every teardown
+  deadline fell 0.0–0.9 s *after* it: the lane reported `ready` with
+  `no_material_change`, a 0.006 % median absolute goodput delta, no false
+  material change, and stable phase, with all eight sinks still `running`.
+  Re-run with one second more warmup (6 s, same 30 s window, same seeds) every
+  deadline falls 0.1–1.0 s *inside* the window, five of the eight sinks end in
+  `read_error/BrokenPipe`, and the lane is `not_ready` on
+  `trace_evidence_not_healthy` alone — with its goodput axis still `stable`
+  (3.7 % median) and its phase still `stable`. At a 20 s warmup the stall is
+  mid-window and the lane is additionally `not_ready`
+  (`within_run_phase_not_stable`) with an `unstable` `control_calibration`
+  (3.85 % median absolute goodput delta): all eight runs deliver ~384 KiB at
+  the link rate in the window's first half and then stall, six of them
+  delivering nothing in the second half. The lane's latency axis stayed quiet
+  (worst per-percentile median 0.91 %, worst single pair 1.31 %), so no window
+  can carry a goodput verdict on it: the teardown time is set by the same
+  early ACK/queue dynamics a candidate can move, and the whole margin between
+  a usable window and a broken one is one second. Its RTO regime is real and
+  its numbers stay useful as a diagnostic, and
+  `lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot`
+  still measures that regime in the `standard` tier.
+- **A long enough run fails the probe outright.** The client's application
+  write does not observe the teardown until ~17 s after it (measured at
+  t ~ 53.4 s, with the client's own last peer response at t ~ 36.2 s and its
+  mux session ending `io_reader/TimedOut`), so a run that lasts past t ~ 53 s —
+  a 5 s warmup with a 60 s window, for example — ends in
+  `bulk pump failed: Kind(BrokenPipe)` and a probe panic (exit 101), and the
+  comparison evidence is `invalid` rather than merely `degraded`. The lane
+  cannot carry a verdict at any window length that reaches the stall.
 - **The negative control.** The `controller-fat-pipe` lane fed the identical
   burst kept its round trip at 302 ms and its RTO on the 1 s `MIN_RTO` floor
   for all 40 samples, so the same estimator arithmetic is unobservable there.

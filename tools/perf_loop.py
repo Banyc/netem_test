@@ -76,11 +76,25 @@ LINK_PROFILES = (
 # verdict.  `jittery-short-rtt` is diagnostic-only for the same reason: its
 # four-seed same-binary control returned `mixed_results` (`not_ready`,
 # `within_run_phase_not_stable`) with three of four pairs moving 11-14 %, so the
-# unshaped lane's host-limited goodput cannot be attributed to a candidate.  The
-# role of every lane is documented in tests/GATE.md (`gate-lane-roles`) and
+# unshaped lane's host-limited goodput cannot be attributed to a candidate.
+# `high-rtt-low-rate-bottleneck` is diagnostic-only for a third reason: its
+# session deterministically tears down about 36 s into every run.  The 200
+# kbit/s direction's 128-packet queue saturates within the first few seconds,
+# after which its tail-drop discards every packet the sender offers -- data
+# *and* the ACKs the peer is waiting for -- while the queue head keeps
+# delivering data, so the peer's `no_response` liveness watchdog fires 30 s
+# after the last ACK that got through and the mux sink then reads
+# `read_error/BrokenPipe`.  The teardown deadline lands 0.0-0.9 s after the end
+# of a 5 s-warmup / 30 s-window run, so that run reports `ready` with stable
+# phase; one second more warmup puts the same deadline 0.1-1.0 s inside the
+# window and the lane is then `not_ready` on `trace_evidence_not_healthy`
+# alone.  The whole margin between a usable window and a broken one is one
+# second of warmup, and the teardown time is set by the early ACK/queue
+# dynamics a candidate can move, so the lane cannot carry a verdict.  The role
+# of every lane is documented in tests/GATE.md (`gate-lane-roles`) and
 # machine-checked by tools/check-gate.py against `lane_classification`, so a
 # lane cannot be mis-declared verdict or diagnostic.
-DIAGNOSTIC_LANES = ("hostile", "jittery-short-rtt")
+DIAGNOSTIC_LANES = ("hostile", "jittery-short-rtt", "high-rtt-low-rate-bottleneck")
 
 
 def lane_classification(profile):
