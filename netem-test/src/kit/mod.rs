@@ -11,6 +11,7 @@
 //! the leaf harness does not pull in tokio.
 
 pub mod contested;
+pub mod emulated;
 pub mod fan;
 pub mod payload;
 pub mod presets;

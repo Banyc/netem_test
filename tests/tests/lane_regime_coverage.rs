@@ -32,9 +32,15 @@
 //! `sample_delay` draws one `CorRng` value per delayed packet from the
 //! Tausworthe `prandom` state seeded by `NetemConfig::seed`, the rate shaper
 //! derives every deadline from `serialization_delay(len, rate)`, and the queue
-//! limit tail-drops before any scheduling arithmetic. The lanes are measured
-//! here through the real `NetemPair` forwarding path, so the numbers below are
-//! the impairment the transport would actually see.
+//! limit tail-drops before any scheduling arithmetic.
+//!
+//! The reorder and round-trip-regime scenarios measure those lanes through the
+//! real `NetemPair` forwarding path, so their numbers are what the transport
+//! would actually see. The RTO-variance scenario reads the same lanes' delay
+//! schedule through the harness's injected clock and in-memory transport
+//! instead: the delay a lane *imposes* is a property of the lane, while the
+//! delay a real socket path *adds on top of it* is a property of the host, and
+//! the fast-loss gate has to be decided by the first, not the second.
 //!
 //! Run the default tier with `cargo test -p tests`; the low-rate lane's
 //! fourteen-second regime measurement is `#[ignore]`d into the `standard` tier
@@ -42,6 +48,7 @@
 
 use std::time::{Duration, Instant};
 
+use netem_test::kit::emulated::emulated_forward;
 use netem_test::kit::presets::{
     clean_delay_link, controller_fat_pipe, deterministic_iid_loss_fat_pipe,
     high_rtt_low_rate_bottleneck, jittery_short_rtt_link,
@@ -201,6 +208,81 @@ fn rate_shaped(config: &NetemConfig, rate: u64) -> NetemConfig {
     }
 }
 
+/// The same round-trip observation as [`observe_lane`], taken through the
+/// harness's injected clock and in-memory transport instead of the wall clock
+/// and real sockets.
+///
+/// [`observe_lane`] is the right instrument for what a datagram's *order* and
+/// *delivery* are on the wire, and it is what the reorder scenario below uses.
+/// It is the wrong instrument for the *variance* the fast-loss gate decides
+/// on, because the link adds its delay on a runner thread that wakes on real
+/// time: the round trip it records is the scheduled one plus whatever the
+/// host's scheduler added, so a single scheduling stall moves `rttvar` by more
+/// than the whole configured impairment does. That reading says how busy the
+/// host was, not what the lane does.
+///
+/// This drives the identical pipeline — `NetemState`, the same seeded PRNG
+/// draws, the same delay sampler and shaper arithmetic, the same heap/FIFO
+/// ordering, the same counters — from the kit's emulated-forwarding primitive,
+/// which moves emulated time only to the next scheduled event and records
+/// forwarded datagrams in memory. The round trip is then
+/// `return_forward_offset - send_offset` and the sample set is a function of
+/// the config and its seed alone: identical on an idle host and on a
+/// saturated one.
+fn observe_emulated_lane(
+    config: &NetemConfig,
+    packets: usize,
+    payload_bytes: usize,
+    spacing: Duration,
+) -> LaneObservation {
+    // The same direction convention the probe uses: the client→server
+    // direction draws from the config's own seed and the echo direction from
+    // seed + 1, so the two delay streams stay distinguishable while staying
+    // reproducible.
+    let c2s = config.clone();
+    let mut s2c = config.clone();
+    s2c.seed = config.seed.wrapping_add(1);
+
+    let payload_for = |id: u64| {
+        let mut payload = vec![0u8; payload_bytes];
+        payload[..ID_BYTES].copy_from_slice(&id.to_be_bytes());
+        payload
+    };
+    let send_offset = |id: u64| spacing * (id as u32);
+
+    // The client's sends arrive at the client→server direction one `spacing`
+    // apart, and each datagram it forwards is echoed straight back into the
+    // server→client direction at the instant it left.
+    let (outbound, c2s_stats) = emulated_forward(
+        &c2s,
+        (0..packets as u64).map(|id| (payload_for(id), send_offset(id))),
+    );
+    let (returned, s2c_stats) = emulated_forward(
+        &s2c,
+        outbound
+            .iter()
+            .map(|forwarded| (forwarded.payload.clone(), forwarded.at)),
+    );
+
+    let mut rtts = vec![Duration::ZERO; packets];
+    let mut arrival = Vec::with_capacity(returned.len());
+    for forwarded in &returned {
+        let id = u64::from_be_bytes(forwarded.payload[..ID_BYTES].try_into().unwrap());
+        rtts[id as usize] = forwarded.at.saturating_sub(send_offset(id));
+        arrival.push(id);
+    }
+
+    LaneObservation {
+        delivered: arrival.len(),
+        sent: packets,
+        rtts,
+        arrival,
+        reordered: c2s_stats.reordered + s2c_stats.reordered,
+        dropped: c2s_stats.dropped + s2c_stats.dropped,
+        queue_limit_overflow: c2s_stats.overflow_dropped + s2c_stats.overflow_dropped,
+    }
+}
+
 /// `rtp`'s RTO recurrence, transcribed from
 /// `crates/rtp/src/traffic_shaping/recovery/rto.rs` (`RtxTimer`):
 ///
@@ -213,9 +295,13 @@ fn rate_shaped(config: &NetemConfig, rate: u64) -> NetemConfig {
 ///
 /// `fast_loss_armed` is the same struct's `4 * rttvar < srtt / 4` gate. This
 /// is a transcription of the estimator's arithmetic, not the transport: the
-/// samples it is fed are measured through the real impairment path, so a lane
-/// that cannot produce a sample large enough to matter is visible as an
-/// unchanged `rto` here too.
+/// samples it is fed are the lane's round trips as whichever observation
+/// supplied them — measured through the real forwarding path for
+/// [`high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot`],
+/// scheduled through the emulated clock for
+/// [`jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on`] — so a
+/// lane that cannot produce a sample large enough to matter is visible as an
+/// unchanged `rto` either way.
 #[derive(Default)]
 struct RtoRecurrence {
     srtt: Option<Duration>,
@@ -389,17 +475,18 @@ async fn jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter
 /// interquartile spread an order of magnitude smaller. And the same samples
 /// move `rtp`'s fast-loss arming quantity across its boundary, which the
 /// battery lanes' near-zero variance cannot do.
-#[tokio::test(flavor = "multi_thread")]
-async fn jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on() {
+///
+/// Every sample is the lane's *scheduled* round trip, taken through the
+/// harness's injected clock and in-memory transport (see
+/// [`observe_emulated_lane`]): the quantity under test is the variance the
+/// impairment imposes on the estimator, and measuring it through real sockets
+/// would fold in the host's scheduler, whose stalls move `rttvar` more than
+/// the impairment does. The real forward path's ordering and delivery for
+/// these same lanes are measured by the sibling scenario in this file.
+#[test]
+fn jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on() {
     let jitterless = clean_delay_link(Duration::from_millis(20), 4);
-    let observation = observe_lane(
-        &jitterless,
-        200,
-        128,
-        Duration::from_millis(1),
-        Duration::from_secs(4),
-    )
-    .await;
+    let observation = observe_emulated_lane(&jitterless, 200, 128, Duration::from_millis(1));
     let rto = rto_over(&observation);
     report(
         "clean-delay-link-20ms (no jitter control)",
@@ -413,7 +500,7 @@ async fn jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on() {
     );
     assert!(
         control_iqr <= Duration::from_millis(3),
-        "the control's spread must be measurement noise, got {control_iqr:?}"
+        "the control's round trips must not spread, got {control_iqr:?}"
     );
 
     for (name, config) in [
@@ -423,14 +510,7 @@ async fn jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on() {
             deterministic_iid_loss_fat_pipe(),
         ),
     ] {
-        let observation = observe_lane(
-            &config,
-            200,
-            128,
-            Duration::from_millis(1),
-            Duration::from_secs(4),
-        )
-        .await;
+        let observation = observe_emulated_lane(&config, 200, 128, Duration::from_millis(1));
         let rto = rto_over(&observation);
         report(name, &observation, &rto);
         assert!(
@@ -465,14 +545,7 @@ async fn jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on() {
     }
 
     let lane = jittery_short_rtt_link();
-    let observation = observe_lane(
-        &lane,
-        200,
-        128,
-        Duration::from_millis(1),
-        Duration::from_secs(4),
-    )
-    .await;
+    let observation = observe_emulated_lane(&lane, 200, 128, Duration::from_millis(1));
     let rto = rto_over(&observation);
     report("jittery-short-rtt", &observation, &rto);
     assert_eq!(

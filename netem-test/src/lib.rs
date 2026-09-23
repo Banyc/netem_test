@@ -340,7 +340,13 @@ struct Clock {
 }
 
 impl Clock {
-    #[cfg(test)]
+    /// New emulated clock starting at the real instant it is built.
+    ///
+    /// Available to the crate's own unit tests and to the `test-kit`
+    /// emulated-forwarding driver, which is the only non-test caller: a plain
+    /// library build has no emulated time to drive, so the constructor stays
+    /// out of it and no unused-code warning is paid.
+    #[cfg(any(test, feature = "test-kit"))]
     fn new() -> Self {
         Self {
             base: Instant::now(),
@@ -353,8 +359,21 @@ impl Clock {
         self.base + Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
     }
 
-    #[cfg(test)]
+    /// Emulated time elapsed since the clock was built.
+    #[cfg(any(test, feature = "test-kit"))]
+    fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+    }
+
+    /// Emulated time from the clock's origin to `instant`; zero for an instant
+    /// at or before the origin.
+    #[cfg(any(test, feature = "test-kit"))]
+    fn offset(&self, instant: Instant) -> Duration {
+        instant.saturating_duration_since(self.base)
+    }
+
     /// Advance emulated time forward by `d`.
+    #[cfg(any(test, feature = "test-kit"))]
     fn advance(&self, d: Duration) {
         self.nanos.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
     }
