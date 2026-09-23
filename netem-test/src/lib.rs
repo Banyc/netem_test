@@ -706,6 +706,29 @@ impl Drop for NetemLink {
 
 // ───────────────────────────── state & runner ─────────────────────────
 
+/// Which forwarding loop a direction's config selects.
+///
+/// The choice is a pure function of the config and is fixed when the pipeline
+/// is built. [`NetemState::schedule`] is the single authority for it: the real
+/// runner loops ([`LinkRunner::run`] and [`SharedLinkRunner::run`]) and the
+/// emulated forwarding driver in [`crate::kit::emulated`] all match on this
+/// value exhaustively, so a new or reclassified regime is a compile error in
+/// every consumer rather than a silent divergence between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Schedule {
+    /// No scheduling and no stochastic work: forward every datagram on arrival.
+    Direct,
+    /// No scheduling, but duplication/loss draws: forward the surviving copies
+    /// on arrival.
+    StochasticDirect,
+    /// Scheduling whose deadlines are monotonic (zero jitter and zero reorder
+    /// gap): a FIFO queue preserves the heap's forwarding order at lower cost.
+    Fifo,
+    /// Scheduling whose deadlines can be non-monotonic (jitter or a reorder
+    /// gap): the delay heap.
+    Heap,
+}
+
 /// Shared per-direction impairment pipeline (state bag).
 ///
 /// Both [`LinkRunner`] and [`SharedLinkRunner`] drive a single [`NetemState`]: it
@@ -824,6 +847,25 @@ impl NetemState {
         self.stop.load(Ordering::Relaxed)
     }
 
+    /// The forwarding loop this config selects.
+    ///
+    /// The single authority for the direct / stochastic-direct / FIFO / heap
+    /// choice: every dispatch site matches on this value instead of
+    /// re-deriving the regime from the config, so the real runner and the
+    /// emulated driver cannot disagree about which queue — or whether any
+    /// queue — a config uses.
+    fn schedule(&self) -> Schedule {
+        if self.direct_stochastic {
+            Schedule::StochasticDirect
+        } else if self.direct_forward {
+            Schedule::Direct
+        } else if self.config.jitter.is_zero() && self.config.reorder_gap_pkts == 0 {
+            Schedule::Fifo
+        } else {
+            Schedule::Heap
+        }
+    }
+
     /// Forward `data` to `dst` without touching the heap when the config is
     /// clean. Returns `true` when the packet was handled (forwarded, dropped
     /// by the deterministic size filter, or gated by blackout); `false` when
@@ -834,7 +876,7 @@ impl NetemState {
         dst: Option<SocketAddr>,
         send: &dyn UdpTransport,
     ) -> bool {
-        if !self.direct_forward {
+        if self.schedule() != Schedule::Direct {
             return false;
         }
         self.forward_direct(data, dst, send)
@@ -1116,17 +1158,6 @@ impl NetemState {
 
     // ─────────────────────── FIFO scheduling path ───────────────────────
 
-    /// True when every scheduled deadline is monotonic in arrival order, so a
-    /// FIFO queue preserves the exact packet order of the delay heap: jitter
-    /// and reorder-gap scheduling are both zero. Direct paths are dispatched
-    /// before this is consulted.
-    fn uses_fifo_scheduling(&self) -> bool {
-        !self.direct_forward
-            && !self.direct_stochastic
-            && self.config.jitter.is_zero()
-            && self.config.reorder_gap_pkts == 0
-    }
-
     /// Same impairment pipeline as [`NetemState::handle_datagram`] but
     /// enqueueing into a [`FifoQueue`]: duplicate-before-loss PRNG draws and
     /// counters are identical, only the storage differs.
@@ -1312,18 +1343,16 @@ impl LinkRunner {
 
     fn run(mut self) {
         let mut buf = [0u8; 64 * 1024];
-        // Dispatch once: the config never changes, so each runner picks the
-        // cheapest loop that preserves its impairment semantics. Stochastic-
-        // only and clean configs avoid the delay heap entirely; monotonic
-        // deadlines use the FIFO queue; jitter/reorder stay on the heap.
-        if self.pipeline.direct_stochastic {
-            self.run_stochastic_direct(&mut buf);
-        } else if self.pipeline.uses_fifo_scheduling() {
-            self.run_fifo(&mut buf);
-        } else if self.pipeline.direct_forward {
-            self.run_direct(&mut buf);
-        } else {
-            self.run_heap(&mut buf);
+        // Dispatch once on the config's regime: the config never changes, so
+        // each runner picks the cheapest loop that preserves its impairment
+        // semantics. Stochastic-only and clean configs avoid the delay heap
+        // entirely; monotonic deadlines use the FIFO queue; jitter/reorder
+        // stay on the heap.
+        match self.pipeline.schedule() {
+            Schedule::StochasticDirect => self.run_stochastic_direct(&mut buf),
+            Schedule::Fifo => self.run_fifo(&mut buf),
+            Schedule::Direct => self.run_direct(&mut buf),
+            Schedule::Heap => self.run_heap(&mut buf),
         }
     }
 
@@ -1963,26 +1992,28 @@ impl SharedLinkRunner {
 
     fn run(mut self) {
         let mut buf = [0u8; 64 * 1024];
-        // Dispatch once to the cheapest loop that preserves the direction's
-        // semantics: stochastic-only and clean configs skip the queue
-        // entirely (with fixed- or learned-destination variants), monotonic
-        // deadlines use the FIFO queue, and jitter/reorder stay on the heap.
-        if self.pipeline.direct_stochastic {
-            if self.fixed_dst.is_some() {
-                self.run_stochastic_fixed_direct(&mut buf);
-            } else {
-                self.run_stochastic_learned_direct(&mut buf);
+        // Dispatch once on the config's regime to the cheapest loop that
+        // preserves the direction's semantics: stochastic-only and clean
+        // configs skip the queue entirely (with fixed- or learned-destination
+        // variants), monotonic deadlines use the FIFO queue, and
+        // jitter/reorder stay on the heap.
+        match self.pipeline.schedule() {
+            Schedule::StochasticDirect => {
+                if self.fixed_dst.is_some() {
+                    self.run_stochastic_fixed_direct(&mut buf);
+                } else {
+                    self.run_stochastic_learned_direct(&mut buf);
+                }
             }
-        } else if self.pipeline.uses_fifo_scheduling() {
-            self.run_fifo(&mut buf);
-        } else if self.pipeline.direct_forward {
-            if self.fixed_dst.is_some() {
-                self.run_fixed_direct(&mut buf);
-            } else {
-                self.run_learned_direct(&mut buf);
+            Schedule::Fifo => self.run_fifo(&mut buf),
+            Schedule::Direct => {
+                if self.fixed_dst.is_some() {
+                    self.run_fixed_direct(&mut buf);
+                } else {
+                    self.run_learned_direct(&mut buf);
+                }
             }
-        } else {
-            self.run_heap(&mut buf);
+            Schedule::Heap => self.run_heap(&mut buf),
         }
     }
 
@@ -2232,6 +2263,9 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+
+    #[cfg(feature = "test-kit")]
+    use crate::kit::emulated::{Forwarded, emulated_forward};
 
     #[test]
     fn prng_is_deterministic() {
@@ -3492,6 +3526,145 @@ mod tests {
         drop(sent);
     }
 
+    /// The real runner and the emulated driver must agree on a config's
+    /// forwarding regime: `LinkRunner::run` dispatches on
+    /// [`NetemState::schedule`] and the emulated driver matches on the same
+    /// value, so this pins the regime each config shape selects (flipping the
+    /// FIFO/heap choice inside the authority fails here) and then identifies
+    /// the regime `emulated_forward` actually *executed* from a behaviour
+    /// fingerprint unique to it (a consumer that stops dispatching on the
+    /// authority and hardcodes one path fails here).
+    ///
+    /// The fingerprint is deterministic — no wall clock, no sockets: the
+    /// direct regimes forward each datagram at its arrival instant and never
+    /// record a scheduler drain, the FIFO and heap regimes always do, and only
+    /// the heap reorders a jittery config.
+    #[cfg(feature = "test-kit")]
+    #[test]
+    fn emulated_driver_executes_the_regime_the_real_runner_classifies() {
+        use crate::kit::presets::{clean_delay_link, jittery_short_rtt_link};
+
+        fn id_of(payload: &[u8]) -> u64 {
+            u64::from_be_bytes(payload[..8].try_into().expect("eight-byte id"))
+        }
+
+        /// Number of forwarded datagrams that overtook an earlier one.
+        fn inversions(forwarded: &[Forwarded]) -> usize {
+            let mut highest = 0u64;
+            let mut count = 0;
+            for datagram in forwarded {
+                let id = id_of(&datagram.payload);
+                if id < highest {
+                    count += 1;
+                }
+                highest = highest.max(id);
+            }
+            count
+        }
+
+        let cases = [
+            (NetemConfig::default(), Schedule::Direct),
+            (
+                NetemConfig {
+                    duplicate: u32::MAX,
+                    ..NetemConfig::default()
+                },
+                Schedule::StochasticDirect,
+            ),
+            (
+                clean_delay_link(Duration::from_millis(20), 4),
+                Schedule::Fifo,
+            ),
+            (jittery_short_rtt_link(), Schedule::Heap),
+        ];
+        const PACKETS: u64 = 64;
+        let spacing = Duration::from_millis(1);
+        for (config, expected) in cases {
+            // The real runner's classification, read from the object whose
+            // `run` dispatches on it.
+            let (runner, _sent) = mock_runner(config.clone());
+            assert_eq!(
+                runner.pipeline.schedule(),
+                expected,
+                "the config {config:?} must select the {expected:?} regime"
+            );
+
+            let arrivals: Vec<(Vec<u8>, Duration)> = (0..PACKETS)
+                .map(|id| (id.to_be_bytes().to_vec(), spacing * (id as u32)))
+                .collect();
+            let (forwarded, counters) = emulated_forward(&config, arrivals);
+            assert!(
+                !forwarded.is_empty(),
+                "the {expected:?} regime must forward something"
+            );
+            for datagram in &forwarded {
+                let id = id_of(&datagram.payload);
+                assert!(id < PACKETS, "only the offered datagrams may be forwarded");
+            }
+
+            match expected {
+                Schedule::Direct | Schedule::StochasticDirect => {
+                    // A queued path would have recorded a scheduler drain even
+                    // with zero delay, so zero drains proves the emulated
+                    // driver took the direct regime.
+                    assert_eq!(
+                        counters.scheduled_drain_batches, 0,
+                        "the {expected:?} regime must not schedule"
+                    );
+                    assert_eq!(
+                        counters.scheduled_drain_packets, 0,
+                        "the {expected:?} regime must not drain a queue"
+                    );
+                    for datagram in &forwarded {
+                        assert_eq!(
+                            datagram.at,
+                            spacing * (id_of(&datagram.payload) as u32),
+                            "the {expected:?} regime must forward on arrival"
+                        );
+                    }
+                    if expected == Schedule::StochasticDirect {
+                        // The stochastic regime applies duplication on the way
+                        // out; the plain direct regime would not.
+                        assert_eq!(
+                            counters.duplicated, PACKETS,
+                            "the stochastic direct regime must apply duplication"
+                        );
+                    }
+                }
+                Schedule::Fifo | Schedule::Heap => {
+                    assert_eq!(
+                        counters.scheduled_drain_packets, counters.forwarded,
+                        "every {expected:?} forward must come from a scheduler drain"
+                    );
+                    assert!(
+                        counters.scheduled_drain_batches > 0,
+                        "the {expected:?} regime must record scheduler drains"
+                    );
+                    assert_eq!(
+                        counters.scheduled_drain_packets, PACKETS,
+                        "no datagram may be dropped or duplicated on these lanes"
+                    );
+                }
+            }
+
+            // Ordering identifies the FIFO/heap split: the same zero-jitter
+            // shape is monotone under either queue, so only the jittery lane
+            // discriminates — a FIFO execution of it would lose the jitter
+            // draws and the reordering entirely.
+            let inverted = inversions(&forwarded);
+            match expected {
+                Schedule::Heap => assert!(
+                    inverted > 0,
+                    "the heap regime must reorder the jittery config, got {inverted} inversions"
+                ),
+                Schedule::Fifo => {
+                    assert_eq!(inverted, 0, "the FIFO regime must preserve arrival order")
+                }
+                Schedule::Direct | Schedule::StochasticDirect => {}
+            }
+        }
+    }
+
     #[test]
     fn datagram_size_filter_stays_on_the_direct_path() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
@@ -3946,7 +4119,7 @@ mod tests {
         };
         let (mut runner, sent) = mock_runner(config);
         assert!(
-            runner.pipeline.uses_fifo_scheduling(),
+            runner.pipeline.schedule() == Schedule::Fifo,
             "a latency-only config must select the FIFO path"
         );
         let clock = sent.clock();
@@ -4111,7 +4284,7 @@ mod tests {
         let (mut fifo_runner, fifo_sent) = mock_runner(config.clone());
         let (mut heap_runner, heap_sent) = mock_runner(config);
         assert!(
-            fifo_runner.pipeline.uses_fifo_scheduling(),
+            fifo_runner.pipeline.schedule() == Schedule::Fifo,
             "latency-only config must select the FIFO path"
         );
         // Two independent shapers with identical rates: both paths start from

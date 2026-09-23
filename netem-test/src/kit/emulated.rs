@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::{AtomicCounters, Clock, Counters, FifoQueue, NetemConfig, NetemState, UdpTransport};
+use crate::{
+    AtomicCounters, Clock, Counters, FifoQueue, NetemConfig, NetemState, Schedule, UdpTransport,
+};
 
 /// One datagram a direction forwarded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,49 +144,53 @@ impl EmulatedDirection {
         }
     }
 
-    /// Deliver one arriving datagram through the path `LinkRunner::run` picks
-    /// for this config: the direct loop for a config with no scheduling, the
-    /// FIFO path when every deadline is monotonic, the delay heap otherwise.
+    /// Deliver one arriving datagram through the regime the direction's
+    /// [`NetemState::schedule`] selects — the same single authority
+    /// `LinkRunner::run` dispatches on, so the two cannot pick different paths.
     fn deliver(&mut self, payload: &[u8]) {
         let now = self.state.now();
-        if self.state.direct_forward {
-            self.state
-                .forward_direct(payload, Some(self.dst), &*self.transport);
-        } else if self.state.direct_stochastic {
-            self.state
-                .forward_stochastic_direct(payload, Some(self.dst), &*self.transport);
-        } else if self.state.uses_fifo_scheduling() {
-            self.state
-                .handle_datagram_fifo(payload, now, Some(self.dst), &mut self.fifo);
-        } else {
-            self.state.handle_datagram(payload, now, Some(self.dst));
+        match self.state.schedule() {
+            Schedule::Direct => {
+                self.state
+                    .forward_direct(payload, Some(self.dst), &*self.transport);
+            }
+            Schedule::StochasticDirect => {
+                self.state
+                    .forward_stochastic_direct(payload, Some(self.dst), &*self.transport);
+            }
+            Schedule::Fifo => {
+                self.state
+                    .handle_datagram_fifo(payload, now, Some(self.dst), &mut self.fifo);
+            }
+            Schedule::Heap => {
+                self.state.handle_datagram(payload, now, Some(self.dst));
+            }
         }
     }
 
     /// Forward every datagram whose deadline has arrived, using the same drain
-    /// the matching runner loop uses.
+    /// the matching runner loop uses for this regime.
     fn drain_due(&mut self) {
-        if self.state.direct_forward || self.state.direct_stochastic {
-            // The direct paths forward on arrival; nothing is ever queued.
-            return;
-        }
         let now = self.state.now();
-        if self.state.uses_fifo_scheduling() {
-            self.state
-                .drain_ready_fifo(&mut self.fifo, now, &*self.transport);
-        } else {
-            self.state.drain_ready(now, &*self.transport);
+        match self.state.schedule() {
+            // The direct regimes forward on arrival; nothing is ever queued.
+            Schedule::Direct | Schedule::StochasticDirect => {}
+            Schedule::Fifo => {
+                self.state
+                    .drain_ready_fifo(&mut self.fifo, now, &*self.transport);
+            }
+            Schedule::Heap => {
+                self.state.drain_ready(now, &*self.transport);
+            }
         }
     }
 
     /// Earliest deadline among queued datagrams, if any.
     fn next_due(&self) -> Option<Instant> {
-        if self.state.uses_fifo_scheduling() {
-            self.fifo.packets.front().map(|queued| queued.time_to_send)
-        } else if self.state.direct_forward || self.state.direct_stochastic {
-            None
-        } else {
-            self.state.queue.peek().map(|queued| queued.0.time_to_send)
+        match self.state.schedule() {
+            Schedule::Direct | Schedule::StochasticDirect => None,
+            Schedule::Fifo => self.fifo.packets.front().map(|queued| queued.time_to_send),
+            Schedule::Heap => self.state.queue.peek().map(|queued| queued.0.time_to_send),
         }
     }
 
