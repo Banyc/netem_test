@@ -383,6 +383,45 @@ no loss, seed 4. A round trip is triangular on `[10 ms, 70 ms]`, mean 40 ms.
   `mixed_results` (`not_ready`, `within_run_phase_not_stable`), with per-pair
   goodput moving 11–14 % in one and up to 32 % in the other, so the lane is
   diagnostic-only.
+- **The counter axis is not a fallback verdict instrument either.** A
+  fast-loss/gate change is not judged on goodput, so two further same-binary
+  controls (seeds 11/21/31/41, 30 s window, 20 s warmup, 8192 B MSS, one
+  executable SHA-256 for both roles) measured the counters such a verdict
+  would rest on. Neither the magnitude nor the sign of a paired delta
+  reproduced between the two invocations. The sender's
+  `retransmission_fast_loss_reason` (11.0–14.0 k per run) moved
+  -10.7/-0.3/-0.1/-1.7 % in the first control and -11.3/+7.7/+0.8/-6.7 % in
+  the second — the sign flips on two of the four seeds;
+  `retransmission_reorder_reason` (97–139 k) moved -19.5/+12.9/+23.6/-1.6 %
+  then -2.9/-0.6/-2.8/-12.0 %, and `retransmission_attempts` (108–151 k)
+  -19.1/+10.4/+21.9/-1.4 % then -3.4/-0.4/-1.9/-11.9 %, each agreeing on two
+  of four seeds. At fixed (role, seed) — one binary, one seed, two invocations
+  — the run-to-run spread is 4.3 % median / 11.6 % max on
+  `retransmission_fast_loss_reason`, 7.6 / 20.0 % on
+  `retransmission_reorder_reason`, 7.8 / 18.1 % on `retransmission_attempts`,
+  and 16.7 / 28.0 % on `retransmission_repeat_attempts`. The reason counters
+  track the lane's host-limited volume axis: at fixed role and seed the
+  delivered goodput itself moved 6.9 % median / 12.2 % max and the count of
+  c2s tail-dropped packets 7.2 / 40.8 %, so a same-binary run moves these
+  counters by as much as the candidate the lane is asked to judge. Both
+  controls ran under continuous background load (loadavg1 2.70–11.68 on a
+  10-CPU host, with another `cargo` build or test present in all 42 of the
+  10 s samples), so this bounds the
+  counter axis under load and does not prove it clean on an idle host; neither
+  control was `ready` at the 20 s warmup, both blocking on
+  `within_run_phase_not_stable`. The gate state itself is unambiguous and was
+  confirmed at battery power: with `rttvar` read as
+  `congestion_queue_tolerance_us / 2` (the jitter term dominating in 100 % of
+  sampled rows), `4 * rttvar` measured 25.0–77.7 ms against `srtt / 4` of
+  7.6–10.4 ms, so the srtt-relative half was disarmed in all 16 runs (0.0 % of
+  rows armed) and the RTO sat on the 1 s floor in all 16 — but the arm count a
+  verdict would compare cannot be read to better than about ±10–20 % here.
+  What a counter verdict would need is a control taken with no concurrent
+  build or soak load that reproduces its per-seed signs across two separate
+  invocations, and a way to separate a fast-loss arm that repairs a real
+  tail-drop from one that races a late arrival; the latter is not available on
+  this lane, whose c2s tail-drop measured 11.8–15.5 % of the direction's
+  packets in every one of the 16 runs.
 - **Why it must leave `rate` unset.** With a rate and no reorder gap, the
   send-time shaper schedules each packet at `max(now + delay, previous_send) +
   serialization`, so the deadlines are monotone and the lane cannot reorder
