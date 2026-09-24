@@ -428,6 +428,29 @@ no loss, seed 4. A round trip is triangular on `[10 ms, 70 ms]`, mean 40 ms.
   however much jitter it configures. The same delay sampling with a 100 Mbit/s
   rate measured 0 inverted deliveries and a 6.5 ms interquartile round-trip
   spread, against 141-145 inversions and 15-17 ms unshaped.
+- **A rate *with* a reorder gap restores the inversions but still not a
+  verdict.** The `reorder` branch of `NetemState::enqueue`
+  (`netem-test/src/lib.rs`) schedules the packet at `now` and never touches
+  `link_free_at`, so a reordered packet jumps the shaped tail and a configured
+  rate no longer makes the deadlines monotone. Measured: the same 20 ms /
+  +/-15 ms / 1024-packet shape with `rate = 100 Mbit/s`,
+  `reorder = u32::MAX / 2`, `reorder_gap_pkts = 2` forwarded 175 of 200
+  emulated echoes inverted (`4 * rttvar` 39.1 ms against `srtt / 4` 12.4 ms),
+  and reached the same disarmed regime on real sockets (0.0 % of 8,879
+  measurement-window rows armed, the jitter term the allowance in 99.9-100 % of
+  rows). It still cannot carry a counter verdict. Once a third of the packets
+  bypass serialization the rate is not a cap: the saturated direction
+  delivered 70.4-104.9 Mbit/s, one run above the configured 100 Mbit/s, so the
+  volume is not pinned. Across a four-seed same-binary control (30 s window,
+  20 s warmup, 8192 B MSS, one executable for both roles, two separate
+  invocations) the fixed-(role, seed) spread on delivered bytes was 0.4-39.1 %
+  (median 0.6-15.8 %) against 0.56 % counting noise, the paired deltas agreed
+  on sign on two of four seeds, and neither endpoint recorded a single
+  fast-loss arm in any of the 16 runs, so the counter a fast-loss/gate change
+  would move is empty. The variant does remove the tail-drop confound (0
+  overflow drops in every direction of all 16 runs), but removing the confound
+  without pinning the volume still fails the stationarity cap the unshaped lane
+  fails.
 
 ### `high_rtt_low_rate_bottleneck`
 
