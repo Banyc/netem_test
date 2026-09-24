@@ -322,28 +322,101 @@ fn netem_reorder_with_rate_jumps_ahead() {
 #[test]
 fn netem_snapshot_reports_queue_and_stats() {
     let (recv, server) = recv_socket();
+    // A hold far longer than this test can last: every datagram that reaches
+    // the link is still queued when the snapshot is taken, so the queue depth
+    // is a value the test can state exactly rather than bound from above. The
+    // queue limit is smaller than the burst, so the link tail-drops the
+    // overflow and the final depth is the limit itself -- a value strictly
+    // below the received count, which a queue depth that merely echoed the
+    // received count could not satisfy.
+    let held = Duration::from_secs(30);
+    let n = 5u8;
+    let cap = 3usize;
+    assert!(
+        cap < usize::from(n),
+        "the cap must bite for the depth to be distinguishable from the received count"
+    );
     let cfg = NetemConfig {
-        latency: Duration::from_millis(200),
+        latency: held,
+        queue_limit_pkts: cap,
         ..NetemConfig::default()
     };
     let link = NetemLink::spawn(server, cfg).unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-    // send 5 packets; with 200ms delay they should sit in the queue briefly.
-    for i in 0..5u8 {
+    // send `n` packets; the hold above keeps every one of them queued.
+    for i in 0..n {
         client.send_to(&[i], link.client_addr()).unwrap();
     }
-    // give the proxy a moment to enqueue.
-    std::thread::sleep(Duration::from_millis(20));
-    let snap = link.snapshot();
+    // Wait until the runner has consumed every datagram. The wait is on the
+    // independently maintained `received` counter, not on the queue depth
+    // being asserted, and the deadline is a liveness guard: a datagram that
+    // never arrives fails here with the counters attached instead of hanging.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while link.stats().received < u64::from(n) {
+        assert!(
+            Instant::now() < deadline,
+            "runner never received all {n} datagrams within 5s: {:?}",
+            link.stats()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // `stop()` joins the runner thread. A datagram is handled to completion
+    // before the loop re-checks the stop flag, so the snapshot below is read
+    // at a quiescent point and cannot race the last enqueue.
     link.stop();
-    assert!(snap.stats.received <= 5);
-    assert!(
-        snap.stats.received > 0,
-        "proxy should have received some packets"
+    let snap = link.snapshot();
+    assert_eq!(
+        snap.stats.received,
+        u64::from(n),
+        "the link must have received every datagram sent, got {:?}",
+        snap.stats
     );
-    // queue may already be partially drained; just assert it's bounded.
-    assert!(snap.queue_len <= 5);
-    // drain whatever arrived
+    // Nothing may leave before the {held:?} hold expires, so the datagrams the
+    // cap admits are still queued and the depth must equal the admitted
+    // count. `forwarded`, `dropped`, and `overflow_dropped` are the production
+    // counters that justify the expected depth (received - overflow_dropped,
+    // since nothing is forwarded or dropped by any other impairment); they are
+    // not a re-derivation of the queue depth.
+    assert_eq!(
+        snap.stats.forwarded, 0,
+        "no datagram may be forwarded before the {held:?} latency elapses, got {:?}",
+        snap.stats
+    );
+    assert_eq!(
+        snap.stats.dropped, 0,
+        "a clean config must not drop the held datagrams, got {:?}",
+        snap.stats
+    );
+    assert_eq!(
+        snap.stats.overflow_dropped,
+        u64::from(n) - cap as u64,
+        "the excess over the queue limit must be tail-dropped, got {:?}",
+        snap.stats
+    );
+    // The exact value: the admitted count is `received - overflow_dropped`,
+    // which is the configured cap `cap`; the queue holds every one of them
+    // because nothing has drained. `cap` is an integer the config above
+    // states, so an always-zero depth, a depth that echoed the received count
+    // ({n}), and a depth off by one all fail here, either at the non-zero
+    // check or at the equality.
+    assert!(
+        snap.queue_len > 0,
+        "the held datagrams must be visible in the queue, got {:?}",
+        snap
+    );
+    assert_eq!(
+        snap.queue_len, cap,
+        "the queue depth must be exactly the admitted datagrams, got {:?}",
+        snap
+    );
+    assert_eq!(
+        snap.queue_len as u64 + snap.stats.overflow_dropped,
+        snap.stats.received,
+        "every received datagram must be either queued or tail-dropped, got {:?}",
+        snap
+    );
+    // Independent confirmation that the depth above is non-zero because the
+    // datagrams are held: nothing drains inside the hold.
     recv.set_read_timeout(Some(Duration::from_millis(50)))
         .unwrap();
     let mut buf = [0u8; 64];
@@ -351,5 +424,69 @@ fn netem_snapshot_reports_queue_and_stats() {
     while recv.recv_from(&mut buf).is_ok() {
         delivered += 1;
     }
-    assert!(delivered <= 5);
+    assert_eq!(
+        delivered, 0,
+        "no datagram may be delivered inside the {held:?} latency"
+    );
+    drop(link);
+
+    // The depth must fall again as the queue drains. A second link with a
+    // short hold lets every datagram leave, and the same accessor must read
+    // zero once the last one has been forwarded rather than staying at its
+    // high-water mark.
+    let link = NetemLink::spawn(
+        server,
+        NetemConfig {
+            latency: Duration::from_millis(20),
+            ..NetemConfig::default()
+        },
+    )
+    .unwrap();
+    for i in 0..n {
+        client.send_to(&[i], link.client_addr()).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while link.stats().forwarded < u64::from(n) {
+        assert!(
+            Instant::now() < deadline,
+            "runner never forwarded all {n} datagrams within 5s: {:?}",
+            link.stats()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Each pop lowers the depth before the send that raises `forwarded`, so
+    // once `forwarded` reaches `n` the depth has already been stored as zero.
+    link.stop();
+    let snap = link.snapshot();
+    assert_eq!(
+        snap.stats.received,
+        u64::from(n),
+        "the draining link must have received every datagram sent, got {:?}",
+        snap.stats
+    );
+    assert_eq!(
+        snap.stats.forwarded,
+        u64::from(n),
+        "the draining link must forward every datagram sent, got {:?}",
+        snap.stats
+    );
+    assert_eq!(
+        snap.queue_len, 0,
+        "the depth must fall to zero once every datagram has drained, got {:?}",
+        snap
+    );
+    recv.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut delivered = 0u32;
+    while delivered < u32::from(n) {
+        match recv.recv_from(&mut buf) {
+            Ok(_) => delivered += 1,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        delivered,
+        u32::from(n),
+        "every drained datagram must reach the server"
+    );
 }
