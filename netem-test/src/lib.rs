@@ -2908,8 +2908,13 @@ mod tests {
         drop(sent);
     }
 
+    /// The gate is consulted when a datagram arrives, not when the queue
+    /// drains it: a datagram already queued when the gate closes still drains
+    /// and is forwarded, while one that arrives while the gate is closed is
+    /// counted received and dropped. The toggle therefore takes effect on the
+    /// very next arrival, with no packet boundary in between.
     #[test]
-    fn blackout_gates_at_forward_time_and_toggles_instantly() {
+    fn blackout_gates_at_receive_time_and_does_not_regate_queued_datagrams() {
         let config = NetemConfig {
             // Latency small enough that the first packet has drained by the time we
             // inspect, while the second is gated.
