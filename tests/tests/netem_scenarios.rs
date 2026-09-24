@@ -115,6 +115,32 @@ fn netem_passes_traffic_unimpaired() {
     assert!(got >= 99, "expected ~all packets delivered, got {got}");
 }
 
+/// The unidirectional link's blackout gate is a runtime control: a closed
+/// gate counts every arriving datagram received and dropped and forwards
+/// none, and reopening it forwards again.
+#[test]
+fn netem_blackout_gate_drops_then_resumes() {
+    let (recv, server) = recv_socket();
+    let link = NetemLink::spawn(server, NetemConfig::default()).unwrap();
+
+    link.set_blackout(true);
+    let (got, _) = burst(&link, &recv, 32, b"x", Duration::from_millis(200));
+    assert_eq!(got, 0, "a closed blackout gate must forward nothing");
+    let gated = link.stats();
+    assert_eq!(gated.received, 32);
+    assert_eq!(gated.dropped, 32);
+    assert_eq!(gated.forwarded, 0);
+
+    link.set_blackout(false);
+    let (got, _) = burst(&link, &recv, 32, b"y", Duration::from_millis(500));
+    link.stop();
+    let resumed = link.stats();
+    assert_eq!(resumed.received, 64);
+    assert_eq!(resumed.dropped, 32);
+    assert!(resumed.forwarded >= 32);
+    assert!(got >= 31, "the reopened gate must forward, got {got}");
+}
+
 #[test]
 fn netem_drops_all_with_max_random_loss() {
     let (recv, server) = recv_socket();
