@@ -1430,10 +1430,12 @@ impl LinkRunner {
                         .drain_ready_fifo(&mut fifo, now, &*self.transport);
                     continue;
                 }
+                // The `front.time_to_send <= now` check above uses this same
+                // `now`, so the wait below is strictly positive: a datagram due
+                // now was already drained, and there is no zero-wait case to
+                // re-drain here (the heap loop, which samples `now` again, still
+                // needs that guard).
                 let receive_wait = self.pipeline.next_receive_wait_fifo(&fifo, now);
-                if receive_wait.is_zero() {
-                    continue;
-                }
                 match self.transport.recv_from_timeout(buf, receive_wait) {
                     Ok((n, _from)) => {
                         let now = self.pipeline.now();
@@ -2147,10 +2149,12 @@ impl SharedLinkRunner {
                     self.pipeline.drain_ready_fifo(&mut fifo, now, &*self.send);
                     continue;
                 }
+                // The `front.time_to_send <= now` check above uses this same
+                // `now`, so the wait below is strictly positive: a datagram due
+                // now was already drained, and there is no zero-wait case to
+                // re-drain here (the heap loop, which samples `now` again, still
+                // needs that guard).
                 let receive_wait = self.pipeline.next_receive_wait_fifo(&fifo, now);
-                if receive_wait.is_zero() {
-                    continue;
-                }
                 match self.recv.recv_from_timeout(buf, receive_wait) {
                     Ok((n, from)) => {
                         if self.fixed_dst.is_some() {
