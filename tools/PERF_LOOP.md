@@ -1095,3 +1095,68 @@ rather than raw sample counts. For sparse-message calibration lanes
 inspect p50/p95/p99 message latency and `message_delivery_percent` rather
 than raw sample counts or near-zero goodput; a tail shift with a wire-byte
 cost is material even when the delivered-byte rate barely moves.
+
+## Instrument limits for per-datagram CPU cost
+
+The verdict lanes measure a link's delivered rate, and on a saturating
+loopback path the per-datagram cost is almost entirely the two syscalls: 3.19
+us per forwarded datagram is `__sendto` 74.45 % + `__recvfrom` 25.33 %, so at
+most 0.2 % of it is the harness's own code. A change that saves or spends
+nanoseconds to a fraction of a microsecond per forwarded datagram therefore
+has very little goodput to move, and two controls bound how much of it the
+paired goodput axis can resolve at all.
+
+- **Positive control.** Re-applying the previously removed redundant
+  per-receive `setsockopt` (an install + recv + restore where install + recv
+  suffices; the argument is the comment on
+  `StdUdpTransport::recv_from_timeout`) is attributed cleanly: on a
+  FIFO-scheduled saturating lane the `setsockopt` leaf is 16.30 % of the
+  `netem-c2s` forwarding thread with the restore against 8.46 % without it,
+  +0.42 us per forwarded datagram. The paired throughput comparison over 6
+  interleaved rounds measured **+0.4 % paired mean**: per-round range -3.1 %
+  to +4.1 %, same-arm spread 20-27 %, with the load average moving 3.9 -> 6.6.
+- **Dose control.** Trunk plus one extra 8 KiB copy per enqueued datagram is
+  attributed again (`_platform_memmove` 3.47 % -> 5.69 % of the same thread)
+  and measures **+1.26 % paired mean** goodput over 5 rounds, against a 5-7 %
+  within-arm spread.
+
+So a per-datagram CPU cost at the ~3.5 %-of-thread scale the dose control's
+own copy occupies is worth about 1 % of measured goodput, which is inside that
+metric's own run-to-run spread — and the positive control moved a larger leaf
+share (7.84 pp of the thread) for +0.4 %. Two more measurements say the same
+from the other direction: a per-datagram change measured at 4.19 -> 0.25
+ns/call (16.8x) on the real listener type produced no paired delta the battery
+could see, and its author refused an end-to-end claim instead of asserting
+one; and the syscall shares above are why a CPU-side change has almost no
+goodput to move.
+
+**Use the instrument that matches the change kind.** A per-datagram CPU cost
+is measured by attribution — the profile's leaf share of the real forwarding
+thread (`--cpu-active-only`, `--thread netem-c2s`, `--rank-by leaf`) — and by
+an interleaved three-arm micro-measurement on the real type; the end-to-end
+claim is refused rather than asserted, and a paired battery run on such a
+change is only a check that the link path still works, so its
+`no_material_change` verdict is uninformative rather than a refutation. A
+change to goodput, latency, phase behaviour, or wire cost is measured by the
+paired battery, on a verdict lane and at a 30 s window.
+
+These are two controls on one machine under load: they bound the resolution of
+the goodput axis, they do not prove a specific change's cost is exactly 3.5 %
+of the thread, they do not prove a CPU-side change is free, and a delta they
+produce carries the same `does_not_prove` guard as any other pair.
+
+One consequence for the record: the redundant-`setsockopt` change was once
+justified by a 6.7 % saving, and that is a CPU-per-forwarded-datagram figure
+(5.41 us -> 5.05 us, against its own -2.7 % same-config run-to-run spread),
+not an end-to-end one. The positive control above *is* that change re-applied,
+and it reproduces that figure in the same unit: +0.42 us per forwarded
+datagram, about 7.8 % of 5.41 us. What does not reproduce — and was never
+claimed — is a throughput effect, since a cost this size cannot move measured
+goodput outside the spread this section is about; the +0.4 % paired mean
+belongs in that role, not as a refutation. The change therefore stands on the
+work having been provably redundant — every receive entry point installs the
+timeout it needs before its own `recv`, so the restore was a pure extra
+`setsockopt` with no scheduling decision or send order behind it — and on a
+CPU-per-datagram measurement its own control independently confirms, not on a
+withdrawn number. That figure survives only in that change's own commit
+message, which is left as written.
