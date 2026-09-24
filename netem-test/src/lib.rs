@@ -3071,6 +3071,33 @@ mod tests {
         let final_stats = pair.stats_c2s();
         assert!(final_stats.forwarded >= 2);
         assert_eq!(final_stats.received, 4);
+
+        // The s2c direction shares the same blackout gate but has its own
+        // control, `set_blackout_s2c`; toggle it to prove the server's replies
+        // are gated and then flow again.
+        server_sock.push_recv(vec![10], server_addr);
+        wait_until("s2c packet received", || pair.stats_s2c().received >= 1);
+        clock.advance(Duration::from_millis(5));
+        wait_until("s2c packet forwarded", || pair.stats_s2c().forwarded >= 1);
+        pair.set_blackout_s2c(true);
+        server_sock.push_recv(vec![11], server_addr);
+        server_sock.push_recv(vec![12], server_addr);
+        wait_until("s2c gated packets received", || {
+            pair.stats_s2c().received == 3
+        });
+        let gated_s2c = pair.stats_s2c();
+        assert_eq!(gated_s2c.received, 3);
+        assert_eq!(gated_s2c.dropped, 2);
+        pair.set_blackout_s2c(false);
+        server_sock.push_recv(vec![13], server_addr);
+        wait_until("s2c final packet received", || {
+            pair.stats_s2c().received == 4
+        });
+        clock.advance(Duration::from_millis(5));
+        wait_until("s2c final packet forwarded", || {
+            pair.stats_s2c().forwarded >= 2
+        });
+        assert_eq!(pair.stats_s2c().received, 4);
         pair.stop();
     }
 
