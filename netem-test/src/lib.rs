@@ -5456,6 +5456,121 @@ mod tests {
         pair.stop();
     }
 
+    /// The bidirectional runner's stochastic-direct loops apply the
+    /// duplicate/loss draws on arrival and forward every surviving copy to the
+    /// fixed server (c2s) or the learned client (s2c) without scheduling. The
+    /// emulated driver and the unidirectional `LinkRunner` cover the same
+    /// regime, but the two `SharedLinkRunner` loops are only reachable through
+    /// a `NetemPair` whose direction has stochastic work and no scheduling, so
+    /// this drives them over in-memory transports and asserts the copies, the
+    /// destinations, and the counters.
+    #[test]
+    fn shared_runner_stochastic_direct_forwards_to_the_fixed_and_learned_routes() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 3500));
+        let client_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 5001));
+        let config = NetemConfig {
+            duplicate: u32::MAX,
+            seed: 5,
+            ..NetemConfig::default()
+        };
+        const PACKETS: u8 = 4;
+        let expected: Vec<u8> = (0..PACKETS).flat_map(|id| [id, id]).collect();
+
+        // c2s: fixed destination (the real server) over the fixed-route loop.
+        let c2s_recv = Arc::new(MockTransport::new(client_addr));
+        let c2s_send = Arc::new(MockTransport::new(server_addr));
+        let c2s_stats = Arc::new(AtomicCounters::default());
+        let c2s = SharedLinkRunner::new(
+            Arc::clone(&c2s_recv) as Arc<dyn UdpTransport>,
+            Arc::clone(&c2s_send) as Arc<dyn UdpTransport>,
+            DirectionRunnerConfig {
+                netem: config.clone(),
+                stats: Arc::clone(&c2s_stats),
+                queue_len: Arc::new(AtomicU64::new(0)),
+                blackout: Arc::new(AtomicBool::new(false)),
+                stop: Arc::new(AtomicBool::new(false)),
+                fixed_dst: Some(server_addr),
+                learned_dst: Arc::new(LearnedDestination::default()),
+                connect_client_on_first_packet: false,
+                shared: None,
+                clock: Some(c2s_recv.clock()),
+            },
+        );
+        assert_eq!(c2s.pipeline.schedule(), Schedule::StochasticDirect);
+        for id in 0..PACKETS {
+            c2s_recv.push_recv(vec![id], client_addr);
+        }
+        c2s_recv.fail_when_drained();
+        c2s.run();
+        {
+            let sent = c2s_send.sent.lock().unwrap();
+            assert_eq!(sent.len(), usize::from(PACKETS) * 2);
+            assert!(sent.iter().all(|(_, dst)| *dst == server_addr));
+            assert_eq!(
+                sent.iter().map(|(data, _)| data[0]).collect::<Vec<u8>>(),
+                expected,
+                "the fixed-route loop must forward both copies of every datagram"
+            );
+        }
+        let counters = c2s_stats.snapshot();
+        assert_eq!(
+            (counters.received, counters.duplicated, counters.forwarded),
+            (
+                u64::from(PACKETS),
+                u64::from(PACKETS),
+                u64::from(PACKETS) * 2
+            )
+        );
+
+        // s2c: the learned client address over the learned-route loop.
+        let s2c_recv = Arc::new(MockTransport::new(server_addr));
+        let s2c_send = Arc::new(MockTransport::new(client_addr));
+        let s2c_stats = Arc::new(AtomicCounters::default());
+        let learned = Arc::new(LearnedDestination::default());
+        learned.publish_if_changed(&mut None, client_addr);
+        let s2c = SharedLinkRunner::new(
+            Arc::clone(&s2c_recv) as Arc<dyn UdpTransport>,
+            Arc::clone(&s2c_send) as Arc<dyn UdpTransport>,
+            DirectionRunnerConfig {
+                netem: config,
+                stats: Arc::clone(&s2c_stats),
+                queue_len: Arc::new(AtomicU64::new(0)),
+                blackout: Arc::new(AtomicBool::new(false)),
+                stop: Arc::new(AtomicBool::new(false)),
+                fixed_dst: None,
+                learned_dst: learned,
+                connect_client_on_first_packet: false,
+                shared: None,
+                clock: Some(s2c_recv.clock()),
+            },
+        );
+        assert_eq!(s2c.pipeline.schedule(), Schedule::StochasticDirect);
+        for id in 0..PACKETS {
+            s2c_recv.push_recv(vec![id], server_addr);
+        }
+        s2c_recv.fail_when_drained();
+        s2c.run();
+        {
+            let sent = s2c_send.sent.lock().unwrap();
+            assert_eq!(sent.len(), usize::from(PACKETS) * 2);
+            assert!(sent.iter().all(|(_, dst)| *dst == client_addr));
+            assert_eq!(
+                sent.iter().map(|(data, _)| data[0]).collect::<Vec<u8>>(),
+                expected,
+                "the learned-route loop must forward both copies of every datagram"
+            );
+        }
+        let counters = s2c_stats.snapshot();
+        assert_eq!(
+            (counters.received, counters.duplicated, counters.forwarded),
+            (
+                u64::from(PACKETS),
+                u64::from(PACKETS),
+                u64::from(PACKETS) * 2
+            )
+        );
+    }
+
     /// Learned-destination publication and refresh must take the shared lock
     /// only when the route actually changes; unchanged routes are served from
     /// the caller's cache and the generation counter.
