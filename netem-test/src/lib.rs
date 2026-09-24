@@ -1011,6 +1011,17 @@ impl NetemState {
     }
 
     fn enqueue(&mut self, data: &[u8], now: Instant, dst: Option<SocketAddr>) {
+        // ── unroutable datagram ──────────────────────────────────────
+        // A direction that has not learned its destination yet (s2c before
+        // the first client packet) cannot route the datagram, so discard it
+        // before any impairment accounting. It must consume no PRNG draw, no
+        // queue slot, and no send-time shaper budget, and must not be counted
+        // delayed/reordered/rate-limited/overflow-dropped: `received`, bumped
+        // in `handle_datagram`, is the only counter that describes it.
+        let Some(dst) = dst else {
+            return;
+        };
+
         // ── queue limit (tail-drop) ──────────────────────────────────
         // Check before the reorder/schedule logic so a tail-dropped packet
         // consumes no PRNG draw, never advances link_free_at, and leaves the
@@ -1083,11 +1094,6 @@ impl NetemState {
                     base
                 }
             }
-        };
-
-        let Some(dst) = dst else {
-            // No known destination yet (s2c before the first client packet).
-            return;
         };
 
         // Reuse a recycled drained payload buffer instead of allocating a
@@ -1199,6 +1205,15 @@ impl NetemState {
         dst: Option<SocketAddr>,
         fifo: &mut FifoQueue,
     ) {
+        // ── unroutable datagram ──────────────────────────────────────
+        // Same guard as the heap path: discard before any impairment
+        // accounting (no queue slot, no PRNG draw, no shaper budget, no
+        // delayed/reordered/rate-limited/overflow-dropped counter), so only
+        // `received` describes a datagram that cannot be routed.
+        let Some(dst) = dst else {
+            return;
+        };
+
         // ── queue limit (tail-drop) ──────────────────────────────────
         if self.config.queue_limit_pkts != 0 && fifo.packets.len() >= self.config.queue_limit_pkts {
             self.stats.inc(|s| &s.overflow_dropped);
@@ -1238,11 +1253,6 @@ impl NetemState {
             t
         } else {
             now + delay
-        };
-
-        let Some(dst) = dst else {
-            // No known destination yet (s2c before the first client packet).
-            return;
         };
 
         // Reuse a recycled drained payload buffer; `extend_from_slice` keeps
@@ -5918,15 +5928,19 @@ mod tests {
         drop(fifo_sent);
     }
 
-    /// A direction that has not learned its destination yet discards the
-    /// datagram — it cannot be routed — but the discard happens *after* the
-    /// schedule is committed. The datagram is therefore counted received and
-    /// still books its serialization time in the send-time shaper, while never
-    /// being counted dropped or overflow-dropped (and never queued). Moving
-    /// the destination check ahead of the scheduling arithmetic would stop the
-    /// shaper metering datagrams that are not on the wire.
+    /// A direction that has not learned its destination yet cannot route the
+    /// datagram, so the discard happens *before* any impairment accounting:
+    /// the datagram is counted received but consumes no PRNG draw, no queue
+    /// slot, and no send-time shaper budget, and it is never counted
+    /// delayed/reordered/rate-limited/overflow-dropped (nor dropped as a
+    /// loss). Metering it would report work the instrument did not do: a
+    /// serialization time booked into `link_free_at` shifts every later
+    /// routed datagram's send time, and a `delayed`/`rate_limited` count
+    /// describes a datagram that is not on the wire.
     #[test]
-    fn a_datagram_with_no_known_destination_is_discarded_after_its_schedule_is_committed() {
+    fn a_datagram_with_no_known_destination_is_discarded_before_its_schedule_is_committed() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+
         // Heap path: jitter makes the deadline non-monotonic, so this config
         // selects the heap.
         let (mut heap, heap_sent) = mock_runner(NetemConfig {
@@ -5955,17 +5969,27 @@ mod tests {
         assert_eq!(heap.pipeline.queue.len(), 0, "nothing may be queued");
         assert!(heap_sent.sent.lock().unwrap().is_empty());
         assert_eq!(
-            stats.rate_limited, 1,
-            "the send-time shaper is metered before the destination is consulted"
+            stats.delayed, 0,
+            "an unroutable datagram never had a send time to delay"
         );
-        assert!(
-            heap.pipeline.link_free_at > link_free_at_before,
-            "the shaper clock advances for a datagram that never leaves"
+        assert_eq!(
+            stats.rate_limited, 0,
+            "the send-time shaper must not meter a datagram that never leaves"
+        );
+        assert_eq!(
+            heap.pipeline.link_free_at, link_free_at_before,
+            "the shaper clock must not advance for a datagram that never leaves"
+        );
+        assert_rng_advanced_by(
+            heap.pipeline.rng,
+            3,
+            0,
+            "an unroutable datagram must consume no PRNG draw",
         );
         drop(heap_sent);
 
-        // FIFO path: zero latency and a rate selects the FIFO, so the booked
-        // serialization time is exactly the datagram's own.
+        // FIFO path: zero latency and a rate selects the FIFO, so a metered
+        // datagram would book exactly its own serialization time.
         let (mut fifo, fifo_sent) = mock_runner(NetemConfig {
             rate: 8_000, // 1 byte per ms, zero latency
             ..NetemConfig::default()
@@ -5984,13 +6008,40 @@ mod tests {
         );
         assert_eq!(queue.packets.len(), 0);
         assert!(fifo_sent.sent.lock().unwrap().is_empty());
-        assert_eq!(stats.rate_limited, 1);
         assert_eq!(
-            fifo.pipeline.link_free_at,
-            now + serialization_delay(10, 8_000).expect("a rate is configured"),
-            "the unroutable datagram still books its serialization time"
+            stats.rate_limited, 0,
+            "the send-time shaper must not meter a datagram that never leaves"
+        );
+        assert_eq!(
+            fifo.pipeline.link_free_at, now,
+            "the unroutable datagram must not book its serialization time"
         );
         drop(fifo_sent);
+
+        // A full queue must not report the discard as an overflow drop either:
+        // routing is a precondition for occupying a queue slot, so the
+        // queue-limit guard is never consulted for an unroutable datagram.
+        let (mut full, full_sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(1),
+            queue_limit_pkts: 1,
+            ..NetemConfig::default()
+        });
+        assert_eq!(full.pipeline.schedule(), Schedule::Fifo);
+        let mut queue = FifoQueue::default();
+        let clock = full_sent.clock();
+        full.pipeline
+            .handle_datagram_fifo(b"queued", clock.now(), Some(server_addr), &mut queue);
+        assert_eq!(queue.packets.len(), 1, "the first datagram fills the queue");
+        full.pipeline
+            .handle_datagram_fifo(b"unroutable", clock.now(), None, &mut queue);
+        let stats = full.pipeline.stats.snapshot();
+        assert_eq!(
+            (stats.received, stats.overflow_dropped),
+            (2, 0),
+            "a full queue is not a drop reason for a datagram with no route"
+        );
+        assert_eq!(queue.packets.len(), 1);
+        drop(full_sent);
     }
 
     /// A closed blackout gate drops the datagram before any impairment is
