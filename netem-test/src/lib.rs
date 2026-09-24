@@ -4423,6 +4423,36 @@ mod tests {
         );
         assert_eq!(stochastic.pipeline.stats.snapshot().dropped, 1);
         drop(stochastic_sent);
+
+        let (mut fifo, fifo_sent) = mock_runner(NetemConfig {
+            max_datagram_size: LIMIT,
+            latency: Duration::from_millis(1),
+            ..NetemConfig::default()
+        });
+        assert_eq!(
+            fifo.pipeline.schedule(),
+            Schedule::Fifo,
+            "a latency-only config must select the FIFO path"
+        );
+        let clock = fifo_sent.clock();
+        let mut queue = FifoQueue::default();
+        fifo.pipeline
+            .handle_datagram_fifo(&at_limit, clock.now(), Some(server_addr), &mut queue);
+        assert_eq!(
+            fifo.pipeline.stats.snapshot().dropped,
+            0,
+            "a datagram exactly max_datagram_size must pass the FIFO path"
+        );
+        assert_eq!(queue.packets.len(), 1);
+        fifo.pipeline
+            .handle_datagram_fifo(&over_limit, clock.now(), Some(server_addr), &mut queue);
+        assert_eq!(fifo.pipeline.stats.snapshot().dropped, 1);
+        assert_eq!(
+            queue.packets.len(),
+            1,
+            "the oversized datagram must be dropped without entering the FIFO"
+        );
+        drop(fifo_sent);
     }
 
     /// Packets with equal deadlines must drain in arrival (FIFO) order. The
