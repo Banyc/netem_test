@@ -778,6 +778,11 @@ struct NetemState {
     reused_packet_buffers: Vec<Vec<u8>>,
     reorder_counter: u32,
     seq: u64,
+    /// Number of times the forwarding regime has been derived through
+    /// [`NetemState::schedule`], for the tests that pin "derived once per
+    /// direction, never per datagram or per emulated event".
+    #[cfg(test)]
+    regime_derivations: AtomicU64,
 }
 
 impl NetemState {
@@ -831,6 +836,8 @@ impl NetemState {
             reused_packet_buffers: Vec::new(),
             reorder_counter: 0,
             seq: 0,
+            #[cfg(test)]
+            regime_derivations: AtomicU64::new(0),
         }
     }
 
@@ -853,8 +860,12 @@ impl NetemState {
     /// choice: every dispatch site matches on this value instead of
     /// re-deriving the regime from the config, so the real runner and the
     /// emulated driver cannot disagree about which queue — or whether any
-    /// queue — a config uses.
+    /// queue — a config uses. Its inputs are immutable, so a caller that needs
+    /// the regime more than once resolves it once and holds the value rather
+    /// than re-deriving it per datagram.
     fn schedule(&self) -> Schedule {
+        #[cfg(test)]
+        self.regime_derivations.fetch_add(1, Ordering::Relaxed);
         if self.direct_stochastic {
             Schedule::StochasticDirect
         } else if self.direct_forward {
@@ -864,22 +875,6 @@ impl NetemState {
         } else {
             Schedule::Heap
         }
-    }
-
-    /// Forward `data` to `dst` without touching the heap when the config is
-    /// clean. Returns `true` when the packet was handled (forwarded, dropped
-    /// by the deterministic size filter, or gated by blackout); `false` when
-    /// the caller must fall through to the queued impairment path.
-    fn try_direct_forward(
-        &self,
-        data: &[u8],
-        dst: Option<SocketAddr>,
-        send: &dyn UdpTransport,
-    ) -> bool {
-        if self.schedule() != Schedule::Direct {
-            return false;
-        }
-        self.forward_direct(data, dst, send)
     }
 
     /// Clean no-clock direct loop: count the datagram, apply the deterministic
@@ -1496,15 +1491,11 @@ impl LinkRunner {
             match self.transport.recv_from_timeout(&mut buf[..], receive_wait) {
                 Ok((n, _from)) => {
                     let dst = Some(self.server_addr);
-                    // Clean configs skip the heap entirely; only packets that
-                    // need impairment reach the queued path.
-                    if !self
-                        .pipeline
-                        .try_direct_forward(&buf[..n], dst, &*self.transport)
-                    {
-                        self.pipeline
-                            .handle_datagram(&buf[..n], self.pipeline.now(), dst);
-                    }
+                    // The dispatch fixed this direction's regime as `Heap`, so
+                    // no received datagram can take the direct path: only the
+                    // queued impairment path applies.
+                    self.pipeline
+                        .handle_datagram(&buf[..n], self.pipeline.now(), dst);
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -2234,15 +2225,11 @@ impl SharedLinkRunner {
                         self.learned_dst
                             .refresh_if_changed(&mut cached, &mut observed_generation)
                     });
-                    // Clean configs skip the heap entirely; only packets that
-                    // need impairment reach the queued path.
-                    if !self
-                        .pipeline
-                        .try_direct_forward(&buf[..n], dst, &*self.send)
-                    {
-                        self.pipeline
-                            .handle_datagram(&buf[..n], self.pipeline.now(), dst);
-                    }
+                    // The dispatch fixed this direction's regime as `Heap`,
+                    // so this received datagram can only take the queued
+                    // impairment path.
+                    self.pipeline
+                        .handle_datagram(&buf[..n], self.pipeline.now(), dst);
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -2625,6 +2612,8 @@ mod tests {
         sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
         local_addr: SocketAddr,
         clock: Clock,
+        /// See [`MockTransport::fail_when_drained`].
+        fatal_when_drained: AtomicBool,
     }
 
     impl MockTransport {
@@ -2634,6 +2623,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 local_addr,
                 clock: Clock::new(),
+                fatal_when_drained: AtomicBool::new(false),
             }
         }
 
@@ -2643,6 +2633,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 local_addr,
                 clock,
+                fatal_when_drained: AtomicBool::new(false),
             }
         }
 
@@ -2653,14 +2644,29 @@ mod tests {
         fn push_recv(&self, data: Vec<u8>, from: SocketAddr) {
             self.recv.lock().unwrap().push_back((data, from));
         }
+
+        /// Make the transport report a fatal error once its queue is drained,
+        /// so a runner loop returns after consuming exactly the queued
+        /// datagrams instead of polling `WouldBlock` until it is stopped.
+        fn fail_when_drained(&self) {
+            self.fatal_when_drained.store(true, Ordering::Relaxed);
+        }
     }
 
     impl UdpTransport for MockTransport {
         fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             let mut q = self.recv.lock().unwrap();
-            let (data, from) = q
-                .pop_front()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no queued datagrams"))?;
+            let (data, from) = match q.pop_front() {
+                Some(datagram) => datagram,
+                None => {
+                    let kind = if self.fatal_when_drained.load(Ordering::Relaxed) {
+                        io::ErrorKind::Other
+                    } else {
+                        io::ErrorKind::WouldBlock
+                    };
+                    return Err(io::Error::new(kind, "no queued datagrams"));
+                }
+            };
             let n = data.len().min(buf.len());
             buf[..n].copy_from_slice(&data[..n]);
             Ok((n, from))
@@ -3505,6 +3511,48 @@ mod tests {
     }
 
     #[test]
+    fn the_heap_loop_does_not_derive_the_regime_per_datagram() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(5),
+            jitter: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let datagrams = 64u64;
+        let captured = Arc::new(MockTransport::new(server_addr));
+        captured.fail_when_drained();
+        let clock = captured.clock();
+        let stats = Arc::new(AtomicCounters::default());
+        let mut runner = LinkRunner::new(RunnerConfig {
+            netem: config,
+            server_addr,
+            stats: Arc::clone(&stats),
+            queue_len: Arc::new(AtomicU64::new(0)),
+            blackout: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            transport: Box::new(Arc::clone(&captured) as Arc<dyn UdpTransport>),
+            clock: Some(clock),
+        });
+        // The dispatch resolves the regime once for the direction.
+        assert_eq!(runner.pipeline.schedule(), Schedule::Heap);
+        for id in 0..datagrams {
+            captured.push_recv(vec![id as u8; 8], server_addr);
+        }
+        runner.run_heap(&mut [0u8; 2048]);
+        assert_eq!(
+            stats.snapshot().received,
+            datagrams,
+            "the loop must consume every queued datagram"
+        );
+        assert_eq!(
+            runner.pipeline.regime_derivations.load(Ordering::Relaxed),
+            1,
+            "the regime is derived once for the direction, never per received datagram"
+        );
+        drop(captured);
+    }
+
+    #[test]
     fn impaired_config_stays_on_the_queue_path() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
         let config = NetemConfig {
@@ -3513,10 +3561,10 @@ mod tests {
         };
         let (mut runner, sent) = mock_runner(config);
         assert!(!runner.pipeline.direct_forward);
-        let dst = Some(server_addr);
-        assert!(
-            !runner.pipeline.try_direct_forward(b"impaired", dst, &*sent),
-            "an impaired config must refuse the direct path"
+        assert_eq!(
+            runner.pipeline.schedule(),
+            Schedule::Fifo,
+            "an impaired config must not select the direct-regime loop"
         );
         assert_eq!(runner.pipeline.stats.snapshot().received, 0);
         // The queued path still handles the datagram.
@@ -3680,7 +3728,7 @@ mod tests {
         assert!(
             runner
                 .pipeline
-                .try_direct_forward(&[0u8; 600], Some(server_addr), &*sent)
+                .forward_direct(&[0u8; 600], Some(server_addr), &*sent)
         );
         let s = runner.pipeline.stats.snapshot();
         assert_eq!(s.received, 1);
@@ -3856,7 +3904,7 @@ mod tests {
         let direct = || {
             let _ = runner
                 .pipeline
-                .try_direct_forward(&payload, Some(server_addr), &*sent);
+                .forward_direct(&payload, Some(server_addr), &*sent);
         };
         let direct_mpps = probe_mpps(direct);
 
@@ -3870,7 +3918,7 @@ mod tests {
         let filter = || {
             let _ = runner_f
                 .pipeline
-                .try_direct_forward(&payload, Some(server_addr), &*sent_f);
+                .forward_direct(&payload, Some(server_addr), &*sent_f);
         };
         let filter_mpps = probe_mpps(filter);
 

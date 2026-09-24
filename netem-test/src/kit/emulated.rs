@@ -106,6 +106,11 @@ impl UdpTransport for RecordingTransport {
 struct EmulatedDirection {
     clock: Clock,
     state: NetemState,
+    /// The regime this direction's config selects, derived once: [`NetemState::schedule`]
+    /// is a pure function of the immutable config, and every event of the
+    /// replay asks for it, so deriving it per event would only repeat the same
+    /// branch tests.
+    regime: Schedule,
     fifo: FifoQueue,
     transport: Arc<RecordingTransport>,
     stats: Arc<AtomicCounters>,
@@ -126,9 +131,11 @@ impl EmulatedDirection {
             None,
             Some(clock.clone()),
         );
+        let regime = state.schedule();
         Self {
             clock,
             state,
+            regime,
             fifo: FifoQueue::default(),
             transport,
             stats,
@@ -145,11 +152,12 @@ impl EmulatedDirection {
     }
 
     /// Deliver one arriving datagram through the regime the direction's
-    /// [`NetemState::schedule`] selects — the same single authority
-    /// `LinkRunner::run` dispatches on, so the two cannot pick different paths.
+    /// [`NetemState::schedule`] selected at construction — the same single
+    /// authority `LinkRunner::run` dispatches on, so the two cannot pick
+    /// different paths.
     fn deliver(&mut self, payload: &[u8]) {
         let now = self.state.now();
-        match self.state.schedule() {
+        match self.regime {
             Schedule::Direct => {
                 self.state
                     .forward_direct(payload, Some(self.dst), &*self.transport);
@@ -172,7 +180,7 @@ impl EmulatedDirection {
     /// the matching runner loop uses for this regime.
     fn drain_due(&mut self) {
         let now = self.state.now();
-        match self.state.schedule() {
+        match self.regime {
             // The direct regimes forward on arrival; nothing is ever queued.
             Schedule::Direct | Schedule::StochasticDirect => {}
             Schedule::Fifo => {
@@ -187,7 +195,7 @@ impl EmulatedDirection {
 
     /// Earliest deadline among queued datagrams, if any.
     fn next_due(&self) -> Option<Instant> {
-        match self.state.schedule() {
+        match self.regime {
             Schedule::Direct | Schedule::StochasticDirect => None,
             Schedule::Fifo => self.fifo.packets.front().map(|queued| queued.time_to_send),
             Schedule::Heap => self.state.queue.peek().map(|queued| queued.0.time_to_send),
@@ -235,8 +243,10 @@ pub fn emulated_forward(
         if direction.next_due_offset() == Some(next) {
             direction.drain_due();
         } else {
-            let payload = arrivals[index].0.clone();
-            direction.deliver(&payload);
+            // The arrival payload is only read, so it is delivered by
+            // reference: cloning it would allocate and copy every arrival for
+            // nothing.
+            direction.deliver(&arrivals[index].0);
             index += 1;
         }
         for payload in direction.transport.take_sent() {
@@ -262,6 +272,30 @@ mod tests {
 
     fn id_of(payload: &[u8]) -> u64 {
         u64::from_be_bytes(payload[..8].try_into().expect("eight-byte id"))
+    }
+
+    /// The emulated driver resolves the direction's regime once, when it is
+    /// built: the value is a pure function of the immutable config and every
+    /// event of a replay asks for it, so deriving it per delivered datagram or
+    /// per drain would only repeat the same branch tests.
+    #[test]
+    fn the_emulated_driver_derives_the_regime_once_per_direction() {
+        use std::sync::atomic::Ordering;
+
+        let config = jittery_short_rtt_link();
+        let mut direction = EmulatedDirection::new(&config);
+        for id in 0..64u64 {
+            direction.advance_to(Duration::from_millis(id));
+            direction.deliver(&id.to_be_bytes());
+            direction.advance_to(Duration::from_millis(id) + Duration::from_millis(40));
+            direction.drain_due();
+            let _ = direction.next_due();
+        }
+        assert_eq!(
+            direction.state.regime_derivations.load(Ordering::Relaxed),
+            1,
+            "a replay must derive the direction's regime once, not per event"
+        );
     }
 
     /// Fixed shaping: every datagram leaves exactly `latency` after it
