@@ -336,6 +336,45 @@ mod tests {
         }
     }
 
+    /// A datagram arriving at the exact instant another datagram's deadline
+    /// expires is drained first and delivered second, so the drain frees the
+    /// queue slot the arrival needs. With a one-packet queue limit that is the
+    /// difference between admitting the arrival and tail-dropping it.
+    #[test]
+    fn an_arrival_at_a_deadline_is_admitted_against_the_slot_the_drain_frees() {
+        let config = NetemConfig {
+            queue_limit_pkts: 1,
+            ..clean_delay_link(Duration::from_millis(2), 1)
+        };
+        let arrivals = vec![
+            (0u64.to_be_bytes().to_vec(), Duration::ZERO),
+            (1u64.to_be_bytes().to_vec(), Duration::from_millis(2)),
+        ];
+        let (forwarded, counters) = emulated_forward(&config, arrivals);
+        assert_eq!(
+            forwarded
+                .iter()
+                .map(|datagram| id_of(&datagram.payload))
+                .collect::<Vec<u64>>(),
+            vec![0, 1],
+            "the arrival must be admitted, not dropped for the slot its drain frees"
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .map(|datagram| datagram.at)
+                .collect::<Vec<Duration>>(),
+            vec![Duration::from_millis(2), Duration::from_millis(4)],
+            "the first datagram leaves at its deadline and the tie arrival one latency later"
+        );
+        assert_eq!(counters.received, 2);
+        assert_eq!(counters.forwarded, 2);
+        assert_eq!(
+            counters.overflow_dropped, 0,
+            "a tie must be resolved by draining before delivering"
+        );
+    }
+
     /// The jitter lane reorders (its deadlines are non-monotonic) and the
     /// zero-jitter lanes do not, which is the ordering property the heap and
     /// FIFO dispatch must preserve.

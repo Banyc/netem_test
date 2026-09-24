@@ -2614,6 +2614,8 @@ mod tests {
         clock: Clock,
         /// See [`MockTransport::fail_when_drained`].
         fatal_when_drained: AtomicBool,
+        /// See [`MockTransport::fail_sends`].
+        sends_fail: AtomicBool,
     }
 
     impl MockTransport {
@@ -2624,6 +2626,7 @@ mod tests {
                 local_addr,
                 clock: Clock::new(),
                 fatal_when_drained: AtomicBool::new(false),
+                sends_fail: AtomicBool::new(false),
             }
         }
 
@@ -2634,6 +2637,7 @@ mod tests {
                 local_addr,
                 clock,
                 fatal_when_drained: AtomicBool::new(false),
+                sends_fail: AtomicBool::new(false),
             }
         }
 
@@ -2650,6 +2654,15 @@ mod tests {
         /// datagrams instead of polling `WouldBlock` until it is stopped.
         fn fail_when_drained(&self) {
             self.fatal_when_drained.store(true, Ordering::Relaxed);
+        }
+
+        /// Make every subsequent `send_to` fail with a real socket error, as a
+        /// connected UDP socket does once an ICMP port-unreachable has been
+        /// reported against its peer. Nothing is recorded on the send side
+        /// while this is set, so a test can tell a forwarded datagram from a
+        /// drained-and-lost one.
+        fn fail_sends(&self) {
+            self.sends_fail.store(true, Ordering::Relaxed);
         }
     }
 
@@ -2681,6 +2694,12 @@ mod tests {
         }
 
         fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
+            if self.sends_fail.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "mock transport is configured to fail sends",
+                ));
+            }
             self.sent.lock().unwrap().push((data.to_vec(), dst));
             Ok(())
         }
@@ -5824,6 +5843,354 @@ mod tests {
         assert_eq!(stats.forwarded, 2);
         assert_eq!(stats.received_bytes, 124);
         assert_eq!(stats.forwarded_bytes, 124);
+        drop(sent);
+    }
+
+    /// `scheduled_drain_*` describe the scheduler, not the wire: a drain that
+    /// removes a packet is one batch and one drained packet even when the send
+    /// fails, and only `forwarded` stays put. A drain is the only way a queued
+    /// packet leaves the queue, so a failing send must not hide the removal
+    /// from the counters the trace tooling reads.
+    #[test]
+    fn drain_accounting_counts_every_removal_even_when_the_send_fails() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        const PACKETS: u8 = 4;
+
+        // Heap path.
+        let (mut heap, heap_sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(1),
+            ..NetemConfig::default()
+        });
+        assert_eq!(heap.pipeline.schedule(), Schedule::Fifo);
+        let clock = heap_sent.clock();
+        for i in 0..PACKETS {
+            heap.handle_datagram(&[i], server_addr, clock.now());
+        }
+        assert_eq!(heap.pipeline.queue.len(), PACKETS as usize);
+        heap_sent.fail_sends();
+        clock.advance(Duration::from_millis(2));
+        heap.drain_ready(clock.now());
+        assert_eq!(
+            heap.pipeline.queue.len(),
+            0,
+            "a failed send must still remove the packet from the queue"
+        );
+        let stats = heap.pipeline.stats.snapshot();
+        assert_eq!(stats.forwarded, 0, "a failed send is not a forward");
+        assert!(heap_sent.sent.lock().unwrap().is_empty());
+        assert_eq!(stats.scheduled_drain_batches, 1);
+        assert_eq!(
+            stats.scheduled_drain_packets,
+            u64::from(PACKETS),
+            "every removed packet belongs to the drain that removed it, sent or not"
+        );
+        assert_eq!(stats.scheduled_drain_max_packets, u64::from(PACKETS));
+
+        // FIFO path.
+        let (mut fifo, fifo_sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(1),
+            ..NetemConfig::default()
+        });
+        let clock = fifo_sent.clock();
+        let mut queue = FifoQueue::default();
+        for i in 0..PACKETS {
+            fifo.pipeline
+                .handle_datagram_fifo(&[i], clock.now(), Some(server_addr), &mut queue);
+        }
+        assert_eq!(queue.packets.len(), PACKETS as usize);
+        fifo_sent.fail_sends();
+        clock.advance(Duration::from_millis(2));
+        fifo.pipeline
+            .drain_ready_fifo(&mut queue, clock.now(), &*fifo_sent);
+        assert_eq!(queue.packets.len(), 0);
+        let stats = fifo.pipeline.stats.snapshot();
+        assert_eq!(stats.forwarded, 0);
+        assert!(fifo_sent.sent.lock().unwrap().is_empty());
+        assert_eq!(stats.scheduled_drain_batches, 1);
+        assert_eq!(stats.scheduled_drain_packets, u64::from(PACKETS));
+        assert_eq!(stats.scheduled_drain_max_packets, u64::from(PACKETS));
+        drop(heap_sent);
+        drop(fifo_sent);
+    }
+
+    /// A direction that has not learned its destination yet discards the
+    /// datagram — it cannot be routed — but the discard happens *after* the
+    /// schedule is committed. The datagram is therefore counted received and
+    /// still books its serialization time in the send-time shaper, while never
+    /// being counted dropped or overflow-dropped (and never queued). Moving
+    /// the destination check ahead of the scheduling arithmetic would stop the
+    /// shaper metering datagrams that are not on the wire.
+    #[test]
+    fn a_datagram_with_no_known_destination_is_discarded_after_its_schedule_is_committed() {
+        // Heap path: jitter makes the deadline non-monotonic, so this config
+        // selects the heap.
+        let (mut heap, heap_sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(10),
+            jitter: Duration::from_millis(1),
+            rate: 8_000, // 1 byte per ms
+            seed: 3,
+            ..NetemConfig::default()
+        });
+        assert_eq!(heap.pipeline.schedule(), Schedule::Heap);
+        let now = heap_sent.clock().now();
+        let link_free_at_before = heap.pipeline.link_free_at;
+        assert_eq!(link_free_at_before, now);
+        heap.pipeline.handle_datagram(&[0u8; 10], now, None);
+        let stats = heap.pipeline.stats.snapshot();
+        assert_eq!(
+            stats.received, 1,
+            "an unroutable datagram is still received"
+        );
+        assert_eq!(stats.forwarded, 0);
+        assert_eq!(
+            stats.dropped, 0,
+            "an unroutable datagram is not a loss drop"
+        );
+        assert_eq!(stats.overflow_dropped, 0);
+        assert_eq!(heap.pipeline.queue.len(), 0, "nothing may be queued");
+        assert!(heap_sent.sent.lock().unwrap().is_empty());
+        assert_eq!(
+            stats.rate_limited, 1,
+            "the send-time shaper is metered before the destination is consulted"
+        );
+        assert!(
+            heap.pipeline.link_free_at > link_free_at_before,
+            "the shaper clock advances for a datagram that never leaves"
+        );
+        drop(heap_sent);
+
+        // FIFO path: zero latency and a rate selects the FIFO, so the booked
+        // serialization time is exactly the datagram's own.
+        let (mut fifo, fifo_sent) = mock_runner(NetemConfig {
+            rate: 8_000, // 1 byte per ms, zero latency
+            ..NetemConfig::default()
+        });
+        assert_eq!(fifo.pipeline.schedule(), Schedule::Fifo);
+        let mut queue = FifoQueue::default();
+        let now = fifo_sent.clock().now();
+        assert_eq!(fifo.pipeline.link_free_at, now);
+        fifo.pipeline
+            .handle_datagram_fifo(&[0u8; 10], now, None, &mut queue);
+        let stats = fifo.pipeline.stats.snapshot();
+        assert_eq!(stats.received, 1);
+        assert_eq!(
+            (stats.forwarded, stats.dropped, stats.overflow_dropped),
+            (0, 0, 0)
+        );
+        assert_eq!(queue.packets.len(), 0);
+        assert!(fifo_sent.sent.lock().unwrap().is_empty());
+        assert_eq!(stats.rate_limited, 1);
+        assert_eq!(
+            fifo.pipeline.link_free_at,
+            now + serialization_delay(10, 8_000).expect("a rate is configured"),
+            "the unroutable datagram still books its serialization time"
+        );
+        drop(fifo_sent);
+    }
+
+    /// A closed blackout gate drops the datagram before any impairment is
+    /// drawn. Gated packets must not consume the loss/duplication draws, or
+    /// lifting the gate would leave every later packet's impairment drawn from
+    /// a shifted PRNG stream and the reproducible seeded scenario would
+    /// silently change.
+    #[test]
+    fn a_closed_blackout_gate_consumes_no_prng_draws() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+
+        // Heap path: a reorder gap and no jitter selects the heap, and a
+        // maximal duplication threshold makes the accepted path draw from the
+        // loss/duplication step the gate must precede.
+        let config = NetemConfig {
+            latency: Duration::from_millis(10),
+            reorder_gap_pkts: 1,
+            reorder: 0,
+            duplicate: u32::MAX,
+            seed: 7,
+            ..NetemConfig::default()
+        };
+        let seed = config.seed;
+        let (mut heap, heap_sent) = mock_runner(config);
+        assert_eq!(heap.pipeline.schedule(), Schedule::Heap);
+        let clock = heap_sent.clock();
+        heap.pipeline.blackout.store(true, Ordering::Relaxed);
+        heap.handle_datagram(b"gated", server_addr, clock.now());
+        assert_eq!(heap.pipeline.queue.len(), 0);
+        let stats = heap.pipeline.stats.snapshot();
+        assert_eq!(stats.received, 1);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(
+            stats.duplicated, 0,
+            "the gate must precede the duplicate draw"
+        );
+        assert_eq!(stats.reordered, 0, "the gate must precede the reorder draw");
+        assert_rng_advanced_by(
+            heap.pipeline.rng,
+            seed,
+            0,
+            "a gated datagram must consume no PRNG draw",
+        );
+        // Positive control: the same datagram with the gate open does draw, so
+        // the assertion above cannot hold vacuously.
+        let rng_gated = heap.pipeline.rng;
+        heap.pipeline.blackout.store(false, Ordering::Relaxed);
+        heap.handle_datagram(b"open", server_addr, clock.now());
+        assert_eq!(heap.pipeline.stats.snapshot().duplicated, 1);
+        assert_ne!(
+            (
+                heap.pipeline.rng.s1,
+                heap.pipeline.rng.s2,
+                heap.pipeline.rng.s3,
+                heap.pipeline.rng.s4,
+            ),
+            (rng_gated.s1, rng_gated.s2, rng_gated.s3, rng_gated.s4),
+            "an ungated datagram must draw, or the gated no-draw assertion is vacuous"
+        );
+        drop(heap_sent);
+
+        // FIFO path: a queue limit and no jitter selects the FIFO, whose
+        // accepted path draws exactly one duplication decision and nothing
+        // else.
+        let config = NetemConfig {
+            latency: Duration::from_millis(10),
+            queue_limit_pkts: 4,
+            duplicate: u32::MAX,
+            seed: 11,
+            ..NetemConfig::default()
+        };
+        let seed = config.seed;
+        let (mut fifo, fifo_sent) = mock_runner(config);
+        assert_eq!(fifo.pipeline.schedule(), Schedule::Fifo);
+        let mut queue = FifoQueue::default();
+        let clock = fifo_sent.clock();
+        fifo.pipeline.blackout.store(true, Ordering::Relaxed);
+        fifo.pipeline
+            .handle_datagram_fifo(b"gated", clock.now(), Some(server_addr), &mut queue);
+        assert_eq!(queue.packets.len(), 0);
+        let stats = fifo.pipeline.stats.snapshot();
+        assert_eq!((stats.received, stats.dropped, stats.duplicated), (1, 1, 0));
+        assert_rng_advanced_by(
+            fifo.pipeline.rng,
+            seed,
+            0,
+            "a gated datagram must consume no PRNG draw on the FIFO path either",
+        );
+        // The FIFO accepted path draws exactly the duplication decision, so
+        // the gate's short-circuit is one draw, counted exactly.
+        fifo.pipeline.blackout.store(false, Ordering::Relaxed);
+        fifo.pipeline
+            .handle_datagram_fifo(b"open", clock.now(), Some(server_addr), &mut queue);
+        assert_eq!(fifo.pipeline.stats.snapshot().duplicated, 1);
+        assert_rng_advanced_by(
+            fifo.pipeline.rng,
+            seed,
+            1,
+            "an ungated FIFO datagram draws exactly once",
+        );
+        drop(fifo_sent);
+    }
+
+    /// A config that carries only a rate, only a queue limit, or only a reorder
+    /// gap still needs the queued pipeline: none of them is a direct-forward
+    /// shape. Dispatching one of them to the direct path would silently stop
+    /// metering, bounding, or scheduling that impairment. (`max_datagram_size`
+    /// is the one deterministic filter that *does* stay direct, pinned by
+    /// [`datagram_size_filter_stays_on_the_direct_path`].)
+    #[test]
+    fn a_rate_or_queue_limit_alone_disqualifies_the_direct_path() {
+        let cases = [
+            (
+                "rate only",
+                NetemConfig {
+                    rate: 8_000,
+                    ..NetemConfig::default()
+                },
+                Schedule::Fifo,
+            ),
+            (
+                "queue limit only",
+                NetemConfig {
+                    queue_limit_pkts: 4,
+                    ..NetemConfig::default()
+                },
+                Schedule::Fifo,
+            ),
+            (
+                "reorder gap only",
+                NetemConfig {
+                    reorder_gap_pkts: 1,
+                    ..NetemConfig::default()
+                },
+                Schedule::Heap,
+            ),
+        ];
+        for (name, config, expected) in cases {
+            let (runner, sent) = mock_runner(config);
+            assert!(
+                !runner.pipeline.direct_forward,
+                "{name}: a queued impairment is not direct-forward eligible"
+            );
+            assert!(
+                !runner.pipeline.direct_stochastic,
+                "{name}: a queued impairment does not take the stochastic direct path"
+            );
+            assert_eq!(runner.pipeline.schedule(), expected, "{name}");
+            drop(sent);
+        }
+    }
+
+    /// A reordered datagram is scheduled at `now` and is not rate-shaped: it
+    /// must not advance the send-time shaper clock and must not count as
+    /// rate-limited, which is what lets it jump ahead of the shaped tail.
+    #[test]
+    fn a_reordered_datagram_bypasses_the_send_time_shaper() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let config = NetemConfig {
+            latency: Duration::from_millis(10),
+            reorder_gap_pkts: 2,
+            reorder: u32::MAX,
+            rate: 8_000, // 10 bytes serialize in 10 ms
+            seed: 7,
+            ..NetemConfig::default()
+        };
+        let (mut runner, sent) = mock_runner(config);
+        assert_eq!(runner.pipeline.schedule(), Schedule::Heap);
+        let now = sent.clock().now();
+        let serialize = serialization_delay(10, 8_000).expect("a rate is configured");
+        assert_eq!(runner.pipeline.link_free_at, now);
+
+        // First datagram: the reorder counter has not reached the gap, so it
+        // takes the shaped branch.
+        runner.handle_datagram(&[0u8; 10], server_addr, now);
+        let stats = runner.pipeline.stats.snapshot();
+        assert_eq!(stats.reordered, 0);
+        assert_eq!(stats.rate_limited, 1);
+        assert_eq!(stats.delayed, 1);
+        let shaped_deadline = now + Duration::from_millis(10) + serialize;
+        assert_eq!(runner.pipeline.link_free_at, shaped_deadline);
+        assert_eq!(
+            runner.pipeline.queue.peek().unwrap().0.time_to_send,
+            shaped_deadline
+        );
+
+        // Second datagram: the counter has reached the gap and the threshold is
+        // maximal, so it is reordered — scheduled at `now` with no shaping.
+        runner.handle_datagram(&[1u8; 10], server_addr, now);
+        let stats = runner.pipeline.stats.snapshot();
+        assert_eq!(stats.reordered, 1, "the second datagram must be reordered");
+        assert_eq!(
+            stats.rate_limited, 1,
+            "a reordered datagram must not count as rate-limited"
+        );
+        assert_eq!(
+            runner.pipeline.link_free_at, shaped_deadline,
+            "a reordered datagram must not move the shaper clock"
+        );
+        let front = runner.pipeline.queue.peek().unwrap();
+        assert_eq!(
+            front.0.time_to_send, now,
+            "the reordered datagram must be scheduled immediately"
+        );
+        assert_eq!(front.0.data, vec![1u8; 10]);
         drop(sent);
     }
 
