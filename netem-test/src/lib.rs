@@ -3583,6 +3583,13 @@ mod tests {
     /// fingerprint unique to it (a consumer that stops dispatching on the
     /// authority and hardcodes one path fails here).
     ///
+    /// The same fingerprint is then taken from the real [`LinkRunner::run`]
+    /// loop itself, driven over an in-memory transport: a dispatch that stops
+    /// matching the authority (for example routing the clean or
+    /// stochastic-direct shape through the heap) fails on the loop's own
+    /// forwarded payloads and counters instead of silently changing what the
+    /// instrument counts.
+    ///
     /// The fingerprint is deterministic — no wall clock, no sockets: the
     /// direct regimes forward each datagram at its arrival instant and never
     /// record a scheduler drain, the FIFO and heap regimes always do, and only
@@ -3709,6 +3716,123 @@ mod tests {
                     assert_eq!(inverted, 0, "the FIFO regime must preserve arrival order")
                 }
                 Schedule::Direct | Schedule::StochasticDirect => {}
+            }
+        }
+
+        /// Drive `packets` datagrams through the real [`LinkRunner::run`]
+        /// dispatch loop over an in-memory transport whose queue drains to a
+        /// fatal error, so the loop returns after consuming exactly the
+        /// offered datagrams. Returns the payloads the direction put on the
+        /// wire, in forwarding order, and the direction's counters.
+        fn run_real_runner(config: NetemConfig, packets: u64) -> (Vec<Vec<u8>>, Counters) {
+            let server_addr =
+                SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+            let captured = Arc::new(MockTransport::new(server_addr));
+            captured.fail_when_drained();
+            let clock = captured.clock();
+            let stats = Arc::new(AtomicCounters::default());
+            let runner = LinkRunner::new(RunnerConfig {
+                netem: config,
+                server_addr,
+                stats: Arc::clone(&stats),
+                queue_len: Arc::new(AtomicU64::new(0)),
+                blackout: Arc::new(AtomicBool::new(false)),
+                stop: Arc::new(AtomicBool::new(false)),
+                transport: Box::new(Arc::clone(&captured) as Arc<dyn UdpTransport>),
+                clock: Some(clock),
+            });
+            for id in 0..packets {
+                captured.push_recv(id.to_be_bytes().to_vec(), server_addr);
+            }
+            runner.run();
+            let payloads = captured
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(data, _)| data.clone())
+                .collect();
+            (payloads, stats.snapshot())
+        }
+
+        // The regime the real run *loop* executes, as distinct from the
+        // authority it reads: `LinkRunner::run` must dispatch every config
+        // shape on the value [`NetemState::schedule`] selects, so the direct
+        // and stochastic-direct shapes must not pay the heap's clock reads or
+        // record a scheduler drain the emulated driver does not, and the
+        // queued shapes must forward from a drain. Each shape is made to
+        // terminate without a clock-advancing helper: a `queue_limit_pkts`-only
+        // config selects FIFO with zero delay, and a `reorder_gap_pkts`-only
+        // config selects the heap while every deadline is `now`.
+        let real_cases = [
+            (NetemConfig::default(), Schedule::Direct),
+            (
+                NetemConfig {
+                    duplicate: u32::MAX,
+                    ..NetemConfig::default()
+                },
+                Schedule::StochasticDirect,
+            ),
+            (
+                NetemConfig {
+                    queue_limit_pkts: 64,
+                    ..NetemConfig::default()
+                },
+                Schedule::Fifo,
+            ),
+            (
+                NetemConfig {
+                    reorder_gap_pkts: 1,
+                    ..NetemConfig::default()
+                },
+                Schedule::Heap,
+            ),
+        ];
+        for (config, expected) in real_cases {
+            let (runner, _sent) = mock_runner(config.clone());
+            assert_eq!(
+                runner.pipeline.schedule(),
+                expected,
+                "the zero-delay shape {config:?} must select the {expected:?} regime"
+            );
+            let arrivals: Vec<(Vec<u8>, Duration)> = (0..PACKETS)
+                .map(|id| (id.to_be_bytes().to_vec(), spacing * (id as u32)))
+                .collect();
+            let (emulated, emulated_counters) = emulated_forward(&config, arrivals);
+            let emulated_payloads: Vec<Vec<u8>> = emulated
+                .iter()
+                .map(|datagram| datagram.payload.clone())
+                .collect();
+            let (real_payloads, real_counters) = run_real_runner(config, PACKETS);
+            assert_eq!(
+                real_payloads, emulated_payloads,
+                "the real {expected:?} loop must forward exactly what the emulated driver forwards"
+            );
+            assert_eq!(
+                real_counters, emulated_counters,
+                "the real {expected:?} loop must count exactly what the emulated driver counts"
+            );
+            match expected {
+                Schedule::Direct | Schedule::StochasticDirect => {
+                    assert_eq!(
+                        real_counters.scheduled_drain_batches, 0,
+                        "the real {expected:?} loop must not record a scheduler drain"
+                    );
+                    assert_eq!(
+                        real_counters.scheduled_drain_packets, 0,
+                        "the real {expected:?} loop must not drain a queue"
+                    );
+                }
+                Schedule::Fifo | Schedule::Heap => {
+                    assert_eq!(
+                        real_counters.scheduled_drain_packets, PACKETS,
+                        "the real {expected:?} loop must forward every datagram from a drain"
+                    );
+                    assert!(
+                        real_counters.scheduled_drain_batches > 0,
+                        "the real {expected:?} loop must record scheduler drains"
+                    );
+                }
             }
         }
     }
