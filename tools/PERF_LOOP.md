@@ -44,6 +44,24 @@ a tag. `run` refuses a frozen suite whose sibling edges still resolve from
 git tags, so a snapshot taken before the rewrite cannot report a comparison
 of the tag against itself.
 
+## Tri-mandate smoke set
+
+The one-command, always-run instrument for the interactive path is
+`tools/mandate-check`. It runs `rtp_mux`'s tri-mandate smoke set
+(`cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`),
+renders each mandate's panels through `tools/mandate_plot.py`, prints a
+verdict line per mandate, and writes `mandate-check.json` so a reader can
+verify from a machine that the mandated checks ran and what they measured:
+
+```sh
+./tools/mandate-check
+```
+
+Any change to `rtp`, `mux` or `rtp_mux` must run it, and its plots must be
+read: the assertion is a tripwire, the panel is the evidence. The contract the
+command depends on, what it writes, and its exit codes are in
+`tools/MANDATE_SMOKE.md`; the bounds are in `rtp_mux/GATE.md`.
+
 ## Default hostile command
 
 ```sh
