@@ -265,6 +265,64 @@ def rasterize_svg(
     return None
 
 
+def rasterize_panels(
+    svg_paths,
+    *,
+    browser: str | None = None,
+    width: int = 960,
+    height: int = 300,
+    timeout: float = 120.0,
+) -> dict:
+    """Rasterize already-written, already-verified standalone SVG panels.
+
+    The SVGs are the caller's responsibility: this function owns only the
+    external browser step, so a caller that must keep its SVG evidence keeps
+    it even when no browser can be found. Returns
+    ``{"browser": <executable>, "png": [paths]}``, raising RenderGraphError
+    that names the missing browser when rasterization was requested but none
+    can be resolved, or that names every PNG the browser failed to produce or
+    that is not a real, non-degenerate PNG.
+    """
+    svg_paths = [Path(path) for path in svg_paths]
+    resolved = find_browser(browser)
+    if resolved is None:
+        directory = svg_paths[0].parent if svg_paths else Path(".")
+        raise RenderGraphError(
+            "cannot rasterize: no headless browser found, so the PNG step cannot "
+            f"run. The {len(svg_paths)} SVG panel(s) were written and verified under "
+            f"{directory}. Set {BROWSER_ENV} or pass --browser, or pass "
+            "--no-rasterize to accept SVG-only evidence explicitly."
+        )
+    summary: dict = {"browser": resolved, "png": []}
+    failures = []
+    for svg_path in svg_paths:
+        png_path = svg_path.with_suffix(".png")
+        problem = rasterize_svg(resolved, svg_path, png_path, width, height, timeout)
+        if problem is not None:
+            failures.append(f"{png_path}: {problem}")
+            continue
+        data = png_path.read_bytes() if png_path.is_file() else b""
+        dimensions = png_dimensions(data)
+        if dimensions is None:
+            failures.append(
+                f"{png_path}: the browser did not produce a valid PNG "
+                f"({len(data)} bytes)"
+            )
+        elif dimensions[0] <= 0 or dimensions[1] <= 0:
+            failures.append(
+                f"{png_path}: the browser produced a degenerate PNG "
+                f"{dimensions[0]}x{dimensions[1]}"
+            )
+        else:
+            summary["png"].append(str(png_path))
+    if failures:
+        raise RenderGraphError(
+            "rasterization failed; the SVGs were verified but the PNG step "
+            "cannot be trusted:\n  " + "\n  ".join(failures)
+        )
+    return summary
+
+
 def render_panels(
     comparison_html: Path,
     out_dir: Path,
@@ -322,42 +380,11 @@ def render_panels(
     if not rasterize:
         return summary
 
-    resolved = find_browser(browser)
-    if resolved is None:
-        raise RenderGraphError(
-            "cannot rasterize: no headless browser found, so the PNG step cannot "
-            f"run. The {len(panels)} SVG panel(s) were written and verified under "
-            f"{out_dir}. Set {BROWSER_ENV} or pass --browser, or pass "
-            "--no-rasterize to accept SVG-only evidence explicitly."
-        )
-    summary["browser"] = resolved
-
-    failures = []
-    for svg_path in summary["svg"]:
-        png_path = Path(svg_path).with_suffix(".png")
-        problem = rasterize_svg(resolved, Path(svg_path), png_path, width, height)
-        if problem is not None:
-            failures.append(f"{png_path}: {problem}")
-            continue
-        data = png_path.read_bytes() if png_path.is_file() else b""
-        dimensions = png_dimensions(data)
-        if dimensions is None:
-            failures.append(
-                f"{png_path}: the browser did not produce a valid PNG "
-                f"({len(data)} bytes)"
-            )
-        elif dimensions[0] <= 0 or dimensions[1] <= 0:
-            failures.append(
-                f"{png_path}: the browser produced a degenerate PNG "
-                f"{dimensions[0]}x{dimensions[1]}"
-            )
-        else:
-            summary["png"].append(str(png_path))
-    if failures:
-        raise RenderGraphError(
-            "rasterization failed; the SVGs were verified but the PNG step "
-            "cannot be trusted:\n  " + "\n  ".join(failures)
-        )
+    rasterization = rasterize_panels(
+        summary["svg"], browser=browser, width=width, height=height
+    )
+    summary["browser"] = rasterization["browser"]
+    summary["png"] = rasterization["png"]
     summary["rasterized"] = True
     return summary
 

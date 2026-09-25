@@ -20,6 +20,13 @@ COLORS = (
     "#4d7c0f",
 )
 
+# A bound is a horizontal reference line: a mandate's ceiling or budget. It
+# is drawn dashed in a neutral dark that no series in COLORS uses -- so a red
+# bound never blends into a red series -- and it is labelled in place, so a
+# standalone panel (or its PNG) still says what the line means.
+BOUND_STROKE = "#111827"
+BOUND_LABEL_STYLE = "fill:#111827"
+
 CONGESTION_ACTION_LANES = {
     "": 0.0,
     "outage_reset": 1.0,
@@ -175,7 +182,31 @@ def finite_extent(series):
     return (low - margin, high + margin)
 
 
-def svg_line_chart(title, x_label, y_label, series, y_extent=None):
+def extent_including_bounds(extent, bounds):
+    """Widen an auto-computed y extent so every bound line stays on canvas.
+
+    ``bounds`` is an iterable of ``(y_value, label)`` pairs. A bound outside
+    the data extent must still be drawn and labelled, since the distance from
+    the data to the bound is the reading; an extent the caller pinned itself
+    is never widened.
+    """
+    values = [value for value, _ in bounds] if bounds else []
+    if not values:
+        return extent
+    low, high = min([extent[0], *values]), max([extent[1], *values])
+    if (low, high) == (extent[0], extent[1]):
+        return extent
+    if low == high:
+        margin = max(abs(low) * 0.05, 1.0)
+        return (low - margin, high + margin)
+    # A bound that widened the extent gets headroom, so the line reads as a
+    # line inside the plot instead of merging with the plot's own border.
+    margin = (high - low) * 0.05
+    return (low - margin, high + margin)
+
+
+def svg_line_chart(title, x_label, y_label, series, y_extent=None, bounds=None):
+    """A line or CDF chart, with optional labelled horizontal bound lines."""
     series = [(name, decimate(points)) for name, points in series if points]
     if not series:
         return f"<section><h2>{html.escape(title)}</h2><p>No samples.</p></section>"
@@ -183,7 +214,10 @@ def svg_line_chart(title, x_label, y_label, series, y_extent=None):
     x_min, x_max = min(xs), max(xs)
     if x_min == x_max:
         x_max = x_min + 1.0
-    y_min, y_max = y_extent or finite_extent(series)
+    if y_extent:
+        y_min, y_max = y_extent
+    else:
+        y_min, y_max = extent_including_bounds(finite_extent(series), bounds)
     legend_columns = min(len(series), 4)
     legend_rows = math.ceil(len(series) / legend_columns)
     plot_top = PAD_TOP + (legend_rows - 1) * 18
@@ -214,6 +248,10 @@ def svg_line_chart(title, x_label, y_label, series, y_extent=None):
         color = COLORS[index % len(COLORS)]
         path = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points)
         parts.append(f"<polyline points=\"{path}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.7\"/>")
+    for y_value, label in bounds or []:
+        y = sy(y_value)
+        parts.append(f"<line class=\"bound\" x1=\"{PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{WIDTH - PAD_RIGHT}\" y2=\"{y:.1f}\" stroke=\"{BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
+        parts.append(f"<text class=\"bound-label\" x=\"{WIDTH - PAD_RIGHT - 4}\" y=\"{y - 5:.1f}\" text-anchor=\"end\" style=\"{BOUND_LABEL_STYLE}\">{html.escape(label)}</text>")
     parts.append(f"<text x=\"{WIDTH / 2}\" y=\"{HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
     parts.append(f"<text x=\"18\" y=\"{HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {HEIGHT / 2})\">{html.escape(y_label)}</text>")
     parts.append("<g class=\"legend\">")
@@ -263,10 +301,32 @@ def svg_histogram(samples, buckets=48):
     return "".join(parts)
 
 
+def cdf_points(samples):
+    """Empirical CDF points ``(value, percentile)`` for one sample series."""
+    ordered = sorted(samples)
+    return [
+        (value, (index + 1) / len(ordered) * 100.0)
+        for index, value in enumerate(ordered)
+    ]
+
+
+def svg_cdf_chart(title, x_label, y_label, series, bounds=None):
+    """One or more empirical CDFs on a fixed 0-100% percentile axis.
+
+    ``series`` is ``[(name, points)]`` with the percentile already carried in
+    each point's y; this is the shape the mandate plotter reads straight from
+    its CSV, while ``svg_cdf`` derives those points from raw samples.
+    """
+    return svg_line_chart(title, x_label, y_label, series, (0.0, 100.0), bounds)
+
+
 def svg_cdf(samples):
-    sorted_samples = sorted(samples)
-    points = [(value, (index + 1) / len(sorted_samples) * 100.0) for index, value in enumerate(sorted_samples)]
-    return svg_line_chart("Raw RTT empirical CDF", "raw RTT (ms)", "samples ≤ x (%)", [("raw RTT", points)], (0.0, 100.0))
+    return svg_cdf_chart(
+        "Raw RTT empirical CDF",
+        "raw RTT (ms)",
+        "samples ≤ x (%)",
+        [("raw RTT", cdf_points(samples))],
+    )
 
 
 def load_trace(trace_dir, rtp_filename="rtp.csv"):
