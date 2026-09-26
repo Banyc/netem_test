@@ -251,18 +251,24 @@ Where the migration stands:
 drafted in `tools/PERF_PENDING_rtp_mux.md`, read from the landed
 `crates/rtp_mux` tree, so that crate's own iteration can apply them verbatim
 and needs only to fill the costs the draft marks for measurement.
-- **`rtp`** — pending, with no draft yet. The crate's own checkers count what a
-declaration would owe: 8 `perf`-tier scenarios, plus 9 in-crate opt-ins (4
-asserting `perf-lane` tests and 5 self-validating probes), out of 32
-`#[ignore]`d tests in all — `perf` 8, `standard` 5, `full` 10, `perf-lane` 4,
-`probe` 5, re-derived and printed by `crates/rtp/tools/check-ignored.py`.
+- **`rtp`** — pending, with no draft yet. What a declaration would owe is the
+crate's own opt-in inventory and its per-tier tally, both re-derived from that
+crate's source and printed by `crates/rtp/tools/check-ignored.py` (run
+`python3 tools/check-ignored.py` from inside `crates/rtp`); the in-crate
+`src/` tiers it classifies are `perf-lane` and `probe`, and the relocated
+`tests/` scenario tiers are `standard`, `full` and `perf`. The command's
+output is the tally — no count is transcribed here, so a probe added in that
+crate cannot make this sentence wrong, which is how the count went stale
+twice.
 **`proxy`** (its `tests/src/stream.rs` perf scenario) — pending, with no draft
 yet.
-- **`mux`** — owes no perf-test declaration, not "no opt-in scenario": its
-`GATE.md` manifest keeps one `standard`-tier scenario
-(`interactive_liveness_soak::interactive_path_liveness_soak`) and no
-`perf`-tier scenario, so the checker has no perf row to enforce there. The
-fairness and perf probes that used to live in `mux` moved to `rtp_mux`.
+- **`mux`** — owes no perf-test declaration, not "no opt-in scenario". Its own
+manifest is the authority: run
+`python3 tools/check-gate.py --crate ../mux mux tests GATE.md` from here and it
+prints the tiers that manifest classifies, reporting the `PENDING` note only
+when a perf-tier scenario is present — which it is not, so the checker has no
+perf row to enforce there. The fairness and perf probes that used to live in
+`mux` moved to `rtp_mux`.
 
 The checker's treatment of an undeclared crate is explicit and advisory — not
 silent, and not fatal. A crate whose manifest has perf-tier scenarios and whose
@@ -752,11 +758,13 @@ arrived and agree with the arm's label), so a zero-sample or dead-instrument
 run fails instead of printing a table of zeros a reader could mistake for a
 measurement. `rtp/GATE.md` carries the probe inventory in its
 `ignored-manifest` and each probe's assertion-token count in
-`gate-probe-selfchecks` (5 of 5 probes recorded, and
-`rtp/tools/check-ignored.py` exits 0 at this writing); that checker requires
-the count to be at least one **and** to equal the probe body's token count, so
-a probe that lost its validation, or quietly gained, lost or moved a check
-under the ignore flag, is an error that names the probe. The checkers refuse
+`gate-probe-selfchecks`; how many probes record one, and whether each count is
+at least one and equals the probe body's token count, is what
+`crates/rtp/tools/check-ignored.py` prints and exits 0 on — no tally is
+transcribed here. It requires the count to be at least one **and** to equal
+the probe body's token count, so a probe that lost its validation, or quietly
+gained, lost or moved a check under the ignore flag, is an error that names
+the probe. The checkers refuse
 an assertion token in the report-only **`perf` scenario** tier —
 `netem_test/tools/check-gate.py` scans a relocated scenario's own body and the
 asserting helpers it reaches (`gate-perf-guard-helpers`) — never in a `probe`.
