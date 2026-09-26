@@ -39,7 +39,7 @@ declared bound that did not make it into the SVG.
 rendered.** `AGENTS.md` ("Read every panel") makes that a defect of the same
 family as an assertion that cannot fail, and two panels of the run that became
 `rtp_mux v0.0.22` were drawn that way (`AUDIT_COVERAGE.md`, "Plots that cannot
-show their own failure"). Two checks enforce it here, and neither can be
+show their own failure"). Three checks enforce it here, and none can be
 silenced by softening a declaration:
 
 - **the axis test** — a bar panel's axis is chosen by `bar_axis_extent`, and
@@ -62,6 +62,21 @@ silenced by softening a declaration:
   governs). A crossing the run asserts nothing loosely against — a per-flow
   delivery floor with no guard — stands as the breach it draws and is not
   refused: the evidence survives a failing run.
+- **the label-fit test** — the bound label is the part of the panel that says
+  what its line governs, and `check_label_fit` reads every drawn label back out
+  of the SVG and refuses the render when its box leaves the plot area. The
+  measured run had three panels whose label began 4.6-14.7 px *above* the plot
+  (`M2-delivery`, `M4-imbalance`, `M4-shares`, whose bounds sit at the top of a
+  band view), and a bound governing a narrow x-window drew its label off the
+  plot's left edge. Labels are therefore laid out in pixels by
+  `rtp_trace_report.layout_bound_label`: wrapped to the plot's width, placed
+  below the line when there is no room above it, and anchored at the line's own
+  end only as far as the text allows. The fit is determined by a *model* of the
+  text width (`rtp_trace_report.label_text_width`, an upper bound over the
+  fonts a browser resolves for the panel's 11px style, pinned in the tests to
+  widths real Chrome measured), so a font wider than that bound is outside what
+  it can catch; the vertical extent needs no width and is caught whatever font
+  draws it.
 
 Two reading choices the input contract leaves open, decided here and made
 loud instead of silent:
@@ -114,6 +129,19 @@ CHARTS = ("line", "cdf", "bar")
 CSV_COLUMNS = ("panel", "series", "x", "y")
 PANEL_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 LEGEND_COLUMNS = 4
+
+# -- the bound-label geometry of a drawn panel ----------------------------
+#
+# `check_label_fit` reads the layout back out of the markup rather than from
+# the plotter's own state, so it measures the artifact that is written: the
+# anchor each label is drawn at and the plot rectangle it is drawn in.
+PLOT_BG_RE = re.compile(
+    r'<rect x="([-0-9.]+)" y="([-0-9.]+)" width="([-0-9.]+)" height="([-0-9.]+)" '
+    r'class="plot-bg"'
+)
+BOUND_LABEL_RE = re.compile(r'<text class="bound-label"([^>]*)>(.*?)</text>', re.S)
+BOUND_LABEL_TITLE_RE = re.compile(r"<title>.*?</title>", re.S)
+TEXT_ATTRIBUTE_RE = re.compile(r'([A-Za-z][\w-]*)="([^"]*)"')
 
 # -- the bar-panel axis policy --------------------------------------------
 #
@@ -740,6 +768,107 @@ def axis_label(y_label, extent):
     return y_label
 
 
+def panel_plot_rect(panel_id, markup):
+    """The ``(left, top, right, bottom)`` rectangle a panel's data is drawn in."""
+    match = PLOT_BG_RE.search(markup)
+    if match is None:
+        _fail(
+            f"panel {panel_id!r} was drawn without a plot area, so there is no "
+            "rectangle its bound labels could be checked against"
+        )
+    left, top, width, height = (float(value) for value in match.groups())
+    return (left, top, left + width, top + height)
+
+
+def label_boxes(markup):
+    """Each drawn bound label as ``(declared, line, (x0, y0, x1, y1))``.
+
+    The box is the anchor the text element carries, extended left by
+    `rtp_trace_report.label_text_width` and up/down by that module's font
+    ascent and descent. A wrapped label is several elements, and each is
+    checked: the block is only inside the plot if every line is. `declared` is
+    the label the element carries in its ``<title>`` (the undivided sentence)
+    and `line` is the one line this element draws.
+    """
+    boxes = []
+    for attributes, content in BOUND_LABEL_RE.findall(markup):
+        values = dict(TEXT_ATTRIBUTE_RE.findall(attributes))
+        titles = BOUND_LABEL_TITLE_RE.findall(content)
+        declared = html.unescape(
+            re.sub(r"</?title>", "", titles[0]) if titles else content
+        )
+        line = html.unescape(BOUND_LABEL_TITLE_RE.sub("", content))
+        anchor = float(values["x"])
+        baseline = float(values["y"])
+        width = REPORT.label_text_width(line)
+        if values.get("text-anchor") == "end":
+            left = anchor - width
+        elif values.get("text-anchor") == "middle":
+            left = anchor - width / 2
+        else:
+            left = anchor
+        boxes.append(
+            (
+                declared,
+                line,
+                (
+                    left,
+                    baseline - REPORT.LABEL_ASCENT_PX,
+                    left + width,
+                    baseline + REPORT.LABEL_DESCENT_PX,
+                ),
+            )
+        )
+    return boxes
+
+
+def check_label_fit(panel_id, markup):
+    """Problems that make a drawn bound label leave the panel's plot area.
+
+    This is `AGENTS.md`'s panel rule as a refusal, the way `check_panel_axis`
+    is: a bound label that is present but not readably placed is evidence a
+    reader can miss, and the reading that found it must not depend on a reader
+    noticing. The measured run had three panels doing exactly that -- the
+    labels of `M2-delivery`, `M4-imbalance` and `M4-shares` each began several
+    pixels above the top of the plot, across the legend.
+
+    The fit is a *model*, not a measurement: `label_text_width` is an upper
+    bound over the fonts a browser resolves for the panel's text style, so a
+    label the model says fits can in principle be drawn by a font wider than
+    that bound and still leave the plot. What this catches is every placement
+    and wrapping defect the tool can produce -- an anchor moved off the plot, a
+    label too long to wrap into `LABEL_MAX_LINES` lines, a block with no room
+    above or below its line -- and what it cannot catch is a font outside the
+    model's table. The vertical extent needs no width at all, so a label drawn
+    above or below the plot is caught whatever font draws it.
+    """
+    left, top, right, bottom = panel_plot_rect(panel_id, markup)
+    problems = []
+    for declared, line, (x0, y0, x1, y1) in label_boxes(markup):
+        outside = []
+        if x0 < left:
+            outside.append(f"{left - x0:.1f} px past its left edge")
+        if x1 > right:
+            outside.append(f"{x1 - right:.1f} px past its right edge")
+        if y0 < top:
+            outside.append(f"{top - y0:.1f} px above it")
+        if y1 > bottom:
+            outside.append(f"{y1 - bottom:.1f} px below it")
+        if not outside:
+            continue
+        detail = "" if line == declared else f" (on the drawn line {line!r})"
+        problems.append(
+            f"panel {panel_id!r}: the bound label {declared!r} does not fit the "
+            f"plot area{detail} -- its drawn box {x0:.1f},{y0:.1f}..{x1:.1f},{y1:.1f} "
+            f"is {', '.join(outside)}, and the plot area is "
+            f"{left:.1f},{top:.1f}..{right:.1f},{bottom:.1f}. The label is the "
+            "part of the panel that says what its bound governs, so it has to "
+            "be inside the panel; shorten the label or its guard list, or give "
+            "the panel an axis with room for it"
+        )
+    return problems
+
+
 def governed_label(bound, series, run_values, crossing=True):
     """A bound's label plus the clause naming what the line governs.
 
@@ -867,7 +996,19 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
             left, right = min(left, right), max(left, right)
         label = governed_label(bound, series, run_values)
         parts.append(f"<line class=\"bound\" x1=\"{left:.1f}\" y1=\"{y:.1f}\" x2=\"{right:.1f}\" y2=\"{y:.1f}\" stroke=\"{REPORT.BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
-        parts.append(f"<text class=\"bound-label\" x=\"{right - 4:.1f}\" y=\"{y - 5:.1f}\" text-anchor=\"end\" style=\"{BAR_BOUND_LABEL_STYLE}\">{html.escape(label)}</text>")
+        markup, _ = REPORT.bound_label_markup(
+            label,
+            right,
+            y,
+            (
+                REPORT.PAD_LEFT,
+                plot_top,
+                REPORT.WIDTH - REPORT.PAD_RIGHT,
+                REPORT.HEIGHT - REPORT.PAD_BOTTOM,
+            ),
+            BAR_BOUND_LABEL_STYLE,
+        )
+        parts.append(markup)
     parts.append(f"<text x=\"{REPORT.WIDTH / 2}\" y=\"{REPORT.HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
     parts.append(f"<text x=\"18\" y=\"{REPORT.HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {REPORT.HEIGHT / 2})\">{html.escape(axis_label(y_label, extent))}</text>")
     parts.append("<g class=\"legend\">")
@@ -935,6 +1076,9 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None):
         markup = REPORT.svg_cdf_chart(
             chart_title, panel_x_label, panel_y_label, series, labelled
         )
+    problems = check_label_fit(panel["id"], markup)
+    if problems:
+        _fail("\n  ".join(problems))
     panels = RENDER.extract_svg_panels(markup)
     if len(panels) != 1:
         _fail(

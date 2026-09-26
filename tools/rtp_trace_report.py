@@ -83,6 +83,179 @@ PAD_RIGHT = 24
 PAD_TOP = 24
 PAD_BOTTOM = 48
 
+# -- bound-label metrics and placement -------------------------------------
+#
+# A bound's label is the annotation that says what its line means, and the
+# mandate panels make it long: `M2 wire budget 6x [1 of 3 bars beyond it; run
+# guards hostile_wire_guard=10 lone_wire_guard=14]`. Drawn at a fixed anchor the
+# label can leave the plot area; measured on the preserved battery run, the
+# three panels whose bound sits at the top of a band-view axis (`M2-delivery`,
+# `M4-imbalance`, `M4-shares`) put the label's top 4.6-14.7 px *above* the plot,
+# across the legend. A label that leaves the plot is the same defect as an axis
+# that cannot show its bound: evidence that is present but not readably placed.
+#
+# So placement happens in pixels, before any browser has drawn the text, which
+# needs a width for the string. There is no font here to measure, so the tables
+# below are an *upper bound* over the proportional families a browser resolves
+# for the panel's own text style (`font-size:11px`, no family declared --
+# measured as `Times` on the development platform), taken as the widest advance
+# any of Times, serif, Helvetica, Arial, sans-serif, Georgia, Verdana, Tahoma
+# and system-ui gives a character of that class. A uniform advance would be
+# useless (`i` and `W` are 3.4x apart) and an underestimate is the defect, so
+# the table errs wide: it is 1.27x the real width of the `M2-wire` label, which
+# is why the real panels still draw theirs on one line.
+
+LABEL_FONT_PX = 11.0
+LABEL_ASCENT_PX = 11.0
+LABEL_DESCENT_PX = 3.0
+LABEL_LINE_HEIGHT_PX = 14.0
+LABEL_GAP_PX = 5.0
+LABEL_INSET_PX = 4.0
+LABEL_MARGIN_PX = 2.0
+LABEL_MAX_LINES = 4
+LABEL_ADVANCE_SAFETY = 1.10
+LABEL_ADVANCE_OTHER = 12.0
+LABEL_ADVANCE_CLASSES = (
+    ("%", 11.85),
+    ("MW", 10.89),
+    ("mw", 10.71),
+    ("=\u00b1", 9.01),
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 8.97),
+    ("0123456789", 7.15),
+    ("_", 7.08),
+    ("abcdefghijklmnopqrstuvwxyz", 6.97),
+    ("[](){}|", 5.5),
+    ("-/\\+';:\"!?", 5.5),
+    (",.", 4.01),
+    (" ", 3.9),
+)
+
+
+def label_char_advance(character):
+    """An upper bound on the advance of `character` at `LABEL_FONT_PX`."""
+    for characters, advance in LABEL_ADVANCE_CLASSES:
+        if character in characters:
+            return advance * LABEL_ADVANCE_SAFETY
+    return LABEL_ADVANCE_OTHER * LABEL_ADVANCE_SAFETY
+
+
+def label_text_width(text):
+    """An upper bound on the width of `text` in the bound-label text style."""
+    return sum(label_char_advance(character) for character in text)
+
+
+def _label_prefix_that_fits(word, budget):
+    """The longest prefix of `word` whose width is at most `budget`."""
+    width = 0.0
+    for index, character in enumerate(word):
+        width += label_char_advance(character)
+        if width > budget:
+            return max(index, 1)
+    return len(word)
+
+
+def wrap_label(text, budget, max_lines=LABEL_MAX_LINES):
+    """Greedy word wrap of a bound label; a word wider than `budget` is broken.
+
+    The wrap is capped at `max_lines`: the remainder is rejoined onto the last
+    line, so a label that cannot be laid out inside the plot overflows it and
+    the mandate plotter refuses the render, instead of the tool quietly drawing
+    a twenty-line block nobody asked for.
+    """
+    lines = []
+    current = ""
+    for word in text.split(" "):
+        if not word:
+            continue
+        candidate = f"{current} {word}" if current else word
+        if label_text_width(candidate) <= budget:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        while label_text_width(word) > budget:
+            cut = _label_prefix_that_fits(word, budget)
+            lines.append(word[:cut])
+            word = word[cut:]
+        current = word
+    if current:
+        lines.append(current)
+    if not lines:
+        lines = [text]
+    if len(lines) > max_lines:
+        lines = lines[: max_lines - 1] + [" ".join(lines[max_lines - 1:])]
+    return lines
+
+
+def layout_bound_label(text, line_right, bound_y, plot):
+    """Place a bound's label inside `plot`, returning its lines and baselines.
+
+    `plot` is ``(left, top, right, bottom)`` in pixels, `line_right` is the x
+    the bound's own line ends at, and `bound_y` is the bound line's y. The
+    result carries `lines`, `anchors` (``(x, baseline)`` per line) and `boxes`
+    (``(x0, y0, x1, y1)`` per line).
+
+    The anchor prefers the end of the bound's own line and moves right only as
+    far as the text needs, so a bound governing a narrow x-window -- whose line
+    is short -- still gets a label that starts inside the plot instead of one
+    running off its left edge. The block sits above the line, and drops below
+    it when the line is too near the plot's top for the block to fit, which is
+    the shape the band-view panels have.
+    """
+    left, top, right, bottom = plot
+    budget = max((right - LABEL_INSET_PX) - (left + LABEL_INSET_PX), LABEL_FONT_PX)
+    lines = wrap_label(text, budget)
+    widest = max(label_text_width(line) for line in lines)
+    anchor = min(
+        max(line_right - LABEL_INSET_PX, left + LABEL_INSET_PX + widest),
+        right - LABEL_INSET_PX,
+    )
+    block = (len(lines) - 1) * LABEL_LINE_HEIGHT_PX
+    baselines = [
+        bound_y - LABEL_GAP_PX - block + index * LABEL_LINE_HEIGHT_PX
+        for index in range(len(lines))
+    ]
+    if baselines[0] - LABEL_ASCENT_PX < top + LABEL_MARGIN_PX:
+        baselines = [
+            bound_y + LABEL_GAP_PX + LABEL_ASCENT_PX + index * LABEL_LINE_HEIGHT_PX
+            for index in range(len(lines))
+        ]
+    boxes = [
+        (
+            anchor - label_text_width(line),
+            baseline - LABEL_ASCENT_PX,
+            anchor,
+            baseline + LABEL_DESCENT_PX,
+        )
+        for line, baseline in zip(lines, baselines)
+    ]
+    return {
+        "lines": lines,
+        "anchors": [(anchor, baseline) for baseline in baselines],
+        "boxes": boxes,
+    }
+
+
+def bound_label_markup(text, line_right, bound_y, plot, style, title=True):
+    """The ``<text>`` markup for one bound's label, laid out inside `plot`.
+
+    The undivided label also goes into a ``<title>``, so a label that wraps is
+    still retrievable as one sentence (as a tooltip, and to whatever verifies
+    that the declared label reached the SVG).
+    """
+    layout = layout_bound_label(text, line_right, bound_y, plot)
+    parts = []
+    for index, (line, (x, y)) in enumerate(zip(layout["lines"], layout["anchors"])):
+        inner = html.escape(line)
+        if index == 0 and title:
+            inner = f"<title>{html.escape(text)}</title>{inner}"
+        parts.append(
+            f'<text class="bound-label" x="{x:.1f}" y="{y:.1f}" '
+            f'text-anchor="end" style="{style}">{inner}</text>'
+        )
+    return "".join(parts), layout
+
 
 def read_csv(path):
     with path.open(newline="", encoding="utf-8") as source:
@@ -251,7 +424,14 @@ def svg_line_chart(title, x_label, y_label, series, y_extent=None, bounds=None):
     for y_value, label in bounds or []:
         y = sy(y_value)
         parts.append(f"<line class=\"bound\" x1=\"{PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{WIDTH - PAD_RIGHT}\" y2=\"{y:.1f}\" stroke=\"{BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
-        parts.append(f"<text class=\"bound-label\" x=\"{WIDTH - PAD_RIGHT - 4}\" y=\"{y - 5:.1f}\" text-anchor=\"end\" style=\"{BOUND_LABEL_STYLE}\">{html.escape(label)}</text>")
+        markup, _ = bound_label_markup(
+            label,
+            WIDTH - PAD_RIGHT,
+            y,
+            (PAD_LEFT, plot_top, WIDTH - PAD_RIGHT, HEIGHT - PAD_BOTTOM),
+            BOUND_LABEL_STYLE,
+        )
+        parts.append(markup)
     parts.append(f"<text x=\"{WIDTH / 2}\" y=\"{HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
     parts.append(f"<text x=\"18\" y=\"{HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {HEIGHT / 2})\">{html.escape(y_label)}</text>")
     parts.append("<g class=\"legend\">")

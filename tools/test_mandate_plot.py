@@ -166,6 +166,39 @@ WIRE_RUN_VALUES = {
     "lone_wire_x": 6.63,
 }
 
+# The run's per-arm guards for a four-arm wire panel, which is the shape that
+# makes the attribution label long enough to wrap.
+WIRE_FOUR_ARM_RUN_VALUES = {
+    "clean_wire_guard": 3.0,
+    "hostile_wire_guard": 10.0,
+    "lone_wire_guard": 14.0,
+    "burst_wire_guard": 21.0,
+}
+
+# Widths of the labels that run drew, measured on its own standalone panels by
+# headless Chrome (`getBBox().width`, 11px text with no font-family declared,
+# resolved as Times). They are the fixtures the width model is calibrated
+# against: the model is a *model*, so the only thing that keeps it honest is a
+# check that fails when it starts underestimating the drawn text.
+RENDERED_LABEL_WIDTHS = (
+    (
+        "M2 wire budget 6x [1 of 3 bars beyond it; run guards "
+        "hostile_wire_guard=10 lone_wire_guard=14]",
+        436.73,
+    ),
+    (
+        "M1 ceiling 250 ms [4 of 16 bars beyond it; run guards "
+        "hostile_p99_guard=900]",
+        349.0,
+    ),
+    ("M4 per-flow delivery floor 0.995", 144.94),
+    ("fair-share bound \u00b11.0%", 103.94),
+    ("fair share 25.0%", 72.36),
+    ("M3 floor 0.35x link rate", 105.37),
+    ("M2 delivery floor 1.000", 105.1),
+    ("M1 ceiling 250 ms", 82.77),
+)
+
 SHARES_ROWS = [
     ["panel", "series", "x", "y"],
     ["shares", "clean", 1.0, 0.250059],
@@ -214,6 +247,32 @@ FRACTION_DECLARATION = {
         }
     ],
 }
+
+# The M2 delivery panel of that run: one series at the ideal, with the floor
+# exactly at it. The axis is the band view (the floor *is* the scale), so the
+# bound lands a few pixels below the plot's top and the label has nowhere to go
+# above it -- the placement the audit measured four pixels above the plot.
+M2_DELIVERY_DECLARATION = {
+    "mandate": "M2",
+    "title": "M2 interactive delivery and own-wire multiple",
+    "x_label": "arm (1=clean 2=hostile 3=lone_tail)",
+    "y_label": "delivery (received / offered)",
+    "panels": [
+        {
+            "id": "delivery",
+            "chart": "bar",
+            "series": [{"name": "delivery"}],
+            "bounds": [{"y": 1.0, "label": "M2 delivery floor 1.000"}],
+        }
+    ],
+}
+
+M2_DELIVERY_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["delivery", "delivery", 1.0, 1.0],
+    ["delivery", "delivery", 2.0, 1.0],
+    ["delivery", "delivery", 3.0, 1.0],
+]
 
 
 class MandatePlotTest(unittest.TestCase):
@@ -549,6 +608,311 @@ class MandatePlotTest(unittest.TestCase):
         )
         self.assertNotEqual(code, 0)
         self.assertIn("run values must be a JSON object", stderr)
+
+    # -- the label-fit test: an annotation must lie inside the plot --------
+    #
+    # The measurement these come from: on the preserved battery run the three
+    # panels whose bound sat at the top of a band-view axis (`M2-delivery`,
+    # `M4-imbalance`, `M4-shares`) drew their label 4.6-14.7 px *above* the plot
+    # area, across the legend, and a bound governing a narrow x-window drew its
+    # label off the plot's left edge. The vertical part of the fit needs no
+    # font at all (it is the anchor plus the ascent/descent); the horizontal
+    # part is `rtp_trace_report.label_text_width`, an upper bound over the fonts
+    # a browser resolves for the panel's 11px text style, pinned by
+    # `RENDERED_LABEL_WIDTHS` to the widths the real renderer measured.
+
+    def rendered_labels(self, declaration, rows, name, *arguments):
+        """Render one panel and return ``(document, plot rect, [(declared, line, box)])``."""
+        code, stderr, out = self.render_mandate(declaration, rows, name, *arguments)
+        self.assertEqual(code, 0, stderr)
+        panel_id = declaration["panels"][0]["id"]
+        document = (out / f"{declaration['mandate']}-{panel_id}.svg").read_text(
+            encoding="utf-8"
+        )
+        return (
+            document,
+            MANDATE.panel_plot_rect(panel_id, document),
+            MANDATE.label_boxes(document),
+        )
+
+    def bound_line_y(self, document):
+        match = MANDATE.re.search(r'class="bound" x1="[-0-9.]+" y1="([-0-9.]+)"', document)
+        self.assertIsNotNone(match, "the panel draws no bound line")
+        return float(match.group(1))
+
+    def test_every_real_panel_draws_its_bound_labels_inside_its_plot_area(self):
+        cases = (
+            ("M1line", HEALTHY_DECLARATION, HEALTHY_ROWS, ()),
+            (
+                "M2wire",
+                WIRE_DECLARATION,
+                WIRE_ROWS,
+                ("--run-values", json.dumps(WIRE_RUN_VALUES)),
+            ),
+            ("M2delivery", M2_DELIVERY_DECLARATION, M2_DELIVERY_ROWS, ()),
+            ("M4shares", SHARES_DECLARATION, SHARES_ROWS, ()),
+            ("M4delivery", DELIVERY_DECLARATION, DELIVERY_ROWS, ()),
+        )
+        for name, declaration, rows, arguments in cases:
+            with self.subTest(panel=name):
+                document, plot, boxes = self.rendered_labels(
+                    declaration, rows, name, *arguments
+                )
+                self.assertTrue(boxes, "the panel drew no bound label at all")
+                self.assertEqual(
+                    MANDATE.check_label_fit(declaration["panels"][0]["id"], document),
+                    [],
+                )
+                left, top, right, bottom = plot
+                for declared, line, (x0, y0, x1, y1) in boxes:
+                    # The vertical extent is width-free, so it is asserted
+                    # against the plot rectangle directly rather than through
+                    # the model the check uses.
+                    self.assertGreaterEqual(y0, top, declared)
+                    self.assertLessEqual(y1, bottom, declared)
+                    self.assertGreaterEqual(x0, left, declared)
+                    self.assertLessEqual(x1, right, declared)
+                    self.assertAlmostEqual(
+                        y1 - y0,
+                        MANDATE.REPORT.LABEL_ASCENT_PX + MANDATE.REPORT.LABEL_DESCENT_PX,
+                    )
+
+    def test_a_bound_at_the_top_of_its_axis_is_labelled_below_its_line(self):
+        # `M2-delivery`'s floor is the band view's own top, so there is no room
+        # for the label above the line; it has to drop below it rather than
+        # escape into the legend, which is where the audit measured it.
+        for name, declaration, rows in (
+            ("M2delivery", M2_DELIVERY_DECLARATION, M2_DELIVERY_ROWS),
+            ("M4shares", SHARES_DECLARATION, SHARES_ROWS),
+        ):
+            with self.subTest(panel=name):
+                document, plot, boxes = self.rendered_labels(declaration, rows, name)
+                bound_y = self.bound_line_y(document)
+                for _, line, (_, y0, _, _) in boxes:
+                    self.assertGreater(
+                        y0,
+                        bound_y,
+                        f"{line!r} is drawn above its own bound and out of the plot",
+                    )
+                self.assertGreaterEqual(boxes[0][2][1], plot[1])
+
+    def test_a_badly_placed_label_fails_the_fit_check(self):
+        # The vacuity pair for the check itself: the same markup, with its own
+        # label moved to the canvas origin, must go red while the untouched
+        # markup passes. Without this the check could be a predicate that is
+        # true of everything.
+        markup = MANDATE.svg_bar_chart(
+            "t",
+            "x",
+            "arm",
+            [("s", [(1.0, 1.0), (2.0, 2.5)])],
+            [{"y": 2.0, "label": "a bound"}],
+        )
+        self.assertEqual(MANDATE.check_label_fit("p", markup), [])
+        misplaced = MANDATE.re.sub(
+            r'(<text class="bound-label" x=")[-0-9.]+(" y=")[-0-9.]+(")',
+            r"\g<1>0.0\g<2>0.0\g<3>",
+            markup,
+        )
+        self.assertNotEqual(misplaced, markup)
+        problems = MANDATE.check_label_fit("p", misplaced)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("does not fit the plot area", problems[0])
+        self.assertIn("past its left edge", problems[0])
+        self.assertIn("above it", problems[0])
+
+    def test_a_label_that_cannot_be_wrapped_into_the_plot_is_refused(self):
+        # The other vacuity half: a label too long to lay out inside the plot
+        # is an error naming the panel and the overflow, not a panel drawn with
+        # its annotation running off the edge. This is the reachable failure --
+        # `LABEL_MAX_LINES` caps the wrap, so the remainder is one line that no
+        # longer fits.
+        label = "M2 wire budget 6x [" + "; ".join(
+            f"arm_{index}_guard=1000000" for index in range(40)
+        ) + "]"
+        declaration = {
+            **WIRE_DECLARATION,
+            "panels": [
+                {
+                    **WIRE_DECLARATION["panels"][0],
+                    "bounds": [{"y": 6, "label": label}],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(
+            declaration,
+            WIRE_ROWS,
+            "M2long",
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("mandate_plot: error:", stderr)
+        self.assertIn("panel 'wire'", stderr)
+        self.assertIn("does not fit the plot area", stderr)
+        self.assertIn("past its left edge", stderr)
+
+    def test_a_line_panels_label_is_held_to_the_same_fit(self):
+        # The check is on the drawn SVG, so it covers every chart kind, not
+        # just the bar panels the attribution clause made long.
+        label = "M1 ceiling 250 ms [" + "; ".join(
+            f"arm_{index}_guard=1000000" for index in range(40)
+        ) + "]"
+        declaration = {
+            **HEALTHY_DECLARATION,
+            "panels": [
+                {
+                    **HEALTHY_DECLARATION["panels"][0],
+                    "bounds": [{"y": 250.0, "label": label}],
+                },
+                HEALTHY_DECLARATION["panels"][1],
+            ],
+        }
+        code, stderr, _ = self.render_mandate(declaration, HEALTHY_ROWS, "M1long")
+        self.assertNotEqual(code, 0)
+        self.assertIn("panel 'latency'", stderr)
+        self.assertIn("does not fit the plot area", stderr)
+
+    def test_a_long_guard_list_wraps_into_the_plot(self):
+        rows = [
+            ["panel", "series", "x", "y"],
+            ["wire", "wire_x", 1.0, 2.1],
+            ["wire", "wire_x", 2.0, 5.0],
+            ["wire", "wire_x", 3.0, 4.4],
+            ["wire", "wire_x", 4.0, 6.63],
+        ]
+        declaration = {
+            **WIRE_DECLARATION,
+            "panels": [
+                {
+                    **WIRE_DECLARATION["panels"][0],
+                    "bounds": [{"y": 6, "label": "M2 wire budget 6x"}],
+                }
+            ],
+        }
+        document, plot, boxes = self.rendered_labels(
+            declaration,
+            rows,
+            "M2wrap",
+            "--run-values",
+            json.dumps(WIRE_FOUR_ARM_RUN_VALUES),
+        )
+        self.assertGreater(len(boxes), 1, "a four-arm guard list has to wrap")
+        self.assertEqual(MANDATE.check_label_fit("wire", document), [])
+        for declared, _, (x0, y0, x1, y1) in boxes:
+            self.assertGreaterEqual(x0, plot[0])
+            self.assertLessEqual(x1, plot[2])
+            self.assertGreaterEqual(y0, plot[1])
+            self.assertLessEqual(y1, plot[3])
+        # the whole sentence survives in the first line's title and the lines
+        # re-join to it, so a wrapped label is still one annotation
+        self.assertEqual(" ".join(line for _, line, _ in boxes), boxes[0][0])
+        self.assertIn("clean_wire_guard=3", boxes[0][0])
+        self.assertIn("burst_wire_guard=21", boxes[0][0])
+
+    def test_a_narrow_governed_window_moves_the_label_inside_the_plot(self):
+        # A bound governing the first of three categories has a line only as
+        # long as that category's slot; the label's anchor has to move right
+        # rather than run the text off the plot's left edge, which is what the
+        # old fixed anchor did.
+        declaration = {
+            **WIRE_DECLARATION,
+            "panels": [
+                {
+                    **WIRE_DECLARATION["panels"][0],
+                    "bounds": [
+                        {
+                            "y": 6,
+                            "label": "M2 wire budget 6x",
+                            "series": "wire_x",
+                            "x": [1],
+                        }
+                    ],
+                }
+            ],
+        }
+        document, plot, boxes = self.rendered_labels(
+            declaration,
+            WIRE_ROWS,
+            "M2narrow",
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        line = MANDATE.re.search(
+            r'class="bound" x1="[-0-9.]+" y1="[-0-9.]+" x2="([-0-9.]+)"',
+            document,
+        )
+        line_right = float(line.group(1))
+        for declared, _, (x0, _, x1, _) in boxes:
+            self.assertGreaterEqual(x0, plot[0])
+            self.assertLessEqual(x1, plot[2])
+            # the label left its governed window rather than leave the plot
+            self.assertGreater(x1, line_right)
+        self.assertGreater(line_right - plot[0], 0.0)
+
+    def test_the_label_width_model_does_not_underestimate_the_rendered_text(self):
+        for label, measured in RENDERED_LABEL_WIDTHS:
+            with self.subTest(label=label):
+                self.assertGreaterEqual(
+                    MANDATE.REPORT.label_text_width(label),
+                    measured,
+                    "the width model must not be narrower than the text the "
+                    "browser draws, or a label it calls fitting can overflow",
+                )
+
+    def test_the_width_model_check_fails_when_the_model_is_narrowed(self):
+        # The vacuity half of the calibration: the same fixture test on a model
+        # narrowed below the measured widths must go red, so the assertion above
+        # is about the model and not a tautology.
+        label, measured = RENDERED_LABEL_WIDTHS[0]
+        with mock.patch.object(MANDATE.REPORT, "LABEL_ADVANCE_SAFETY", 0.2):
+            self.assertLess(MANDATE.REPORT.label_text_width(label), measured)
+
+    def test_every_bar_beyond_the_bound_is_not_labelled_as_a_crossing(self):
+        # A boundary case of the attribution rule: when *every* bar is past the
+        # bound the crossing is the verdict's, not one arm's tolerated guard, so
+        # the panel draws the bound's own name and no `N of M` clause. Uniform
+        # failure is read from the bars; a single bar past it is the case the
+        # clause exists for.
+        rows = [
+            ["panel", "series", "x", "y"],
+            ["wire", "wire_x", 1.0, 7.2],
+            ["wire", "wire_x", 2.0, 9.5],
+            ["wire", "wire_x", 3.0, 8.1],
+        ]
+        document, plot, boxes = self.rendered_labels(
+            WIRE_DECLARATION,
+            rows,
+            "M2all",
+            "--run-values",
+            json.dumps(WIRE_FOUR_ARM_RUN_VALUES),
+        )
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0][1], "M2 wire budget 6x")
+        self.assertNotIn("beyond it", document)
+        for _, _, (x0, y0, x1, y1) in boxes:
+            self.assertGreaterEqual(x0, plot[0])
+            self.assertLessEqual(x1, plot[2])
+
+    def test_a_lone_bar_beyond_the_bound_names_the_crossing_and_the_guards(self):
+        # The other boundary case, and the one the audit's label was for: one of
+        # three bars past the budget, with the run's own guards named, all of it
+        # inside the plot area.
+        document, plot, boxes = self.rendered_labels(
+            WIRE_DECLARATION,
+            WIRE_ROWS,
+            "M2one",
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0][1], boxes[0][0])
+        self.assertIn("1 of 3 bars beyond it", boxes[0][1])
+        self.assertIn("hostile_wire_guard=10", boxes[0][1])
+        self.assertIn("lone_wire_guard=14", boxes[0][1])
+        for _, _, (x0, _, x1, _) in boxes:
+            self.assertGreaterEqual(x0, plot[0])
+            self.assertLessEqual(x1, plot[2])
 
     # -- healthy renders ---------------------------------------------------
 

@@ -708,6 +708,20 @@ the reader:
   A crossing nothing in the run asserts a looser guard against — a per-flow
   delivery floor — stands as the breach it draws, so a failing run still
   renders its evidence.
+- **a bound label must lie inside the plot.** The label is what says what the
+  line governs, and `check_label_fit` reads each drawn label back out of the
+  SVG and refuses the render when its box leaves the plot area. Measured on a
+  preserved run, three panels whose bound sits at the top of a band view
+  (`M2-delivery`, `M4-imbalance`, `M4-shares`) drew the label 4.6-14.7 px
+  *above* the plot, across the legend, and a bound governing a narrow
+  x-window drew it off the plot's left edge. Labels are laid out in pixels by
+  `rtp_trace_report.layout_bound_label`: wrapped to the plot's width, dropped
+  below the line when there is no room above it, and anchored at the line's own
+  end only as far as the text allows. The fit rests on a *model* of the text
+  width (`rtp_trace_report.label_text_width`, an upper bound over the fonts a
+  browser resolves for the panel's 11px style), pinned in the tests to widths
+  real Chrome measured — so a font wider than that bound is outside what it can
+  catch, while the vertical extent needs no width at all.
 
 ### `tools/perf-loop` — the paired A/B battery (`tools/PERF_LOOP.md`)
 
