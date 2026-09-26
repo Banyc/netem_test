@@ -72,12 +72,13 @@ tier budgets, its own nominal per-test costs and its own baseline row in its
 own `GATE.md` — one authority per number, the same rule the product mandates
 follow. This document states the form and the check.
 
-The declarative form is three fenced blocks in that crate's `GATE.md`,
+The declarative form is four fenced blocks in that crate's `GATE.md`,
 alongside the existing ones:
 
     gate-perf-design       <target>::<test> = <tier> | <nominal_cost_s> | <relation> | <coverage>
     gate-budgets           <tier> = <budget_s>, plus baseline/baseline.<family>/drift/drift_floor_s
     gate-coverage-gaps     <cell> = <non-empty reason>
+    gate-env-tier          <name> = <vars> | <runner> | <measures> | <cells>
 
 `<coverage>` is a comma-separated list of cells, each
 `<mandate-or-property>@<dimension>=<value>[+<dimension>=<value>…]` — for
@@ -100,6 +101,33 @@ names is printed by name as an advisory note, because a manifest written before
 the lib target was nameable must not fail for omitting one. A declaration that
 names a `lib` test the compiled target does not report is still refused, and a
 removed one is still STALE.
+
+**`gate-env-tier` is the block for the opt-in surface every other block is
+blind to.** A tier that is not `#[ignore]`d at all but *scaled* by environment
+variables — the tests run in the default tier and what varies their load shape
+is a variable the crate's own runner sets — appears in no `gate-manifest` line,
+because every other block is derived from the `#[ignore]` set. The block names,
+per surface, the **variables**, the **runner** (a script path relative to the
+crate root) and the **quantity it measures**, in one comma-separated cell list
+using the same grammar the coverage cells use:
+
+    gate-env-tier   soak-accept-churn = SOAK_DIALERS,SOAK_ITERATIONS | local/soak.py | per-dial liveness rate | liveness@shape=dial-churn
+
+The checker detects such a surface from two artifacts rather than from a
+convention: a name counts when a script in the crate names it **and** this
+crate's Rust sources pass it to a function that reads the process environment
+(the reader is the transitive closure over crate-local calls, because a name is
+normally handed to a wrapper — `env_parse("SOAK_DIALERS", 16)` — that forwards
+it to `env::var`, so a one-hop scan reports no surface at all and would be
+vacuously silent). Detection is what makes the block enforceable in both
+directions: with the block present, every detected variable it omits is an
+error, every variable the runner sets and the sources read must be declared,
+and every declared variable must be read by some source of the crate (a
+fabricated one is stale). A detected surface with **no** block is a note rather
+than a failure, for the same reason an unmigrated perf declaration is: a
+`GATE.md` written before the block existed cannot be failed for a line the
+grammar did not have, and the point is that the surface is named rather than
+invisible.
 
 **One reference cannot serve every family, so a declaration may carry several
 baselines.** `baseline = <row>` is the **default** reference a row inherits

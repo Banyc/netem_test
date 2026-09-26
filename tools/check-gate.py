@@ -157,6 +157,24 @@ LIB_TARGET = "lib"
 # stable name (`M1`, `conformance-delay`, `probe-throughput`).
 CELL_PROPERTY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 CELL_DIMENSION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*=[^=,+\s]+$")
+# An environment variable name, as an env-scaled opt-in surface declares it.
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+# A whole string literal's contents (an escaped quote or a newline ends it for
+# these scanners' purposes), used to read a name out of a call's arguments
+# rather than out of a file's prose.
+STRING_LITERAL_RE = re.compile(r'"([^"\n]*)"')
+# `env::var(…)`/`env::var_os(…)`, the one pair that reads the process environment.
+ENV_READ_RE = re.compile(r"env::var(?:_os)?\s*\(")
+ENV_LITERAL_RE = re.compile(r'env::var(?:_os)?\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+# A file the crate could use to run a test batch: the only place a variable can
+# be set for a child process.
+RUNNER_SUFFIXES = frozenset(
+    {".py", ".nu", ".sh", ".bash", ".command", ".bat", ".ps1", ".js", ".ts"}
+)
+# Never scanned: build output and version-control metadata.
+SKIP_DIRS = frozenset({"target", ".git", ".jj", "node_modules", ".pytest_cache"})
+# A file larger than this is data, not a script or a source to read literals from.
+MAX_SCANNED_BYTES = 2_000_000
 # A dimension's bare name, as used by a `composite(...)` relation.
 CELL_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 # A family's cell-name namespace: a cell property name (`[A-Za-z][A-Za-z0-9_.-]*`,
@@ -1785,6 +1803,22 @@ class PerfBudgets:
 
 
 @dataclass(frozen=True)
+class EnvTier:
+    """One env-scaled opt-in surface: its variables, its runner and its cells.
+
+    `gate-manifest` and its neighbours describe what is `#[ignore]`d; this is the
+    surface that is scaled by an environment variable instead, which no other
+    block can see.
+    """
+
+    name: str
+    variables: tuple[str, ...]
+    runner: str
+    measures: str
+    cells: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PerfGap:
     """One `gate-coverage-gaps` line: an uncovered cell and why it is empty."""
 
@@ -2686,6 +2720,327 @@ def check_perf_membership(
     return summary
 
 
+def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
+    """Check the ```gate-env-tier block, and detect a surface no block declares.
+
+    An env-scaled opt-in tier is a real opt-in surface that every other block
+    is blind to, because every other block keys on `#[ignore]`: the tests run
+    in the default tier, and what scales them is an environment variable the
+    crate's own runner sets. The grammar had no line for one, so such a surface
+    appeared in no block at all.
+
+    Detection is two-sided and needs both sides to fire, which is what makes it
+    an artifact rather than a guess: a name counts when a script in the crate
+    *names* it and the crate's Rust sources pass it to a function that reads the
+    process environment. The declaration is then enforced in both directions —
+    every variable the runner sets and the sources read must be declared, and
+    every declared variable must be read — and a detected surface the declaration
+    omits is an error. An undeclared surface with no block at all is a **note**,
+    not a failure, for the same reason an unmigrated perf declaration is: a
+    `GATE.md` written before the block existed cannot be failed for a line the
+    grammar did not have, and the point is that the surface is named rather than
+    invisible.
+
+    Returns ``(summary_lines, notes)``.
+    """
+    notes: list[str] = []
+    root = layout().root
+    rust_sources = _rust_env_read_names(root)
+    detected: dict[str, set[str]] = {}
+    for script in _crate_scripts(root):
+        for name in _script_env_names(script):
+            if name in rust_sources:
+                detected.setdefault(name, set()).add(str(script.relative_to(root)))
+    block = manifest_block("gate-env-tier")
+    if block is None:
+        if detected:
+            scripts = sorted({s for names in detected.values() for s in names})
+            readers = sorted(
+                {source for name in detected for source in rust_sources.get(name, ())}
+            )
+            notes.append(
+                "note: env-scaled opt-in surface undeclared: "
+                f"{', '.join(sorted(detected))} (named by {', '.join(scripts)} "
+                f"and read by {', '.join(readers)}); a ```gate-env-tier block "
+                "names the variables, the runner and what it measures "
+                "(advisory, because a GATE.md written before the block existed "
+                "cannot be failed for a line the grammar did not have)"
+            )
+        return [], notes
+
+    surfaces = parse_env_tier(block, problems)
+    declared: dict[str, EnvTier] = {}
+    for surface in surfaces:
+        for variable in surface.variables:
+            declared.setdefault(variable, surface)
+    for variable, scripts in sorted(detected.items()):
+        if variable not in declared:
+            problems.append(
+                f"gate-env-tier: {variable} is set by {', '.join(sorted(scripts))} "
+                "and read by this crate's sources, so it scales an opt-in tier, "
+                "but no declared surface names it; add it to the surface's "
+                "variable list (a surface the declaration omits is exactly the "
+                "one nothing else can see)"
+            )
+    available = set(rust_sources)
+    for surface in surfaces:
+        runner = root / surface.runner
+        if not runner.is_file():
+            problems.append(
+                f"gate-env-tier surface {surface.name}: runner "
+                f"{surface.runner!r} is not a file under {root}; a surface is "
+                "run by something, and that something is part of the record"
+            )
+            continue
+        runner_sets = _script_env_names(runner)
+        unread = sorted(set(surface.variables) - available)
+        if unread:
+            problems.append(
+                f"gate-env-tier surface {surface.name}: {', '.join(unread)} is "
+                "passed to no env-reading function of this crate; a declared "
+                "variable the crate never reads is a stale declaration"
+            )
+        unset = sorted(set(surface.variables) - runner_sets)
+        if len(unset) == len(surface.variables):
+            problems.append(
+                f"gate-env-tier surface {surface.name}: runner "
+                f"{surface.runner!r} names none of the declared variables "
+                f"({', '.join(surface.variables)}); the runner and the surface "
+                "must be the same instrument"
+            )
+        missing = sorted((runner_sets & available) - set(surface.variables))
+        if missing:
+            problems.append(
+                f"gate-env-tier surface {surface.name}: runner "
+                f"{surface.runner!r} sets {', '.join(missing)}, which this "
+                "crate's sources read, and the surface does not name them; "
+                "every variable of the surface must be declared"
+            )
+
+    variables = sorted({variable for surface in surfaces for variable in surface.variables})
+    cells = sum(len(surface.cells) for surface in surfaces)
+    summary = [
+        f"  gate-env-tier: {len(surfaces)} env-scaled surface(s), "
+        f"{len(variables)} variable(s), {cells} coverage cell(s)"
+    ]
+    for surface in surfaces:
+        summary.append(
+            f"  gate-env-tier-surface: {surface.name} ({surface.runner}) "
+            f"{', '.join(surface.variables)} - {surface.measures}"
+        )
+    return summary, notes
+
+
+def parse_env_tier(text: str, problems: list[str]) -> list[EnvTier]:
+    """Parse `gate-env-tier` rows: `<name> = <vars> | <runner> | <measures> | <cells>`.
+
+    `<vars>` is a comma-separated list of environment variable names, `<runner>`
+    a script path relative to the crate root, `<measures>` prose, and `<cells>`
+    a comma-separated list in the same grammar the coverage cells use.
+    """
+    surfaces: list[EnvTier] = []
+    seen: set[str] = set()
+    for number, line in _perf_lines(text):
+        name, separator, rest = line.partition(" = ")
+        name, rest = name.strip(), rest.strip()
+        if not separator:
+            problems.append(
+                f"gate-env-tier line {number}: {line!r} is not '<name> = <vars> "
+                "| <runner> | <measures> | <cells>'"
+            )
+            continue
+        if not CELL_KEY_RE.match(name):
+            problems.append(
+                f"gate-env-tier line {number}: {name!r} does not name a surface; "
+                "write a name ([A-Za-z][A-Za-z0-9_-]*)"
+            )
+            continue
+        if name in seen:
+            problems.append(f"gate-env-tier: duplicate surface {name!r}")
+            continue
+        fields = [field.strip() for field in rest.split("|")]
+        if len(fields) != 4:
+            problems.append(
+                f"gate-env-tier surface {name}: expected '<vars> | <runner> | "
+                f"<measures> | <cells>', got {len(fields)} field(s)"
+            )
+            continue
+        variables_text, runner, measures, cells_text = fields
+        problem = False
+        variables = [item.strip() for item in variables_text.split(",") if item.strip()]
+        if not variables:
+            problems.append(
+                f"gate-env-tier surface {name}: no variable named; a surface is "
+                "scaled by at least one environment variable"
+            )
+            problem = True
+        for variable in variables:
+            if not ENV_NAME_RE.match(variable):
+                problems.append(
+                    f"gate-env-tier surface {name}: {variable!r} is not an "
+                    "environment variable name ([A-Z][A-Z0-9_]*)"
+                )
+                problem = True
+        duplicates = sorted({v for v in variables if variables.count(v) > 1})
+        if duplicates:
+            problems.append(
+                f"gate-env-tier surface {name}: {', '.join(duplicates)} named "
+                "more than once"
+            )
+            problem = True
+        if not runner:
+            problems.append(
+                f"gate-env-tier surface {name}: no runner named; an env-scaled "
+                "surface is run by a script, and the runner is part of the record"
+            )
+            problem = True
+        if not measures:
+            problems.append(
+                f"gate-env-tier surface {name}: says nothing about what it "
+                "measures; a surface with no measured quantity is not a declaration"
+            )
+            problem = True
+        cells = [cell.strip() for cell in cells_text.split(",") if cell.strip()]
+        if not cells:
+            problems.append(
+                f"gate-env-tier surface {name}: covers no cell; state what the "
+                "surface measures in the coverage vocabulary"
+            )
+            problem = True
+        for cell in cells:
+            issue = cell_problem(cell)
+            if issue is not None:
+                problems.append(
+                    f"gate-env-tier surface {name}: cell {cell!r} is malformed: {issue}"
+                )
+                problem = True
+        if problem:
+            continue
+        seen.add(name)
+        surfaces.append(EnvTier(name, tuple(variables), runner, measures, tuple(cells)))
+    return surfaces
+
+
+def _crate_scripts(root: Path) -> list[Path]:
+    """The crate's own scripts: the only place a runner can set a variable."""
+    scripts: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if path.suffix not in RUNNER_SUFFIXES or not path.is_file():
+            continue
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+            continue
+        scripts.append(path)
+    return scripts
+
+
+def _script_env_names(script: Path) -> set[str]:
+    """The environment-variable-shaped string literals a script names.
+
+    Every all-caps literal, not only one in an assignment: a runner names its
+    variables in a dict it hands to the child process, and which literal is the
+    assignment is a parsing question with no answer that survives a rewrite.
+    The other side of the detection — the crate's sources actually reading the
+    name — is what keeps a marker like `SOAK_RESULT` out of the surface.
+    """
+    text = _read_scanned(script)
+    if text is None:
+        return set()
+    return {
+        literal
+        for literal in STRING_LITERAL_RE.findall(text)
+        if ENV_NAME_RE.match(literal)
+    }
+
+
+def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
+    """`ENV_NAME -> {source}` for the names this crate's sources read from the env.
+
+    The reader side is a closure over the crate-local call graph, because a
+    name is almost never passed to `env::var` directly: it is passed to a
+    helper that parses it (`env_parse("SOAK_DIALERS", 16)`) which forwards it
+    to one that reads it, so a one-hop scan would report no surface at all and
+    the detection would be vacuously silent. Bare-name resolution
+    over-approximates across modules, which is why a name counts only when the
+    script side names it too.
+    """
+    functions: list[tuple[str, str, Path]] = []
+    for path in sorted(root.rglob("*.rs")):
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+            continue
+        text = _read_scanned(path)
+        if text is None:
+            continue
+        for match in FN_RE.finditer(text):
+            start = text.find("{", match.end())
+            if start == -1:
+                continue
+            end = _brace_end(text, start)
+            functions.append((match.group(1), text[start:end], path))
+    readers = {name for name, body, _ in functions if ENV_READ_RE.search(body)}
+    changed = True
+    while changed:
+        changed = False
+        for name, body, _ in functions:
+            if name in readers:
+                continue
+            if any(call in readers for call in CALL_RE.findall(body)):
+                readers.add(name)
+                changed = True
+    found: dict[str, set[str]] = {}
+    for name, body, path in functions:
+        spans = [match.group(1) for match in ENV_LITERAL_RE.finditer(body)]
+        for match in CALL_RE.finditer(body):
+            if match.group(1) in readers:
+                spans.append(_call_arguments(body, match.end() - 1))
+        for span in spans:
+            for literal in STRING_LITERAL_RE.findall(span):
+                if ENV_NAME_RE.match(literal):
+                    found.setdefault(literal, set()).add(str(path.relative_to(root)))
+    return found
+
+
+def _brace_end(text: str, open_index: int) -> int:
+    """The index of the `}` closing the `{` at ``open_index``."""
+    depth = 0
+    index = open_index
+    while index < len(text):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return len(text) - 1
+
+
+def _call_arguments(text: str, open_index: int) -> str:
+    """The text inside the parentheses whose `(` is at ``open_index``."""
+    depth = 0
+    index = open_index
+    while index < len(text):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1 : index]
+        index += 1
+    return ""
+
+
+def _read_scanned(path: Path) -> str | None:
+    """A file's text, or None when it is too large to be a scanned source."""
+    try:
+        if path.stat().st_size > MAX_SCANNED_BYTES:
+            return None
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def read_mandate_report(path: Path, problems: list[str]):
     """The per-test timings of a `mandate-check.json`, or None with a problem."""
     if not path.is_file():
@@ -3177,6 +3532,16 @@ def main() -> int:
         print(f"PERF DECLARATION: {problem}")
     bad = bad or bool(perf_problems)
 
+    # The env-scaled opt-in surface: a tier that is not `#[ignore]`d at all but
+    # scaled by environment variables, which every other block is blind to.
+    env_problems: list[str] = []
+    env_summary, env_notes = check_env_tier(env_problems)
+    for note in env_notes:
+        print(note)
+    for problem in env_problems:
+        print(f"ENV TIER: {problem}")
+    bad = bad or bool(env_problems)
+
     # The documented counts: a number in prose that a command already
     # determines is verified against the source that determines it, or has left
     # the prose for the command that prints it. Harness-only, because the
@@ -3222,6 +3587,8 @@ def main() -> int:
             f"{diagnostic} diagnostic-only"
         )
     for line in perf_summary:
+        print(line)
+    for line in env_summary:
         print(line)
     for line in doc_summary:
         print(line)

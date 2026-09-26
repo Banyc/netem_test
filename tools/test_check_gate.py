@@ -1036,5 +1036,210 @@ class CheckGatePerfTest(unittest.TestCase):
         )
 
 
+# The env-scaled opt-in surface fixture: a crate-local env reader reached
+# through a wrapper (the shape a real crate uses), and a runner that names the
+# variables it sets.
+ENV_KNOB_RS = """fn env_parse(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+pub fn iterations() -> u64 {
+    env_parse("FIXTURE_ITERATIONS", 10)
+}
+
+pub fn rounds() -> u64 {
+    env_parse("FIXTURE_ROUNDS", 4)
+}
+"""
+
+ENV_RUNNER_PY = '''#!/usr/bin/env python3
+"""Runs the fixture's batches with the sizing the sweep needs."""
+
+import os
+import subprocess
+import sys
+
+
+def main():
+    env = dict(os.environ)
+    env["FIXTURE_ITERATIONS"] = "100"
+    env["FIXTURE_ROUNDS"] = "8"
+    return subprocess.run([sys.executable, "-c", "pass"], env=env).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def append_block(path: Path, name: str, body: str) -> None:
+    path.write_text(
+        path.read_text(encoding="utf-8") + f"\n```{name}\n{body}```\n",
+        encoding="utf-8",
+    )
+
+
+class CheckGateEnvTierTest(unittest.TestCase):
+    """The env-scaled opt-in surface: detection, and the enforcement it gets.
+
+    Every other block keys on `#[ignore]`, so a tier that is scaled by an
+    environment variable and run by a script appears in none of them. These
+    cases pin both halves: the surface a crate has but has not declared is named
+    (not silently absent), and a declared surface is enforced in both directions
+    (a variable the runner sets and the sources read must be named, a declared
+    variable the crate never reads is stale).
+
+    The fixture is its own crate root rather than a subclass of the perf
+    fixture: the env check reads sources and scripts, not compiled test lists,
+    so it needs no `gate-perf-design`/`gate-budgets` blocks at all.
+    """
+
+    GATE = (
+        "# the fixture gate\n\n```gate-manifest\nalpha::t_ig = perf\n```\n\n"
+        "```gate-default-required\nalpha::t_ok\n```\n\n"
+        "```gate-asserting\nalpha::t_ok\n```\n\n"
+        "```gate-perf-guard-helpers\n```\n"
+    )
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/tmp"))
+        self.root = Path(self._tmp.name) / "fixture"
+        (self.root / "tests" / "tests").mkdir(parents=True)
+        (self.root / "tests" / "tests" / "alpha.rs").write_text(ALPHA_RS, encoding="utf-8")
+        (self.root / "src").mkdir(parents=True)
+        (self.root / "src" / "env_knob.rs").write_text(ENV_KNOB_RS, encoding="utf-8")
+        (self.root / "local").mkdir()
+        (self.root / "local" / "run_env.py").write_text(ENV_RUNNER_PY, encoding="utf-8")
+        (self.root / "tests" / "GATE.md").write_text(self.GATE, encoding="utf-8")
+        self.bin_dir = Path(self._tmp.name) / "bin"
+        self.bin_dir.mkdir()
+        cargo = self.bin_dir / "cargo"
+        cargo.write_text(FAKE_CARGO, encoding="utf-8")
+        cargo.chmod(0o755)
+        self.plan_path = Path(self._tmp.name) / "plan.json"
+        self.plan_path.write_text(
+            json.dumps({"lists": {"tests|alpha": {"default": ["t_ok"], "ignored": ["t_ig"]}}}),
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def declare(self, body):
+        append_block(self.root / "tests" / "GATE.md", "gate-env-tier", body + "\n")
+
+    def check(self):
+        env = dict(os.environ)
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["FAKE_CARGO_PLAN"] = str(self.plan_path)
+        proc = subprocess.run(
+            [
+                PYTHON,
+                str(CHECK_GATE),
+                "--crate",
+                str(self.root),
+                "tests",
+                "tests/tests",
+                "tests/GATE.md",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(self.root),
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def rejects(self, fragment):
+        code, output = self.check()
+        self.assertNotEqual(code, 0, f"expected a non-zero exit; output={output}")
+        self.assertIn(fragment, output)
+        return output
+
+    def test_an_undeclared_surface_is_named_rather_than_invisible(self):
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("env-scaled opt-in surface undeclared", output)
+        self.assertIn("FIXTURE_ITERATIONS", output)
+        self.assertIn("local/run_env.py", output)
+        self.assertIn("src/env_knob.rs", output)
+
+    def test_a_well_formed_surface_passes_and_is_summarised(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+            "| per-dial loss rate under a sized load | fixture-liveness@shape=churn"
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("gate-env-tier: 1 env-scaled surface(s)", output)
+        self.assertIn("gate-env-tier-surface: fixture-churn", output)
+        self.assertNotIn("env-scaled opt-in surface undeclared", output)
+
+    def test_a_surface_the_declaration_omits_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS | local/run_env.py "
+            "| per-dial loss rate under a sized load | fixture-liveness@shape=churn"
+        )
+        self.rejects(
+            "FIXTURE_ROUNDS is set by local/run_env.py and read by this "
+            "crate's sources, so it scales an opt-in tier"
+        )
+
+    def test_a_declared_variable_no_source_reads_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS,FIXTURE_GHOST "
+            "| local/run_env.py | per-dial loss rate | fixture-liveness@shape=churn"
+        )
+        self.rejects(
+            "fixture-churn: FIXTURE_GHOST is passed to no env-reading function"
+        )
+
+    def test_a_runner_naming_no_declared_variable_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | tools/other.py "
+            "| per-dial loss rate | fixture-liveness@shape=churn"
+        )
+        (self.root / "tools").mkdir()
+        (self.root / "tools" / "other.py").write_text("print('nothing')\n")
+        self.rejects("runner 'tools/other.py' names none of the declared variables")
+
+    def test_a_runner_that_is_not_a_file_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/absent.py "
+            "| per-dial loss rate | fixture-liveness@shape=churn"
+        )
+        self.rejects("runner 'local/absent.py' is not a file under")
+
+    def test_a_repeated_variable_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ITERATIONS | local/run_env.py "
+            "| per-dial loss rate | fixture-liveness@shape=churn"
+        )
+        self.rejects("FIXTURE_ITERATIONS named more than once")
+
+    def test_a_malformed_variable_name_fails(self):
+        self.declare(
+            "fixture-churn = fixture_iterations | local/run_env.py "
+            "| per-dial loss rate | fixture-liveness@shape=churn"
+        )
+        self.rejects("is not an environment variable name")
+
+    def test_a_surface_with_no_coverage_cell_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+            "| per-dial loss rate | "
+        )
+        self.rejects("covers no cell")
+
+    def test_a_surface_that_measures_nothing_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+            "| | fixture-liveness@shape=churn"
+        )
+        self.rejects("says nothing about what it measures")
+
+
 if __name__ == "__main__":
     unittest.main()
