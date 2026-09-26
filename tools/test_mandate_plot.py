@@ -226,6 +226,35 @@ SHARES_DECLARATION = {
     ],
 }
 
+# The recorded `MANDATE M2` line of a real run, whose clean arm is asserted at
+# `1.000` while the impaired arms are asserted at its own `delivery_floor` of
+# `0.995` -- the two floors the delivery panel has to draw per arm.
+M2_RUN_VALUES = {
+    "clean_delivery": 1.0,
+    "clean_wire_x": 2.11,
+    "hostile_delivery": 1.0,
+    "hostile_wire_x": 5.14,
+    "lone_delivery": 1.0,
+    "lone_wire_x": 6.41,
+    "budget": 6.0,
+    "hostile_wire_guard": 10.0,
+    "lone_wire_guard": 14.0,
+    "delivery_floor": 0.995,
+}
+
+# The recorded `MANDATE M4` line, whose per-flow delivery floor is `0.995` on
+# *both* arms -- the same value the declaration draws -- so there is nothing
+# restated and no per-arm split is owed.
+M4_DELIVERY_RUN_VALUES = {
+    "flows": 4.0,
+    "clean_delivery_min": 1.0,
+    "hostile_delivery_min": 1.0,
+    "imbalance_bound": 0.01,
+    "fair_share": 0.25,
+    "delivery_floor": 0.995,
+    "hostile_p99_guard": 900.0,
+}
+
 # The recorded `M4-shares`/`M4-imbalance` pair, verbatim from a real run's
 # `M4.csv`: the shares straddle the fair share (0.249912 and 0.250029 around
 # 0.25), so no bar can fail the line the panel draws, and the imbalance panel
@@ -2228,6 +2257,150 @@ class MandatePlotTest(unittest.TestCase):
                 self.assertEqual(
                     MANDATE.departure_view_note(panel, [delivery, shares], points), ""
                 )
+
+    def test_a_bound_the_run_restates_is_drawn_per_arm_and_named(self):
+        # The measured defect: `M2-delivery` drew the clean arm's `1.000` line
+        # across all three arms, and the run guards the other two at `0.995`,
+        # so a hostile bar at `0.996` crossed the drawn line while sitting
+        # inside its own arm's floor -- a breach the verdict tolerates, and the
+        # one difference between the arms the panel exists to compare. The wire
+        # panel beside it already names the run's per-arm guards; this is the
+        # same thing, drawn per arm.
+        declaration = M2_DELIVERY_DECLARATION
+        panels = declaration["panels"]
+        points = _points(M2_DELIVERY_ROWS)
+        series = MANDATE.panel_series(panels[0], points)
+        bounds = MANDATE._bound_specs(panels[0])
+        self.assertEqual(
+            MANDATE.arm_bound_values(panels[0], series, bounds, M2_RUN_VALUES),
+            {"clean": 1.0, "hostile": 0.995, "lone": 0.995},
+        )
+        plans = MANDATE.effective_bounds(panels[0], series, bounds, M2_RUN_VALUES)
+        self.assertEqual(
+            [(plan["y"], plan["arms"], plan["window"]) for plan in plans],
+            [(1.0, ["clean"], [1.0]), (0.995, ["hostile", "lone"], [2.0, 3.0])],
+        )
+        code, stderr, out = self.render_mandate(
+            declaration,
+            M2_DELIVERY_ROWS,
+            "M2arms",
+            "--run-values",
+            json.dumps(M2_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M2-delivery.svg").read_text(encoding="utf-8")
+        self.assertEqual(document.count('class="bound"'), 2)
+        self.assertEqual(
+            [declared for declared, _, _ in MANDATE.label_boxes(document)],
+            [
+                "M2 delivery floor 1.000 [governs clean]",
+                "run delivery_floor=0.995 [governs hostile lone]",
+            ],
+        )
+        self.assertEqual(
+            MANDATE.check_bound_arm_governance(
+                "delivery", panels[0], series, bounds, M2_RUN_VALUES, document
+            ),
+            [],
+        )
+        # The two lines really are over different arms, not one line drawn
+        # twice: the first ends where arm 1's band ends.
+        spans = MANDATE.re.findall(
+            r'class="bound" x1="([-0-9.]+)"[^>]*x2="([-0-9.]+)"', document
+        )
+        self.assertEqual(len(spans), 2, spans)
+        # Two lines over two runs of arms, meeting at the boundary between
+        # them, rather than one line drawn twice over the whole plot.
+        self.assertEqual(spans[0][1], spans[1][0])
+        self.assertLess(float(spans[0][1]), float(spans[1][1]))
+
+    def test_a_bound_drawn_across_arms_with_different_floors_is_refused(self):
+        # The vacuity of the per-arm check: the pre-change drawing -- one line
+        # at the declared bound, its label naming no arm -- must go red, both
+        # as a predicate and end to end.
+        declaration = M2_DELIVERY_DECLARATION
+        panels = declaration["panels"]
+        points = _points(M2_DELIVERY_ROWS)
+        series = MANDATE.panel_series(panels[0], points)
+        bounds = MANDATE._bound_specs(panels[0])
+        one_line = MANDATE.svg_bar_chart(
+            "M2 [delivery]",
+            "arm (1=clean 2=hostile 3=lone_tail)",
+            "delivery (received / offered)",
+            series,
+            bounds,
+            (0.979, 1.001),
+            M2_RUN_VALUES,
+        )
+        problems = MANDATE.check_bound_arm_governance(
+            "delivery", panels[0], series, bounds, M2_RUN_VALUES, one_line
+        )
+        self.assertEqual(len(problems), 2, problems)
+        joined = "\n".join(problems)
+        self.assertIn("would be the floor of neither", joined)
+        self.assertIn("governs clean", joined)
+        self.assertIn("governs hostile lone", joined)
+        # End to end: a drawing that keeps the single declared line does not
+        # write the panel at all.
+        drawn_chart = MANDATE.svg_bar_chart
+
+        def chart_with_one_bound(*arguments, **keywords):
+            plan = dict(arguments[4][0])
+            plan.pop("window", None)
+            plan.pop("arms", None)
+            return drawn_chart(*arguments[:4], [plan], *arguments[5:], **keywords)
+
+        with mock.patch.object(MANDATE, "svg_bar_chart", chart_with_one_bound):
+            code, stderr, _ = self.render_mandate(
+                declaration,
+                M2_DELIVERY_ROWS,
+                "M2arms2",
+                "--run-values",
+                json.dumps(M2_RUN_VALUES),
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("would be the floor of neither", stderr)
+
+    def test_a_run_that_restates_nothing_owes_no_per_arm_split(self):
+        # The other half of the vacuity: the split is offered only where the
+        # run restates the quantity's bound at a different value. M4's own
+        # per-flow delivery floor is the value its declaration draws, and the
+        # wire panel's restatement is of a *different* quantity's bound, so
+        # neither panel is split -- and a split offered anyway would be an
+        # invention rather than a reading.
+        delivery = {
+            "id": "delivery",
+            "chart": "bar",
+            "series": [{"name": "delivery"}],
+            "bounds": [{"y": 1.0, "label": "M2 delivery floor 1.000"}],
+        }
+        series = [("delivery", [(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)])]
+        bounds = MANDATE._bound_specs(delivery)
+        self.assertIsNone(MANDATE.arm_bound_values(delivery, series, bounds, None))
+        self.assertIsNone(
+            MANDATE.arm_bound_values(delivery, series, bounds, M4_DELIVERY_RUN_VALUES)
+        )
+        self.assertEqual(
+            MANDATE.effective_bounds(delivery, series, bounds, M4_DELIVERY_RUN_VALUES),
+            [{"y": 1.0, "label": "M2 delivery floor 1.000"}],
+        )
+        # With one series the run's own arms are not enumerated, so nothing can
+        # be attributed per arm and the panel keeps its single declared line.
+        wire = {
+            "id": "wire",
+            "chart": "bar",
+            "series": [{"name": "wire_x"}],
+            "bounds": [{"y": 6.0, "label": "M2 wire budget 6x"}],
+        }
+        wire_series = [("wire_x", [(1.0, 2.15), (2.0, 5.0), (3.0, 6.63)])]
+        wire_bounds = MANDATE._bound_specs(wire)
+        self.assertIsNone(
+            MANDATE.arm_bound_values(wire, wire_series, wire_bounds, M2_RUN_VALUES)
+        )
+        self.assertEqual(
+            MANDATE.effective_bounds(wire, wire_series, wire_bounds, M2_RUN_VALUES),
+            [{"y": 6.0, "label": "M2 wire budget 6x"}],
+        )
 
     def test_a_reading_band_that_eats_the_plot_is_refused(self):
         # The band and the shape it explains share one canvas, so the band may

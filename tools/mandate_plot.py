@@ -146,6 +146,18 @@ silenced by softening a declaration:
   outright when a reading names an arm no line panel draws, and
   `check_reading_band` refuses a band that would leave the plot too short to
   show the shape it explains.
+- **the per-arm bound test** — `check_bound_arm_governance` refuses a bar panel
+  that draws one bound across arms whose own bounds differ. A bound the run
+  *restates* for some of the arms (`delivery_floor=0.995` under a declared
+  `1.000`) is not one floor drawn across one group of arms: a bar between the
+  two values crosses the declaration's line while sitting inside its own arm's
+  floor, which is a breach the verdict tolerates and the one difference between
+  the arms the panel exists to compare. The run's own keys enumerate the arms
+  (`<arm>_<quantity>`) and name the arms that are not its reference (`*_guard`),
+  so the declared bound is drawn over the reference arms and the run's own over
+  the rest, each segment naming the arms it governs. A run that restates
+  nothing, a panel whose arms the run does not enumerate, and a quantity whose
+  bound the run never restates are all left with their single declared line.
 - **the departure-view test** — `check_departure_view_stated` refuses a bar
   panel whose bound is a value its own bars *straddle*. Such a bound is a
   reference rather than a line a bar can cross, so the mandate behind the panel
@@ -1402,6 +1414,191 @@ def bound_is_the_scale(values, y, unit):
     return len(reaching) * 2 > len(values)
 
 
+# -- a bound the run restates per arm -------------------------------------
+#
+# `M2`'s delivery panel draws one bar per arm against one line. The clean arm
+# is asserted at `1.000` and the impaired arms at the run's own floor
+# (`0.995`), so a bar at `0.996` crosses the drawn line while being inside its
+# own arm's floor: the panel shows a breach the verdict tolerates, and the
+# difference between the arms it is comparing -- which floor applies to which
+# -- is exactly what it cannot show. The wire panel beside it already names
+# the run's per-arm guards (`hostile_wire_guard=10`, `lone_wire_guard=14`); a
+# bound the run restates is the same thing, drawn per arm instead of only
+# named on one line.
+PER_ARM_BOUND_SUFFIXES = ("_guard", "_floor")
+"""What a run's key ends in to be that arm's own bound for a quantity."""
+
+QUANTITY_BOUND_SUFFIXES = ("_floor", "_guard", "_budget")
+"""What a run's key ends in to be an unprefixed bound for a quantity."""
+
+
+def run_arm_names(series, run_values):
+    """The run's own arm names for a single-series panel, in the run's order.
+
+    A `MANDATE` line names each arm's measurement of a quantity as
+    `<arm>_<quantity>`, so the keys ending in the panel's own series name
+    enumerate the arms in the order the producer measured them -- which is the
+    order the producer writes the panel's bars in. That is what lets a per-arm
+    bound be drawn over the arm it belongs to rather than over all of them.
+    """
+    if not isinstance(run_values, dict) or len(series) != 1:
+        return []
+    quantity = series[0][0]
+    names = []
+    for key in run_values:
+        if not isinstance(key, str) or not key.endswith("_" + quantity):
+            continue
+        name = key[: -len(quantity) - 1]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def per_arm_bound(arm, quantity, run_values):
+    """The run's own bound for one arm's quantity, or ``None`` when it states none."""
+    if not isinstance(run_values, dict):
+        return None
+    for suffix in PER_ARM_BOUND_SUFFIXES:
+        value = run_values.get(f"{arm}_{quantity}{suffix}")
+        if numeric(value):
+            return float(value)
+    return None
+
+
+def quantity_bound(quantity, run_values):
+    """The run's own unprefixed bound for a quantity, as ``(key, value)``."""
+    if not isinstance(run_values, dict):
+        return None
+    for suffix in QUANTITY_BOUND_SUFFIXES:
+        key = f"{quantity}{suffix}"
+        value = run_values.get(key)
+        if numeric(value):
+            return key, float(value)
+    return None
+
+
+def guarded_arms(arms, run_values):
+    """The arms the run states a guard of its own for, whatever the quantity.
+
+    The `MANDATE` line's per-arm guards are how the run says which arms are not
+    its reference: `hostile_wire_guard` and `lone_wire_guard` leave the clean
+    arm as the one the declaration's own bound governs. That is the same
+    division the run's restated floor follows, so it is what decides which
+    arms a restated bound is drawn over.
+    """
+    if not isinstance(run_values, dict):
+        return []
+    guarded = []
+    for arm in arms:
+        for key in run_values:
+            if not isinstance(key, str) or not key.endswith(GUARD_KEY_SUFFIX):
+                continue
+            if key[: -len(GUARD_KEY_SUFFIX)].startswith(f"{arm}_"):
+                guarded.append(arm)
+                break
+    return guarded
+
+
+def arm_bound_values(panel, series, bounds, run_values):
+    """Each drawn arm's own bound, or ``None`` when one bound serves them all.
+
+    The split is offered only where it is a fact about the run: one bar series,
+    one declared bound, the panel's categories being exactly the arms the run
+    enumerates, and the run restating the quantity's bound at a *different*
+    value. Where it applies, the declared bound governs the reference arms and
+    the run's own is drawn over the rest, so the panel shows which floor
+    belongs to which arm.
+    """
+    if panel["chart"] != "bar" or len(bounds) != 1 or len(series) != 1:
+        return None
+    declared = float(bounds[0]["y"])
+    restated = quantity_bound(series[0][0], run_values)
+    if restated is None or restated[1] == declared:
+        return None
+    arms = run_arm_names(series, run_values)
+    categories = sorted({x for _, points in series for x, _ in points})
+    if len(arms) < 2 or categories != [float(index + 1) for index in range(len(arms))]:
+        return None
+    guarded = guarded_arms(arms, run_values)
+    if not guarded or len(guarded) == len(arms):
+        return None
+    values = {}
+    for arm in arms:
+        own = per_arm_bound(arm, series[0][0], run_values)
+        if own is not None:
+            values[arm] = own
+        else:
+            values[arm] = restated[1] if arm in guarded else declared
+    return values
+
+
+def effective_bounds(panel, series, bounds, run_values):
+    """The bound lines a bar panel draws: one per contiguous run of equal values.
+
+    With no restatement this is the declared bounds, unchanged. With one, each
+    segment carries the arms it governs and the x-window it is drawn over, and
+    names the run's own key when its value is the run's rather than the
+    declaration's -- so a run whose arms have different floors is drawn as
+    different floors rather than as one line a reader has to guess at.
+    """
+    values = arm_bound_values(panel, series, bounds, run_values)
+    if values is None:
+        return [dict(bound) for bound in bounds]
+    arms = list(values)
+    restated = quantity_bound(series[0][0], run_values)
+    segments = []
+    start = 0
+    while start < len(arms):
+        value = values[arms[start]]
+        end = start + 1
+        while end < len(arms) and values[arms[end]] == value:
+            end += 1
+        run = arms[start:end]
+        segments.append(
+            {
+                "y": value,
+                "label": (
+                    bounds[0]["label"]
+                    if value == float(bounds[0]["y"])
+                    else f"run {restated[0]}={restated[1]:g}"
+                ),
+                "arms": run,
+                "window": [float(index + 1) for index in range(start, end)],
+            }
+        )
+        start = end
+    return segments
+
+
+def check_bound_arm_governance(panel_id, panel, series, bounds, run_values, markup):
+    """Problems that leave a bound drawn across arms with different floors unnamed.
+
+    "Does each drawn bound apply to every series it crosses?" is `AGENTS.md`'s
+    second panel test, and a bound the run restates per arm is the bar panel's
+    case of it: one line drawn across arms whose own floors differ reads as the
+    floor of whichever arm crossed it, which is a breach for one arm and a pass
+    for its neighbour. So every segment the run's own bounds imply has to be on
+    the panel, each naming the arms it governs.
+    """
+    planned = effective_bounds(panel, series, bounds, run_values)
+    if len(planned) <= len(bounds):
+        return []
+    drawn = [declared for declared, _, _ in label_boxes(markup)]
+    problems = []
+    for bound in planned:
+        label = governed_label(bound, series, run_values)
+        if label in drawn:
+            continue
+        problems.append(
+            f"panel {panel_id!r}: the run states the bound {planned[0]['label']!r} "
+            f"for some arms and {planned[-1]['label']!r} for others, so one line "
+            "across every bar would be the floor of neither; the panel has to "
+            "draw each arm's own bound and name the arms it governs. Missing: "
+            f"{label!r} (drawn: {drawn!r})"
+        )
+    return problems
+
+
 def named_guard_values(series, bounds, run_values, *, crossing):
     """The run's own guards the panel's drawn labels will name.
 
@@ -2252,6 +2449,8 @@ def governed_label(bound, series, run_values, crossing=True):
     also what makes the range honest — a panel may draw what it names.
     """
     clauses = []
+    if bound.get("arms"):
+        clauses.append(f"governs {' '.join(bound['arms'])}")
     if bound.get("series"):
         clauses.append(f"governs series {bound['series']}")
     window = bound_governed_x(bound)
@@ -2385,6 +2584,23 @@ def note_baselines(text, plot_top, plot_bottom, budget, note_row, label_area):
     return list(zip(lines, top))
 
 
+def drawn_bound_window(bound):
+    """The x-window a bound is drawn over: its declared governance, or its arms.
+
+    A bound the run restates per arm carries the categories it governs under
+    `window` rather than as a declared `x`, so that the label's own governance
+    clause names the *arms* instead of repeating the ordinals it already
+    implies.
+    """
+    window = bound_governed_x(bound)
+    if window is not None:
+        return window
+    arms = bound.get("window")
+    if arms:
+        return (min(arms), max(arms))
+    return None
+
+
 def svg_bar_chart(
     title,
     x_label,
@@ -2497,7 +2713,7 @@ def svg_bar_chart(
     panel_note_lines = []
     for bound in bounds or []:
         y = sy(bound["y"])
-        window = bound_governed_x(bound)
+        window = drawn_bound_window(bound)
         if window is None:
             left, right = REPORT.PAD_LEFT, REPORT.WIDTH - REPORT.PAD_RIGHT
         else:
@@ -2639,6 +2855,10 @@ def panel_markup(
     )
     panel_y_label = panel_y_label_for(panel, y_label, series)
     bounds = _bound_specs(panel)
+    # A bound the run restates for some of the panel's arms is drawn as each
+    # arm's own bound, so every check below -- the axis, the headroom, the
+    # drawn lines -- measures the bounds the panel actually draws.
+    drawn_bounds = effective_bounds(panel, series, bounds, run_values)
     pinned = _require_extent(panel.get("y_extent"), f"panels.{panel['id']}.y_extent")
     # A line panel reserves a band above the plot for its per-arm readings, so
     # the plot it draws -- and therefore the axis every check below measures --
@@ -2650,9 +2870,9 @@ def panel_markup(
         if chart == "line"
         else bar_plot_height(len(series))
     )
-    axis = panel_axis_extent(panel, series, bounds, run_values, plot_height)
+    axis = panel_axis_extent(panel, series, drawn_bounds, run_values, plot_height)
     guards = named_guard_values(
-        series, bounds, run_values, crossing=chart == "bar"
+        series, drawn_bounds, run_values, crossing=chart == "bar"
     )
     problems = (
         check_bound_governance(panel["id"], series, bounds, run_values)
@@ -2679,11 +2899,13 @@ def panel_markup(
         # crossing of a ceiling is the line poking above it, so it owes the
         # axis-range and headroom checks (which it gets) rather than a band.
         problems += check_panel_axis(
-            panel["id"], series, bounds, axis, plot_height, run_values
+            panel["id"], series, drawn_bounds, axis, plot_height, run_values
         )
     problems += check_named_values_in_axis(
-        panel["id"], bounds, guards, axis, plot_height
-    ) + check_bound_headroom(panel["id"], bounds, guards, axis, plot_height)
+        panel["id"], drawn_bounds, guards, axis, plot_height
+    ) + check_bound_headroom(
+        panel["id"], drawn_bounds, guards, axis, plot_height
+    )
     if problems:
         _fail("\n  ".join(problems))
     drawn = [(series_label(name), points) for name, points in series]
@@ -2693,7 +2915,7 @@ def panel_markup(
             panel_x_label,
             panel_y_label,
             series,
-            bounds,
+            drawn_bounds,
             axis,
             run_values,
             note=departure_view_note(panel, panels or [panel], points),
@@ -2732,6 +2954,9 @@ def panel_markup(
         + (
             check_departure_view_stated(
                 panel["id"], panel, panels or [panel], points, markup
+            )
+            + check_bound_arm_governance(
+                panel["id"], panel, series, bounds, run_values, markup
             )
             + check_bar_separation(panel["id"], markup)
             if chart == "bar"
@@ -2858,16 +3083,31 @@ def render_mandate(
                 "is not a graph)"
             )
         bounds = panel.get("bounds") or []
+        # A bound the run restates per arm is drawn as each arm's own line, so
+        # the count is the plan's -- one line per contiguous run of equal
+        # values -- and each *declared* bound has to appear among the labels
+        # the panel actually drew. The labels are read from their `<title>`
+        # elements, which carry the undivided sentence, because a wrapped label
+        # splits its own text across elements and a raw substring test would
+        # fail on a line break rather than on a missing bound.
+        planned = effective_bounds(
+            panel, panel_series(panel, points), _bound_specs(panel), run_values
+        )
         drawn = written.count('class="bound"')
-        if drawn != len(bounds):
+        if drawn != len(planned):
             _fail(
-                f"{svg_path} draws {drawn} bound line(s) for {len(bounds)} declared "
-                "bound(s); a bound that is not in the panel is not a bound"
+                f"{svg_path} draws {drawn} bound line(s) for the {len(planned)} "
+                "bound(s) the declaration and the run's own per-arm bounds call "
+                "for; a bound that is not in the panel is not a bound"
             )
+        titles = [
+            html.unescape(re.sub(r"</?title>", "", title))
+            for title in BOUND_LABEL_TITLE_RE.findall(written)
+        ]
         missing = [
             bound["label"]
             for bound in bounds
-            if html.escape(bound["label"]) not in written
+            if not any(title.startswith(bound["label"]) for title in titles)
         ]
         if missing:
             _fail(f"{svg_path} does not label every declared bound; missing {missing}")
