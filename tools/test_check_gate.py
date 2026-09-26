@@ -105,7 +105,7 @@ mod tests {
 
 GATE_TEMPLATE = """# the fixture gate
 
-```gate-manifest
+{lib_package}```gate-manifest
 {manifest}
 ```
 
@@ -201,8 +201,15 @@ class CheckGatePerfTest(unittest.TestCase):
         manifest="alpha::t_ig = perf",
         required="alpha::t_ok",
         asserting="alpha::t_ok",
+        lib_package=None,
     ):
+        block = (
+            ""
+            if lib_package is None
+            else f"```gate-lib-package\n{lib_package}\n```\n\n"
+        )
         text = GATE_TEMPLATE.format(
+            lib_package=block,
             manifest=manifest,
             required=required,
             asserting=asserting,
@@ -332,6 +339,57 @@ class CheckGatePerfTest(unittest.TestCase):
             manifest="alpha::t_ig = perf\nlib::tests::probe = perf\nlib::tests::t_nope = perf"
         )
         self.rejects("STALE manifest entry (no longer ignored): lib::tests::t_nope")
+
+    def test_a_declared_lib_package_resolves_the_reserved_target(self):
+        """A manifest may name a sibling member's lib target as the reserved one."""
+        (self.root / "other" / "src").mkdir(parents=True)
+        (self.root / "other" / "src" / "lib.rs").write_text(LIB_RS, encoding="utf-8")
+        self.write_plan(
+            {
+                "lists": {
+                    "tests|alpha": {"default": ["t_ok"], "ignored": ["t_ig"]},
+                    "tests|beta": {"default": ["t_beta"], "ignored": []},
+                    "other|lib": {
+                        "default": ["tests::t_lib_default"],
+                        "ignored": ["tests::probe"],
+                    },
+                }
+            }
+        )
+        self.write_gate(
+            lib_package="other",
+            required="alpha::t_ok\nlib::tests::t_lib_default",
+            asserting="alpha::t_ok\nlib::tests::t_lib_default",
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("does not report this test", output)
+        self.assertIn("default-required: 2 asserting scenario(s) present", output)
+        self.assertIn("gate-perf-design: 4 perf test row(s)", output)
+
+    def test_a_declared_lib_package_that_lacks_the_test_fails(self):
+        """The declaration redirects resolution; it is not a fallback to both."""
+        (self.root / "other" / "src").mkdir(parents=True)
+        (self.root / "other" / "src" / "lib.rs").write_text(LIB_RS, encoding="utf-8")
+        # The plan keeps the lib tests under `tests`; the declared `other` lib
+        # reports none, so a row that resolved against `tests` would pass here.
+        self.write_gate(lib_package="other")
+        self.rejects(
+            "PERF DECLARATION: gate-perf-design row lib::tests::probe: the 'lib' "
+            "target does not report this test"
+        )
+
+    def test_a_gate_lib_package_block_naming_no_package_fails(self):
+        self.write_gate(lib_package="")
+        self.rejects("must name exactly one package, found 0")
+
+    def test_a_gate_lib_package_block_naming_two_packages_fails(self):
+        self.write_gate(lib_package="other\nnetem-test")
+        self.rejects("must name exactly one package, found 2")
+
+    def test_a_gate_lib_package_block_naming_an_invalid_package_fails(self):
+        self.write_gate(lib_package="not a package")
+        self.rejects("which is not a cargo package name")
 
     def test_declaration_without_perf_blocks_still_passes(self):
         (self.root / "tests" / "GATE.md").write_text(

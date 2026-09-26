@@ -16,6 +16,13 @@ Run the checker after adding, removing, or re-tiering any scenario:
 python3 tools/check-gate.py
 ```
 
+The same gate through the parameterized form the sibling crates use (the
+scenario directory is `tests/tests`, one level below this package's own root):
+
+```sh
+python3 tools/check-gate.py --crate . tests tests/tests tests/GATE.md
+```
+
 The application scenarios that consume `rtp`, `mux` or `rtp_mux` are asserted
 by **those crates'** own gates, never here: the harness keeps the impairment
 instrument and its conformance suite, and each layer's floors are stated and
@@ -70,8 +77,20 @@ name the reserved `lib` target beside the scenario targets — the harness's own
 `cargo test -p netem-test --lib` rather than `--test lib`:
 `lib::tests::a_closed_blackout_gate_consumes_no_prng_draws` is the one lib
 property pinned here, so the PRNG-draw conformance rule the emulation is
-reproducible from cannot be silently dropped from the always-run tier. The
-`gate-asserting` block records the report-only/asserting split.
+reproducible from cannot be silently dropped from the always-run tier.
+
+Those lib tests live in the `netem-test` member, not in the `tests` package
+this manifest belongs to, so the `gate-lib-package` block below names the
+package that owns the reserved `lib` target. Without it the checker resolves
+`lib::…` against the checked package (`tests`), whose `--lib` target contains
+none of them, and the manifest fails. Every block that can name a `lib::…`
+entry (`gate-manifest`, `gate-default-required`, `gate-asserting`,
+`gate-perf-design`) reads this declaration. The `gate-asserting` block records
+the report-only/asserting split.
+
+```gate-lib-package
+netem-test
+```
 
 ```gate-default-required
 netem_scenarios::netem_blackout_gate_drops_then_resumes

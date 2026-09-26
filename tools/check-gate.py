@@ -12,12 +12,17 @@ that MUST run in the default (`cargo test`, non-`#[ignore]`d) tier. The default
 tier is defined by the absence of `#[ignore]`, so without this an asserting
 scenario can silently be re-ignored and stop running.
 
-The reserved target name `lib` names the package's `--lib` target, and it is a
-real opt-in surface: the `gate-manifest`, `gate-default-required` and
-`gate-asserting` blocks may name `lib::<module>::<test>` the same way they name
-an integration target, and their ignored tests are resolved from
-`cargo test -p <package> --lib -- --list --ignored` rather than dying as an
-unexplained STALE entry or a `--test lib` cargo failure. A `lib` entry is
+The reserved target name `lib` names a package's `--lib` target, and it is a
+real opt-in surface: the `gate-manifest`, `gate-default-required`,
+`gate-asserting` and `gate-perf-design` blocks may name
+`lib::<module>::<test>` the same way they name an integration target, and their
+ignored tests are resolved from `cargo test -p <package> --lib -- --list
+--ignored` rather than dying as an unexplained STALE entry or a `--test lib`
+cargo failure. The package is the checked one, unless the manifest's
+`gate-lib-package` block names another: a manifest can only belong to one
+package, but the reserved target can name a sibling member's lib tests (the
+harness's own gate resolves `lib::…` against `netem-test`, whose lib tests the
+`tests` package it belongs to does not contain). A `lib` entry is
 resolved beside the scenario directory's targets, never instead of them: the
 scenario targets are still required to be classified, while an ignored lib test
 no block names is reported by name (advisory, since a lib target is a separate
@@ -148,10 +153,12 @@ PERF_TIERS = frozenset(TIERS | {"default"})
 # none and the row says why it repeats the baseline's cell.
 RELATION_KINDS = frozenset({"baseline", "orthogonal", "composite", "re-measurement"})
 LANE_ROLES = {"verdict", "diagnostic"}
-# The reserved perf-design target naming a package's `--lib` test target. In
-# harness mode it is the `netem-test` package (whose wall-clock probes are lib
-# unit tests); in per-crate mode it is the checked package.
+# The reserved perf-design target naming a package's `--lib` test target. It
+# resolves to the checked package unless the manifest's `gate-lib-package`
+# block names another member (the harness's `tests` gate covers `netem-test`).
 LIB_TARGET = "lib"
+# A cargo package name, as a `gate-lib-package` declaration must state one.
+PACKAGE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 # `<mandate-or-property>@<dimension>=<value>[+<dimension>=<value>...]`. A value
 # may not contain `=`, `,` or `+` (those delimit the cell), and a property is a
 # stable name (`M1`, `conformance-delay`, `probe-throughput`).
@@ -265,24 +272,33 @@ class CrateLayout:
 
     @property
     def lib_package(self) -> str:
-        """The package whose `--lib` target the reserved `lib` design rows name.
+        """The package whose `--lib` target the reserved `lib` entries name.
 
-        In harness mode the harness's own wall-clock probes are `netem-test`'s
-        lib unit tests, so the reserved target resolves there; in per-crate
-        mode it resolves the checked package, which is the crate whose
-        scenarios and lib tests the gate covers.
+        The checked package by default; a manifest that carries a
+        ```gate-lib-package block names another member instead, because the
+        reserved target can name a sibling package's lib tests. Harness mode's
+        default is the `netem-test` member, whose lib unit tests are the
+        harness's own wall-clock probes.
         """
+        declared = declared_lib_package()
+        if declared is not None:
+            return declared
         return "netem-test" if self.is_harness else self.package
 
     @property
     def lib_root(self) -> Path:
         """The package root of the `--lib` target (``<lib_root>/src`` is its tree).
 
-        In harness mode the reserved target is the `netem-test` member, which
-        is a subdirectory of the workspace root; in per-crate mode it is the
-        checked package's own root.
+        The declared package's member directory when the reserved target names
+        another package (the harness's `netem-test` member is a subdirectory of
+        the workspace root), and the checked root when it names the checked
+        package itself.
         """
-        return self.root / "netem-test" if self.is_harness else self.root
+        package = self.lib_package
+        if package == self.package:
+            return self.root
+        member = self.root / package
+        return member if member.is_dir() else self.crates_root / package
 
     @property
     def kit_dir(self) -> Path:
@@ -372,6 +388,38 @@ def required_default_entries() -> list[str]:
         for line in block.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
+
+
+def declared_lib_package() -> str | None:
+    """The package a manifest declares for the reserved `lib` target, if any.
+
+    A manifest belongs to one package, but the reserved `lib` target may name
+    a sibling member's lib tests: the harness's own gate covers `netem-test`'s
+    lib unit tests, which the `tests` package the manifest sits in does not
+    contain. The ```gate-lib-package block names that package once, and every
+    block resolving a `lib::…` entry reads it. A declaration of anything other
+    than one cargo package name is refused rather than silently ignored.
+    """
+    block = manifest_block("gate-lib-package")
+    if block is None:
+        return None
+    names = [
+        line.strip()
+        for line in block.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if len(names) != 1:
+        sys.exit(
+            f"{layout().manifest}: the ```gate-lib-package block must name "
+            f"exactly one package, found {len(names)}"
+        )
+    name = names[0]
+    if not PACKAGE_NAME_RE.match(name):
+        sys.exit(
+            f"{layout().manifest}: gate-lib-package names {name!r}, which is "
+            "not a cargo package name"
+        )
+    return name
 
 
 def asserting_entries() -> list[str]:
