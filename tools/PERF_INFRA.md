@@ -51,6 +51,17 @@ low-loss, low-jitter arm. A gate roster that does not include the hostile
 regime, and a verdict read without its panel, cannot see that class of
 regression.
 
+The change was the **fast-loss re-arm** — `rtp` change
+`vluwlmkwwrkxlusvyrkppvnookxttpux` (commit `9b276c82`), abandoned, whose
+description begins "re-arm fast loss for a lost retransmission on fresh SACK
+evidence". It let the evidence-gated fast-loss path re-declare a lost
+retransmission, which had previously fallen through to the time-based
+reorder window. On the paired battery (four seeds) it measured goodput
+**11.75 → 7.44 MiB/s (−36.7 %)** and RTT p99 **355 → 445 ms (+25.7 %)**,
+with per-GiB retransmission attempts rising **1.3 k → 20 k**; it was
+abandoned rather than landed, and is recoverable in the `rtp` repo by that
+commit id.
+
 ### The field problem it targets
 
 On one unchanged deployed build, a real client's ping showed:
@@ -145,14 +156,21 @@ On that pin:
   spikes criterion", but no README in `rtp_mux`, `rtp` or `mux` states it —
   the phrase is in `netem_test/tests/README.md`. Both are corrections for the
   next agent in that crate, which was held by another agent at this writing.
-- **Clean-arm own wire is back at ~3.63×** after the revert, at its
-  pre-regression level; the constitution arm's `both` case is what
-  `rtp_mux/GATE.md` records as ~3.6×. (The `clean` smoke arm reads ~2.2× on
-  the same pin — a different cadence and load, so the two are not
-  interchangeable.)
+- **Clean-arm own wire is back at ~3.63×** after reverting the **fresh-tail
+  cover split** — `rtp` change `tnlxylvslomrkyzyozlroqmkrovowomt` (commit
+  `f0b22e2e5301`), reverted by `xnzwoywuszqrylnpxsllsspluusporpr` (commit
+  `7f68486688dd`), which is `rtp v0.0.94`. The split stopped paying the
+  interactive fresh-tail cover on a pipelined tail; measured on the dual-lane
+  arms it cost p99 **29.6 → 83.0 ms** at 6 % iid and **231.8 → 478.1 ms**
+  under Gilbert-Elliot burst with the bulk lane loaded, with samples over
+  250 ms rising 12 → 46. Own wire is back at its pre-regression level; the
+  constitution arm's `both` case is what `rtp_mux/GATE.md` records as ~3.6×.
+  (The `clean` smoke arm reads ~2.2× on the same pin — a different cadence
+  and load, so the two are not interchangeable.)
 
-Two decisions are open. Neither was taken unilaterally, because each trades
-one mandate against another and the trade is a product call.
+Two decisions are open, and both belong to the operator; they are recorded
+here rather than taken unilaterally, because each trades one mandate against
+another and the trade is a product call.
 
 1. **How to cut the field tail.** Either **armour the repair**, which spends
    M2 own-wire, or **shorten the `300 ms` rung and/or the tail-probe budget**,
@@ -163,6 +181,17 @@ one mandate against another and the trade is a product call.
    jitter p99 ≈ 108 ms at 5.5–5.9× own-wire, against the deployed build's
    ≈ 37 ms at ≈ 6.8×. A materially better tail for a materially larger wire
    budget; neither side dominates.
+
+### What "done" means
+
+Done means: every smoke-set arm meets **M1's mandate bound** (p99 ≤ 250 ms
+and **zero** samples over 250 ms) with `delivery == 1.000`, **and** no arm
+exceeds **M2's 6× budget**. The hostile and lone-tail arms' current guards
+(900 ms / 3200 ms / 8000 ms / 8 % / 10× / 14×) exist **only because the
+product currently breaches the mandate bounds there** — they are temporary
+regression guards, not the goal. Where M1 and M2 cannot both hold, **M1
+wins** (the operator's stated priority) and the M2 breach is recorded as an
+**accepted, dated deviation** with its measured numbers.
 
 ## Half 2 — the infrastructure
 
