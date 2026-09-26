@@ -78,10 +78,11 @@ alongside the existing ones:
     gate-perf-design       <target>::<test> = <tier> | <nominal_cost_s> | <relation> | <coverage>
     gate-budgets           <tier> = <budget_s>, plus baseline/baseline.<family>/drift/drift_floor_s
     gate-coverage-gaps     <cell> = <non-empty reason>
-    gate-env-tier          <name> = <vars> | <runner> | <measures> | <cells>
+    gate-env-tier          <name> = <vars> | <runner> | <measures> | <cells> [| <load>]
 
 `<runner>` is a script path relative to the crate root, or `-` for a surface
-no script runs.
+no script runs. `<load>` is the optional shape and cost the surface was
+measured under.
 
 `<coverage>` is a comma-separated list of cells, each
 `<mandate-or-property>@<dimension>=<value>[+<dimension>=<value>…]` — for
@@ -146,6 +147,21 @@ set one of its variables, because that script is its runner and naming it is
 what the surface owes. This is what makes the scriptless half expressible as a
 surface of its own rather than as extra names on a row whose runner sets none
 of them.
+
+The optional `<load>` field is the shape a cost was measured under, written so
+that its count is derived rather than restated: `<var>=<count>` sizes one of the
+surface's own variables at the count the measurement used, `total=<expr>` is
+arithmetic over those variables and integer literals
+(`5*SOAK_DIALERS*SOAK_ITERATIONS+SOAK_DIALERS*10`), `wall=<seconds>s` the
+measured wall clock, and `bound=<rate>/<unit>` the detection limit the
+measurement supports. The checker refuses a load whose total is not arithmetic
+over the named variables, whose total derives from none of its own factors (a
+count restated beside the shape is the count nobody can reproduce), that states
+no positive wall clock, whose keys are not the surface's variables, and whose
+factors the surface's runner does not set — the last is what makes the record
+the runner's own shape rather than a number written beside a name. The counts
+themselves are the measurement's to state: what is checked is that they belong
+to the surface, that the runner sets them, and that the total follows from them.
 
 **A zero-row declaration is a form, not an absence.** A crate whose work has no
 perf arm at all — nothing measures a bound, no impairment instrument is

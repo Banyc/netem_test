@@ -135,6 +135,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import json
 import math
@@ -169,6 +170,16 @@ CELL_PROPERTY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 CELL_DIMENSION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*=[^=,+\s]+$")
 # An environment variable name, as an env-scaled opt-in surface declares it.
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+# A surface's `<load>` field: `<key>=<value>` items naming the shape a cost was
+# measured under. A key is one of the surface's variables at the count the
+# measurement sized it to, or the reserved `total` (the count the shape yields),
+# `wall` (the measured wall clock) and `bound` (the detection limit it supports).
+ENV_TIER_LOAD_RESERVED = ("total", "wall", "bound")
+ENV_TIER_LOAD_COUNT_RE = re.compile(r"^[0-9]+$")
+ENV_TIER_LOAD_WALL_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)s$")
+ENV_TIER_LOAD_BOUND_RE = re.compile(
+    r"^([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)/([A-Za-z][A-Za-z0-9_-]*)$"
+)
 # A whole string literal's contents (an escaped quote or a newline ends it for
 # these scanners' purposes), used to read a name out of a call's arguments
 # rather than out of a file's prose.
@@ -1854,6 +1865,28 @@ class PerfBudgets:
 
 
 @dataclass(frozen=True)
+class EnvTierLoad:
+    """The load shape an env-scaled surface's cost was measured under.
+
+    `factors` are the surface's own variables and the counts the measurement
+    sized them to, `total` the count `expression` yields from them, `wall` the
+    measured wall clock in seconds, and `bound` the detection limit the
+    measurement supports (empty when it states none). Prose can state a load
+    shape with nothing reading it; every part of this one is checked.
+    """
+
+    factors: tuple[tuple[str, int], ...]
+    expression: str
+    total: int
+    wall: float
+    bound: str
+
+    def describe(self) -> str:
+        bound = f", bound {self.bound}" if self.bound else ""
+        return f"{self.expression} = {self.total}, {self.wall:g}s{bound}"
+
+
+@dataclass(frozen=True)
 class EnvTier:
     """One env-scaled opt-in surface: its variables, its runner and its cells.
 
@@ -1867,6 +1900,7 @@ class EnvTier:
     runner: str
     measures: str
     cells: tuple[str, ...]
+    load: EnvTierLoad | None = None
 
 
 @dataclass(frozen=True)
@@ -2910,6 +2944,17 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
         runner_sets = script_names.get(root / surface.runner) or _script_env_names(
             root / surface.runner
         )
+        if surface.load is not None:
+            outside = sorted(
+                key for key, _ in surface.load.factors if key not in runner_sets
+            )
+            if outside:
+                problems.append(
+                    f"gate-env-tier surface {surface.name}: its load sizes "
+                    f"{', '.join(outside)}, which the runner "
+                    f"{surface.runner!r} does not set; the recorded shape must "
+                    "be the shape the runner runs"
+                )
         unset = sorted(set(surface.variables) - runner_sets)
         if len(unset) == len(surface.variables):
             problems.append(
@@ -2943,16 +2988,183 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
             f"  gate-env-tier-surface: {surface.name} ({runner}) "
             f"{', '.join(surface.variables)} - {surface.measures}"
         )
+        if surface.load is not None:
+            summary.append(
+                f"  gate-env-tier-load: {surface.name} {surface.load.describe()}"
+            )
     return summary, notes
 
 
-def parse_env_tier(text: str, problems: list[str]) -> list[EnvTier]:
-    """Parse `gate-env-tier` rows: `<name> = <vars> | <runner> | <measures> | <cells>`.
+def load_expression(
+    expression: str, sizes: dict[str, int]
+) -> tuple[int, set[str]] | None:
+    """The count a load's `total` expression yields, and the names it reads.
 
-    `<vars>` is a comma-separated list of environment variable names, `<runner>`
-    a script path relative to the crate root or `-` for a surface no script
-    runs, `<measures>` prose, and `<cells>` a comma-separated list in the same
-    grammar the coverage cells use.
+    `None` when the expression is not arithmetic over the load's variables and
+    integer literals. The expression is parsed, never evaluated as Python: only
+    `+`, `*`, parentheses, integer literals and the load's own variables reach a
+    value, so a declaration cannot smuggle in anything else.
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return None
+    names: set[str] = set()
+    value = _load_expression_node(tree.body, sizes, names)
+    if value is None:
+        return None
+    return value, names
+
+
+def _load_expression_node(
+    node: ast.AST, sizes: dict[str, int], names: set[str]
+) -> int | None:
+    """One arithmetic node of a load expression, or None if it is not one."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        return None
+    if isinstance(node, ast.Name):
+        names.add(node.id)
+        return sizes.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mult)):
+        left = _load_expression_node(node.left, sizes, names)
+        right = _load_expression_node(node.right, sizes, names)
+        if left is None or right is None:
+            return None
+        return left + right if isinstance(node.op, ast.Add) else left * right
+    return None
+
+
+def parse_env_tier_load(
+    text: str, name: str, variables: tuple[str, ...], problems: list[str]
+) -> EnvTierLoad | None:
+    """Parse a surface's `<load>` field, or name what is wrong with it.
+
+    `<var>=<count>` records one of the surface's own variables at the count the
+    measurement sized it to, and the reserved keys state the rest of the
+    measurement: `total=<expr>` the count the shape yields, `wall=<seconds>s`
+    the wall clock it took, and `bound=<rate>/<unit>` the detection limit it
+    supports. `<expr>` is arithmetic over the named variables and integer
+    literals — `5*SOAK_DIALERS*SOAK_ITERATIONS+SOAK_DIALERS*10` — because a
+    shape's count is a product of its factors only for a surface with one
+    regime; what a checker can hold to the shape is that its count is derived
+    from the recorded sizes rather than restated beside them.
+    """
+    problem = False
+    counts: dict[str, str] = {}
+    for item in [part.strip() for part in text.split(",") if part.strip()]:
+        key, separator, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not separator or not key or not value:
+            problems.append(
+                f"gate-env-tier surface {name}: load {item!r} is not "
+                "'<key>=<value>'"
+            )
+            problem = True
+            continue
+        if key in counts:
+            problems.append(
+                f"gate-env-tier surface {name}: load {key} named more than once"
+            )
+            problem = True
+            continue
+        counts[key] = value
+    factors: list[tuple[str, int]] = []
+    for key, value in counts.items():
+        if key in ENV_TIER_LOAD_RESERVED:
+            continue
+        if key not in variables:
+            problems.append(
+                f"gate-env-tier surface {name}: load key {key!r} is neither "
+                f"{', '.join(ENV_TIER_LOAD_RESERVED)} nor a variable of the "
+                f"surface ({', '.join(variables)}); a load shape is sized by "
+                "the surface's own variables"
+            )
+            problem = True
+            continue
+        if not ENV_TIER_LOAD_COUNT_RE.match(value) or int(value) < 1:
+            problems.append(
+                f"gate-env-tier surface {name}: load {key}={value} is not a "
+                "positive count of that variable"
+            )
+            problem = True
+            continue
+        factors.append((key, int(value)))
+    if not factors:
+        problems.append(
+            f"gate-env-tier surface {name}: its load names no variable of the "
+            "surface; a shape is the surface's own knobs at the values the "
+            "measurement sized them to"
+        )
+        problem = True
+    if problem:
+        return None
+    total_text = counts["total"] if "total" in counts else None
+    if total_text is None:
+        problems.append(
+            f"gate-env-tier surface {name}: its load states no total; the "
+            "count the shape yields is what a cost is stated against"
+        )
+        return None
+    evaluation = load_expression(total_text, dict(factors))
+    if evaluation is None:
+        problems.append(
+            f"gate-env-tier surface {name}: load total={total_text} is not "
+            "arithmetic over the named variables and integer literals "
+            "('5*SOAK_DIALERS*SOAK_ITERATIONS+SOAK_DIALERS*10')"
+        )
+        return None
+    total, named = evaluation
+    if not named:
+        problems.append(
+            f"gate-env-tier surface {name}: load total={total_text} yields a "
+            "count from no variable of the shape; the count a shape yields is "
+            "derived from its own sizes"
+        )
+        return None
+    if total < 1:
+        problems.append(
+            f"gate-env-tier surface {name}: load total={total_text} is not a "
+            "positive count"
+        )
+        return None
+    wall_match = ENV_TIER_LOAD_WALL_RE.match(counts.get("wall", ""))
+    if wall_match is None or float(wall_match.group(1)) <= 0:
+        problems.append(
+            f"gate-env-tier surface {name}: load wall={counts.get('wall')} is "
+            "not a positive duration in seconds ('1.97s'); a load shape with "
+            "no measured wall clock is not a cost"
+        )
+        return None
+    bound = counts.get("bound", "")
+    if bound:
+        bound_match = ENV_TIER_LOAD_BOUND_RE.match(bound)
+        if bound_match is None or float(bound_match.group(1)) <= 0:
+            problems.append(
+                f"gate-env-tier surface {name}: load bound={bound} is not a "
+                "positive rate ('1.8e-4/dial'); a bound is stated per what it "
+                "bounds"
+            )
+            return None
+    return EnvTierLoad(
+        tuple(factors),
+        total_text,
+        total,
+        float(wall_match.group(1)),
+        bound,
+    )
+
+
+def parse_env_tier(text: str, problems: list[str]) -> list[EnvTier]:
+    """Parse `gate-env-tier` rows.
+
+    `<name> = <vars> | <runner> | <measures> | <cells> [| <load>]`, where
+    `<vars>` is a comma-separated list of environment variable names,
+    `<runner>` a script path relative to the crate root or `-` for a surface
+    no script runs, `<measures>` prose, `<cells>` a comma-separated list in the
+    same grammar the coverage cells use, and `<load>` the optional shape the
+    surface's cost was measured under.
     """
     surfaces: list[EnvTier] = []
     seen: set[str] = set()
@@ -2975,13 +3187,14 @@ def parse_env_tier(text: str, problems: list[str]) -> list[EnvTier]:
             problems.append(f"gate-env-tier: duplicate surface {name!r}")
             continue
         fields = [field.strip() for field in rest.split("|")]
-        if len(fields) != 4:
+        if len(fields) not in (4, 5):
             problems.append(
                 f"gate-env-tier surface {name}: expected '<vars> | <runner> | "
-                f"<measures> | <cells>', got {len(fields)} field(s)"
+                f"<measures> | <cells> [| <load>]', got {len(fields)} field(s)"
             )
             continue
-        variables_text, runner, measures, cells_text = fields
+        variables_text, runner, measures, cells_text = fields[:4]
+        load_text = fields[4] if len(fields) == 5 else None
         problem = False
         variables = [item.strip() for item in variables_text.split(",") if item.strip()]
         if not variables:
@@ -3032,10 +3245,17 @@ def parse_env_tier(text: str, problems: list[str]) -> list[EnvTier]:
                     f"gate-env-tier surface {name}: cell {cell!r} is malformed: {issue}"
                 )
                 problem = True
+        load = None
+        if load_text is not None:
+            load = parse_env_tier_load(load_text, name, tuple(variables), problems)
+            if load is None:
+                problem = True
         if problem:
             continue
         seen.add(name)
-        surfaces.append(EnvTier(name, tuple(variables), runner, measures, tuple(cells)))
+        surfaces.append(
+            EnvTier(name, tuple(variables), runner, measures, tuple(cells), load)
+        )
     return surfaces
 
 

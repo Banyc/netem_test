@@ -1497,6 +1497,96 @@ class CheckGateEnvTierScriptlessTest(EnvTierFixture):
         )
 
 
+class CheckGateEnvTierLoadTest(EnvTierFixture):
+    """The load shape and cost a surface records with its declaration.
+
+    A cost stated in prose is read by nothing; the field is written so its
+    count is derived from the sizes it records, its keys are the surface's own
+    variables, and those variables are the ones the runner sets -- so the
+    recorded shape is the shape the runner runs.
+    """
+
+    EXTRA_SOURCES = {"src/wake_knob.rs": WAKE_KNOB_RS}
+
+    CHURN = (
+        "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS,FIXTURE_WAKE_BOUND "
+        "| local/run_env.py | per-dial loss rate under a sized load "
+        "| fixture-liveness@shape=churn"
+    )
+
+    def test_a_load_shape_is_recorded_and_evaluated(self):
+        self.declare(
+            self.CHURN
+            + "\nfixture-load = FIXTURE_ITERATIONS,FIXTURE_ROUNDS "
+            "| local/run_env.py | per-dial loss rate at a stated cost "
+            "| fixture-liveness@shape=churn "
+            "| FIXTURE_ITERATIONS=100,FIXTURE_ROUNDS=8,"
+            "total=FIXTURE_ITERATIONS*FIXTURE_ROUNDS,wall=2.5s,bound=3e-4/dial"
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn(
+            "gate-env-tier-load: fixture-load "
+            "FIXTURE_ITERATIONS*FIXTURE_ROUNDS = 800, 2.5s, bound 3e-4/dial",
+            output,
+        )
+
+    def test_a_load_whose_total_is_not_arithmetic_fails(self):
+        self.declare(
+            self.CHURN
+            + "\nfixture-load = FIXTURE_ITERATIONS | local/run_env.py "
+            "| per-dial loss rate at a stated cost "
+            "| fixture-liveness@shape=churn "
+            "| FIXTURE_ITERATIONS=100,total=2*,wall=2.5s"
+        )
+        self.rejects(
+            "load total=2* is not arithmetic over the named variables"
+        )
+
+    def test_a_load_total_no_variable_produces_fails(self):
+        self.declare(
+            self.CHURN
+            + "\nfixture-load = FIXTURE_ITERATIONS | local/run_env.py "
+            "| per-dial loss rate at a stated cost "
+            "| fixture-liveness@shape=churn "
+            "| FIXTURE_ITERATIONS=100,total=800,wall=2.5s"
+        )
+        self.rejects("load total=800 yields a count from no variable")
+
+    def test_a_load_with_no_wall_clock_fails(self):
+        self.declare(
+            self.CHURN
+            + "\nfixture-load = FIXTURE_ITERATIONS | local/run_env.py "
+            "| per-dial loss rate at a stated cost "
+            "| fixture-liveness@shape=churn "
+            "| FIXTURE_ITERATIONS=100,total=FIXTURE_ITERATIONS*8"
+        )
+        self.rejects("load wall=None is not a positive duration")
+
+    def test_a_load_sizing_a_variable_the_runner_does_not_set_fails(self):
+        self.declare(
+            self.CHURN
+            + "\nfixture-load = FIXTURE_WAKE_BOUND | local/run_env.py "
+            "| the wake bound at a stated cost "
+            "| fixture-wake@shape=handover "
+            "| FIXTURE_WAKE_BOUND=50,total=FIXTURE_WAKE_BOUND*2,wall=0.5s"
+        )
+        self.rejects(
+            "its load sizes FIXTURE_WAKE_BOUND, which the runner "
+            "'local/run_env.py' does not set"
+        )
+
+    def test_a_row_with_a_sixth_field_is_refused(self):
+        self.declare(
+            self.CHURN
+            + "\nfixture-load = FIXTURE_ITERATIONS | local/run_env.py "
+            "| the load at a stated cost | fixture-liveness@shape=churn "
+            "| FIXTURE_ITERATIONS=100,total=FIXTURE_ITERATIONS*8,wall=0.5s "
+            "| extra"
+        )
+        self.rejects("got 6 field(s)")
+
+
 class CheckGateScenarioDirectoryTest(CheckGatePerfFixture):
     """`--crate`'s scenario directory is reconciled with the package's targets.
 
