@@ -135,6 +135,16 @@ On that pin:
   six-datagram cover is exhausted, each further rung waits
   `TAIL_PROBED_MIN_RTO` (`300 ms`) compounded onto the current RTO, so one
   losing episode's latency is a multiple of 300 ms.
+- **Known-wrong in `rtp_mux`, recorded 2026-09-26.**
+  `crates/rtp_mux/GATE.md:158` names the hostile defect's mechanism as "the
+  1 s `MIN_RTO` repair floor plus exponential backoff", which understates what
+  was measured — the compounding `TAIL_PROBED_MIN_RTO` (`300 ms`) rung ladder
+  above (a seeded probe produces 613/918/1222/1520 ms rungs; the field's 1063
+  and 3205 ms maxima are 3 and 10 rungs). `GATE.md:66` and
+  `tests/dual_lane_mandates.rs:17` there also cite "the README's zero >250 ms
+  spikes criterion", but no README in `rtp_mux`, `rtp` or `mux` states it —
+  the phrase is in `netem_test/tests/README.md`. Both are corrections for the
+  next agent in that crate, which was held by another agent at this writing.
 - **Clean-arm own wire is back at ~3.63×** after the revert, at its
   pre-regression level; the constitution arm's `both` case is what
   `rtp_mux/GATE.md` records as ~3.6×. (The `clean` smoke arm reads ~2.2× on
