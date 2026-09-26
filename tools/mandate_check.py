@@ -149,9 +149,13 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   from). ``timings`` and ``mandates`` are unchanged, so a reader of
   ``mandate-check/2`` keeps working.
 
-The six expected evidence files and the ``plots`` directory are removed from
-``--dir`` before the smoke set runs, so evidence found afterwards was
-produced by this run rather than left behind by an earlier one.
+The eight expected evidence files, the ``plots`` directory, and this
+command's own ``mandate-check.json`` and ``mandate-smoke.log`` are removed from
+``--dir`` before the smoke set runs, so evidence found afterwards was produced
+by this run rather than left behind by an earlier one. The previous report is
+removed for the same reason the evidence is: ``tools/mandate-compare`` reads
+``<dir>/mandate-check.json``, so a report surviving a run that wrote none would
+be compared as if it were that run's measurement.
 
 ## Exit codes
 
@@ -777,7 +781,16 @@ def _capture(command, *, cwd):
 
 
 def prepare_output_dir(out_dir):
-    """Create the run directory and clear the evidence a previous run left.
+    """Create the run directory and clear what an earlier run left in it.
+
+    Every file this command's run writes is removed: the eight evidence files
+    the smoke set produces, the ``plots`` directory, this command's report and
+    the smoke set's log. The report is removed for the same reason the
+    evidence is — a reader (``tools/mandate-compare``) reads
+    ``<dir>/mandate-check.json``, so one surviving a run that wrote none would
+    be read as that run's measurement. Removal happens before the smoke set is
+    built and before the checkout is validated, so no exit path can leave a
+    previous run's report standing.
 
     Only the files this command owns are removed, and only from a directory
     that is either empty or carries a previous run's report or log. A
@@ -801,6 +814,10 @@ def prepare_output_dir(out_dir):
             f"command ({REPORT_NAME} or {LOG_NAME}), so it is not this "
             "command's directory to clear; pass an empty --dir"
         )
+    for name in (REPORT_NAME, LOG_NAME):
+        stale = out_dir / name
+        if stale.is_file():
+            stale.unlink()
     for mandate in MANDATE_IDS:
         for suffix in (".json", ".csv"):
             stale = out_dir / f"{mandate}{suffix}"
@@ -1305,12 +1322,15 @@ def main(argv=None):
     try:
         if args.timeout <= 0:
             raise MandateCheckError("--timeout must be positive")
-        crate = resolve_crate(args.rtp_mux)
         if args.dir is not None:
             out_dir = args.dir.expanduser().resolve()
         else:
             out_dir = default_out_dir()
+        # The run directory is cleared before anything is validated, so that
+        # no later failure can leave an earlier run's report standing where a
+        # comparison would read it as this run's.
         prepare_output_dir(out_dir)
+        crate = resolve_crate(args.rtp_mux)
         cargo = shutil.which(args.cargo)
         if cargo is None:
             raise MandateCheckError(

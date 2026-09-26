@@ -178,12 +178,16 @@ The verdict block printed on stdout carries the same information: the
 revision and command, one line per mandate with its measured values, the
 plot paths, the verdict, and every problem.
 
-The six expected evidence files and the `plots` directory are removed from
-`--dir` before the smoke set runs, so evidence found afterwards was produced
-by this run and not left behind by an earlier one. Only a directory that is
-empty or that carries an earlier run's `mandate-check.json` or
-`mandate-smoke.log` is cleared; a directory holding anything else is refused
-rather than trimmed.
+The eight expected evidence files, the `plots` directory, this command's own
+`mandate-check.json`, and `mandate-smoke.log` are removed from `--dir` before
+the smoke set runs — and before the `rtp_mux` checkout is validated — so
+evidence found afterwards was produced by this run and not left behind by an
+earlier one. Removing the earlier report is as load-bearing as removing the
+evidence: `tools/mandate-compare` reads `<dir>/mandate-check.json`, so a report
+that survived a run which wrote none would be compared as if it were that
+run's measurement. Only a directory that is empty or that carries an earlier
+run's `mandate-check.json` or `mandate-smoke.log` is cleared; a directory
+holding anything else is refused rather than trimmed.
 
 ## The per-test timings
 

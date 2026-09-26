@@ -584,6 +584,42 @@ class MandateCheckTest(unittest.TestCase):
         self.assertNotEqual(rendered, "<svg/>")
         self.assertNotIn("stale", (self.out / "M1.csv").read_text(encoding="utf-8"))
 
+    def test_a_run_that_writes_no_report_leaves_no_earlier_runs_report(self):
+        # `tools/mandate-compare` reads `<dir>/mandate-check.json`, so a report
+        # left behind by an earlier run is compared as if it were this run's
+        # measurement. A run that cannot write its own report must therefore
+        # leave none at all: not the report, not the log that explains what the
+        # smoke set printed, and not an evidence file.
+        self.out.mkdir(parents=True)
+        stale_report = self.out / MANDATE_CHECK.REPORT_NAME
+        stale_report.write_text(
+            json.dumps({"schema": "mandate-check/3", "ok": True, "verdict": "PASS"}),
+            encoding="utf-8",
+        )
+        stale_log = self.out / MANDATE_CHECK.LOG_NAME
+        stale_log.write_text("an earlier run's smoke-set output\n", encoding="utf-8")
+        (self.out / "M1.csv").write_text(
+            "panel,series,x,y\nstale,stale,0,1\n", encoding="utf-8"
+        )
+        # The run cannot do its job: the smoke set source is gone, so the
+        # command fails before it writes anything.
+        (self.crate / "tests" / "mandate_smoke.rs").unlink()
+        code, stdout, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("does not exist", stderr)
+        self.assertFalse(
+            stale_report.exists(),
+            "the earlier run's report survived a run that wrote none, so a "
+            "later comparison would read it as this run's measurement",
+        )
+        self.assertFalse(
+            stale_log.exists(),
+            "the earlier run's log survived a run that wrote none, so it "
+            "describes a different run than the one that just failed",
+        )
+        self.assertFalse((self.out / "M1.csv").exists())
+        self.assertFalse((self.out / "plots").exists())
+
     def test_a_foreign_non_empty_dir_is_refused_rather_than_cleared(self):
         self.out.mkdir(parents=True)
         stranger = self.out / "notes.txt"
@@ -1035,6 +1071,14 @@ class MandateCheckTest(unittest.TestCase):
         self.assertIn("does not exist", stderr)
 
     def test_missing_cargo_is_refused(self):
+        # The previous run's report is seeded first: a run refused after the
+        # run directory was prepared must not leave it behind for a later
+        # comparison to read as this run's measurement.
+        self.out.mkdir(parents=True)
+        stale_report = self.out / MANDATE_CHECK.REPORT_NAME
+        stale_report.write_text(
+            json.dumps({"schema": "mandate-check/3", "ok": True}), encoding="utf-8"
+        )
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             code = MANDATE_CHECK.main(
@@ -1049,6 +1093,7 @@ class MandateCheckTest(unittest.TestCase):
             )
         self.assertEqual(code, 2)
         self.assertIn("was not found on PATH", stderr.getvalue())
+        self.assertFalse(stale_report.exists())
 
     def test_a_plot_that_cannot_be_produced_is_refused(self):
         code, stdout, stderr = self.run_tool(
