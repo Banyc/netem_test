@@ -4,7 +4,9 @@
 unenforced there. This file is the exact set of blocks that crate's `GATE.md`
 needs: the `gate-perf-design` rows, the `gate-budgets` block and the
 `gate-coverage-gaps` lines. Every row also declares its relation to the
-baseline of its own family (see "The relation each row declares" below). It is
+baseline of its own family (see "The relation each row declares" below), and
+the family membership those relations imply is derived from the rows' cells in
+"Family membership" below. It is
 a draft, not an
 authority — the numbers become `rtp_mux`'s when that crate's iteration lands
 them in its own `GATE.md`, where `python3 ../netem_test/tools/check-gate.py
@@ -83,8 +85,9 @@ disagrees with that derivation, so these are not a judgement call. Nor is a
 row stated against a reference of a family it belongs to by inspection: which
 family a row belongs to is exactly what the `@<family>` suffix declares, and
 `check-gate.py` only enforces that the family exists, that a family's
-reference row carries its `baseline@<family>` label, and that every declared
-family is used by some row.
+reference row carries its `baseline@<family>` label, that every declared
+family is used by some row, and that the row's cells lie in the family's own
+**cell-name namespace** (`members.<family>`, see "Family membership" below).
 
 The set splits into **29 families** plus the default: the four mandates, the
 constitution gate, the per-target probe groups (the rtp and mux echo ceilings,
@@ -97,6 +100,23 @@ states that family's common context most completely — which is what makes a
 member one dimension away attributable — never a retuned arm. Against those
 references the 94 rows are **46 orthogonal**, **16 composite**, **3
 re-measurement** and **29 baseline** (one per family).
+
+**The reference is still a choice, and deriving it does not work by the obvious
+rule.** Membership is derived from the cells ("Family membership" below), but
+the family's *reference row* is not: the natural derivation — take the member
+that makes the most of its family orthogonal — fails both ways. It does not
+pin one: all 4 of the harness's families and 16 of this draft's 29 have several
+max-orthogonality members (`probe` has three). And it points the wrong way: the
+checker derives a row's varied dimensions from *the row's own keys*, so a
+sparser reference scores at least as well as a richer one — the harness's
+five-dimension default baseline ties at 7 orthogonal with
+`netem_reorder_with_rate_jumps_ahead`, whose cell states two dimensions. Every
+declared reference (all 33) does attain its family's maximum, so no family's
+orthogonal count is depressed by the choice — but for the three families whose
+tied references split differently (`probe` 2/0/1 against 2/1/0; this draft's
+`fairness` 1/2/1 against 1/3/0 and `interactive` 1/1/1 against 1/2/0) the
+composite and re-measurement counts are reference-dependent, and the reference
+remains a declaration the checker takes as given.
 
 The composites are the 14 rows for which no arm in their own family is within
 one declared dimension, plus 2 whose nearest declared arm sits in another
@@ -127,6 +147,105 @@ family is a **new** arm stated one axis away from a reference, and that is a
 change to the tests, not to these labels. Nothing the draft cannot determine
 was guessed: the labels are the checker's derivation, and the `TBD` costs stay
 `TBD`.
+
+## Family membership
+
+A `@<family>` suffix is a claim that the row **belongs** to that family, and
+`check-gate.py` derives that membership from the row's own cells rather than
+taking the label: each family declares the **cell-name namespace** its rows
+live in (`members.<family> = <prefix>`, a cell's property name optionally
+followed by `*`), a cell name may not be claimed by two families, a family's
+namespace must contain its own reference row, and a row whose cells are named
+by a family's namespace must state against it. The default family owns the
+**residual**: every cell name no `members.<family>` claims.
+
+Applied to this draft that derivation rejects most of it. The proposed
+namespaces below are the narrowest prefix each family's own cells support, and
+where they share none, the reference's own cell name:
+
+```gate-members-proposed
+members.constitution = M*
+members.contested = contested
+members.decomposition = frame-reorder*
+members.dual-lane = hol-dual-lane*
+members.fairness = multi-flow-longrun*
+members.fec = fec-tuning*
+members.fec-instrument-sanity = instrument-sanity
+members.frame-reorder = frame-reorder-fec
+members.hol-cap400 = hol*
+members.hol-dual-lane-frame = hol-dual-lane*
+members.hol-ge5-shared = hol*
+members.hol-ge5-solo = hol
+members.hol-rtt40 = hol
+members.hol-shared-frame = hol-*
+members.hol-solo = hol
+members.hol-split = hol
+members.hol-verify4 = bulk-lane-ab
+members.hostile-probes = ceiling*
+members.instrument-sanity = instrument-sanity
+members.interactive = M*
+members.latency-sweep = M1
+members.lone-tail = M1*
+members.m3-bulk = M3
+members.mux-ceiling-echo = loopback-ceiling
+members.mux-ceiling-sink = loopback-ceiling
+members.mux-over-rtp = mux-over-rtp*
+members.reorder = reorder-*
+members.rtp-ceiling = ceiling
+```
+
+`tools/test_pending_declaration.py` runs the checker's membership derivation on
+this proposal and pins the result, so the numbers below cannot rot:
+
+- **14 cell names are claimed by two or more families**: `M1` (constitution,
+  interactive, latency-sweep, lone-tail), `M2` (constitution, interactive),
+  `M3` (constitution, interactive, m3-bulk), `M4` (constitution, interactive),
+  `ceiling` (hostile-probes, rtp-ceiling), `contested` (contested,
+  hostile-probes), `frame-reorder-fec` (decomposition, frame-reorder), `hol`
+  (hol-cap400, hol-ge5-shared, hol-ge5-solo, hol-rtt40, hol-solo, hol-split),
+  `hol-dual-lane` (dual-lane, hol-cap400, hol-dual-lane-frame,
+  hol-ge5-shared, hol-shared-frame), `hol-fec`, `hol-fec-recovery`,
+  `hol-frame` and `hol-paced` (each hol-cap400, hol-ge5-shared,
+  hol-shared-frame), `instrument-sanity` (fec-instrument-sanity,
+  instrument-sanity) and `loopback-ceiling` (mux-ceiling-echo,
+  mux-ceiling-sink). Where a cell name recurs the families sharing it are *not*
+  distinguishable by their cells: the `hol_probe` families differ in their
+  dimensions' values, not in the names their cells carry.
+- **8 families span more than one cell name**, so no single namespace covers
+  them: `decomposition` (`frame-reorder`, `loss-vs-queue`), `dual-lane`
+  (`hol-dual-lane`, `dual-lane-matched-load`), `fairness` (`M4`,
+  `fairness-sweep`, `fairness-longrun`, `dual-lane-longrun`,
+  `multi-flow-longrun`), `fec` (`fec-tuning`, `hol-fec-recovery`),
+  `hol-dual-lane-frame` (`M4`, `hol`, `hol-dual-lane`), `hostile-probes`
+  (`ceiling`, `contested`, `mux-over-rtp`), `lone-tail` (`M1`,
+  `non-loss-impairment`) and `mux-over-rtp` (`mux-over-rtp`,
+  `small-stream-while-bulk`).
+- **81 of the 94 rows state a family whose namespace does not name their
+  cells**: 13 whose cells carry a name the family does not claim, and 68 whose
+  cells carry a name two or more families claim.
+- **Both composite artefacts of the free label fail.**
+  `rtp_mux_jitter::jitter_interactive_bulk_and_loss` carries the cell name
+  `M2`, which `constitution` and `interactive` both claim, so its
+  `@interactive` cannot be derived from its cells;
+  `rtp_mux_jitter::jitter_nonloss_impairments` carries `non-loss-impairment`,
+  which its family's `M1*` namespace does not claim, so neither `@lone-tail`
+  nor any other declared family holds it. Both are one declared dimension from
+  arms in other families *because their cells are foreign to the family they
+  name* - the free label was hiding exactly that.
+
+None of this is a reason to retune an arm. A row whose cells are foreign to its
+family is closed by a **new** single-axis arm whose cell carries the family's
+name, or by splitting the family so each half owns one name; renaming an
+existing cell is a change to that arm's declaration and is out of scope here.
+Re-cutting the families *by* cell name, which is what the rule would force,
+replaces the 29 context families with the cell-name groups, and measured on
+these 94 rows it costs the attribution: the `hol` group becomes one family of
+27 rows with 7 orthogonal and 19 composite, the `M1` group one family of 9 with
+1 orthogonal, 6 composite and 1 re-measurement, and 15 of the resulting groups
+hold a single row, whose reference no sibling row states against (the
+stale-reference failure). The draft therefore records the conflict instead of
+pretending its partition is derived: the families stay as they are, and the
+membership block above is a proposal whose rejection *is* the finding.
 
 ## The blocks to paste into `crates/rtp_mux/GATE.md`
 
@@ -271,7 +390,11 @@ gate) and 4135 s in `perf` (26 rows, 7 of them still `TBD`); `standard` and
 `full` hold only ceilings until their rows are measured. Set each tier's budget
 to its measured sum plus headroom **as a declared change** once the `TBD` rows
 have been measured — a tier sum over its budget is a checker failure, so an
-unmeasured budget is what forces the measurement.
+unmeasured budget is what forces the measurement. The block carries no
+`members.<family>` lines: the namespaces it would need are in "Family
+membership" above, and 81 of the 94 rows' cells contradict their family's, so
+applying them verbatim would make the crate's gate red on the day it is pasted
+rather than land a declaration that enforces something.
 
 The gaps below record two kinds of hole. The cells the product does not claim
 (`M1@lane=single`, `soak@scale=multi-hour`, …) are the first. The
@@ -309,7 +432,16 @@ attribution@baseline-family=lone-tail = rtp_mux_jitter::jitter_request_response_
    without a number are the `hol_probe`, ceiling-probe and longrun rows.
 2. Paste the three blocks into `crates/rtp_mux/GATE.md` next to the existing
    ones, and set each tier budget from the measured sums.
-3. Run `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`
+3. **Decide the families by their cells before pasting.** The three blocks do
+   not carry `members.<family>` lines because the proposal in "Family
+   membership" is rejected: 14 cell names are claimed by two or more of the
+   draft's families and 81 of its 94 rows state a family whose namespace does
+   not name their cells. Land the declaration either with the rows refiled
+   into cell-name-coherent families — a change to the labels, not to any
+   window, cadence or tier — or with a new single-axis arm per foreign row,
+   and only then add the `members.<family>` lines `check-gate.py` requires;
+   pasting them as they stand is a red gate.
+4. Run `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`
    through `tools/mandate-check`, then
    `python3 ../netem_test/tools/check-gate.py --crate . rtp_mux tests GATE.md
    --mandate-check-json <run>/mandate-check.json`. The checker resolves every

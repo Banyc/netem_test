@@ -113,6 +113,25 @@ the family whose reference the row is, a relation naming a family the block
 does not declare, and a declared baseline no row states a relation against are
 all errors.
 
+**Membership is a property of the row, not of the label.** Stating a relation
+against a family is a claim that the row belongs to it, so every named family
+also declares the **cell-name namespace** its rows live in:
+`members.<family> = <prefix>` names the prefix a cell's property (the part
+before the `@`) starts with — a bare name for an exact namespace, `name*` for a
+prefix. The checker then derives membership from the row's own cells: every
+cell of a row must be named by the namespace of the family it names, a cell
+name may not be claimed by two families, a family's namespace must contain its
+own reference row (the family is identified by the cells its reference
+carries), and a row whose cells are named by a family's namespace must state
+against that family. The **default** family is the *residual*: it owns every
+cell name no `members.<family>` claims, which is the shape a crate's own
+conformance (or mandate) vocabulary has — the harness's default spans
+`baseline`, `blackout` and `conformance-*` and shares no prefix — so it needs
+no line, and the run summary prints those residual names so a new one is
+visible rather than silent. Every failure names the line or the row and what
+to write instead: the checker computes the prefix the family's own cells
+support, or names the family whose namespace already claims the row's cells.
+
 The checker derives the dimensions the row varies from the row's own cells
 against that family's reference. A
 dimension whose value differs from the baseline's — **including one the
@@ -150,23 +169,35 @@ reference never states is counted as varying it even when the value is the
 reference's own state.
 
 The family labels are themselves a declaration, and this is the limit the
-several-baselines form **adds**. The checker can see that a family is declared,
-that its reference row exists, that its reference row is labelled as such, that
-a relation names a family that exists, and that some row other than the
-reference states against it. It cannot see whether a row is in the *right*
-family: a row whose cells happen to vary one dimension from another family's
-reference may be stated against it and pass, and the label is only as honest
-as its author. What is **partition-invariant**, and therefore the number to
-read for shortening, is how many rows have *some* other row one dimension
-away at all: a row with a one-dimension relative is attributable to that
-dimension whichever family it is filed under, and a row with none — every
+several-baselines form **adds**. The checker derives membership from the row's
+cells against the family's declared cell-name namespace, so a row cannot be
+filed under a family whose cells are not named like its own: the label has to
+agree with the cells. What it still cannot see is whether the *declaration* is
+apt — the namespace is written by the author, so a family whose name does not
+match its cells is caught only when the cells of two families collide, and a
+cell name quietly added to a family's namespace is exactly as honest as its
+author. It also cannot see the code: a row whose cells are foreign to its
+family is reported, but whether the arm really measures the cell it names is
+not, which is what the settings' immutability and `tools/mandate-compare`'s
+per-arm record are for. What is **partition-invariant**, and therefore the
+number to read for shortening, is how many rows have *some* other row one
+dimension away at all: a row with a one-dimension relative is attributable to
+that dimension whichever family it is filed under, and a row with none — every
 other arm two or more declared dimensions away — cannot be attributed however
 the families are cut. The declared composites are the rows that landed on the
 second side of that line; the rows that landed on the first but serve as their
 family's reference are the baseline rows. A family whose only sibling is two
 or more dimensions away has **no usable baseline**, and the only honest
 outcomes are a new single-axis arm beside it or a composite label naming what
-it does vary.
+it does vary. The **reference row** is still a declaration: the obvious way to
+derive it — the member that makes the most of its family orthogonal — does not
+pin one (several members tie in every family of both landed declarations) and
+points the wrong way, because the varied dimensions are counted from *the row's
+own keys*, so a sparser reference scores at least as well as a richer one. The
+orthogonal count of a family is therefore the declared reference's, and where
+tied references split differently the composite/re-measurement counts move with
+the choice, so the reference stays visible in the run summary and in
+`tools/mandate-compare`'s per-arm record rather than being claimed derivable.
 
 `tools/check-gate.py` enforces the declaration for any crate whose `GATE.md`
 carries the blocks: an unknown target, an unknown test, a test declared in the
@@ -175,8 +206,14 @@ gap without a reason, a missing `baseline`, a named baseline whose row does not
 exist, a baseline no row states a relation against, a relation naming an
 undeclared family, a `baseline` label on a row that is not that family's
 reference, a row that is the reference of more than one family, an unlabelled
-row, a relation that disagrees with the row's cells, and an ambiguous row are
-all failures that name the problem. It runs the same way as the other gate
+row, a relation that disagrees with the row's cells, an ambiguous row, a family
+with no `members.<family>` namespace, a namespace naming an undeclared family,
+a malformed namespace, a bare `members` line, a duplicate namespace, a
+namespace no row's cell name falls in, a namespace that misses its own rows, a
+reference row outside its own namespace, a row whose cells are not named by the
+namespace of the family it names, a cell name claimed by two families, and a
+default-family row whose cells a named family claims are all failures that name
+the problem and what to write instead. It runs the same way as the other gate
 checks:
 
 ```sh

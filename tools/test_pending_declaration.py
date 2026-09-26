@@ -47,6 +47,7 @@ class PendingDeclarationTest(unittest.TestCase):
         self.design = block("gate-perf-design")
         self.budgets_text = block("gate-budgets")
         self.gaps = block("gate-coverage-gaps")
+        self.members_text = block("gate-members-proposed")
         budgets = {}
         baseline = None
         named = {}
@@ -193,6 +194,135 @@ class PendingDeclarationTest(unittest.TestCase):
             self.assertTrue(separator, f"gap line {line!r} is not '<cell> = <reason>'")
             self.assertIsNone(CHECK_GATE.cell_problem(cell.strip()), f"gap cell {cell!r} is malformed")
             self.assertTrue(reason.strip(), f"gap {cell!r} records no reason")
+
+
+class PendingMembershipTest(unittest.TestCase):
+    """The draft's families are not a partition of its cell names.
+
+    `check-gate.py` derives a row's family from its cells: a family declares
+    the cell-name namespace its rows live in (`members.<family> = <prefix>`),
+    a cell name may not be claimed by two families, and a row whose cells are
+    named by a family's namespace must state against it. The draft's 29 context
+    families share 14 cell names and 8 of them span more than one name, so the
+    declaration the rule needs does not exist for them: the proposal in
+    `tools/PERF_PENDING_rtp_mux.md` ("Family membership") is run here and its
+    rejection is pinned, so the conflict is a recorded number rather than a
+    claim in prose - and a change to the draft's cells or families cannot shift
+    it silently.
+    """
+
+    def setUp(self):
+        text = DRAFT.read_text(encoding="utf-8")
+        design = re.search(r"```gate-perf-design\n(.*?)```", text, re.S).group(1)
+        design = re.sub(r"\| TBD \|", "| 0 |", design)
+        self.rows = CHECK_GATE.parse_perf_design(design, [])
+        budgets_text = block("gate-budgets")
+        self.members = {}
+        for line in block("gate-members-proposed").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, separator, value = line.partition(" = ")
+            self.assertTrue(separator, f"membership line {line!r} is not '<key> = <prefix>'")
+            self.assertTrue(key.startswith("members."), key)
+            self.assertTrue(
+                CHECK_GATE.MEMBERSHIP_PREFIX_RE.match(value.strip()),
+                f"{key} = {value!r} is not a cell-name namespace",
+            )
+            self.members[key[len("members.") :]] = value.strip()
+        problems: list[str] = []
+        self.budgets = CHECK_GATE.parse_perf_budgets(budgets_text, problems)
+        self.assertEqual(problems, [], "\n".join(problems))
+        self.assertNotIn(
+            "members",
+            budgets_text,
+            "the pasteable gate-budgets block must not carry the rejected "
+            "membership lines; they live in the gate-members-proposed block",
+        )
+        self.assertIsNotNone(self.members, "the draft proposes no membership")
+
+    def test_every_family_has_a_proposed_namespace(self):
+        self.assertEqual(sorted(self.members), sorted(self.budgets.named))
+
+    def test_the_proposal_is_rejected_with_the_recorded_numbers(self):
+        budgets = CHECK_GATE.PerfBudgets(
+            self.budgets.tiers,
+            self.budgets.baseline,
+            self.budgets.drift,
+            self.budgets.drift_floor_seconds,
+            self.budgets.named,
+            self.members,
+        )
+        problems: list[str] = []
+        summary = CHECK_GATE.check_perf_membership(self.rows, budgets, problems)
+        self.assertEqual(len(self.rows), 94)
+        self.assertEqual(len(problems), 103, "\n".join(problems))
+        collision = [
+            problem
+            for problem in problems
+            if "a cell name belongs to exactly one family" in problem
+        ]
+        self.assertEqual(len(collision), 14)
+        self.assertIn(
+            "  gate-perf-membership: 28 cell-name namespace(s) declared, 22 cell "
+            "name(s) claimed, 81 row(s) stated outside the namespace of the "
+            "family they name",
+            summary,
+        )
+        outside = [
+            problem
+            for problem in problems
+            if "the row's cells and the family it names disagree" in problem
+        ]
+        self.assertEqual(len(outside), 13)
+        joined = "\n".join(problems)
+        self.assertIn(
+            "gate-perf-design row rtp_mux_jitter::jitter_nonloss_impairments: "
+            "its cells are named non-loss-impairment, which members.lone-tail = "
+            "M1* does not claim",
+            joined,
+        )
+        ambiguous = [
+            problem
+            for problem in problems
+            if re.search(r"which \d+ families claim", problem)
+            and "disagree" not in problem
+        ]
+        self.assertEqual(len(ambiguous), 68)
+        self.assertEqual(len(outside) + len(ambiguous), 81)
+        self.assertIn(
+            "gate-perf-design row rtp_mux_jitter::jitter_interactive_bulk_and_loss: "
+            "its cells are named M2, which 2 families claim",
+            joined,
+        )
+
+    def test_the_families_that_span_two_cell_names_are_recorded(self):
+        """Eight families' cells share no prefix, so no namespace covers them."""
+        spanning = []
+        for family in sorted(self.members):
+            names = sorted(
+                {
+                    CHECK_GATE.cell_name(cell)
+                    for row in self.rows
+                    if (row.relation.family if row.relation else None) == family
+                    for cell in row.cells
+                }
+            )
+            if not CHECK_GATE.prefix_hint(names):
+                spanning.append(family)
+        self.assertEqual(
+            spanning,
+            [
+                "decomposition",
+                "dual-lane",
+                "fairness",
+                "fec",
+                "hol-dual-lane-frame",
+                "hostile-probes",
+                "lone-tail",
+                "mux-over-rtp",
+            ],
+        )
 
 
 if __name__ == "__main__":
