@@ -259,7 +259,6 @@ PRODUCER_KEYS = (
     "sections",
     "verdicts",
     "log",
-    "evidence",
 )
 REVISION_TIMEOUT_SECONDS = 30.0
 LOG_TAIL_LINES = 20
@@ -945,8 +944,6 @@ def _producer_problem(entry, seen):
             f"the producer {entry['id']!r} declares the verdict section(s) "
             f"{', '.join(outside)} it does not list among its sections"
         )
-    if not isinstance(entry["evidence"], bool):
-        return f"the producer {entry['id']!r} gives evidence neither true nor false"
     seen.add(entry["id"])
     return None
 
@@ -1377,7 +1374,9 @@ def producer_record(producer, out_dir):
         "path": None,
         "sections": list(producer["sections"]),
         "verdicts": list(producer["verdicts"]),
-        "evidence": producer["evidence"],
+        # Derived, not declared: a producer that prints a verdict line owes its
+        # evidence, so a registry entry cannot declare the guard away.
+        "evidence": bool(producer["verdicts"]),
         "log": str(out_dir / producer["log"]),
         "command": None,
         "revision": None,

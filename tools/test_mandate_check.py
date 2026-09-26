@@ -1466,6 +1466,10 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(report["producers"]["netem_test"]["arms"], 4)
         self.assertEqual(report["producers"]["netem_test"]["target"], "lib")
         self.assertFalse(report["producers"]["netem_test"]["verdicts"])
+        # Evidence is derived from the verdict sections, so the registry entry
+        # cannot declare the guard away.
+        self.assertFalse(report["producers"]["netem_test"]["evidence"])
+        self.assertTrue(report["producers"]["rtp_mux"]["evidence"])
         # The record a `mandate-check/4` reader reads stays the primary
         # producer's, not the second one's.
         self.assertEqual(report["smoke"]["producer"], "rtp_mux")
@@ -1657,6 +1661,19 @@ class MandateCheckTest(unittest.TestCase):
         problems = []
         self.assertIsNone(MANDATE_CHECK.load_producer_declaration(path, problems))
         self.assertIn("is declared by both", " ".join(problems))
+
+    def test_a_registry_entry_cannot_declare_its_evidence_away(self):
+        path = self.root / "producers.json"
+        declaration = json.loads(
+            (
+                WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME
+            ).read_text(encoding="utf-8")
+        )
+        declaration["producers"][1]["evidence"] = False
+        path.write_text(json.dumps(declaration), encoding="utf-8")
+        problems = []
+        self.assertIsNone(MANDATE_CHECK.load_producer_declaration(path, problems))
+        self.assertIn("unknown key(s) evidence", " ".join(problems))
 
     def test_default_rtp_mux_is_the_sibling_checkout(self):
         self.assertEqual(

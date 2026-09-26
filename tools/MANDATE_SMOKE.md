@@ -43,9 +43,10 @@ A producer is one entry of `tools/mandate-producers.json` (schema
   `--`;
 - `sections`, `verdicts` — every section an arm may be attributed to, and
   which of those print a `MANDATE` line and write plots (`verdicts ⊆`
-  `sections`);
+  `sections`); a producer with a verdict section owes that section's evidence,
+  which is derived rather than declared so a registry entry cannot declare the
+  guard away;
 - `log` — its own log file inside `--dir`;
-- `evidence` — whether the run owes plots and verdict lines;
 - `default_path` — its checkout, resolved against this workspace (a CLI path
   is resolved against the current directory instead).
 
