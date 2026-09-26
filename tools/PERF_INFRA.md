@@ -429,18 +429,21 @@ arm against its declared cell, not this comparison.
 ### The checked-in baseline
 
 `tools/mandate-baseline.json` is the `mandate-check.json` of one real
-`tools/mandate-check` run, checked in so a later run's numbers have a
-reference and prior panel state is recoverable. It was taken with
-`tools/mandate-check` (no arguments) on 2026-09-26, with `netem_test` at
-`c7c297f6` and the sibling `rtp_mux` at `b4c4faea8f08` (change
+`tools/mandate-check` run, checked in so that `tools/mandate-compare` has a
+reference: it records the per-arm measurements a later run's coverage is
+compared against. It was taken with `tools/mandate-check` (no arguments, so no
+`--quick`) on 2026-09-26, with this workspace's runner at change `sznyxuozrm`
+and the sibling `rtp_mux` at `8f5d83909bf2` (change
 `wmrkurmovoouxvsyuwpozsuovvkwmrrx`), which pins `rtp v0.0.94`; the run took
-**182.7 s**, passed all three mandates, and rendered 12 plots. The baseline
-predates M4, so its report records three mandates; a fresh `tools/mandate-check`
-run writes a four-mandate report. The checked-in
-copy is the run's JSON with machine-local absolute paths replaced by tokens —
-every measured value, the command, the revisions and the duration are
-verbatim. The plots themselves are not committed; re-run the command to
-regenerate them.
+**213.9 s**, passed all four mandates, and recorded **19 arms** — 3 M1, 3 M2,
+3 M3 reps, 8 M4 flows and 2 M4 aggregates. The checked-in copy is the run's
+JSON with machine-local absolute paths replaced by tokens (`<baseline run
+ dir>`, `<rtp_mux checkout>`, `<netem_test checkout>`, `<cargo>`); every
+measured value, the command, the revisions and the duration are verbatim. The
+plots themselves are not committed; re-run the command to regenerate them.
+Because the comparison refuses a baseline whose schema predates the per-arm
+record, this file has to be re-recorded with a current `tools/mandate-check`
+(no `--quick`) whenever the runner or the smoke set changes shape.
 
 ### `tools/mandate_plot.py` — the validated panel renderer
 

@@ -1,6 +1,766 @@
 {
+  "arm_declaration": {
+    "declared_cells": 9,
+    "path": "<netem_test checkout>/tools/mandate-arms.json",
+    "schema": "mandate-arms/1",
+    "source": "tools/PERF_INFRA.md, 'The smoke set' (the arm table: each arm's impairment, load shape and lanes), and the M3/M4 arm descriptions in rtp_mux/tests/mandate_smoke.rs; the cells restate what those documents already state and are not a second authority for any bound."
+  },
+  "arm_notes": [],
+  "arms": [
+    {
+      "cells": [
+        "M1@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+scale=256B+metric=p99"
+      ],
+      "counters": {
+        "bulk_sink_bytes": 8388420,
+        "bulk_wire_bytes": 8482483,
+        "received": 2278,
+        "sent": 2278,
+        "wire_bytes": 1299278
+      },
+      "dialect": "kv",
+      "id": "M1/clean",
+      "label": "clean",
+      "mandate": "M1",
+      "raw_line": "[mandate-smoke clean] sent= 2278 recv= 2278 delivery=1.000 p50=   24.7 p90=   33.0 p99=   94.6 p999=  102.5 max=   111.6 over250=   0 wire=   1299278B x=2.23 bulk_sink=   8388420B bulk_wire=   8482483B wall=15.7s window=12s",
+      "sample_count": 2278,
+      "stats": {
+        "delivery": 1.0,
+        "max": 111.6,
+        "over250": 0,
+        "p50": 24.7,
+        "p90": 33.0,
+        "p99": 94.6,
+        "p999": 102.5
+      },
+      "values": {
+        "bulk_sink": 8388420,
+        "bulk_wire": 8482483,
+        "delivery": 1.0,
+        "max": 111.6,
+        "over250": 0,
+        "p50": 24.7,
+        "p90": 33.0,
+        "p99": 94.6,
+        "p999": 102.5,
+        "recv": 2278,
+        "sent": 2278,
+        "wall": 15.7,
+        "window": 12,
+        "wire": 1299278,
+        "x": 2.23
+      },
+      "windows": {
+        "wall_seconds": 15.7,
+        "window_seconds": 12
+      }
+    },
+    {
+      "cells": [
+        "M1@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=cadence+flows=1+scale=256B+metric=p99"
+      ],
+      "counters": {
+        "bulk_sink_bytes": 8388420,
+        "bulk_wire_bytes": 8484001,
+        "received": 2339,
+        "sent": 2339,
+        "wire_bytes": 2410556
+      },
+      "dialect": "kv",
+      "id": "M1/hostile",
+      "label": "hostile",
+      "mandate": "M1",
+      "raw_line": "[mandate-smoke hostile] sent= 2339 recv= 2339 delivery=1.000 p50=   61.8 p90=  166.5 p99=  314.3 p999=  411.4 max=   425.9 over250=  50 wire=   2410556B x=4.03 bulk_sink=   8388420B bulk_wire=   8484001B wall=15.7s window=12s",
+      "sample_count": 2339,
+      "stats": {
+        "delivery": 1.0,
+        "max": 425.9,
+        "over250": 50,
+        "p50": 61.8,
+        "p90": 166.5,
+        "p99": 314.3,
+        "p999": 411.4
+      },
+      "values": {
+        "bulk_sink": 8388420,
+        "bulk_wire": 8484001,
+        "delivery": 1.0,
+        "max": 425.9,
+        "over250": 50,
+        "p50": 61.8,
+        "p90": 166.5,
+        "p99": 314.3,
+        "p999": 411.4,
+        "recv": 2339,
+        "sent": 2339,
+        "wall": 15.7,
+        "window": 12,
+        "wire": 2410556,
+        "x": 4.03
+      },
+      "windows": {
+        "wall_seconds": 15.7,
+        "window_seconds": 12
+      }
+    },
+    {
+      "cells": [
+        "M1@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=request-response+depth=1+flows=1+scale=256B+metric=p99"
+      ],
+      "counters": {
+        "bulk_sink_bytes": 0,
+        "bulk_wire_bytes": 2981,
+        "received": 514,
+        "sent": 514,
+        "wire_bytes": 758885
+      },
+      "dialect": "kv",
+      "id": "M1/lone_tail",
+      "label": "lone_tail",
+      "mandate": "M1",
+      "raw_line": "[mandate-smoke lone_tail] sent=  514 recv=  514 delivery=1.000 p50=    0.3 p90=   59.1 p99=  218.7 p999=  694.7 max=  5660.4 over250=   3 wire=    758885B x=5.77 bulk_sink=         0B bulk_wire=      2981B wall=18.7s window=15s",
+      "sample_count": 514,
+      "stats": {
+        "delivery": 1.0,
+        "max": 5660.4,
+        "over250": 3,
+        "p50": 0.3,
+        "p90": 59.1,
+        "p99": 218.7,
+        "p999": 694.7
+      },
+      "values": {
+        "bulk_sink": 0,
+        "bulk_wire": 2981,
+        "delivery": 1.0,
+        "max": 5660.4,
+        "over250": 3,
+        "p50": 0.3,
+        "p90": 59.1,
+        "p99": 218.7,
+        "p999": 694.7,
+        "recv": 514,
+        "sent": 514,
+        "wall": 18.7,
+        "window": 15,
+        "wire": 758885,
+        "x": 5.77
+      },
+      "windows": {
+        "wall_seconds": 18.7,
+        "window_seconds": 15
+      }
+    },
+    {
+      "cells": [
+        "M2@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+metric=own-wire"
+      ],
+      "counters": {
+        "bulk_sink_bytes": 8388420,
+        "bulk_wire_bytes": 8482132,
+        "received": 2314,
+        "sent": 2314,
+        "wire_bytes": 1254345
+      },
+      "dialect": "kv",
+      "id": "M2/clean",
+      "label": "clean",
+      "mandate": "M2",
+      "raw_line": "[mandate-smoke clean] sent= 2314 recv= 2314 delivery=1.000 p50=   24.6 p90=   35.6 p99=   88.4 p999=   96.5 max=   105.9 over250=   0 wire=   1254345B x=2.12 bulk_sink=   8388420B bulk_wire=   8482132B wall=15.7s window=12s",
+      "sample_count": 2314,
+      "stats": {
+        "delivery": 1.0,
+        "max": 105.9,
+        "over250": 0,
+        "p50": 24.6,
+        "p90": 35.6,
+        "p99": 88.4,
+        "p999": 96.5
+      },
+      "values": {
+        "bulk_sink": 8388420,
+        "bulk_wire": 8482132,
+        "delivery": 1.0,
+        "max": 105.9,
+        "over250": 0,
+        "p50": 24.6,
+        "p90": 35.6,
+        "p99": 88.4,
+        "p999": 96.5,
+        "recv": 2314,
+        "sent": 2314,
+        "wall": 15.7,
+        "window": 12,
+        "wire": 1254345,
+        "x": 2.12
+      },
+      "windows": {
+        "wall_seconds": 15.7,
+        "window_seconds": 12
+      }
+    },
+    {
+      "cells": [
+        "M2@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=cadence+flows=1+metric=own-wire"
+      ],
+      "counters": {
+        "bulk_sink_bytes": 8388420,
+        "bulk_wire_bytes": 8481172,
+        "received": 2399,
+        "sent": 2399,
+        "wire_bytes": 3092096
+      },
+      "dialect": "kv",
+      "id": "M2/hostile",
+      "label": "hostile",
+      "mandate": "M2",
+      "raw_line": "[mandate-smoke hostile] sent= 2399 recv= 2399 delivery=1.000 p50=   34.7 p90=  144.7 p99=  227.9 p999=  288.6 max=   303.3 over250=  11 wire=   3092096B x=5.03 bulk_sink=   8388420B bulk_wire=   8481172B wall=15.7s window=12s",
+      "sample_count": 2399,
+      "stats": {
+        "delivery": 1.0,
+        "max": 303.3,
+        "over250": 11,
+        "p50": 34.7,
+        "p90": 144.7,
+        "p99": 227.9,
+        "p999": 288.6
+      },
+      "values": {
+        "bulk_sink": 8388420,
+        "bulk_wire": 8481172,
+        "delivery": 1.0,
+        "max": 303.3,
+        "over250": 11,
+        "p50": 34.7,
+        "p90": 144.7,
+        "p99": 227.9,
+        "p999": 288.6,
+        "recv": 2399,
+        "sent": 2399,
+        "wall": 15.7,
+        "window": 12,
+        "wire": 3092096,
+        "x": 5.03
+      },
+      "windows": {
+        "wall_seconds": 15.7,
+        "window_seconds": 12
+      }
+    },
+    {
+      "cells": [
+        "M2@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+shape=request-response+depth=1+flows=1+metric=own-wire"
+      ],
+      "counters": {
+        "bulk_sink_bytes": 0,
+        "bulk_wire_bytes": 3525,
+        "received": 819,
+        "sent": 819,
+        "wire_bytes": 1321172
+      },
+      "dialect": "kv",
+      "id": "M2/lone_tail",
+      "label": "lone_tail",
+      "mandate": "M2",
+      "raw_line": "[mandate-smoke lone_tail] sent=  819 recv=  819 delivery=1.000 p50=    0.3 p90=   57.6 p99=  214.3 p999= 1598.3 max=  5975.8 over250=   7 wire=   1321172B x=6.30 bulk_sink=         0B bulk_wire=      3525B wall=24.2s window=15s",
+      "sample_count": 819,
+      "stats": {
+        "delivery": 1.0,
+        "max": 5975.8,
+        "over250": 7,
+        "p50": 0.3,
+        "p90": 57.6,
+        "p99": 214.3,
+        "p999": 1598.3
+      },
+      "values": {
+        "bulk_sink": 0,
+        "bulk_wire": 3525,
+        "delivery": 1.0,
+        "max": 5975.8,
+        "over250": 7,
+        "p50": 0.3,
+        "p90": 57.6,
+        "p99": 214.3,
+        "p999": 1598.3,
+        "recv": 819,
+        "sent": 819,
+        "wall": 24.2,
+        "window": 15,
+        "wire": 1321172,
+        "x": 6.3
+      },
+      "windows": {
+        "wall_seconds": 24.2,
+        "window_seconds": 15
+      }
+    },
+    {
+      "cells": [
+        "M3@lane=bulk+rate=8MiBps+burst=2MiB+period=3s+reps=3+metric=capacity-fraction"
+      ],
+      "counters": {
+        "delivered_bytes": 5963776,
+        "forwarded_bytes": 6033540
+      },
+      "dialect": "bulk-rep",
+      "id": "M3/m3/rep1",
+      "label": "m3/rep1",
+      "mandate": "M3",
+      "raw_line": "[mandate-smoke m3/rep1] delivered 0.948 MiB/s over 6.001370084s, shaper forwarded 0.959 MiB/s, capacity 1.000 MiB/s, fraction 0.948 (5963776 / 6033540 bytes)",
+      "sample_count": null,
+      "stats": {
+        "capacity_mib_s": 1.0,
+        "delivered_mib_s": 0.948,
+        "fraction": 0.948,
+        "shaper_mib_s": 0.959
+      },
+      "values": {
+        "capacity_mib_s": 1.0,
+        "delivered_bytes": 5963776,
+        "delivered_mib_s": 0.948,
+        "elapsed_seconds": 6.001370084,
+        "forwarded_bytes": 6033540,
+        "fraction": 0.948,
+        "shaper_mib_s": 0.959
+      },
+      "windows": {
+        "elapsed_seconds": 6.001370084
+      }
+    },
+    {
+      "cells": [
+        "M3@lane=bulk+rate=8MiBps+burst=2MiB+period=3s+reps=3+metric=capacity-fraction"
+      ],
+      "counters": {
+        "delivered_bytes": 5996544,
+        "forwarded_bytes": 6042087
+      },
+      "dialect": "bulk-rep",
+      "id": "M3/m3/rep2",
+      "label": "m3/rep2",
+      "mandate": "M3",
+      "raw_line": "[mandate-smoke m3/rep2] delivered 0.953 MiB/s over 6.0018805s, shaper forwarded 0.960 MiB/s, capacity 1.000 MiB/s, fraction 0.953 (5996544 / 6042087 bytes)",
+      "sample_count": null,
+      "stats": {
+        "capacity_mib_s": 1.0,
+        "delivered_mib_s": 0.953,
+        "fraction": 0.953,
+        "shaper_mib_s": 0.96
+      },
+      "values": {
+        "capacity_mib_s": 1.0,
+        "delivered_bytes": 5996544,
+        "delivered_mib_s": 0.953,
+        "elapsed_seconds": 6.0018805,
+        "forwarded_bytes": 6042087,
+        "fraction": 0.953,
+        "shaper_mib_s": 0.96
+      },
+      "windows": {
+        "elapsed_seconds": 6.0018805
+      }
+    },
+    {
+      "cells": [
+        "M3@lane=bulk+rate=8MiBps+burst=2MiB+period=3s+reps=3+metric=capacity-fraction"
+      ],
+      "counters": {
+        "delivered_bytes": 5832704,
+        "forwarded_bytes": 5896912
+      },
+      "dialect": "bulk-rep",
+      "id": "M3/m3/rep3",
+      "label": "m3/rep3",
+      "mandate": "M3",
+      "raw_line": "[mandate-smoke m3/rep3] delivered 0.927 MiB/s over 6.000534458s, shaper forwarded 0.937 MiB/s, capacity 1.000 MiB/s, fraction 0.927 (5832704 / 5896912 bytes)",
+      "sample_count": null,
+      "stats": {
+        "capacity_mib_s": 1.0,
+        "delivered_mib_s": 0.927,
+        "fraction": 0.927,
+        "shaper_mib_s": 0.937
+      },
+      "values": {
+        "capacity_mib_s": 1.0,
+        "delivered_bytes": 5832704,
+        "delivered_mib_s": 0.927,
+        "elapsed_seconds": 6.000534458,
+        "forwarded_bytes": 5896912,
+        "fraction": 0.927,
+        "shaper_mib_s": 0.937
+      },
+      "windows": {
+        "elapsed_seconds": 6.000534458
+      }
+    },
+    {
+      "cells": [
+        "M4@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {},
+      "dialect": "kv",
+      "id": "M4/m4/clean",
+      "label": "m4/clean",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/clean] ideal_share=0.2500 min_share=0.2499 max_share=+0.2501 imbalance=0.0002 window=12s wall=15.5s",
+      "sample_count": null,
+      "stats": {
+        "ideal_share": 0.25,
+        "imbalance": 0.0002,
+        "max_share": 0.2501,
+        "min_share": 0.2499
+      },
+      "values": {
+        "ideal_share": 0.25,
+        "imbalance": 0.0002,
+        "max_share": 0.2501,
+        "min_share": 0.2499,
+        "wall": 15.5,
+        "window": 12
+      },
+      "windows": {
+        "wall_seconds": 15.5,
+        "window_seconds": 12
+      }
+    },
+    {
+      "cells": [
+        "M4@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 547840,
+        "offered_bytes": 547840,
+        "received": 2140,
+        "sent": 2140
+      },
+      "dialect": "kv",
+      "id": "M4/m4/clean flow A",
+      "label": "m4/clean flow A",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/clean flow A] sent= 2140 recv= 2140 delivery=1.000 share=0.2501 offered=  547840B delivered=  547840B p50=   22.4 p90=  156.6 p99=  176.5 max=   229.2",
+      "sample_count": 2140,
+      "stats": {
+        "delivery": 1.0,
+        "max": 229.2,
+        "p50": 22.4,
+        "p90": 156.6,
+        "p99": 176.5,
+        "share": 0.2501
+      },
+      "values": {
+        "delivered": 547840,
+        "delivery": 1.0,
+        "max": 229.2,
+        "offered": 547840,
+        "p50": 22.4,
+        "p90": 156.6,
+        "p99": 176.5,
+        "recv": 2140,
+        "sent": 2140,
+        "share": 0.2501
+      },
+      "windows": {}
+    },
+    {
+      "cells": [
+        "M4@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 547584,
+        "offered_bytes": 547584,
+        "received": 2139,
+        "sent": 2139
+      },
+      "dialect": "kv",
+      "id": "M4/m4/clean flow C",
+      "label": "m4/clean flow C",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/clean flow C] sent= 2139 recv= 2139 delivery=1.000 share=0.2499 offered=  547584B delivered=  547584B p50=   22.5 p90=  158.3 p99=  177.3 max=   213.0",
+      "sample_count": 2139,
+      "stats": {
+        "delivery": 1.0,
+        "max": 213.0,
+        "p50": 22.5,
+        "p90": 158.3,
+        "p99": 177.3,
+        "share": 0.2499
+      },
+      "values": {
+        "delivered": 547584,
+        "delivery": 1.0,
+        "max": 213.0,
+        "offered": 547584,
+        "p50": 22.5,
+        "p90": 158.3,
+        "p99": 177.3,
+        "recv": 2139,
+        "sent": 2139,
+        "share": 0.2499
+      },
+      "windows": {}
+    },
+    {
+      "cells": [
+        "M4@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 547584,
+        "offered_bytes": 547584,
+        "received": 2139,
+        "sent": 2139
+      },
+      "dialect": "kv",
+      "id": "M4/m4/clean flow D",
+      "label": "m4/clean flow D",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/clean flow D] sent= 2139 recv= 2139 delivery=1.000 share=0.2499 offered=  547584B delivered=  547584B p50=   24.8 p90=  157.6 p99=  176.3 max=   205.8",
+      "sample_count": 2139,
+      "stats": {
+        "delivery": 1.0,
+        "max": 205.8,
+        "p50": 24.8,
+        "p90": 157.6,
+        "p99": 176.3,
+        "share": 0.2499
+      },
+      "values": {
+        "delivered": 547584,
+        "delivery": 1.0,
+        "max": 205.8,
+        "offered": 547584,
+        "p50": 24.8,
+        "p90": 157.6,
+        "p99": 176.3,
+        "recv": 2139,
+        "sent": 2139,
+        "share": 0.2499
+      },
+      "windows": {}
+    },
+    {
+      "cells": [
+        "M4@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 547840,
+        "offered_bytes": 547840,
+        "received": 2140,
+        "sent": 2140
+      },
+      "dialect": "kv",
+      "id": "M4/m4/clean flow L",
+      "label": "m4/clean flow L",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/clean flow L] sent= 2140 recv= 2140 delivery=1.000 share=0.2501 offered=  547840B delivered=  547840B p50=   22.7 p90=  155.4 p99=  175.8 max=   190.7",
+      "sample_count": 2140,
+      "stats": {
+        "delivery": 1.0,
+        "max": 190.7,
+        "p50": 22.7,
+        "p90": 155.4,
+        "p99": 175.8,
+        "share": 0.2501
+      },
+      "values": {
+        "delivered": 547840,
+        "delivery": 1.0,
+        "max": 190.7,
+        "offered": 547840,
+        "p50": 22.7,
+        "p90": 155.4,
+        "p99": 175.8,
+        "recv": 2140,
+        "sent": 2140,
+        "share": 0.2501
+      },
+      "windows": {}
+    },
+    {
+      "cells": [
+        "M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {},
+      "dialect": "kv",
+      "id": "M4/m4/hostile",
+      "label": "m4/hostile",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/hostile] ideal_share=0.2500 min_share=0.2499 max_share=+0.2501 imbalance=0.0002 window=12s wall=15.5s",
+      "sample_count": null,
+      "stats": {
+        "ideal_share": 0.25,
+        "imbalance": 0.0002,
+        "max_share": 0.2501,
+        "min_share": 0.2499
+      },
+      "values": {
+        "ideal_share": 0.25,
+        "imbalance": 0.0002,
+        "max_share": 0.2501,
+        "min_share": 0.2499,
+        "wall": 15.5,
+        "window": 12
+      },
+      "windows": {
+        "wall_seconds": 15.5,
+        "window_seconds": 12
+      }
+    },
+    {
+      "cells": [
+        "M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 551680,
+        "offered_bytes": 551680,
+        "received": 2155,
+        "sent": 2155
+      },
+      "dialect": "kv",
+      "id": "M4/m4/hostile flow A",
+      "label": "m4/hostile flow A",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/hostile flow A] sent= 2155 recv= 2155 delivery=1.000 share=0.2501 offered=  551680B delivered=  551680B p50=   93.6 p90=  210.2 p99=  330.3 max=   370.1",
+      "sample_count": 2155,
+      "stats": {
+        "delivery": 1.0,
+        "max": 370.1,
+        "p50": 93.6,
+        "p90": 210.2,
+        "p99": 330.3,
+        "share": 0.2501
+      },
+      "values": {
+        "delivered": 551680,
+        "delivery": 1.0,
+        "max": 370.1,
+        "offered": 551680,
+        "p50": 93.6,
+        "p90": 210.2,
+        "p99": 330.3,
+        "recv": 2155,
+        "sent": 2155,
+        "share": 0.2501
+      },
+      "windows": {}
+    },
+    {
+      "cells": [
+        "M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 551680,
+        "offered_bytes": 551680,
+        "received": 2155,
+        "sent": 2155
+      },
+      "dialect": "kv",
+      "id": "M4/m4/hostile flow C",
+      "label": "m4/hostile flow C",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/hostile flow C] sent= 2155 recv= 2155 delivery=1.000 share=0.2501 offered=  551680B delivered=  551680B p50=   96.6 p90=  195.9 p99=  300.7 max=   419.3",
+      "sample_count": 2155,
+      "stats": {
+        "delivery": 1.0,
+        "max": 419.3,
+        "p50": 96.6,
+        "p90": 195.9,
+        "p99": 300.7,
+        "share": 0.2501
+      },
+      "values": {
+        "delivered": 551680,
+        "delivery": 1.0,
+        "max": 419.3,
+        "offered": 551680,
+        "p50": 96.6,
+        "p90": 195.9,
+        "p99": 300.7,
+        "recv": 2155,
+        "sent": 2155,
+        "share": 0.2501
+      },
+      "windows": {}
+    },
+    {
+      "cells": [
+        "M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 551424,
+        "offered_bytes": 551424,
+        "received": 2154,
+        "sent": 2154
+      },
+      "dialect": "kv",
+      "id": "M4/m4/hostile flow D",
+      "label": "m4/hostile flow D",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/hostile flow D] sent= 2154 recv= 2154 delivery=1.000 share=0.2499 offered=  551424B delivered=  551424B p50=   86.0 p90=  197.5 p99=  361.9 max=   445.6",
+      "sample_count": 2154,
+      "stats": {
+        "delivery": 1.0,
+        "max": 445.6,
+        "p50": 86.0,
+        "p90": 197.5,
+        "p99": 361.9,
+        "share": 0.2499
+      },
+      "values": {
+        "delivered": 551424,
+        "delivery": 1.0,
+        "max": 445.6,
+        "offered": 551424,
+        "p50": 86.0,
+        "p90": 197.5,
+        "p99": 361.9,
+        "recv": 2154,
+        "sent": 2154,
+        "share": 0.2499
+      },
+      "windows": {}
+    },
+    {
+      "cells": [
+        "M4@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share"
+      ],
+      "counters": {
+        "delivered_bytes": 551424,
+        "offered_bytes": 551424,
+        "received": 2154,
+        "sent": 2154
+      },
+      "dialect": "kv",
+      "id": "M4/m4/hostile flow L",
+      "label": "m4/hostile flow L",
+      "mandate": "M4",
+      "raw_line": "[mandate-smoke m4/hostile flow L] sent= 2154 recv= 2154 delivery=1.000 share=0.2499 offered=  551424B delivered=  551424B p50=   96.9 p90=  192.3 p99=  298.0 max=   342.5",
+      "sample_count": 2154,
+      "stats": {
+        "delivery": 1.0,
+        "max": 342.5,
+        "p50": 96.9,
+        "p90": 192.3,
+        "p99": 298.0,
+        "share": 0.2499
+      },
+      "values": {
+        "delivered": 551424,
+        "delivery": 1.0,
+        "max": 342.5,
+        "offered": 551424,
+        "p50": 96.9,
+        "p90": 192.3,
+        "p99": 298.0,
+        "recv": 2154,
+        "sent": 2154,
+        "share": 0.2499
+      },
+      "windows": {}
+    }
+  ],
   "command": [
-    "cargo",
+    "<cargo>",
     "test",
     "--release",
     "-p",
@@ -11,11 +771,13 @@
     "--nocapture"
   ],
   "cwd": "<rtp_mux checkout>",
-  "duration_seconds": 182.676,
+  "duration_seconds": 213.887,
   "exit_code": 0,
   "mandates": {
     "M1": {
       "declared": true,
+      "duration_seconds": 50.083,
+      "finished_at_seconds": 81.247,
       "panels": 2,
       "plots": [
         "<baseline run dir>/plots/M1-latency.svg",
@@ -23,34 +785,34 @@
         "<baseline run dir>/plots/M1-latency.png",
         "<baseline run dir>/plots/M1-cdf.png"
       ],
-      "raw_line": "MANDATE M1 PASS clean_p50=25.3 clean_p90=43.0 clean_p99=89.0 clean_p999=97.9 clean_max=102.5 clean_over250=0 hostile_p50=39.5 hostile_p90=150.6 hostile_p99=245.1 hostile_p999=283.6 hostile_max=289.9 hostile_over250=21 lone_p50=0.3 lone_p90=69.6 lone_p99=174.7 lone_p999=681.9 lone_max=2693.3 lone_over250=4 ceiling=250.0 hostile_p99_guard=900.0 hostile_over250_guard=8.0 lone_p99_guard=3200.0 lone_p999_guard=8000.0 lone_over250_guard=8.0",
+      "raw_line": "MANDATE M1 PASS clean_p50=24.7 clean_p90=33.0 clean_p99=94.6 clean_p999=102.5 clean_max=111.6 clean_over250=0 hostile_p50=61.8 hostile_p90=166.5 hostile_p99=314.3 hostile_p999=411.4 hostile_max=425.9 hostile_over250=50 lone_p50=0.3 lone_p90=59.1 lone_p99=218.7 lone_p999=694.7 lone_max=5660.4 lone_over250=3 ceiling=250.0 hostile_p99_guard=900.0 hostile_over250_guard=8.0 lone_p99_guard=3200.0 lone_p999_guard=8000.0 lone_over250_guard=8.0",
       "series_counts": [
         3,
         3
       ],
       "values": {
         "ceiling": 250.0,
-        "clean_max": 102.5,
+        "clean_max": 111.6,
         "clean_over250": 0,
-        "clean_p50": 25.3,
-        "clean_p90": 43.0,
-        "clean_p99": 89.0,
-        "clean_p999": 97.9,
-        "hostile_max": 289.9,
-        "hostile_over250": 21,
+        "clean_p50": 24.7,
+        "clean_p90": 33.0,
+        "clean_p99": 94.6,
+        "clean_p999": 102.5,
+        "hostile_max": 425.9,
+        "hostile_over250": 50,
         "hostile_over250_guard": 8.0,
-        "hostile_p50": 39.5,
-        "hostile_p90": 150.6,
-        "hostile_p99": 245.1,
-        "hostile_p999": 283.6,
+        "hostile_p50": 61.8,
+        "hostile_p90": 166.5,
+        "hostile_p99": 314.3,
+        "hostile_p999": 411.4,
         "hostile_p99_guard": 900.0,
-        "lone_max": 2693.3,
-        "lone_over250": 4,
+        "lone_max": 5660.4,
+        "lone_over250": 3,
         "lone_over250_guard": 8.0,
         "lone_p50": 0.3,
-        "lone_p90": 69.6,
-        "lone_p99": 174.7,
-        "lone_p999": 681.9,
+        "lone_p90": 59.1,
+        "lone_p99": 218.7,
+        "lone_p999": 694.7,
         "lone_p999_guard": 8000.0,
         "lone_p99_guard": 3200.0
       },
@@ -58,6 +820,8 @@
     },
     "M2": {
       "declared": true,
+      "duration_seconds": 55.564,
+      "finished_at_seconds": 136.811,
       "panels": 2,
       "plots": [
         "<baseline run dir>/plots/M2-delivery.svg",
@@ -65,7 +829,7 @@
         "<baseline run dir>/plots/M2-delivery.png",
         "<baseline run dir>/plots/M2-wire.png"
       ],
-      "raw_line": "MANDATE M2 PASS clean_delivery=1.000 clean_wire_x=2.16 hostile_delivery=1.000 hostile_wire_x=4.65 lone_delivery=1.000 lone_wire_x=5.40 budget=6.0 hostile_wire_guard=10.0 lone_wire_guard=14.0 delivery_floor=0.995",
+      "raw_line": "MANDATE M2 PASS clean_delivery=1.000 clean_wire_x=2.12 hostile_delivery=1.000 hostile_wire_x=5.03 lone_delivery=1.000 lone_wire_x=6.30 budget=6.0 hostile_wire_guard=10.0 lone_wire_guard=14.0 delivery_floor=0.995",
       "series_counts": [
         3,
         3
@@ -73,19 +837,21 @@
       "values": {
         "budget": 6.0,
         "clean_delivery": 1.0,
-        "clean_wire_x": 2.16,
+        "clean_wire_x": 2.12,
         "delivery_floor": 0.995,
         "hostile_delivery": 1.0,
         "hostile_wire_guard": 10.0,
-        "hostile_wire_x": 4.65,
+        "hostile_wire_x": 5.03,
         "lone_delivery": 1.0,
         "lone_wire_guard": 14.0,
-        "lone_wire_x": 5.4
+        "lone_wire_x": 6.3
       },
       "verdict": "PASS"
     },
     "M3": {
       "declared": true,
+      "duration_seconds": 61.61,
+      "finished_at_seconds": 198.421,
       "panels": 2,
       "plots": [
         "<baseline run dir>/plots/M3-goodput.svg",
@@ -93,19 +859,67 @@
         "<baseline run dir>/plots/M3-goodput.png",
         "<baseline run dir>/plots/M3-fraction.png"
       ],
-      "raw_line": "MANDATE M3 PASS delivered_mib_s=0.963 shaper_mib_s=0.972 capacity_mib_s=1.000 fraction=0.963 floor=0.350 reps=3 measured_s=18.0",
+      "raw_line": "MANDATE M3 PASS delivered_mib_s=0.948 shaper_mib_s=0.959 capacity_mib_s=1.000 fraction=0.948 floor=0.350 reps=3 measured_s=18.0",
       "series_counts": [
         6,
         3
       ],
       "values": {
         "capacity_mib_s": 1.0,
-        "delivered_mib_s": 0.963,
+        "delivered_mib_s": 0.948,
         "floor": 0.35,
-        "fraction": 0.963,
+        "fraction": 0.948,
         "measured_s": 18.0,
         "reps": 3,
-        "shaper_mib_s": 0.972
+        "shaper_mib_s": 0.959
+      },
+      "verdict": "PASS"
+    },
+    "M4": {
+      "declared": true,
+      "duration_seconds": 31.164,
+      "finished_at_seconds": 31.164,
+      "panels": 4,
+      "plots": [
+        "<baseline run dir>/plots/M4-shares.svg",
+        "<baseline run dir>/plots/M4-imbalance.svg",
+        "<baseline run dir>/plots/M4-delivery.svg",
+        "<baseline run dir>/plots/M4-latency.svg",
+        "<baseline run dir>/plots/M4-shares.png",
+        "<baseline run dir>/plots/M4-imbalance.png",
+        "<baseline run dir>/plots/M4-delivery.png",
+        "<baseline run dir>/plots/M4-latency.png"
+      ],
+      "raw_line": "MANDATE M4 PASS flows=4 clean_delivery_min=1.000 hostile_delivery_min=1.000 clean_share_min=0.2499 clean_share_max=0.2501 hostile_share_min=0.2499 hostile_share_max=0.2501 clean_imbalance=0.0002 hostile_imbalance=0.0002 imbalance_bound=0.010 fair_share=0.2500 delivery_floor=0.995 clean_p99_spread=1.009 hostile_p99_spread=1.214 spread_bound=2.0 clean_p50_max=24.8 clean_p99_max=177.3 hostile_p99_max=361.9 ceiling=250.0 hostile_p99_guard=900.0 window_s=12.0 wall_s=31.0",
+      "series_counts": [
+        8,
+        8,
+        8,
+        16
+      ],
+      "values": {
+        "ceiling": 250.0,
+        "clean_delivery_min": 1.0,
+        "clean_imbalance": 0.0002,
+        "clean_p50_max": 24.8,
+        "clean_p99_max": 177.3,
+        "clean_p99_spread": 1.009,
+        "clean_share_max": 0.2501,
+        "clean_share_min": 0.2499,
+        "delivery_floor": 0.995,
+        "fair_share": 0.25,
+        "flows": 4,
+        "hostile_delivery_min": 1.0,
+        "hostile_imbalance": 0.0002,
+        "hostile_p99_guard": 900.0,
+        "hostile_p99_max": 361.9,
+        "hostile_p99_spread": 1.214,
+        "hostile_share_max": 0.2501,
+        "hostile_share_min": 0.2499,
+        "imbalance_bound": 0.01,
+        "spread_bound": 2.0,
+        "wall_s": 31.0,
+        "window_s": 12.0
       },
       "verdict": "PASS"
     }
@@ -118,16 +932,76 @@
   "rtp_mux": {
     "change_id": "wmrkurmovoouxvsyuwpozsuovvkwmrrx",
     "path": "<rtp_mux checkout>",
-    "revision": "b4c4faea8f08bc45ef9f8de7d1bb510f4503e64d",
+    "revision": "8f5d83909bf25c4f0f70af2b978600fcdea4bd11",
     "revision_source": "jj"
   },
-  "schema": "mandate-check/1",
+  "schema": "mandate-check/3",
   "smoke": {
     "exit_code": 0,
     "log": "<baseline run dir>/mandate-smoke.log",
     "timed_out": false
   },
-  "started_at": "2026-09-26T04:11:45+00:00",
+  "started_at": "2026-09-26T05:51:51+00:00",
   "timeout_seconds": 900.0,
+  "timings": {
+    "mandates": [
+      {
+        "duration_seconds": 31.164,
+        "finished_at_seconds": 31.164,
+        "mandate": "M4"
+      },
+      {
+        "duration_seconds": 50.083,
+        "finished_at_seconds": 81.247,
+        "mandate": "M1"
+      },
+      {
+        "duration_seconds": 55.564,
+        "finished_at_seconds": 136.811,
+        "mandate": "M2"
+      },
+      {
+        "duration_seconds": 61.61,
+        "finished_at_seconds": 198.421,
+        "mandate": "M3"
+      }
+    ],
+    "method": "streamed-line-arrival: a test's completion is the arrival of its libtest result line, and its duration is bracketed against the previous completion (0 for the first, the child's start); a mandate's duration is bracketed the same way against its neighbouring MANDATE lines. A bracket includes the gap before the test started",
+    "origin": "smoke-child-start",
+    "tests": [
+      {
+        "duration_seconds": 31.165,
+        "finished_at_seconds": 31.165,
+        "name": "m4_interactive_lane_fairness",
+        "started_at_seconds": 0.0,
+        "state": "ok",
+        "target": "mandate_smoke"
+      },
+      {
+        "duration_seconds": 50.084,
+        "finished_at_seconds": 81.249,
+        "name": "m1_interactive_tail_latency",
+        "started_at_seconds": 31.165,
+        "state": "ok",
+        "target": "mandate_smoke"
+      },
+      {
+        "duration_seconds": 55.562,
+        "finished_at_seconds": 136.811,
+        "name": "m2_interactive_delivery_and_wire",
+        "started_at_seconds": 81.249,
+        "state": "ok",
+        "target": "mandate_smoke"
+      },
+      {
+        "duration_seconds": 61.61,
+        "finished_at_seconds": 198.421,
+        "name": "m3_bulk_goodput_fraction",
+        "started_at_seconds": 136.811,
+        "state": "ok",
+        "target": "mandate_smoke"
+      }
+    ]
+  },
   "verdict": "PASS"
 }
