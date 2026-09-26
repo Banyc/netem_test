@@ -32,7 +32,7 @@ PYTHON = sys.executable
 # `--list` shape. An invocation the plan does not name prints nothing, which
 # is how the fixtures express an unknown target.
 FAKE_CARGO = '''#!/usr/bin/env python3
-"""A stand-in cargo that prints a plan's `--list` output."""
+"""A stand-in cargo that prints a plan's `--list` output and target list."""
 
 import json
 import os
@@ -40,9 +40,49 @@ import pathlib
 import sys
 
 
+def metadata(plan):
+    """The package's own target list, as an explicit plan or from the lists.
+
+    A plan that states `metadata` is used as given; otherwise the packages and
+    their test targets are the `package|target` keys the plan already answers
+    `--list` for, so a fixture's target list and its list answers cannot
+    disagree, and each target's source sits under the scenario directory the
+    fixture is checked with. The reserved `lib` target is not a scenario
+    target and is left out.
+    """
+    if "metadata" in plan:
+        return plan["metadata"]
+    targets = {}
+    for key in plan.get("lists", {}):
+        package, _, target = key.partition("|")
+        if not target or target == "lib":
+            continue
+        targets.setdefault(package, []).append(
+            {
+                "name": target,
+                "kind": ["test"],
+                "src_path": f"{{root}}/tests/tests/{target}.rs",
+            }
+        )
+    return {
+        "packages": [
+            {
+                "name": package,
+                "targets": sorted(targets[package], key=lambda t: t["name"]),
+            }
+            for package in sorted(targets)
+        ]
+    }
+
+
 def main():
     plan = json.loads(pathlib.Path(os.environ["FAKE_CARGO_PLAN"]).read_text())
     argv = sys.argv[1:]
+    if argv[:1] == ["metadata"]:
+        # `{root}` is the directory cargo was invoked in, so a fixture states
+        # its target sources relative to its own root.
+        print(json.dumps(metadata(plan)).replace("{root}", os.getcwd()))
+        return 0
     package = ""
     target = ""
     for index, item in enumerate(argv):
@@ -135,7 +175,8 @@ GATE_TEMPLATE = """# the fixture gate
 
 # The default plan: `alpha` has a default test and one `#[ignore]`d perf-tier
 # scenario, `beta` one default test, and the reserved `lib` target one ignored
-# report-only probe.
+# report-only probe. The packages' own test targets are derived from these
+# lists unless a case states `metadata` itself.
 BASE_PLAN = {
     "lists": {
         "tests|alpha": {"default": ["t_ok"], "ignored": ["t_ig"]},
@@ -166,7 +207,14 @@ BASE_BUDGETS = "\n".join(
 BASE_GAPS = "M1@lane=dual-lane = owned by rtp_mux, whose declaration is pending"
 
 
-class CheckGatePerfTest(unittest.TestCase):
+class CheckGatePerfFixture(unittest.TestCase):
+    """The fake-cargo fixture: a crate root, a stand-in cargo and a GATE.md.
+
+    It carries no cases of its own, so a case class that needs the fixture
+    inherits the setup and helpers without inheriting another case class's
+    cases.
+    """
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/tmp"))
         self.root = Path(self._tmp.name) / "fixture"
@@ -254,6 +302,10 @@ class CheckGatePerfTest(unittest.TestCase):
         self.assertNotEqual(code, 0, f"expected a non-zero exit; output={output}")
         self.assertIn(fragment, output)
         return output
+
+
+class CheckGatePerfTest(CheckGatePerfFixture):
+    """The perf-test dual mandate: the declared budgets and coverage."""
 
     # -- the well-formed declaration ---------------------------------------
 
@@ -1324,6 +1376,95 @@ class CheckGateEnvTierTest(unittest.TestCase):
             "| | fixture-liveness@shape=churn"
         )
         self.rejects("says nothing about what it measures")
+
+
+class CheckGateScenarioDirectoryTest(CheckGatePerfFixture):
+    """`--crate`'s scenario directory is reconciled with the package's targets.
+
+    The ignored set is derived over the package's own test targets: cargo says
+    which exist, the directory says where their sources live. A directory that
+    holds none of them is the wrong directory rather than an empty gate, and
+    deriving the set from its glob alone reported every manifest entry as
+    STALE; a directory that holds only some of them under-reports the same
+    way, so both are named.
+    """
+
+    def check_dir(self, dir_name):
+        env = dict(os.environ)
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["FAKE_CARGO_PLAN"] = str(self.plan_path)
+        proc = subprocess.run(
+            [
+                PYTHON,
+                str(CHECK_GATE),
+                "--crate",
+                str(self.root),
+                "tests",
+                dir_name,
+                "tests/GATE.md",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(self.root),
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def with_metadata_target(self, name, src_path):
+        """A plan whose package compiles one more target, at ``src_path``."""
+        plan = json.loads(json.dumps(BASE_PLAN))
+        plan["metadata"] = {
+            "packages": [
+                {
+                    "name": "tests",
+                    "targets": [
+                        {
+                            "name": "alpha",
+                            "kind": ["test"],
+                            "src_path": "{root}/tests/tests/alpha.rs",
+                        },
+                        {
+                            "name": "beta",
+                            "kind": ["test"],
+                            "src_path": "{root}/tests/tests/beta.rs",
+                        },
+                        {
+                            "name": name,
+                            "kind": ["test"],
+                            "src_path": f"{{root}}/{src_path}",
+                        },
+                    ],
+                }
+            ]
+        }
+        self.write_plan(plan)
+
+    def test_a_directory_holding_no_target_is_resolved_rather_than_blamed(self):
+        """The package root is not the scenario directory; it is not an empty gate."""
+        self.write_gate()
+        code, output = self.check_dir("tests")
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("STALE manifest entry", output)
+        self.assertIn("holds no `*.rs` test target", output)
+        self.assertIn("resolved from cargo's own target list", output)
+        self.assertIn("gate manifest OK: 1 ignored scenarios classified", output)
+
+    def test_a_directory_holding_some_of_the_targets_fails(self):
+        """A partial directory reports the targets it does not hold as STALE."""
+        self.with_metadata_target("gamma", "tests/tests/gamma.rs")
+        self.write_gate()
+        code, output = self.check_dir("tests/tests")
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("SCENARIO DIRECTORY", output)
+        self.assertIn("also compiles gamma", output)
+
+    def test_targets_under_more_than_one_directory_are_an_error(self):
+        """An ambiguous package has no single scenario directory to resolve to."""
+        self.with_metadata_target("delta", "tests/elsewhere/delta.rs")
+        self.write_gate()
+        code, output = self.check_dir("tests")
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("compiles its targets under 2 directories", output)
 
 
 if __name__ == "__main__":

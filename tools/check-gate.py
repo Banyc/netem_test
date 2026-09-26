@@ -125,6 +125,9 @@ Usage:
     python3 tools/check-gate.py --crate <root> <package> <dir> <GATE.md>
     # e.g. mux: python3 tools/check-gate.py \
     #   --crate ../mux mux tests GATE.md   (from the netem_test root)
+    # <dir> names the package's scenario directory: the ignored set is derived
+    # over the package's own test targets, so a <dir> that holds none of them
+    # is resolved to the package's own and the substitution is printed.
     # with a per-test timing report, the declared costs are also drift-checked:
     python3 tools/check-gate.py --mandate-check-json <run>/mandate-check.json
 """
@@ -138,7 +141,7 @@ import math
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 TIERS = {"standard", "full", "perf"}
@@ -3410,6 +3413,82 @@ def ignored_scenarios(target: str) -> set[str]:
     return listed_scenarios(target, ignored=True)
 
 
+def package_test_targets() -> dict[str, Path]:
+    """`{target name: source path}` for the checked package's test targets.
+
+    Cargo is the authority on which test targets a package compiles; the
+    scenario directory only says where their sources live. A directory glob is
+    not an authority: it can see no target at all while the package compiles
+    several, which is how a `--crate … <dir> …` argument naming the package's
+    root instead of its scenario directory derived an empty ignored set, after
+    which every manifest entry was reported STALE. A package cargo cannot
+    report is a named non-zero exit, because without its target list no
+    ignored set can be derived.
+    """
+    cmd = ["cargo", "metadata", "--format-version", "1", "--no-deps"]
+    proc = subprocess.run(cmd, cwd=layout().root, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.exit(f"cargo {' '.join(cmd[1:])} failed in {layout().root}")
+    try:
+        packages = json.loads(proc.stdout)["packages"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        sys.exit(f"cargo {' '.join(cmd[1:])} printed no package list")
+    for package in packages:
+        if package.get("name") == layout().package:
+            return {
+                target["name"]: Path(target["src_path"])
+                for target in package.get("targets", [])
+                if "test" in target.get("kind", [])
+            }
+    sys.exit(
+        f"cargo {' '.join(cmd[1:])} does not report package "
+        f"{layout().package} in {layout().root}"
+    )
+
+
+def scenario_dir_resolution() -> tuple[Path | None, list[str], list[str]]:
+    """The scenario directory to derive the ignored set from.
+
+    Returns `(dir, notes, problems)`: `dir` is `None` when the caller's
+    scenario directory is already the package's own, and the directory to read
+    instead when it is not. The ignored set is derived over the package's test
+    targets — cargo says which exist, the scenario directory says where their
+    sources live — so a directory that holds no `*.rs` target while the
+    package compiles some is not an empty gate but the wrong directory: it is
+    resolved to the package's own and the substitution is printed, so the
+    manifest is never blamed for it. A directory that holds some of the
+    package's targets but not all of them is an error naming the ones it does
+    not hold, because that same under-enumeration reports their manifest rows
+    as STALE.
+    """
+    listed = {path.stem for path in layout().dir.glob("*.rs")}
+    targets = package_test_targets()
+    if not targets or (listed and not set(targets) - listed):
+        return None, [], []
+    missing = sorted(set(targets) - listed)
+    if listed:
+        return None, [], [
+            f"SCENARIO DIRECTORY {layout().dir} holds {len(listed)} test "
+            f"target(s) but package {layout().package} also compiles "
+            f"{', '.join(missing)}; name the package's scenario directory"
+        ]
+    dirs = sorted({path.parent for path in targets.values()})
+    if len(dirs) != 1:
+        return None, [], [
+            f"SCENARIO DIRECTORY {layout().dir} holds no `*.rs` test target and "
+            f"package {layout().package} compiles its targets under "
+            f"{len(dirs)} directories "
+            f"({', '.join(str(directory) for directory in dirs)}); name the "
+            "package's scenario directory"
+        ]
+    return dirs[0], [
+        f"note: scenario directory {layout().dir} holds no `*.rs` test target; "
+        f"package {layout().package} compiles its targets under {dirs[0]}, "
+        "resolved from cargo's own target list"
+    ], []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -3417,7 +3496,9 @@ def main() -> int:
         nargs=4,
         metavar=("ROOT", "PACKAGE", "DIR", "GATE_MD"),
         help="check <PACKAGE>'s gate in <ROOT> with scenarios in <DIR> and "
-        "manifest <GATE_MD> (omitted: the netem_test harness layout)",
+        "manifest <GATE_MD> (omitted: the netem_test harness layout); a <DIR> "
+        "holding none of <PACKAGE>'s test targets is resolved to the package's "
+        "own, a <DIR> holding only some of them is an error",
     )
     parser.add_argument(
         "--mandate-check-json",
@@ -3453,6 +3534,12 @@ def main() -> int:
     else:
         LAYOUT = harness_layout(Path(__file__).resolve().parent)
 
+    resolved_dir, dir_notes, dir_problems = scenario_dir_resolution()
+    if resolved_dir is not None:
+        LAYOUT = replace(LAYOUT, dir=resolved_dir)
+    for note in dir_notes:
+        print(note)
+
     manifest = manifest_entries()
     targets = sorted(p.stem for p in layout().dir.glob("*.rs"))
     actual: set[str] = set()
@@ -3467,6 +3554,9 @@ def main() -> int:
     actual_lib = ignored_scenarios(LIB_TARGET)
 
     bad = False
+    for problem in dir_problems:
+        print(problem)
+        bad = True
     missing = sorted(actual - manifest.keys())
     stale = sorted(manifest.keys() - actual - actual_lib)
     if missing or stale:
