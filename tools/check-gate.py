@@ -40,6 +40,21 @@ re-export -- the harness kit
 reach into the relocated helpers is still declared. An unrecorded asserting
 helper, a changed token count, or a stale entry is an error.
 
+The perf-test dual mandate (time and coverage) is checked the same way. When a
+crate's `GATE.md` carries the `gate-perf-design`, `gate-budgets` and
+`gate-coverage-gaps` blocks, every declared row's `<target>::<test>` must exist
+in the tier the row declares (resolved from the compiled test binaries for an
+integration target, or from the package's `--lib` target for the reserved
+target name `lib`), the sum of the declared nominal costs per tier must fit
+that tier's declared budget, and every covered cell and gap reason must be
+non-empty and well-formed. When a fresh `mandate-check.json` is supplied
+(`--mandate-check-json`, or `mandate-check.json` in the crate root), each
+declared row that the report measured per-test is compared with the report's
+streamed wall-clock and a drift past the declared tolerance is an error. A
+crate that has perf-tier scenarios but no perf blocks is reported with an
+advisory note and no failure: the declaration is required but its migration is
+visible rather than silently assumed.
+
 In harness mode (no `--crate`) it also checks the perf-loop lane roles in the
 `gate-lane-roles` block against `perf_loop.lane_classification`, the function
 that stamps `link_role` into a run's `run.json`. A lane is either a verdict
@@ -56,12 +71,16 @@ Usage:
     python3 tools/check-gate.py --crate <root> <package> <dir> <GATE.md>
     # e.g. mux: python3 tools/check-gate.py \
     #   --crate ../mux mux tests GATE.md   (from the netem_test root)
+    # with a per-test timing report, the declared costs are also drift-checked:
+    python3 tools/check-gate.py --mandate-check-json <run>/mandate-check.json
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import math
 import re
 import subprocess
 import sys
@@ -69,7 +88,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 TIERS = {"standard", "full", "perf"}
+# The tiers a perf design row may name: the three opt-in tiers plus the
+# always-run default tier (a row's `default` tier is resolved from the test not
+# being `#[ignore]`d, matching `gate-default-required`).
+PERF_TIERS = frozenset(TIERS | {"default"})
 LANE_ROLES = {"verdict", "diagnostic"}
+# The reserved perf-design target naming a package's `--lib` test target. In
+# harness mode it is the `netem-test` package (whose wall-clock probes are lib
+# unit tests); in per-crate mode it is the checked package.
+LIB_TARGET = "lib"
+# `<mandate-or-property>@<dimension>=<value>[+<dimension>=<value>...]`. A value
+# may not contain `=`, `,` or `+` (those delimit the cell), and a property is a
+# stable name (`M1`, `conformance-delay`, `probe-throughput`).
+CELL_PROPERTY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+CELL_DIMENSION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*=[^=,+\s]+$")
+# The default drift tolerance (relative) and the absolute floor below which a
+# difference is not reported, overridable per crate in `gate-budgets`.
+DEFAULT_DRIFT_TOLERANCE = 0.5
+DEFAULT_DRIFT_FLOOR_SECONDS = 2.0
+DEFAULT_REPORT_NAME = "mandate-check.json"
 ASSERTING_TIERS = {"standard", "full"}
 ASSERTION_TOKENS = re.compile(
     r"(debug_assert_ne!|debug_assert_eq!|debug_assert!|assert_ne!|assert_eq!|assert!|panic!|unreachable!)"
@@ -146,6 +183,17 @@ class CrateLayout:
                 dirs.append((kit_dir, prefix))
                 seen_dirs.add(kit_dir)
         return dirs
+
+    @property
+    def lib_package(self) -> str:
+        """The package whose `--lib` target the reserved `lib` design rows name.
+
+        In harness mode the harness's own wall-clock probes are `netem-test`'s
+        lib unit tests, so the reserved target resolves there; in per-crate
+        mode it resolves the checked package, which is the crate whose
+        scenarios and lib tests the gate covers.
+        """
+        return "netem-test" if self.is_harness else self.package
 
     @property
     def kit_dir(self) -> Path:
@@ -735,17 +783,475 @@ def check_lane_roles() -> tuple[dict[str, str], list[str]]:
     return documented, errors
 
 
-def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
-    cmd = [
-        "cargo", "test", "-p", layout().package, "--test", target, "--", "--list",
+@dataclass(frozen=True)
+class PerfRow:
+    """One `gate-perf-design` row: a perf test, its tier, cost and coverage."""
+
+    name: str
+    tier: str
+    cost: float
+    cells: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PerfBudgets:
+    """The `gate-budgets` block: one budget per tier, plus the baseline row."""
+
+    tiers: dict[str, float]
+    baseline: str | None
+    drift: float
+    drift_floor_seconds: float
+
+
+@dataclass(frozen=True)
+class PerfGap:
+    """One `gate-coverage-gaps` line: an uncovered cell and why it is empty."""
+
+    cell: str
+    reason: str
+
+
+def _perf_lines(block: str) -> list[tuple[int, str]]:
+    """The non-empty, non-comment lines of a perf block with their numbers."""
+    return [
+        (number, raw.strip())
+        for number, raw in enumerate(block.splitlines(), start=1)
+        if raw.strip() and not raw.strip().startswith("#")
     ]
+
+
+def cell_problem(cell: str) -> str | None:
+    """Why ``cell`` is not `<property>@<dimension>=<value>[+...]`, or None."""
+    property_name, _, dimensions = cell.partition("@")
+    if not dimensions:
+        return "no '@<dimension>=<value>' part"
+    if not CELL_PROPERTY_RE.match(property_name):
+        return f"property {property_name!r} is not a name ([A-Za-z][A-Za-z0-9_.-]*)"
+    for part in dimensions.split("+"):
+        if not CELL_DIMENSION_RE.match(part):
+            return f"dimension {part!r} is not '<dimension>=<value>'"
+    return None
+
+
+def parse_perf_design(text: str, problems: list[str]) -> list[PerfRow]:
+    """Parse the `gate-perf-design` rows, naming every malformed one."""
+    rows: list[PerfRow] = []
+    seen: set[str] = set()
+    for number, line in _perf_lines(text):
+        name, separator, rest = line.partition(" = ")
+        if not separator:
+            problems.append(
+                "gate-perf-design line "
+                f"{number}: {line!r} is not '<target>::<test> = <tier> | "
+                "<nominal_cost_s> | <coverage>'",
+            )
+            continue
+        name = name.strip()
+        parts = [part.strip() for part in rest.split("|")]
+        if len(parts) != 3:
+            problems.append(
+                f"gate-perf-design row {name}: expected '<tier> | <cost_s> | "
+                f"<coverage>', found {len(parts)} field(s)"
+            )
+            continue
+        tier, cost_text, coverage_text = parts
+        if tier not in PERF_TIERS:
+            problems.append(
+                f"gate-perf-design row {name}: unknown tier {tier!r} (one of "
+                f"{', '.join(sorted(PERF_TIERS))})"
+            )
+            continue
+        try:
+            cost = float(cost_text)
+        except ValueError:
+            problems.append(
+                f"gate-perf-design row {name}: nominal cost {cost_text!r} is not "
+                "a number of seconds"
+            )
+            continue
+        if cost < 0:
+            problems.append(f"gate-perf-design row {name}: nominal cost {cost} is negative")
+            continue
+        cells = tuple(cell.strip() for cell in coverage_text.split(",") if cell.strip())
+        if not cells:
+            problems.append(
+                f"gate-perf-design row {name}: no coverage cell; a perf test must "
+                "name the cells it covers, and a cell it does not cover belongs "
+                "in gate-coverage-gaps with a reason"
+            )
+        for cell in cells:
+            reason = cell_problem(cell)
+            if reason is not None:
+                problems.append(
+                    f"gate-perf-design row {name}: coverage cell {cell!r} is "
+                    f"malformed: {reason}"
+                )
+        if name in seen:
+            problems.append(f"gate-perf-design: duplicate row {name}")
+        seen.add(name)
+        rows.append(PerfRow(name, tier, cost, cells))
+    return rows
+
+
+def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
+    """Parse the `gate-budgets` block: `<tier> = <budget_s>` plus the baseline."""
+    tiers: dict[str, float] = {}
+    baseline: str | None = None
+    drift = DEFAULT_DRIFT_TOLERANCE
+    floor = DEFAULT_DRIFT_FLOOR_SECONDS
+    for number, line in _perf_lines(text):
+        key, separator, value = line.partition(" = ")
+        key, value = key.strip(), value.strip()
+        if not separator:
+            problems.append(
+                f"gate-budgets line {number}: {line!r} is not '<tier> = <budget_s>'"
+            )
+            continue
+        if key == "baseline":
+            if not value:
+                problems.append("gate-budgets: the baseline line names no row")
+                continue
+            baseline = value
+            continue
+        if key in ("drift", "drift_floor_s"):
+            try:
+                parsed = float(value)
+            except ValueError:
+                problems.append(f"gate-budgets: {key} {value!r} is not a number")
+                continue
+            if parsed < 0:
+                problems.append(f"gate-budgets: {key} {parsed} is negative")
+                continue
+            if key == "drift":
+                drift = parsed
+            else:
+                floor = parsed
+            continue
+        if key not in PERF_TIERS:
+            problems.append(
+                f"gate-budgets line {number}: {key!r} is neither a tier nor one "
+                "of baseline/drift/drift_floor_s"
+            )
+            continue
+        if key in tiers:
+            problems.append(f"gate-budgets: duplicate budget for tier {key}")
+            continue
+        try:
+            budget = float(value)
+        except ValueError:
+            problems.append(f"gate-budgets: tier {key} budget {value!r} is not a number")
+            continue
+        if budget < 0:
+            problems.append(f"gate-budgets: tier {key} budget {budget} is negative")
+            continue
+        tiers[key] = budget
+    if baseline is None:
+        problems.append(
+            "gate-budgets declares no 'baseline = <row>' line; every design row's "
+            "coverage must be stated relative to a named baseline row"
+        )
+    return PerfBudgets(tiers, baseline, drift, floor)
+
+
+def parse_perf_gaps(text: str, problems: list[str]) -> list[PerfGap]:
+    """Parse the `gate-coverage-gaps` lines: `<cell> = <reason>`."""
+    gaps: list[PerfGap] = []
+    for number, line in _perf_lines(text):
+        cell, separator, reason = line.partition(" = ")
+        cell, reason = cell.strip(), reason.strip()
+        if not separator:
+            # A line whose reason is empty (`<cell> =`) still names a cell: it
+            # is a reason-less gap, not a line that is not a gap at all.
+            if line.endswith("="):
+                cell, reason = line[:-1].strip(), ""
+            else:
+                problems.append(
+                    f"gate-coverage-gaps line {number}: {line!r} is not "
+                    "'<cell> = <reason>'"
+                )
+                continue
+        if not cell:
+            problems.append(f"gate-coverage-gaps line {number}: the gap names no cell")
+            continue
+        if not reason:
+            problems.append(
+                f"gate-coverage-gaps: cell {cell!r} records no reason; a cell may "
+                "be knowingly empty but never silently empty"
+            )
+            continue
+        problem = cell_problem(cell)
+        if problem is not None:
+            problems.append(
+                f"gate-coverage-gaps: cell {cell!r} is malformed: {problem}"
+            )
+            continue
+        gaps.append(PerfGap(cell, reason))
+    return gaps
+
+
+def read_mandate_report(path: Path, problems: list[str]):
+    """The per-test timings of a `mandate-check.json`, or None with a problem."""
+    if not path.is_file():
+        problems.append(
+            f"the mandate-check report {path} does not exist; pass --mandate-check-json "
+            "a report this run produced, or omit it to skip the drift comparison"
+        )
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        problems.append(f"the mandate-check report {path} cannot be read: {error}")
+        return None
+    if not isinstance(payload, dict):
+        problems.append(
+            f"the mandate-check report {path} is not a JSON object, so its "
+            "schema and timings cannot be read"
+        )
+        return None
+    schema = payload.get("schema")
+    if not isinstance(schema, str) or not schema.startswith("mandate-check/"):
+        problems.append(
+            f"the mandate-check report {path} declares schema {schema!r}, not a "
+            "mandate-check report this checker can read"
+        )
+        return None
+    return payload
+
+
+def report_timings(report) -> dict[str, float]:
+    """`<target>::<test> -> measured seconds` from a report's per-test timings."""
+    timings = report.get("timings")
+    if not isinstance(timings, dict):
+        return {}
+    measured: dict[str, float] = {}
+    for entry in timings.get("tests") or []:
+        if not isinstance(entry, dict):
+            continue
+        name, target = entry.get("name"), entry.get("target")
+        duration = entry.get("duration_seconds")
+        if not isinstance(name, str) or not isinstance(target, str):
+            continue
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+            continue
+        measured[f"{target}::{name}"] = float(duration)
+    return measured
+
+
+class TargetListings:
+    """The default and `#[ignore]`d test names of a design row's target.
+
+    An integration target of the checked package resolves through
+    `cargo test -p <package> --test <target>`; the reserved `lib` target
+    resolves through `cargo test -p <lib_package> --lib`. Both invocations are
+    cached, so a design row is never resolved twice.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, bool], set[str]] = {}
+
+    def names(self, target: str, *, ignored: bool) -> set[str]:
+        key = (target, ignored)
+        if key in self._cache:
+            return self._cache[key]
+        found = listed_test_names(
+            target,
+            ignored=ignored,
+            lib=(target == LIB_TARGET),
+            package=layout().lib_package if target == LIB_TARGET else None,
+        )
+        self._cache[key] = found
+        return found
+
+    def tier(self, name: str, manifest: dict[str, str]) -> str | None:
+        """The tier the compiled test set puts ``name`` in, or None if unknown."""
+        target, _, _test = name.partition("::")
+        # `--list` names every test, ignored or not; the default tier is what
+        # remains after the `#[ignore]`d set is removed.
+        default = self.names(target, ignored=False) - self.names(target, ignored=True)
+        ignored = self.names(target, ignored=True)
+        if target == LIB_TARGET:
+            # A lib target has no `gate-manifest` of its own; its tier is read
+            # from whether the test is `#[ignore]`d. An ignored lib test is
+            # report-only unless the crate's manifest says otherwise.
+            if name in default:
+                return manifest.get(name, "default")
+            if name in ignored:
+                return manifest.get(name, "perf")
+            return None
+        if name in default:
+            return "default"
+        if name in manifest:
+            return manifest[name]
+        if name in ignored:
+            return None
+        return None
+
+
+def check_perf_gate(
+    manifest: dict[str, str], report_path: Path | None
+) -> tuple[list[str], list[str], list[str]]:
+    """Check the perf-design/budgets/coverage-gaps blocks of this GATE.md.
+
+    Returns ``(problems, summary_lines, notes)``. The notes are advisory (an
+    undeclared crate, a report without per-test timings) and never fail the
+    check; every problem is named and fails it.
+    """
+    problems: list[str] = []
+    notes: list[str] = []
+    design_block = manifest_block("gate-perf-design")
+    budgets_block = manifest_block("gate-budgets")
+    gaps_block = manifest_block("gate-coverage-gaps")
+    perf_tier = sorted(name for name, tier in manifest.items() if tier == "perf")
+    if design_block is None:
+        if budgets_block is not None or gaps_block is not None:
+            problems.append(
+                "gate-perf-design is missing while gate-budgets/gate-coverage-gaps "
+                "is present: the perf declaration must be complete or absent"
+            )
+        elif perf_tier:
+            notes.append(
+                f"note: {layout().package} declares {len(perf_tier)} perf-tier "
+                "scenario(s) but no ```gate-perf-design block; its perf-test "
+                "time/coverage declaration is PENDING (advisory, not a failure)"
+            )
+        return problems, [], notes
+    for name, block in (("gate-budgets", budgets_block), ("gate-coverage-gaps", gaps_block)):
+        if block is None:
+            problems.append(
+                f"gate-perf-design is present without a ```{name} block"
+            )
+    rows = parse_perf_design(design_block, problems)
+    budgets = parse_perf_budgets(budgets_block or "", problems)
+    gaps = parse_perf_gaps(gaps_block or "", problems)
+
+    listings = TargetListings()
+    for row in rows:
+        target = row.name.partition("::")[0]
+        actual = listings.tier(row.name, manifest)
+        if actual is None:
+            problems.append(
+                f"gate-perf-design row {row.name}: the {target!r} target does "
+                "not report this test (an unknown target or an unknown test is "
+                "a failure)"
+            )
+            continue
+        if actual != row.tier:
+            problems.append(
+                f"gate-perf-design row {row.name} declares tier {row.tier!r} but "
+                f"the test set puts it in {actual!r}"
+            )
+
+    by_tier: dict[str, list[PerfRow]] = {}
+    for row in rows:
+        by_tier.setdefault(row.tier, []).append(row)
+    for tier in sorted(by_tier):
+        total = sum(row.cost for row in by_tier[tier])
+        budget = budgets.tiers.get(tier)
+        if budget is None:
+            problems.append(
+                f"gate-perf-design uses the {tier} tier but gate-budgets declares "
+                f"no budget for it; {len(by_tier[tier])} row(s) totalling "
+                f"{total:.2f}s cannot be paid for"
+            )
+        elif total > budget:
+            names = ", ".join(row.name for row in by_tier[tier])
+            problems.append(
+                f"gate-perf-design declares {total:.2f}s in the {tier} tier, over "
+                f"its {budget:.2f}s budget ({names}); retier a test, lower a "
+                "cost, or raise the budget as a declared change"
+            )
+    if budgets.baseline is not None and budgets.baseline not in {row.name for row in rows}:
+        problems.append(
+            f"gate-budgets: baseline {budgets.baseline!r} is not a gate-perf-design "
+            "row, so the rows' coverage is stated against nothing"
+        )
+
+    measured = {}
+    if report_path is not None:
+        report = read_mandate_report(report_path, problems)
+        if report is not None:
+            if report_path.stat().st_mtime < layout().manifest.stat().st_mtime:
+                notes.append(
+                    f"note: {report_path} predates {layout().manifest}; its "
+                    "per-test timings are stale and the drift comparison is skipped"
+                )
+            else:
+                measured = report_timings(report)
+                compared = 0
+                for row in rows:
+                    seconds = measured.get(row.name)
+                    if seconds is None:
+                        continue
+                    compared += 1
+                    delta = seconds - row.cost
+                    relative = delta / row.cost if row.cost > 0 else math.inf
+                    if (
+                        abs(delta) > budgets.drift_floor_seconds
+                        and abs(relative) > budgets.drift
+                    ):
+                        problems.append(
+                            f"measured/declared drift for {row.name}: declared "
+                            f"{row.cost:.2f}s, measured {seconds:.2f}s "
+                            f"({relative:+.0%}, tolerance {budgets.drift:.0%}, "
+                            f"floor {budgets.drift_floor_seconds:.1f}s)"
+                        )
+                    budget = budgets.tiers.get(row.tier)
+                    if budget is not None and seconds > budget:
+                        problems.append(
+                            f"{row.name} measured {seconds:.2f}s, over its "
+                            f"{row.tier} tier budget {budget:.2f}s"
+                        )
+                if not measured:
+                    notes.append(
+                        f"note: {report_path} carries no per-test timings "
+                        f"(schema {report.get('schema')!r}); the declared costs "
+                        "are not drift-checked"
+                    )
+                else:
+                    notes.append(
+                        f"note: drift compared {compared} of {len(rows)} declared "
+                        f"row(s) against {report_path} (tolerance "
+                        f"{budgets.drift:.0%}, floor "
+                        f"{budgets.drift_floor_seconds:.1f}s)"
+                    )
+
+    cells = sum(len(row.cells) for row in rows)
+    summary = [
+        f"  gate-perf-design: {len(rows)} perf test row(s), {cells} coverage "
+        f"cell(s), {len(gaps)} gap(s), baseline "
+        f"{budgets.baseline or 'unset'}"
+    ]
+    for tier in sorted(by_tier):
+        total = sum(row.cost for row in by_tier[tier])
+        budget = budgets.tiers.get(tier)
+        summary.append(
+            f"  gate-budgets: {tier} {total:.2f}/{budget:.2f}s"
+            if budget is not None
+            else f"  gate-budgets: {tier} {total:.2f}/no budget"
+        )
+    return problems, summary, notes
+
+
+def listed_test_names(
+    target: str, *, ignored: bool, lib: bool = False, package: str | None = None
+) -> set[str]:
+    """The `<target>::<test>` names cargo reports for one test target.
+
+    ``lib`` selects `<package> --lib` (the reserved perf-design target) instead
+    of `--test <target>`; ``package`` defaults to the checked package. A cargo
+    failure is a named non-zero exit: without the test list a design row cannot
+    be resolved at all.
+    """
+    package = package or layout().package
+    where = ["--lib"] if lib else ["--test", target]
+    cmd = ["cargo", "test", "-p", package, *where, "--", "--list"]
     if ignored:
         cmd.append("--ignored")
     proc = subprocess.run(cmd, cwd=layout().root, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         mode = " --list --ignored" if ignored else " --list"
-        sys.exit(f"cargo test -p {layout().package} --test {target}{mode} failed")
+        sys.exit(f"cargo test -p {package} {' '.join(where)}{mode} failed")
     found: set[str] = set()
     for line in proc.stdout.splitlines():
         match = re.match(r"(.+): test$", line)
@@ -761,6 +1267,10 @@ def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
     return found
 
 
+def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
+    return listed_test_names(target, ignored=ignored)
+
+
 def ignored_scenarios(target: str) -> set[str]:
     return listed_scenarios(target, ignored=True)
 
@@ -773,6 +1283,17 @@ def main() -> int:
         metavar=("ROOT", "PACKAGE", "DIR", "GATE_MD"),
         help="check <PACKAGE>'s gate in <ROOT> with scenarios in <DIR> and "
         "manifest <GATE_MD> (omitted: the netem_test harness layout)",
+    )
+    parser.add_argument(
+        "--mandate-check-json",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "a fresh mandate-check.json whose per-test timings are compared "
+            "with the declared nominal costs (default: <crate root>/"
+            f"{DEFAULT_REPORT_NAME} when it exists)"
+        ),
     )
     args = parser.parse_args()
 
@@ -912,6 +1433,20 @@ def main() -> int:
     else:
         lane_roles = {}
 
+    # The perf-test dual mandate: time budgets and declared coverage. A crate
+    # that has perf tests but no declaration is a note, not a failure, so an
+    # unmigrated crate is visible without blocking the rest of the gate.
+    report_path = args.mandate_check_json
+    if report_path is None:
+        default_report = layout().root / DEFAULT_REPORT_NAME
+        report_path = default_report if default_report.is_file() else None
+    perf_problems, perf_summary, perf_notes = check_perf_gate(manifest, report_path)
+    for note in perf_notes:
+        print(note)
+    for problem in perf_problems:
+        print(f"PERF DECLARATION: {problem}")
+    bad = bad or bool(perf_problems)
+
     if bad:
         print(
             f"\nmanifest has {len(manifest)} entries, binaries report "
@@ -938,6 +1473,8 @@ def main() -> int:
             f"  gate-lane-roles: {len(lane_roles)} perf-loop lane(s), "
             f"{diagnostic} diagnostic-only"
         )
+    for line in perf_summary:
+        print(line)
     return 0
 
 
