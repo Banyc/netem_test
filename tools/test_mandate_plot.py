@@ -417,10 +417,13 @@ def _latency_rows(points):
     ]
 
 
-# A real run's M1 readings, and the shape the panel below is about: one 250 ms
-# ceiling drawn across three arms whose own guards differ by more than the
-# ceiling itself (`lone_tail`'s p99 guard is 3200 ms). These are the
-# `MANDATE M1` line's own numbers and the run's own drawn `M1.csv` points.
+# A real run's M1 readings, and the shape both of the panels below are about.
+# The line panel draws one 250 ms ceiling across three arms whose own guards
+# differ by more than the ceiling itself (`lone_tail`'s is 3200 ms), and the CDF
+# beside it draws the same three distributions with no horizontal bound at all.
+# These are the `MANDATE M1` line's own numbers and the run's own drawn
+# `M1.csv` points: `clean` reached the ceiling's side of its distribution at
+# 107.7 ms, `hostile` reads 99.4 % at 250 ms and `lone_tail` 99.06 %.
 M1_RUN_VALUES = {
     "clean_p50": 24.4,
     "clean_p90": 30.0,
@@ -2565,7 +2568,7 @@ class MandatePlotTest(unittest.TestCase):
             "elapsed time (s)",
             "latency (ms)",
             series,
-            MANDATE.REPORT.extent_including_bounds(
+            REPORT_EXTENT := MANDATE.REPORT.extent_including_bounds(
                 MANDATE.REPORT.finite_extent(series), [(250.0, "")]
             ),
             [(250.0, "M1 ceiling 250 ms")],
@@ -2612,6 +2615,183 @@ class MandatePlotTest(unittest.TestCase):
             )
         self.assertNotEqual(code, 0, stderr)
         self.assertIn("the bound of none of them", stderr)
+
+    def test_the_value_at_a_bound_is_read_off_the_drawn_segment(self):
+        # The value a panel states at its x bound has to be the one the drawn
+        # polyline shows there: interpolated between the bracketing samples,
+        # and clamped to the series' own end when the bound is past it.
+        self.assertEqual(
+            MANDATE.value_at([(0.0, 0.0), (100.0, 50.0), (200.0, 100.0)], 150.0),
+            75.0,
+        )
+        self.assertEqual(MANDATE.value_at([(0.0, 0.0), (100.0, 100.0)], 250.0), 100.0)
+        self.assertEqual(MANDATE.value_at([], 250.0), None)
+        self.assertEqual(MANDATE.panel_unit("percentile (%)"), "%")
+        self.assertEqual(MANDATE.panel_unit("latency (ms)"), "ms")
+        self.assertEqual(MANDATE.panel_unit("share"), "")
+
+    def test_a_cdf_carries_the_ceiling_and_the_value_it_is_read_at(self):
+        # `M1-cdf` draws the latency distribution and no bound of its own; the
+        # mandate's ceiling is a value on the axis its *x* carries, so the
+        # panel can draw the failure its mandate is read for -- the curve not
+        # reaching the top by the ceiling -- and has to state, at that x, what
+        # each curve reads. The four readings below are the run's own drawn
+        # `M1.csv` points: at 250 ms the clean curve has already reached 100 %,
+        # `hostile` reads 99.4 % and `lone_tail` 99.06 %.
+        panels = M1_ARMS_DECLARATION["panels"]
+        points = _points(M1_ARMS_ROWS)
+        code, stderr, out = self.render_mandate(
+            M1_ARMS_DECLARATION,
+            M1_ARMS_ROWS,
+            "M1ceil",
+            "--run-values",
+            json.dumps(M1_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        cdf = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        self.assertEqual(len(MANDATE.re.findall(r'class="x-bound"', cdf)), 1)
+        self.assertEqual(
+            [declared for declared, _, _ in MANDATE.label_boxes(cdf)],
+            [
+                "M1 ceiling 250 ms [at 250 ms: clean 100%, hostile 99.4%, "
+                "lone_tail 99.06%]"
+            ],
+        )
+        # The frame now carries the failure, so the bare pointer to the sibling
+        # panel is gone: the panel that can draw the failure does not name the
+        # one that used to.
+        self.assertEqual(MANDATE.drawn_notes(cdf), [])
+        self.assertEqual(
+            MANDATE.check_x_bound_drawn(
+                "cdf",
+                panels[1],
+                panels,
+                points,
+                "elapsed time (s)",
+                "latency (ms)",
+                M1_RUN_VALUES,
+                cdf,
+            ),
+            [],
+        )
+        # End to end: a chart that drops the mark and the sentence does not
+        # write the panel at all.
+        drawn_cdf = MANDATE.REPORT.svg_cdf_chart
+
+        def cdf_without_its_ceiling(*arguments, **keywords):
+            return drawn_cdf(*arguments, **{**keywords, "x_bounds": None})
+
+        with mock.patch.object(MANDATE.REPORT, "svg_cdf_chart", cdf_without_its_ceiling):
+            code, stderr, _ = self.render_mandate(
+                M1_ARMS_DECLARATION,
+                M1_ARMS_ROWS,
+                "M1ceil2",
+                "--run-values",
+                json.dumps(M1_RUN_VALUES),
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("has to say what the bound reads", stderr)
+
+    def test_a_cdf_ceiling_value_from_another_series_is_refused(self):
+        # The other half of the vacuity, and the one `check_reading_numbers`
+        # exists for: a sentence that reached the panel is not a sentence that
+        # is true of it. This drawer states the value it reads one unit high,
+        # so the numbers on the artifact are no longer the numbers the panel's
+        # own drawn points measure, and the render must be refused.
+        real = MANDATE.x_bound_label
+
+        def one_unit_high(bound, series, x_unit, y_unit, drawn_range=None):
+            return real(
+                bound,
+                [(name, [(x, value + 1.0) for x, value in points]) for name, points in series],
+                x_unit,
+                y_unit,
+                drawn_range,
+            )
+
+        with mock.patch.object(MANDATE, "x_bound_label", one_unit_high):
+            code, stderr, _ = self.render_mandate(
+                M1_ARMS_DECLARATION,
+                M1_ARMS_ROWS,
+                "M1ceil3",
+                "--run-values",
+                json.dumps(M1_RUN_VALUES),
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("which the series it is drawn from does not measure", stderr)
+
+    def test_a_ceiling_beyond_the_drawn_x_range_is_stated_not_drawn(self):
+        # A run whose samples all sit under the ceiling cannot draw the mark:
+        # there is no pixel for a value past the axis. It still owes the
+        # reading, and it owes saying that the value is outside the drawn
+        # range, so the clamp the value is read with cannot pass for a
+        # measurement.
+        declaration = {
+            "mandate": "M1",
+            "title": "M1 interactive tail latency",
+            "x_label": "elapsed time (s)",
+            "y_label": "latency (ms)",
+            "panels": [
+                {
+                    "id": "latency",
+                    "chart": "line",
+                    "series": [{"name": "clean"}, {"name": "hostile"}],
+                    "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+                },
+                {
+                    "id": "cdf",
+                    "chart": "cdf",
+                    "x_label": "latency (ms)",
+                    "y_label": "percentile (%)",
+                    "series": [{"name": "clean"}, {"name": "hostile"}],
+                    "bounds": [],
+                },
+            ],
+        }
+        rows = [
+            ["panel", "series", "x", "y"],
+            ["latency", "clean", 1.0, 20.0],
+            ["latency", "clean", 2.0, 60.0],
+            ["latency", "clean", 3.0, 24.0],
+            ["latency", "hostile", 1.0, 30.0],
+            ["latency", "hostile", 2.0, 70.0],
+            ["latency", "hostile", 3.0, 34.0],
+            ["cdf", "clean", 20.0, 0.0],
+            ["cdf", "clean", 60.0, 50.0],
+            ["cdf", "clean", 100.0, 100.0],
+            ["cdf", "hostile", 30.0, 0.0],
+            ["cdf", "hostile", 70.0, 50.0],
+            ["cdf", "hostile", 100.0, 100.0],
+        ]
+        code, stderr, out = self.render_mandate(
+            declaration, rows, "M1under", "--run-values", json.dumps({"ceiling": 250.0})
+        )
+        self.assertEqual(code, 0, stderr)
+        cdf = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        self.assertEqual(len(MANDATE.re.findall(r'class="x-bound"', cdf)), 0)
+        self.assertEqual(
+            [declared for declared, _, _ in MANDATE.label_boxes(cdf)],
+            [
+                "M1 ceiling 250 ms [at 250 ms: clean 100%, hostile 100%] "
+                "(x beyond this panel's drawn range)"
+            ],
+        )
+        # The vacuity: drop the clause that says the value is outside the
+        # drawn range and the render is refused -- the clamp then reads as a
+        # measurement.
+        real = MANDATE.x_bound_label
+
+        def without_the_caveat(bound, series, x_unit, y_unit, drawn_range=None):
+            return real(bound, series, x_unit, y_unit, None).replace(
+                " (x beyond this panel's drawn range)", ""
+            )
+
+        with mock.patch.object(MANDATE, "x_bound_label", without_the_caveat):
+            code, stderr, _ = self.render_mandate(
+                declaration, rows, "M1under2", "--run-values", json.dumps({"ceiling": 250.0})
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("outside this panel's drawn x range", stderr)
 
     def test_a_panel_with_no_bound_says_where_the_bound_is_drawn(self):
         # `M1-cdf` draws the latency distribution and no line at all: the

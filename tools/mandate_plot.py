@@ -166,6 +166,21 @@ silenced by softening a declaration:
   against a panel whose only mark was the 250 ms mandate ceiling, which is not
   what that arm is asserted against (its own p99 guard is 3200 ms): the reader
   saw a 6.3×-over-ceiling peak and no way to learn it was a pass.
+- **the x-bound test** — `check_x_bound_drawn` refuses a panel that leaves a
+  mandate bound off a frame that can carry it. `bounds` are horizontal, so a
+  ceiling expressed on the plot's *x* axis — an M1 latency ceiling read against
+  a latency CDF — has no declared representation: it is carried on the sibling
+  panel whose *y* axis is that quantity, and read back there rather than stated
+  twice. Where the two panels' own drawn axis labels name the same quantity
+  (`latency (ms)` on both sides), the panel draws a vertical mark at the
+  ceiling and states, at that x, what each curve reads — `M1 ceiling 250 ms [at
+  250 ms: clean 100%, hostile 99.4%, lone_tail 99.06%]` — which is the failure a
+  CDF is read for (the curve not reaching its top by the ceiling) made visible
+  in-frame. The values are parsed back out of the artifact and measured against
+  the same drawn points the panel plots, so a sentence whose numbers came from
+  anywhere else is refused. A ceiling outside the drawn x range owes no mark
+  (there is no pixel for it) but still owes the reading, and owes saying it is
+  outside, so the clamp the value is read with cannot pass for a measurement.
 - **the departure-view test** — `check_departure_view_stated` refuses a panel
   whose own frame cannot carry the failure its mandate is read for. Two
   shapes, one rule. A bar panel whose bound is a value its own bars *straddle*
@@ -179,9 +194,12 @@ silenced by softening a declaration:
   `(mine - y) / y` — so the note names a panel the relation actually holds for.
   A panel that draws **no bound at all** while a sibling of the same mandate
   draws one (`M1-cdf` under `M1-latency`) has no mark to read its own quantity
-  against either, and names the sibling and the bound it carries. The check
-  refuses a silent panel in both shapes, because a panel drawn silently reads
-  as evidence that there is no failure to draw.
+  against either, and names the sibling and the bound it carries — unless the
+  bound is expressible on its own x axis, which is the case the x-bound test
+  above takes over: naming a sibling is what a frame does when it *cannot*
+  carry the failure, and a bare pointer is not enough once the value is
+  knowable. The check refuses a silent panel in both shapes, because a panel
+  drawn silently reads as evidence that there is no failure to draw.
 - **the stated-number test** — `check_reading_numbers` reads the numbers back
   out of that drawn band and measures them against the drawn points. A band is
   the part of a latency panel a reader trusts *instead of* the pixels, so a
@@ -205,9 +223,12 @@ loud instead of silent:
   available for deriving one.
 - ``bounds`` are horizontal only (``y``). A mandate ceiling expressed on the
   plot's *x* axis (an M1 latency ceiling against a latency CDF) has no declared
-  representation yet; the M1 declaration in the contract solves this by leaving
-  the CDF panel's ``bounds`` empty and carrying the ceiling on the latency
-  panel.
+  representation: the M1 declaration in the contract carries it on the latency
+  panel, and the CDF panel reads it back off the sibling whose *y* axis names
+  the CDF's *x* quantity, drawing it as a vertical mark and stating the value
+  each curve reads there (`derived_x_bounds`, `check_x_bound_drawn`). A
+  declaration that renamed either axis stops the transfer instead of
+  annotating a panel the bound is not about.
 """
 
 from __future__ import annotations
@@ -2085,6 +2106,239 @@ def relative_departure_panel(panel, panels, points, y):
     return None
 
 
+def panel_unit(label):
+    """The unit a panel's own axis label declares, or ``""``.
+
+    `percentile (%)` declares `%` and `latency (ms)` declares `ms`, so a value a
+    panel states in its own y quantity is written with the unit its axis
+    already carries instead of a unit this tool would have to choose.
+    """
+    match = re.search(r"\(([^()]*)\)\s*$", label or "")
+    return match.group(1).strip() if match else ""
+
+
+def value_at(points, x):
+    """The value a drawn series reads at ``x``, off the segment it draws there.
+
+    A panel asserts the value *at* a bound it draws on its x axis, so the value
+    has to be the one the reader can see: linearly interpolated between the two
+    drawn samples that bracket ``x``, exactly as the polyline between them is
+    drawn. A series that has already reached the top by ``x`` reads its last
+    value, and one that starts after ``x`` reads its first -- a clamp, which is
+    why `derived_x_bounds`' caller states when the bound is outside the drawn
+    range rather than letting the clamp read as a measurement.
+    """
+    if not points:
+        return None
+    if x <= points[0][0]:
+        return points[0][1]
+    if x >= points[-1][0]:
+        return points[-1][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x0 <= x <= x1:
+            if x1 == x0:
+                return y1
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return points[-1][1]
+
+
+def derived_x_bounds(panel, panels, points, mandate_x_label, mandate_y_label, run_values):
+    """The bounds a sibling panel draws on the quantity this panel's x axis carries.
+
+    ``bounds`` are horizontal, so a mandate ceiling expressed on the plot's *x*
+    axis -- an M1 latency ceiling read against a latency CDF -- has no declared
+    representation: the declaration carries it on the panel whose *y* axis is
+    that quantity, and this reads it back rather than duplicating a bound the
+    mandate already states once (one authority per bound). The relation is
+    derived from the two panels' own drawn axis labels, so a declaration that
+    renamed either axis stops the transfer instead of annotating a panel the
+    bound is not about.
+    """
+    if panel["chart"] not in ("line", "cdf"):
+        return []
+    mine = panel_series(panel, points)
+    our_x = panel_x_label_for(
+        panel,
+        mandate_x_label,
+        [x for _, series in mine for x, _ in series],
+        run_values,
+    )
+    derived = []
+    for other in panels:
+        if other["id"] == panel["id"]:
+            continue
+        their_y = panel_y_label_for(
+            other, mandate_y_label, panel_series(other, points)
+        )
+        if their_y != our_x:
+            continue
+        for bound in other.get("bounds") or []:
+            derived.append(
+                {
+                    "x": float(bound["y"]),
+                    "label": bound["label"],
+                    "source": other["id"],
+                }
+            )
+    return derived
+
+
+def x_bound_label(bound, series, x_unit, y_unit, drawn_range=None):
+    """A bound carried to the x axis, with the value every series reads there.
+
+    The failure a CDF is read for is the curve not reaching its top by the
+    ceiling, and the ceiling is a value on the axis the CDF's *x* carries: so
+    the panel states, at that x, what each curve reads. Without it the reader
+    has the shape and no mark to read it against -- whether any sample exceeds
+    the ceiling is answerable only from the numbers, which is the debt a bare
+    pointer to the sibling panel leaves unpaid once the value is knowable.
+    """
+    x = bound["x"]
+    readings = []
+    for name, points in series:
+        value = value_at(points, x)
+        if value is None:
+            continue
+        readings.append(f"{name} {value:.4g}{y_unit}")
+    outside = (
+        drawn_range is not None
+        and not (drawn_range[0] <= x <= drawn_range[1])
+    )
+    text = (
+        f"{bound['label']} [at {x:g}{' ' + x_unit if x_unit else ''}: "
+        + ", ".join(readings)
+        + "]"
+    )
+    if outside:
+        text += " (x beyond this panel's drawn range)"
+    return text
+
+
+def check_x_bound_drawn(
+    panel_id, panel, panels, points, mandate_x_label, mandate_y_label, run_values, markup
+):
+    """Problems that leave a mandate bound off a panel that can carry it in-frame.
+
+    A panel whose mandate can fail on its own x axis must be able to draw that
+    failure: the mark has to be on the artifact, and the sentence has to state
+    the value the bound is read against. The sentence is not checked against
+    the formatter that wrote it -- that would prove only that it reached the
+    panel -- but read back out of the artifact and measured, per series, against
+    the same drawn points the panel plots, so a magnitude taken from anywhere
+    else is refused rather than drawn authoritatively. A bound outside the drawn
+    x range owes no line (there is no pixel for it) but still owes the
+    sentence, and the sentence says it is outside, so the clamp `value_at`
+    returns cannot read as a measurement.
+    """
+    derived = derived_x_bounds(
+        panel, panels, points, mandate_x_label, mandate_y_label, run_values
+    )
+    if not derived:
+        return []
+    series = panel_series(panel, points)
+    drawn = [(name, REPORT.decimate(points)) for name, points in series]
+    x_unit = panel_unit(
+        panel_x_label_for(
+            panel,
+            mandate_x_label,
+            [x for _, points in series for x, _ in points],
+            run_values,
+        )
+    )
+    y_unit = panel_unit(panel_y_label_for(panel, mandate_y_label, series))
+    xs = [x for _, points in drawn for x, _ in points]
+    drawn_range = (min(xs), max(xs)) if xs else None
+    drawn_xs = [
+        float(value)
+        for value in re.findall(r'class="x-bound" x1="([-0-9.]+)"', markup)
+    ]
+    labels = [declared for declared, _, _ in label_boxes(markup)]
+    left, _, right, _ = panel_plot_rect(panel_id, markup)
+    problems = []
+    for bound in derived:
+        # The sentence this bound owes is the one that reads *this* x: two bounds
+        # whose labels share a prefix would otherwise be able to answer for each
+        # other, and the value check below would compare one bound's numbers
+        # against the other's point.
+        reading = f"at {bound['x']:g}"
+        stated = next(
+            (
+                label
+                for label in labels
+                if label.startswith(bound["label"])
+                and label != bound["label"]
+                and reading in label
+            ),
+            None,
+        )
+        if stated is None:
+            problems.append(
+                f"panel {panel_id!r}: the mandate's bound {bound['label']!r} is "
+                f"stated on panel {bound['source']!r} on this panel's own x "
+                f"quantity, so this panel can draw the failure and has to say "
+                f"what the bound reads there. Expected on the panel: "
+                f"{x_bound_label(bound, drawn, x_unit, y_unit, drawn_range)!r}; "
+                f"drawn: {labels!r}"
+            )
+            continue
+        for name, points in drawn:
+            value = value_at(points, bound["x"])
+            if value is None:
+                continue
+            written = re.search(
+                rf"{re.escape(name)}\s+([-+0-9.eE]+){re.escape(y_unit)}", stated
+            )
+            if written is None:
+                problems.append(
+                    f"panel {panel_id!r}: the bound {bound['label']!r} is drawn "
+                    f"without a value for series {name!r}, which the panel plots; "
+                    f"the series reads {value:.6g}{y_unit} at {bound['x']:g} and "
+                    "a reader told nothing is told the pointer the value "
+                    f"replaced (drawn: {stated!r})"
+                )
+                continue
+            problem = stated_problem(
+                panel_id,
+                name,
+                f"its value at {bound['x']:g} as",
+                written.group(1),
+                value,
+            )
+            if problem is not None:
+                problems.append(problem)
+        outside = drawn_range is None or not (
+            drawn_range[0] <= bound["x"] <= drawn_range[1]
+        )
+        if outside:
+            if "beyond this panel's drawn range" not in stated:
+                problems.append(
+                    f"panel {panel_id!r}: the bound {bound['label']!r} at "
+                    f"{bound['x']:g} is outside this panel's drawn x range and "
+                    "the panel's sentence does not say so, so the value it "
+                    f"states reads as a measurement (drawn: {stated!r})"
+                )
+            continue
+        if not drawn_xs:
+            problems.append(
+                f"panel {panel_id!r}: the bound {bound['label']!r} at "
+                f"{bound['x']:g} lies inside this panel's drawn x range "
+                f"{drawn_range[0]:g}..{drawn_range[1]:g}, so the artifact needs "
+                "a vertical mark at it -- a bound the panel states but does not "
+                "draw is a claim with no mark to read it against"
+            )
+            continue
+        span = drawn_range[1] - drawn_range[0]
+        want = left + (bound["x"] - drawn_range[0]) / span * (right - left)
+        if min(abs(value - want) for value in drawn_xs) <= 1.5:
+            continue
+        problems.append(
+            f"panel {panel_id!r}: its drawn x marks are at {drawn_xs} px and the "
+            f"bound {bound['label']!r} at {bound['x']:g} is {want:.1f} px; a mark "
+            "somewhere else on the axis is not the bound the sentence states"
+        )
+    return problems
+
+
 def departure_view_note(panel, panels, points):
     """The note a share panel owes: what it is, and where its failure is drawn.
 
@@ -2121,16 +2375,23 @@ def departure_view_note(panel, panels, points):
     return ""
 
 
-def bound_reference_note(panel, panels, points):
+def bound_reference_note(panel, panels, points, x_label="", y_label="", run_values=None):
     """The note a panel with no bound of its own owes: where the bound is drawn.
 
     A panel that draws no line at all cannot show a breach of the mandate's
     bound however faithfully it draws its quantity: the reader has no mark to
     read the quantity against. So it says which panel of the mandate carries
-    the bound, and which bound that is -- the same debt a share panel owes for
-    a departure it cannot contain.
+    the bound and which bound that is -- the same debt a share panel owes for a
+    departure it cannot contain.
+
+    It owes nothing once the bound is expressible on its *own* x axis and
+    `check_x_bound_drawn` draws it there with the value it is read at: naming a
+    sibling panel is what a frame does when it cannot carry the failure, and a
+    bare pointer is not enough once the value is knowable.
     """
     if panel.get("bounds"):
+        return ""
+    if derived_x_bounds(panel, panels, points, x_label, y_label, run_values):
         return ""
     for other in panels:
         if other["id"] == panel["id"]:
@@ -2145,10 +2406,10 @@ def bound_reference_note(panel, panels, points):
     return ""
 
 
-def composition_note(panel, panels, points):
+def composition_note(panel, panels, points, x_label="", y_label="", run_values=None):
     """The note a panel owes for the failure its own frame cannot carry."""
     return departure_view_note(panel, panels, points) or bound_reference_note(
-        panel, panels, points
+        panel, panels, points, x_label, y_label, run_values
     )
 
 
@@ -2220,7 +2481,9 @@ def check_note_fit(panel_id, markup):
     return problems
 
 
-def check_departure_view_stated(panel_id, panel, panels, points, markup):
+def check_departure_view_stated(
+    panel_id, panel, panels, points, markup, x_label="", y_label="", run_values=None
+):
     """Problems that leave a composition panel silent about the failure it cannot show.
 
     Two shapes, one rule. A panel whose bound is a value its own bars straddle
@@ -2231,8 +2494,13 @@ def check_departure_view_stated(panel_id, panel, panels, points, markup):
     where the failure is drawn and what it measures. What is refused is
     neither, because a panel drawn silently reads as evidence that there is no
     failure to draw.
+
+    A panel that *can* carry the failure -- a bound on its own x quantity, which
+    `check_x_bound_drawn` draws with the value it is read at -- owes no note:
+    the frame carries it, and a pointer to a sibling panel would be the weaker
+    answer.
     """
-    expected = composition_note(panel, panels, points)
+    expected = composition_note(panel, panels, points, x_label, y_label, run_values)
     if not expected:
         return []
     drawn = " ".join(drawn_notes(markup))
@@ -3055,7 +3323,13 @@ def panel_markup(
     # is the one that band leaves.
     readings = panel_readings(series, run_censoring) if chart == "line" else []
     reading_rows = sum(len(lines) for lines in REPORT.reading_lines(readings))
-    note = composition_note(panel, panels or [panel], points)
+    # A bound the mandate states on this panel's own *x* quantity -- the latency
+    # ceiling the sibling latency panel draws, read against a latency CDF -- is
+    # carried here as a vertical mark with the value each curve reads at it.
+    x_bounds = derived_x_bounds(panel, panels or [panel], points, x_label, y_label, run_values)
+    note = composition_note(
+        panel, panels or [panel], points, x_label, y_label, run_values
+    )
     note_rows = len(REPORT.wrap_label(note, REPORT.READING_PLOT_WIDTH)) if note else 0
     plot_height = (
         REPORT.line_plot_height(len(series), reading_rows + note_rows)
@@ -3101,6 +3375,30 @@ def panel_markup(
     if problems:
         _fail("\n  ".join(problems))
     drawn = [(series_label(name), points) for name, points in series]
+    # The mark's sentence states what the *drawn* polyline reads, so it is built
+    # from the decimated points the chart itself plots.
+    plotted = [(name, REPORT.decimate(points)) for name, points in series]
+    plotted_range = (
+        (
+            min(x for _, points in plotted for x, _ in points),
+            max(x for _, points in plotted for x, _ in points),
+        )
+        if plotted
+        else None
+    )
+    drawn_x_bounds = [
+        (
+            bound["x"],
+            x_bound_label(
+                bound,
+                plotted,
+                panel_unit(panel_x_label),
+                panel_unit(panel_y_label),
+                plotted_range,
+            ),
+        )
+        for bound in x_bounds
+    ]
     if chart == "bar":
         markup = svg_bar_chart(
             chart_title,
@@ -3128,6 +3426,7 @@ def panel_markup(
             markers=True,
             readings=readings,
             note=note,
+            x_bounds=drawn_x_bounds,
         )
     else:
         labelled = [
@@ -3135,7 +3434,13 @@ def panel_markup(
             for bound in drawn_bounds
         ]
         markup = REPORT.svg_cdf_chart(
-            chart_title, panel_x_label, panel_y_label, drawn, labelled, note=note
+            chart_title,
+            panel_x_label,
+            panel_y_label,
+            drawn,
+            labelled,
+            note=note,
+            x_bounds=drawn_x_bounds,
         )
     problems = (
         check_label_fit(panel["id"], markup)
@@ -3146,7 +3451,14 @@ def panel_markup(
         + check_note_fit(panel["id"], markup)
         + (
             check_departure_view_stated(
-                panel["id"], panel, panels or [panel], points, markup
+                panel["id"],
+                panel,
+                panels or [panel],
+                points,
+                markup,
+                x_label,
+                y_label,
+                run_values,
             )
             + check_bound_arm_governance(
                 panel["id"], panel, series, bounds, run_values, markup
@@ -3154,10 +3466,27 @@ def panel_markup(
             + check_bar_separation(panel["id"], markup)
             if chart == "bar"
             else check_departure_view_stated(
-                panel["id"], panel, panels or [panel], points, markup
+                panel["id"],
+                panel,
+                panels or [panel],
+                points,
+                markup,
+                x_label,
+                y_label,
+                run_values,
             )
             + check_bound_arm_governance(
                 panel["id"], panel, series, bounds, run_values, markup
+            )
+            + check_x_bound_drawn(
+                panel["id"],
+                panel,
+                panels or [panel],
+                points,
+                x_label,
+                y_label,
+                run_values,
+                markup,
             )
         )
         + (

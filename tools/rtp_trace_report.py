@@ -257,6 +257,41 @@ def bound_label_markup(text, line_right, bound_y, plot, style, title=True):
     return "".join(parts), layout
 
 
+def x_bound_label_markup(text, line_x, plot, style, title=True):
+    """The ``<text>`` markup for a **vertical** bound's label, laid out in `plot`.
+
+    A bound the mandate expresses on the plot's *x* axis -- a latency ceiling
+    read against a latency CDF -- is drawn as a vertical line, and its label
+    cannot use `layout_bound_label`: that places a block above (or below) a
+    horizontal line and anchors it at the line's own right end, which for a
+    vertical line at a fifth of the plot's width leaves the block hanging off
+    the plot's left edge. So the block is laid out beside the line instead, on
+    whichever side has the wider budget, wrapped to that budget and anchored at
+    the line's own x: the reader is told which mark the sentence belongs to by
+    the ink being next to it, and `check_label_fit` measures the result against
+    the plot area the way it measures a horizontal bound's label.
+    """
+    left, top, right, bottom = plot
+    right_budget = max((right - LABEL_INSET_PX) - (line_x + LABEL_GAP_PX), 0.0)
+    left_budget = max((line_x - LABEL_GAP_PX) - (left + LABEL_INSET_PX), 0.0)
+    to_the_right = right_budget >= left_budget
+    budget = max(right_budget if to_the_right else left_budget, LABEL_FONT_PX)
+    lines = wrap_label(text, budget)
+    anchor = line_x + LABEL_GAP_PX if to_the_right else line_x - LABEL_GAP_PX
+    text_anchor = "start" if to_the_right else "end"
+    parts = []
+    for index, line in enumerate(lines):
+        inner = html.escape(line)
+        if index == 0 and title:
+            inner = f"<title>{html.escape(text)}</title>{inner}"
+        baseline = top + LABEL_ASCENT_PX + 2.0 + index * LABEL_LINE_HEIGHT_PX
+        parts.append(
+            f'<text class="bound-label" x="{anchor:.1f}" y="{baseline:.1f}" '
+            f'text-anchor="{text_anchor}" style="{style}">{inner}</text>'
+        )
+    return "".join(parts)
+
+
 # -- drawing a line series honestly ----------------------------------------
 #
 # A polyline is a claim that the quantity moved from one sample to the next, and
@@ -510,8 +545,9 @@ def svg_line_chart(
     markers=False,
     readings=None,
     note="",
+    x_bounds=None,
 ):
-    """A line or CDF chart, with optional labelled horizontal bound lines.
+    """A line or CDF chart, with optional labelled bound lines on either axis.
 
     Three opt-in honesty features, all off by default so the paired loop's own
     graphs are unchanged: ``walls`` breaks a series' line wherever its sampling
@@ -520,6 +556,12 @@ def svg_line_chart(
     per line, which is where a producer's machine verdict is stated on the
     panel it is about. ``note`` is prose the frame owes its reader -- what the
     frame cannot show about itself -- and is reserved and drawn the same way.
+    ``x_bounds`` is the same honesty feature as ``bounds`` on the other axis:
+    one ``(x_value, label)`` per vertical dashed line, for a bound the mandate
+    states on the quantity this panel's *x* axis carries (a latency ceiling
+    against a latency CDF). A bound outside the drawn x range is not drawn as a
+    line -- there is no pixel for it -- but its label is, so a mark the reader
+    cannot see is still a sentence they can read.
     """
     series = [(name, decimate(points)) for name, points in series if points]
     if not series:
@@ -592,6 +634,20 @@ def svg_line_chart(
             BOUND_LABEL_STYLE,
         )
         parts.append(markup)
+    for x_value, label in x_bounds or []:
+        x = sx(x_value)
+        plot = (PAD_LEFT, plot_top, WIDTH - PAD_RIGHT, HEIGHT - PAD_BOTTOM)
+        if PAD_LEFT <= x <= WIDTH - PAD_RIGHT:
+            parts.append(
+                f'<line class="x-bound" x1="{x:.1f}" y1="{plot_top:.1f}" '
+                f'x2="{x:.1f}" y2="{HEIGHT - PAD_BOTTOM:.1f}" '
+                f'stroke="{BOUND_STROKE}" stroke-width="1.4" '
+                'stroke-dasharray="6 4"/>'
+            )
+        # A bound past the frame's edge keeps its label at the edge it left by,
+        # so the sentence that says the mark is off-frame is inside the frame.
+        anchor_x = min(max(x, PAD_LEFT), WIDTH - PAD_RIGHT)
+        parts.append(x_bound_label_markup(label, anchor_x, plot, BOUND_LABEL_STYLE))
     if wrapped:
         # The band sits between the legend and the plot, in the space the plot's
         # own top was pushed down by, so a reading is never drawn over the
@@ -672,15 +728,25 @@ def cdf_points(samples):
     ]
 
 
-def svg_cdf_chart(title, x_label, y_label, series, bounds=None, note=""):
+def svg_cdf_chart(title, x_label, y_label, series, bounds=None, note="", x_bounds=None):
     """One or more empirical CDFs on a fixed 0-100% percentile axis.
 
     ``series`` is ``[(name, points)]`` with the percentile already carried in
     each point's y; this is the shape the mandate plotter reads straight from
-    its CSV, while ``svg_cdf`` derives those points from raw samples.
+    its CSV, while ``svg_cdf`` derives those points from raw samples. A bound
+    stated on the CDF's *x* axis (a latency ceiling) is an ``x_bounds`` entry:
+    the failure a CDF is read for is the curve's value at the ceiling, which
+    only a mark on that axis can carry.
     """
     return svg_line_chart(
-        title, x_label, y_label, series, (0.0, 100.0), bounds, note=note
+        title,
+        x_label,
+        y_label,
+        series,
+        (0.0, 100.0),
+        bounds,
+        note=note,
+        x_bounds=x_bounds,
     )
 
 

@@ -739,6 +739,14 @@ the reader:
   for it — the shape whose absence let a `lone_tail` peak of 1567.1 ms cross
   `M1-latency`'s 250 ms ceiling with nothing on the panel saying that arm is
   asserted at its own 3200 ms p99 guard.
+- **a mandate bound a panel can carry must be drawn on it.** A ceiling stated
+  on a sibling panel's *y* axis and read against this panel's *x* axis (the M1
+  ceiling against the latency CDF) is drawn as a vertical mark with the value
+  each curve reads there, and those values are measured against the panel's own
+  drawn points (`check_x_bound_drawn`). A panel that can carry the failure does
+  not point at the panel that carries it instead: a bare pointer is not enough
+  once the value is knowable. A ceiling outside the drawn x range owes no mark
+  but still owes the reading, and owes saying it is outside.
 - **a bound label must lie inside the plot.** The label is what says what the
   line governs, and `check_label_fit` reads each drawn label back out of the
   SVG and refuses the render when its box leaves the plot area. Measured on a
