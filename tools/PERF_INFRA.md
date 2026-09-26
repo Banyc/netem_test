@@ -243,7 +243,10 @@ sweep and constitution targets, `rtp` holds its burst-loss, bufferbloat and FEC
 tiers, and `mux` its benches. Those rows belong in those crates' `GATE.md`.
 Where the migration stands:
 
-- **`netem_test`** (this repository) — declared, in `tests/GATE.md`.
+- **`netem_test`** (this repository) — declared, in `tests/GATE.md`, and its
+  perf-tier probes are a recorded producer: their four `probe-*` rows are the
+  `probe` family, and `tools/mandate-check` records their arms alongside
+  `rtp_mux`'s (see "The producers: which are covered").
 - **`rtp_mux`** — pending. The exact rows, budgets and gap lines for it are
 drafted in `tools/PERF_PENDING_rtp_mux.md`, read from the landed
 `crates/rtp_mux` tree, so that crate's own iteration can apply them verbatim
@@ -501,6 +504,32 @@ the three tests in `gate-default-required`, so a plain `cargo test -p rtp_mux`
 runs them too; `tools/mandate-check` is the release, evidence-producing
 invocation.
 
+### The producers: which are covered
+
+`rtp_mux`'s smoke set is the producer the instrument was built for, and it is
+no longer the only one. A **producer** is one entry of
+`tools/mandate-producers.json`: its cargo invocation, its source, its log, the
+sections its arms are attributed to, and which of those sections print a
+`MANDATE` line and write plots. `tools/mandate-check` runs **every** declared
+producer by default, so a single invocation produces per-arm records for all
+of them — that is what makes the coverage-preservation comparison available to
+a crate that is not `rtp_mux`. Two producers are declared and covered today:
+
+- **`rtp_mux`** — the tri-mandate smoke set above
+  (`cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`): its
+  `M1`-`M4` arms, its verdict lines and the eight evidence files.
+- **`netem_test`** — this workspace's four perf-tier probes, in the harness
+  `lib` target
+  (`cargo test --release -p netem-test --lib -- --ignored --test-threads=1 --nocapture`):
+  four report-only arms in the `probe` section. They assert no bound, so they
+  print no `MANDATE` line and write no evidence; each arm line carries its own
+  section (`section=probe`), which is how a producer with no verdict line
+  still reports attributable arms.
+
+The contract a producer owes, and the form a crate's author follows to make a
+new test binary recordable, is in `tools/MANDATE_SMOKE.md`; the cells each
+producer's arms cover are declared in `tools/mandate-arms.json`.
+
 ### The per-arm record and the coverage comparison
 
 The dual mandate's coverage half needs an instrument, not an argument. A
@@ -510,10 +539,12 @@ while quietly weakening the p99 that assertion reads. Two tools close that
 hole.
 
 **`tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
-the smoke set already printed becomes an `arms` entry in `mandate-check.json`
-(schema `mandate-check/4`, which over `/3` also records the `rtp_mux`
-`tree_id` — the content a run built, since a commit id read from `jj`'s `@` is
-an auto-snapshot jj rewrites; the record's fields are in
+a producer printed becomes an `arms` entry in `mandate-check.json` (schema
+`mandate-check/5`, which over `/4` adds the `producers` map — one record per
+declared producer, with its invocation, revision, tree, log, exit status and
+arm count — and a `producer` field on every arm; `/4` over `/3` added the
+`rtp_mux` `tree_id`, the content a run built, since a commit id read from
+`jj`'s `@` is an auto-snapshot jj rewrites; the record's fields are in
 `tools/MANDATE_SMOKE.md`):
 the arm id and mandate, its **sample count** (the producer's own `recv`), the
 **statistics** the assertions read (`p50`/`p90`/`p99`/`p999`/`max`/`over250`, the
@@ -542,7 +573,10 @@ read stopped being measured, the delivery ratio fell past its tolerance, a
 declared cell is covered by no arm any more, or a mandate vanished. A **value
 change** is a statistics move — a latency percentile, a goodput rate, a share —
 which on a shared host is run-to-run noise: it is reported always and is a
-failure (exit `5`) only under `--fail-on-value-drift`.
+failure (exit `5`) only under `--fail-on-value-drift`. Every arm of every
+producer the report covers is compared, and the verdict block names both runs'
+producers: a producer whose arms the candidate did not record is a coverage
+regression, not a green diff over the arms that happen to be left.
 
 The count tolerance is 50 % rather than tight because that is the run-to-run
 band two recorded full runs of the unchanged tree showed on the
