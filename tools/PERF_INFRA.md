@@ -247,6 +247,20 @@ the three tests in `gate-default-required`, so a plain `cargo test -p rtp_mux`
 runs them too; `tools/mandate-check` is the release, evidence-producing
 invocation.
 
+### The checked-in baseline
+
+`tools/mandate-baseline.json` is the `mandate-check.json` of one real
+`tools/mandate-check` run, checked in so a later run's numbers have a
+reference and prior panel state is recoverable. It was taken with
+`tools/mandate-check` (no arguments) on 2026-09-26, with `netem_test` at
+`c7c297f6` and the sibling `rtp_mux` at `b4c4faea8f08` (change
+`wmrkurmovoouxvsyuwpozsuovvkwmrrx`), which pins `rtp v0.0.94`; the run took
+**182.7 s**, passed all three mandates, and rendered 12 plots. The checked-in
+copy is the run's JSON with machine-local absolute paths replaced by tokens —
+every measured value, the command, the revisions and the duration are
+verbatim. The plots themselves are not committed; re-run the command to
+regenerate them.
+
 ### `tools/mandate_plot.py` — the validated panel renderer
 
 Reads a `<mandate>.json` panel declaration and its `<mandate>.csv`, writes one

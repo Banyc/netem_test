@@ -1,0 +1,133 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--release",
+    "-p",
+    "rtp_mux",
+    "--test",
+    "mandate_smoke",
+    "--",
+    "--nocapture"
+  ],
+  "cwd": "<rtp_mux checkout>",
+  "duration_seconds": 182.676,
+  "exit_code": 0,
+  "mandates": {
+    "M1": {
+      "declared": true,
+      "panels": 2,
+      "plots": [
+        "<baseline run dir>/plots/M1-latency.svg",
+        "<baseline run dir>/plots/M1-cdf.svg",
+        "<baseline run dir>/plots/M1-latency.png",
+        "<baseline run dir>/plots/M1-cdf.png"
+      ],
+      "raw_line": "MANDATE M1 PASS clean_p50=25.3 clean_p90=43.0 clean_p99=89.0 clean_p999=97.9 clean_max=102.5 clean_over250=0 hostile_p50=39.5 hostile_p90=150.6 hostile_p99=245.1 hostile_p999=283.6 hostile_max=289.9 hostile_over250=21 lone_p50=0.3 lone_p90=69.6 lone_p99=174.7 lone_p999=681.9 lone_max=2693.3 lone_over250=4 ceiling=250.0 hostile_p99_guard=900.0 hostile_over250_guard=8.0 lone_p99_guard=3200.0 lone_p999_guard=8000.0 lone_over250_guard=8.0",
+      "series_counts": [
+        3,
+        3
+      ],
+      "values": {
+        "ceiling": 250.0,
+        "clean_max": 102.5,
+        "clean_over250": 0,
+        "clean_p50": 25.3,
+        "clean_p90": 43.0,
+        "clean_p99": 89.0,
+        "clean_p999": 97.9,
+        "hostile_max": 289.9,
+        "hostile_over250": 21,
+        "hostile_over250_guard": 8.0,
+        "hostile_p50": 39.5,
+        "hostile_p90": 150.6,
+        "hostile_p99": 245.1,
+        "hostile_p999": 283.6,
+        "hostile_p99_guard": 900.0,
+        "lone_max": 2693.3,
+        "lone_over250": 4,
+        "lone_over250_guard": 8.0,
+        "lone_p50": 0.3,
+        "lone_p90": 69.6,
+        "lone_p99": 174.7,
+        "lone_p999": 681.9,
+        "lone_p999_guard": 8000.0,
+        "lone_p99_guard": 3200.0
+      },
+      "verdict": "PASS"
+    },
+    "M2": {
+      "declared": true,
+      "panels": 2,
+      "plots": [
+        "<baseline run dir>/plots/M2-delivery.svg",
+        "<baseline run dir>/plots/M2-wire.svg",
+        "<baseline run dir>/plots/M2-delivery.png",
+        "<baseline run dir>/plots/M2-wire.png"
+      ],
+      "raw_line": "MANDATE M2 PASS clean_delivery=1.000 clean_wire_x=2.16 hostile_delivery=1.000 hostile_wire_x=4.65 lone_delivery=1.000 lone_wire_x=5.40 budget=6.0 hostile_wire_guard=10.0 lone_wire_guard=14.0 delivery_floor=0.995",
+      "series_counts": [
+        3,
+        3
+      ],
+      "values": {
+        "budget": 6.0,
+        "clean_delivery": 1.0,
+        "clean_wire_x": 2.16,
+        "delivery_floor": 0.995,
+        "hostile_delivery": 1.0,
+        "hostile_wire_guard": 10.0,
+        "hostile_wire_x": 4.65,
+        "lone_delivery": 1.0,
+        "lone_wire_guard": 14.0,
+        "lone_wire_x": 5.4
+      },
+      "verdict": "PASS"
+    },
+    "M3": {
+      "declared": true,
+      "panels": 2,
+      "plots": [
+        "<baseline run dir>/plots/M3-goodput.svg",
+        "<baseline run dir>/plots/M3-fraction.svg",
+        "<baseline run dir>/plots/M3-goodput.png",
+        "<baseline run dir>/plots/M3-fraction.png"
+      ],
+      "raw_line": "MANDATE M3 PASS delivered_mib_s=0.963 shaper_mib_s=0.972 capacity_mib_s=1.000 fraction=0.963 floor=0.350 reps=3 measured_s=18.0",
+      "series_counts": [
+        6,
+        3
+      ],
+      "values": {
+        "capacity_mib_s": 1.0,
+        "delivered_mib_s": 0.963,
+        "floor": 0.35,
+        "fraction": 0.963,
+        "measured_s": 18.0,
+        "reps": 3,
+        "shaper_mib_s": 0.972
+      },
+      "verdict": "PASS"
+    }
+  },
+  "ok": true,
+  "out_dir": "<baseline run dir>",
+  "problems": [],
+  "quick": false,
+  "report": "<baseline run dir>/mandate-check.json",
+  "rtp_mux": {
+    "change_id": "wmrkurmovoouxvsyuwpozsuovvkwmrrx",
+    "path": "<rtp_mux checkout>",
+    "revision": "b4c4faea8f08bc45ef9f8de7d1bb510f4503e64d",
+    "revision_source": "jj"
+  },
+  "schema": "mandate-check/1",
+  "smoke": {
+    "exit_code": 0,
+    "log": "<baseline run dir>/mandate-smoke.log",
+    "timed_out": false
+  },
+  "started_at": "2026-09-26T04:11:45+00:00",
+  "timeout_seconds": 900.0,
+  "verdict": "PASS"
+}
