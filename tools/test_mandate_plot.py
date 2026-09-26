@@ -226,6 +226,53 @@ SHARES_DECLARATION = {
     ],
 }
 
+# The recorded `M4-shares`/`M4-imbalance` pair, verbatim from a real run's
+# `M4.csv`: the shares straddle the fair share (0.249912 and 0.250029 around
+# 0.25), so no bar can fail the line the panel draws, and the imbalance panel
+# carries the departure `(share - 0.25) / 0.25` to the evidence files' own
+# six-decimal resolution.
+SHARES_IMBALANCE_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["shares", "clean", 1.0, 0.250029],
+    ["imbalance", "clean", 1.0, 0.000118],
+    ["shares", "clean", 2.0, 0.250029],
+    ["imbalance", "clean", 2.0, 0.000118],
+    ["shares", "clean", 3.0, 0.250029],
+    ["imbalance", "clean", 3.0, 0.000118],
+    ["shares", "clean", 4.0, 0.249912],
+    ["imbalance", "clean", 4.0, -0.000353],
+    ["shares", "hostile", 1.0, 0.250029],
+    ["imbalance", "hostile", 1.0, 0.000114],
+    ["shares", "hostile", 2.0, 0.249914],
+    ["imbalance", "hostile", 2.0, -0.000343],
+    ["shares", "hostile", 3.0, 0.250029],
+    ["imbalance", "hostile", 3.0, 0.000114],
+    ["shares", "hostile", 4.0, 0.250029],
+    ["imbalance", "hostile", 4.0, 0.000114],
+]
+
+SHARES_IMBALANCE_DECLARATION = {
+    "mandate": "M4",
+    "title": "M4 interactive lane fairness: 4 flows on one interactive lane",
+    "x_label": "flow (1..4)",
+    "y_label": "share of the lane's delivered bytes",
+    "panels": [
+        {
+            "id": "shares",
+            "chart": "bar",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [{"y": 0.250000, "label": "fair share 25.0%"}],
+        },
+        {
+            "id": "imbalance",
+            "chart": "bar",
+            "y_label": "departure from the fair share",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [{"y": 0.01, "label": "fair-share bound \u00b11.0%"}],
+        },
+    ],
+}
+
 FRACTION_ROWS = [
     ["panel", "series", "x", "y"],
     ["fraction", "fraction", 1.0, 0.958217],
@@ -339,6 +386,13 @@ def _latency_rows(points):
     return [["panel", "series", "x", "y"]] + [
         ["latency", "lone_tail", x, y] for x, y in points
     ]
+
+
+def _points(rows):
+    """CSV rows from a fixture, in the shape `mandate_plot.parse_points` takes."""
+    return MANDATE.parse_points(
+        [(line, row[0], row[1], row[2], row[3]) for line, row in enumerate(rows[1:], start=2)]
+    )
 
 
 def _reading_markup(sentences):
@@ -2050,6 +2104,130 @@ class MandatePlotTest(unittest.TestCase):
         self.assertNotEqual(code, 0, stderr)
         self.assertIn("states its maximum as 1074.1", stderr)
         self.assertIn("does not measure", stderr)
+
+    def test_a_share_panel_names_the_panel_that_carries_its_departure(self):
+        # `M4-shares` draws a share against the fair share, and the mandate's
+        # failure is the *departure* from it: a bound its own bars straddle is
+        # a reference, not a line any of them can fail, so the frame itself has
+        # no failure in it to draw. The panel therefore says what it is, names
+        # the panel that carries the departure, and states the run's own worst
+        # departure per arm and the bound it is read against -- all of it
+        # derived from the companion panel's own drawn points.
+        declaration = SHARES_IMBALANCE_DECLARATION
+        panels = declaration["panels"]
+        points = _points(SHARES_IMBALANCE_ROWS)
+        code, stderr, out = self.render_mandate(
+            declaration, SHARES_IMBALANCE_ROWS, "M4depart"
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-shares.svg").read_text(encoding="utf-8")
+        self.assertEqual(
+            " ".join(MANDATE.drawn_notes(document)),
+            "composition view - the departure is drawn on panel 'imbalance' "
+            "(bound 1.0%): worst clean 0.04%, hostile 0.03%",
+        )
+        self.assertEqual(
+            MANDATE.check_departure_view_stated(
+                "shares", panels[0], panels, points, document
+            ),
+            [],
+        )
+        # The note is inside the plot and clear of the bound label, which is
+        # where a note about the frame has to live to be read.
+        self.assertEqual(MANDATE.check_note_fit("shares", document), [])
+        self.assertEqual(MANDATE.check_label_fit("shares", document), [])
+        self.assertEqual(MANDATE.check_label_overlap("shares", document), [])
+
+    def test_a_share_panel_without_its_departure_statement_is_refused(self):
+        # The vacuity of the departure-view check: the same declaration and the
+        # same data, drawn without the note, must go red -- and end to end, a
+        # render that suppresses the note must not write the panel at all.
+        declaration = SHARES_IMBALANCE_DECLARATION
+        panels = declaration["panels"]
+        points = _points(SHARES_IMBALANCE_ROWS)
+        bare = MANDATE.svg_bar_chart(
+            "M4 [shares]",
+            "flow (1..4)",
+            "share of the lane's delivered bytes",
+            [("clean", [(1.0, 0.250029)]), ("hostile", [(1.0, 0.250029)])],
+            [{"y": 0.25, "label": "fair share 25.0%"}],
+        )
+        # The pre-change drawing: no note at all, and the check names the panel
+        # whose departure it is silent about.
+        self.assertEqual(MANDATE.drawn_notes(bare), [])
+        problems = MANDATE.check_departure_view_stated(
+            "shares", panels[0], panels, points, bare
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("cannot show the departure", problems[0])
+        self.assertIn("'imbalance'", problems[0])
+        self.assertIn("no departure to draw", problems[0])
+        # The other red half: a note whose numbers came from somewhere else is
+        # not the note this panel's own data derives, so it is refused too.
+        code, stderr, out = self.render_mandate(
+            declaration, SHARES_IMBALANCE_ROWS, "M4depart2"
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-shares.svg").read_text(encoding="utf-8")
+        lying = document.replace("clean 0.04%", "clean 4.00%")
+        self.assertNotEqual(lying, document)
+        problems = MANDATE.check_departure_view_stated(
+            "shares", panels[0], panels, points, lying
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("Expected on the panel", problems[0])
+        # End to end: a drawing that drops the note does not write the panel,
+        # rather than writing one that reads as "no departure".
+        drawn_chart = MANDATE.svg_bar_chart
+
+        def chart_without_its_note(*arguments, **keywords):
+            return drawn_chart(*arguments, **{**keywords, "note": ""})
+
+        with mock.patch.object(MANDATE, "svg_bar_chart", chart_without_its_note):
+            code, stderr, _ = self.render_mandate(
+                declaration, SHARES_IMBALANCE_ROWS, "M4depart3"
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("cannot show the departure", stderr)
+
+    def test_a_panel_whose_bound_a_bar_can_fail_owes_no_note(self):
+        # The check is about a bound the bars *straddle*, not about every bar
+        # panel: a floor is a line a bar can fail, so that panel can already
+        # show its own failure and is left alone -- as is a share panel whose
+        # mandate declares no panel carrying the departure for it to name.
+        delivery = {
+            "id": "delivery",
+            "chart": "bar",
+            "series": [{"name": "clean"}],
+            "bounds": [{"y": 0.995, "label": "M4 per-flow delivery floor 0.995"}],
+        }
+        shares = {
+            "id": "shares",
+            "chart": "bar",
+            "series": [{"name": "clean"}],
+            "bounds": [{"y": 0.25, "label": "fair share 25.0%"}],
+        }
+        points = MANDATE.parse_points(
+            [
+                (2, "delivery", "clean", "1.0", "1.0"),
+                (3, "shares", "clean", "1.0", "0.250029"),
+                (4, "shares", "clean", "2.0", "0.249912"),
+            ]
+        )
+        self.assertEqual(MANDATE.target_bounds(delivery, [("clean", [(1.0, 1.0)])]), [])
+        self.assertEqual(
+            len(
+                MANDATE.target_bounds(
+                    shares, [("clean", [(1.0, 0.250029), (2.0, 0.249912)])]
+                )
+            ),
+            1,
+        )
+        for panel in (delivery, shares):
+            with self.subTest(panel=panel["id"]):
+                self.assertEqual(
+                    MANDATE.departure_view_note(panel, [delivery, shares], points), ""
+                )
 
     def test_a_reading_band_that_eats_the_plot_is_refused(self):
         # The band and the shape it explains share one canvas, so the band may

@@ -146,6 +146,18 @@ silenced by softening a declaration:
   outright when a reading names an arm no line panel draws, and
   `check_reading_band` refuses a band that would leave the plot too short to
   show the shape it explains.
+- **the departure-view test** — `check_departure_view_stated` refuses a bar
+  panel whose bound is a value its own bars *straddle*. Such a bound is a
+  reference rather than a line a bar can cross, so the mandate behind the panel
+  fails on a *departure* from it, and a departure of the bound's size is
+  invisible on an axis whose whole span is the share. The panel therefore
+  either draws that departure or says on its own face that it is a composition
+  view, names the panel that carries it, and states the run's own worst
+  departure and the bound it is read against. The companion is derived from the
+  two panels' drawn points — a panel is this one's departure view when every
+  point it draws is `(mine - y) / y` — so the note names a panel the relation
+  actually holds for, and the check refuses a silent panel rather than a
+  missing one.
 - **the stated-number test** — `check_reading_numbers` reads the numbers back
   out of that drawn band and measures them against the drawn points. A band is
   the part of a latency panel a reader trusts *instead of* the pixels, so a
@@ -397,6 +409,12 @@ compete for the same 300 px canvas, so the band may not eat the shape it is
 there to explain: below this many pixels of plot the panel is refused, the same
 way an axis that cannot show its bound is.
 """
+
+PANEL_NOTE_RE = re.compile(
+    r'<text class="panel-note" x="([-0-9.]+)" y="([-0-9.]+)"[^>]*>(.*?)</text>',
+    re.S,
+)
+"""The note a panel draws to say what its own frame cannot show."""
 
 PLACEHOLDER_TEXT_RE = re.compile(r"\[\s*\]|\(\s*\)|\bNone\b|\bnull\b|\bnan\b")
 """What a template renders where the collection it names came out empty.
@@ -1649,6 +1667,210 @@ def check_bound_governance(panel_id, series, bounds, run_values):
     return problems
 
 
+# -- the panel a share cannot fail, and where its failure is drawn --------
+#
+# `AGENTS.md`'s fourth panel test is "does the panel show the quantity its
+# mandate fails on". A share panel draws the share; a share *mandate* fails on
+# the departure from it, and a departure of a bound's size is invisible on an
+# axis whose whole span is the share. So the share panel is a composition view
+# of a failure it cannot contain, and the honest resolutions are to draw the
+# departure against its bound or to say on the panel that it is one and name
+# the panel that carries the failure. Silence is the one thing that is not
+# allowed: a share panel that draws no departure reads as evidence that there
+# is no departure to draw.
+def panel_series(panel, points):
+    """A panel's series as ``[(name, [(x, y)])]``, in declaration order."""
+    return [
+        (entry["name"], sorted(points[(panel["id"], entry["name"])]))
+        for entry in panel["series"]
+    ]
+
+
+def target_bounds(panel, series):
+    """The bounds a bar panel's own bars straddle, which none of them can fail.
+
+    A bound the values sit on both sides of is the value they are read *at*
+    rather than a line a bar crosses (`bound_side`'s own distinction), and the
+    standing case is a fair share. A bound a minority of the bars is beyond is
+    a different thing -- a crossing, whose governance `check_bound_governance`
+    owns -- and is excluded here.
+    """
+    values = _bound_values(series)
+    return [
+        bound
+        for bound in _bound_specs(panel)
+        if bound_side(values, bound["y"]) is None
+        and not crossing_values(values, bound["y"])
+    ]
+
+
+def relative_departure_panel(panel, panels, points, y):
+    """The mandate panel that draws ``(value - y) / y`` for this panel's points.
+
+    The relation is *derived* from the two panels' own drawn points rather than
+    declared, because a declaration is a claim and the pixels are the artifact:
+    a panel is this one's departure view at `y` when every point it draws is
+    `(mine - y) / y` for the matching series and category. That is the shape a
+    share and its imbalance have, and it is what keeps the note from naming a
+    panel the relation does not actually hold for. The tolerance is the
+    evidence files' own resolution -- the two series are rounded to six
+    decimals before they are written, which is `1e-6` on a share of `0.25` and
+    therefore `4e-6` on the departure derived from it.
+    """
+    mine = {
+        (name, x): value
+        for name, series in panel_series(panel, points)
+        for x, value in series
+    }
+    if not mine or y == 0.0:
+        return None
+    for other in panels:
+        if other["id"] == panel["id"] or other["chart"] != "bar":
+            continue
+        theirs = {
+            (name, x): value
+            for name, series in panel_series(other, points)
+            for x, value in series
+        }
+        if set(theirs) != set(mine):
+            continue
+        if all(
+            abs(theirs[key] - (value - y) / y) <= 1e-5 for key, value in mine.items()
+        ):
+            return other, theirs
+    return None
+
+
+def departure_view_note(panel, panels, points):
+    """The note a share panel owes: what it is, and where its failure is drawn.
+
+    Returns the empty string when the panel is not one of these -- a line
+    panel, a panel with no bound its bars straddle, or a share whose departure
+    no other panel of the mandate draws. The numbers come from the companion's
+    own drawn points and its own bound, so the note is a reading of the
+    artifact rather than a sentence about the producer.
+    """
+    if panel["chart"] != "bar":
+        return ""
+    series = panel_series(panel, points)
+    for bound in target_bounds(panel, series):
+        found = relative_departure_panel(panel, panels, points, bound["y"])
+        if found is None:
+            continue
+        companion, values = found
+        bounds = _bound_specs(companion)
+        if not bounds:
+            continue
+        departure_bound = min(value["y"] for value in bounds)
+        worst = []
+        for entry in companion["series"]:
+            points_of = [
+                value for (name, _), value in values.items() if name == entry["name"]
+            ]
+            if points_of:
+                worst.append((entry["name"], max(abs(value) for value in points_of)))
+        return (
+            f"composition view - the departure is drawn on panel "
+            f"'{companion['id']}' (bound {departure_bound:.1%}): worst "
+            + ", ".join(f"{name} {value:.2%}" for name, value in worst)
+        )
+    return ""
+
+
+def drawn_notes(markup):
+    """The lines of the notes a panel draws on its own face, in draw order."""
+    return [
+        html.unescape(BOUND_LABEL_TITLE_RE.sub("", content)).strip()
+        for _, _, content in PANEL_NOTE_RE.findall(markup)
+    ]
+
+
+def note_boxes(markup):
+    """Each drawn note line as ``(text, (x0, y0, x1, y1))``."""
+    boxes = []
+    for x, y, content in PANEL_NOTE_RE.findall(markup):
+        text = html.unescape(BOUND_LABEL_TITLE_RE.sub("", content)).strip()
+        left = float(x)
+        baseline = float(y)
+        boxes.append(
+            (
+                text,
+                (
+                    left,
+                    baseline - REPORT.LABEL_ASCENT_PX,
+                    left + REPORT.label_text_width(text),
+                    baseline + REPORT.LABEL_DESCENT_PX,
+                ),
+            )
+        )
+    return boxes
+
+
+def check_note_fit(panel_id, markup):
+    """Problems that make a panel's own note unreadable where it is drawn.
+
+    A note is text on the panel's face, so it lives under the same rule as a
+    bound label: it has to be inside the plot it explains, and it may not share
+    ink with another drawn text. A note that leaves the plot is an annotation
+    about the legend, and one that overlaps a bound label leaves neither
+    readable.
+    """
+    boxes = note_boxes(markup)
+    if not boxes:
+        return []
+    left, top, right, bottom = panel_plot_rect(panel_id, markup)
+    problems = []
+    for text, (x0, y0, x1, y1) in boxes:
+        if x0 < left or y0 < top or x1 > right or y1 > bottom:
+            problems.append(
+                f"panel {panel_id!r}: its note {text!r} is drawn at "
+                f"{x0:.1f},{y0:.1f}..{x1:.1f},{y1:.1f}, outside the plot area "
+                f"{left:.1f},{top:.1f}..{right:.1f},{bottom:.1f}; a note about "
+                "what this frame cannot show has to be inside the frame"
+            )
+    others = [(declared, box) for declared, _, box in label_boxes(markup)] + [
+        (text, box) for text, box in boxes
+    ]
+    for index, (declared, box) in enumerate(others):
+        for other_text, other in others[index + 1 :]:
+            area = box_overlap(box, other)
+            if area <= LABEL_OVERLAP_PX2:
+                continue
+            problems.append(
+                f"panel {panel_id!r}: the drawn text {declared!r} shares {area:.0f} "
+                f"px with {other_text!r}, so neither is readable; a note is what "
+                "the reader is told instead of the pixels, so it may not be drawn "
+                "under another label"
+            )
+    return problems
+
+
+def check_departure_view_stated(panel_id, panel, panels, points, markup):
+    """Problems that leave a composition panel silent about the failure it cannot show.
+
+    The panel's bound is a value its own bars straddle, so no bar can fail it
+    and the mandate behind the panel -- which fails on a *departure* from that
+    value -- has no failure this frame can contain. Either the departure is
+    drawn here, or the panel says on its own face that it is a composition view
+    and names the panel that carries it together with the numbers there. What
+    is refused is neither of those, because a share panel drawn without one
+    reads as evidence that there is no departure to draw.
+    """
+    expected = departure_view_note(panel, panels, points)
+    if not expected:
+        return []
+    drawn = " ".join(drawn_notes(markup))
+    if expected in drawn:
+        return []
+    return [
+        f"panel {panel_id!r}: its bound is a value its own bars straddle, so this "
+        "frame cannot show the departure the mandate fails on, and the panel says "
+        "neither where that failure is drawn nor what it measures. Expected on the "
+        f"panel: {expected!r}; drawn: {drawn!r}. A share panel drawn silently is "
+        "read as evidence that there is no departure to draw"
+    ]
+
+
 def check_bound_x_categories(panel_id, series, bounds):
     """Every x a bound declares it governs must be a category the panel draws."""
     problems = []
@@ -2115,7 +2337,64 @@ def tick_label(value, decimals):
     return label.lstrip("-") if float(label) == 0.0 else label
 
 
-def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run_values=None):
+def note_baselines(text, plot_top, plot_bottom, budget, note_row, label_area):
+    """The lines a panel's note draws as, and the baselines they are placed at.
+
+    Candidate blocks are stepped down the plot a line height at a time, and the
+    first whose drawn boxes share no ink with the labels the frame already drew
+    is the one used; the block is kept inside the plot and below whatever
+    already occupies its top (the band-view note). A frame with room for none
+    keeps the top candidate, so `check_note_fit` refuses it by name rather than
+    the note silently landing under a label.
+    """
+    if not text:
+        return []
+    lines = REPORT.wrap_label(text, budget)
+    width = max(REPORT.label_text_width(line) for line in lines)
+    left = REPORT.PAD_LEFT + 5
+
+    def block(row):
+        return [
+            plot_top + 13 + (row + index) * REPORT.LABEL_LINE_HEIGHT_PX
+            for index in range(len(lines))
+        ]
+
+    def boxes(baselines):
+        return [
+            (
+                left,
+                y - REPORT.LABEL_ASCENT_PX,
+                left + width,
+                y + REPORT.LABEL_DESCENT_PX,
+            )
+            for y in baselines
+        ]
+
+    top = block(note_row)
+    last_row = note_row
+    while block(last_row)[-1] + REPORT.LABEL_DESCENT_PX <= plot_bottom - 4:
+        last_row += 1
+    for row in range(note_row, last_row):
+        baselines = block(row)
+        if all(
+            box_overlap(box, other) <= LABEL_OVERLAP_PX2
+            for box in boxes(baselines)
+            for other in label_area
+        ):
+            return list(zip(lines, baselines))
+    return list(zip(lines, top))
+
+
+def svg_bar_chart(
+    title,
+    x_label,
+    y_label,
+    series,
+    bounds=None,
+    extent=None,
+    run_values=None,
+    note="",
+):
     """Grouped bars for ``[(name, [(x, y)])]`` on the axis ``bar_axis_extent`` picks.
 
     ``rtp_trace_report.svg_histogram`` buckets raw samples, which is a
@@ -2123,6 +2402,8 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
     with the report's own axis constants, palette and extent helper. ``bounds``
     are declaration dicts: each is drawn across the x-window it governs (the
     whole plot unless it declares ``x``), and labelled with that governance.
+    ``note`` is what the frame cannot show -- the departure view of a share
+    panel, say -- drawn wrapped inside the plot, above the bars' tops.
     """
     series = [(name, points) for name, points in series if points]
     bounds = bounds or []
@@ -2210,6 +2491,10 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
                 )
                 top = sy(y_value)
                 parts.append(f"<rect x=\"{left:.1f}\" y=\"{min(top, baseline):.1f}\" width=\"{bar_width:.1f}\" height=\"{abs(top - baseline):.1f}\" fill=\"{color}\"/>")
+    # The boxes the frame's own bound labels draw, so the note below is placed
+    # into room that is actually free rather than over a label.
+    label_area = []
+    panel_note_lines = []
     for bound in bounds or []:
         y = sy(bound["y"])
         window = bound_governed_x(bound)
@@ -2227,7 +2512,7 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
             left, right = min(left, right), max(left, right)
         label = governed_label(bound, series, run_values)
         parts.append(f"<line class=\"bound\" x1=\"{left:.1f}\" y1=\"{y:.1f}\" x2=\"{right:.1f}\" y2=\"{y:.1f}\" stroke=\"{REPORT.BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
-        markup, _ = REPORT.bound_label_markup(
+        markup, layout = REPORT.bound_label_markup(
             label,
             right,
             y,
@@ -2240,12 +2525,35 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
             BAR_BOUND_LABEL_STYLE,
         )
         parts.append(markup)
-    note = band_view_note(extent)
-    if note:
+        label_area.extend(layout["boxes"])
+    band_note = band_view_note(extent)
+    note_row = 0
+    if band_note:
         parts.append(
             f"<text class=\"axis-note\" x=\"{REPORT.PAD_LEFT + 5:.1f}\" "
             f"y=\"{plot_top + 13:.1f}\" style=\"{BAR_BOUND_LABEL_STYLE}\">"
-            f"{html.escape(note)}</text>"
+            f"{html.escape(band_note)}</text>"
+        )
+        note_row += 1
+    # The note is what the frame cannot show, so it is drawn in whatever room
+    # the frame's own bound labels left: below them at the top of the plot, or
+    # failing that along the bottom. Either way it is placed against the boxes
+    # the labels actually drew, and a frame with room for neither is refused by
+    # `check_note_fit` rather than annotated illegibly.
+    for baseline in note_baselines(
+        note,
+        plot_top,
+        REPORT.HEIGHT - REPORT.PAD_BOTTOM,
+        plot_width - 2 * REPORT.LABEL_INSET_PX,
+        note_row,
+        label_area,
+    ):
+        panel_note_lines.append(baseline)
+    for line, y in panel_note_lines:
+        parts.append(
+            f"<text class=\"panel-note\" x=\"{REPORT.PAD_LEFT + 5:.1f}\" "
+            f"y=\"{y:.1f}\" "
+            f"style=\"{BAR_BOUND_LABEL_STYLE}\">{html.escape(line)}</text>"
         )
     parts.append(f"<text x=\"{REPORT.WIDTH / 2}\" y=\"{REPORT.HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
     parts.append(f"<text x=\"18\" y=\"{REPORT.HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {REPORT.HEIGHT / 2})\">{html.escape(y_label)}</text>")
@@ -2310,11 +2618,15 @@ def check_axis_label(panel_id, y_label, series, *, declared, carried):
     ]
 
 
-def panel_markup(title, x_label, y_label, panel, points, run_values=None, run_censoring=None):
+def panel_markup(
+    title, x_label, y_label, panel, points, run_values=None, run_censoring=None, panels=None
+):
     """Markup for one declared panel, as exactly one ``<svg>`` document span.
 
     ``run_censoring`` are the run's own per-arm readings for the lines this
     mandate draws; a line panel states them above its plot (`arm_reading`).
+    ``panels`` is the whole mandate's panel list, which a composition panel
+    needs in order to name the panel that carries the failure it cannot show.
     """
     chart = panel["chart"]
     chart_title = f"{title} [{panel['id']}]"
@@ -2384,6 +2696,7 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None, run_ce
             bounds,
             axis,
             run_values,
+            note=departure_view_note(panel, panels or [panel], points),
         )
     elif chart == "line":
         labelled = [
@@ -2415,7 +2728,15 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None, run_ce
         + check_series_labels(panel["id"], markup, series)
         + check_canvas_text_fit(panel["id"], markup)
         + check_tick_labels_distinct(panel["id"], markup)
-        + (check_bar_separation(panel["id"], markup) if chart == "bar" else [])
+        + check_note_fit(panel["id"], markup)
+        + (
+            check_departure_view_stated(
+                panel["id"], panel, panels or [panel], points, markup
+            )
+            + check_bar_separation(panel["id"], markup)
+            if chart == "bar"
+            else []
+        )
         + (
             check_gap_honesty(panel["id"], series, markup)
             + check_readings_stated(panel["id"], series, readings, markup)
@@ -2514,7 +2835,7 @@ def render_mandate(
     for panel in panels:
         panel_id = panel["id"]
         markup = panel_markup(
-            title, x_label, y_label, panel, points, run_values, run_censoring
+            title, x_label, y_label, panel, points, run_values, run_censoring, panels
         )
         problems = RENDER.validate_panel(0, markup)
         if problems:
