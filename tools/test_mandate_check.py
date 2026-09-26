@@ -284,6 +284,12 @@ PASS_LINES = [
     "[mandate-smoke lone_tail] sent=  240 recv=  240 delivery=1.000 p50=    0.3 "
     "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
     "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
+    # The producer's own censoring reading for the M1 series, which is what the
+    # latency panel states per arm: the verdict no pixel carries.
+    "[m1-censoring] arm=impaired samples=3 last=88.2 rungs_at_edge=-0.50 "
+    "rise_run=1 edge_gap_ms=1000.0 screen=flat verdict=Clear max=88.2 "
+    "burst=1.0 rungs=0 step=300 rtt=50 required=50.0 room=2000.0 "
+    "window_holds=true lone_tail=false datagrams=4320",
     "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0",
     "test m1_interactive_tail_latency ... ok <86.163s>",
     "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   25.3 "
@@ -1135,15 +1141,58 @@ class MandateCheckTest(unittest.TestCase):
             )
         self.assertEqual(MANDATE_CHECK.resolve_tree_id(self.crate, None, None), (None, None))
 
-    def test_report_records_each_arm_measurement_schema_six(self):
+    def test_a_malformed_censoring_row_is_refused(self):
+        # The rows are the readings the M1 panel states, so a row that reads
+        # nothing, and two rows for one arm, are failures rather than panels
+        # drawn from a reading nothing chose.
+        for label, extra in (
+            ("no measurement", ["[m1-censoring] arm=impaired verdict="]),
+            (
+                "printed twice",
+                ["[m1-censoring] arm=impaired verdict=Clear room=2000.0"],
+            ),
+        ):
+            with self.subTest(case=label):
+                plan = self.healthy_plan(stdout=list(PASS_LINES) + extra)
+                self.reject(
+                    plan,
+                    "is printed twice"
+                    if label == "printed twice"
+                    else "carries no <key>=<value> measurement",
+                )
+
+    def test_report_records_each_arm_measurement_schema_seven(self):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         report = self.report()
-        self.assertEqual(report["schema"], "mandate-check/6")
+        self.assertEqual(report["schema"], "mandate-check/7")
         # The schema bump is over `/5`: a `/5` reader's keys keep their meaning
         # (a test's `duration_seconds` is still its own seconds, and the arm
         # record is untouched), and the new keys say where a duration came
-        # from rather than changing what the old ones name.
+        # from rather than changing what the old ones name. `/7` over `/6` adds
+        # the per-arm instrument readings the plots state, in `censoring` (one
+        # record per producer) and `censoring_arms` (the arms a mandate's line
+        # panel actually states).
+        self.assertEqual(
+            sorted(report["censoring"]),
+            ["rtp_mux"],
+        )
+        self.assertEqual(
+            report["censoring"]["rtp_mux"]["instrument"], "m1-censoring"
+        )
+        self.assertEqual(
+            report["censoring"]["rtp_mux"]["arms"]["impaired"]["verdict"], "Clear"
+        )
+        self.assertEqual(report["mandates"]["M1"]["censoring_arms"], ["impaired"])
+        self.assertEqual(report["mandates"]["M2"]["censoring_arms"], [])
+        # The reading is on the panel, not only in the report: the verdict, the
+        # arm's room, and a dot at every drawn sample (so the series' own
+        # discreteness is visible rather than inferred from its steepness).
+        svg = (self.out / "plots" / "M1-latency.svg").read_text(encoding="utf-8")
+        self.assertIn("impaired: Clear", svg)
+        self.assertIn("room 2000 ms", svg)
+        self.assertIn('<circle class="sample"', svg)
+
         self.assertEqual(
             sorted(report["timings"]),
             ["mandates", "method", "origin", "targets", "tests"],
@@ -1241,6 +1290,19 @@ class MandateCheckTest(unittest.TestCase):
         self.assertGreater(report["arm_declaration"]["declared_cells"], 0)
         self.assertIn("arms: 16 measured", stdout)
         self.assertIn("M1 arms: 3 (clean, hostile, lone_tail), 1840 sample(s)", stdout)
+
+    def test_m1_without_a_censoring_reading_is_refused(self):
+        # The panel that cannot show its own failure: a peak that returned and a
+        # climb cut off by the window's end are the same pixels, so a producer
+        # that declares M1 and prints no per-arm censoring reading is refused
+        # rather than rendered with no machine verdict on it.
+        plan = self.healthy_plan(
+            stdout=[
+                line for line in PASS_LINES if not line.startswith("[m1-censoring]")
+            ]
+        )
+        self.reject(plan, "no '[m1-censoring] arm=...' reading")
+
 
     def test_a_prose_arm_line_is_kept_as_a_note_rather_than_dropped(self):
         plan = self.healthy_plan(

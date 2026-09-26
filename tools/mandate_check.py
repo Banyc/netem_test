@@ -185,8 +185,14 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   and the panel series counts, plus the run's exact command, the ``rtp_mux``
   source revision (its ``jj`` or ``git`` commit and change ids, and the tree
   that revision points at, each when resolvable), the wall-clock duration,
-  every problem found and the exit code. ``schema`` is ``mandate-check/6``:
-  over ``mandate-check/5`` (which added the ``producers`` map, one record per
+  every problem found and the exit code. ``schema`` is ``mandate-check/7``:
+  over ``mandate-check/6`` it adds ``censoring`` -- one record per producer
+  that declares M1, holding the instrument, the mandate and every per-arm
+  reading that producer printed (``[m1-censoring] arm=...``) -- and
+  ``mandates.<id>.censoring_arms``, the arms a mandate's line panel was given
+  and stated. A ``/6`` reader keeps working: the key is new and the fields
+  ``/6`` defines are unchanged. ``mandate-check/6`` over ``mandate-check/5``
+  (which added the ``producers`` map, one record per
   declared producer) it takes each test's ``duration_seconds`` from libtest's
   own ``--report-time`` stamp rather than bracketing it against the previous
   completion, adds ``duration_source`` to every test and every mandate, and
@@ -207,7 +213,7 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   (the prose-only arm lines, with their mandate when one can be attributed)
   and ``arm_declaration`` (the declaration the cells were read from).
   so a reader of ``mandate-check/2`` or ``mandate-check/3`` keeps working, and
-  the fields those schemas define are unchanged by ``mandate-check/6``.
+  the fields those schemas define are unchanged by ``mandate-check/7``.
 
 The eight expected evidence files, the ``plots`` directory, and this
 command's own ``mandate-check.json`` and ``mandate-smoke.log`` are removed from
@@ -223,8 +229,11 @@ be compared as if it were that run's measurement.
 - ``2`` — the command could not do its job: missing/empty ``rtp_mux``
   checkout, missing smoke-set source, cargo not found, a compile or test
   failure, a timeout, a missing/malformed/multiple ``MANDATE`` line, a
+  producer that declares M1 without printing a single ``[m1-censoring] arm=...``
+  reading (its latency panel would state no verdict), a
   missing/empty/mis-shaped declaration or data file, a malformed,
-  unattributable, undeclared or absent arm line, a target that ran tests
+  unattributable, undeclared or absent arm line, a per-arm reading for an arm
+  no line panel draws, a target that ran tests
   without one libtest per-test stamp to time them from, a per-test time that
   cannot fit its target's own total, or a panel that could not be rendered or
   verified. The evidence is not trustworthy, whatever the verdicts said.
@@ -273,7 +282,7 @@ REPORT_NAME = "mandate-check.json"
 # name is its registry entry's.
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/6"
+REPORT_SCHEMA = "mandate-check/7"
 ARMS_DECLARATION_NAME = "mandate-arms.json"
 ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
 PRODUCERS_DECLARATION_NAME = "mandate-producers.json"
@@ -419,6 +428,29 @@ ARM_WINDOW_KEYS = {
 # A value's optional unit suffix: the producer prints `12345B` and `12.3s`. The
 # number is recorded; the unit is not a second quantity to compare.
 ARM_UNIT_SUFFIXES = ("B", "s")
+
+M1_CENSORING_INSTRUMENT = "m1-censoring"
+"""The M1 arms' own `[m1-censoring] arm=...` rows, which the panel must state.
+
+The M1 latency series is the one panel whose verdict is not readable from its
+pixels: a peak that returned and a climb cut off by the window's end are the
+same shape, and a hole in the sampling draws as a wall. So the smoke set prints
+one row per arm carrying the arm's own censoring reading (`verdict`,
+`rungs_at_edge`, the arm's `room`), this command hands those readings to
+`tools/mandate_plot.py`, and the panel states them per arm. A producer that
+declares M1 without printing them is refused: the panel would be drawn for a
+failure it cannot show.
+"""
+
+CENSORING_ROW_RE = re.compile(
+    r"^\[(?P<instrument>[A-Za-z0-9_.-]+)\] arm=(?P<arm>\S+)[ \t]+(?P<body>.*?)[ \t]*$"
+)
+"""One producer instrument's per-arm reading row, outside the arm-line family.
+
+The prefix is deliberately not `[mandate-smoke …]`: these rows are instrument
+readings rather than arms the coverage declaration carries, so they are parsed
+here and not by `parse_arm_lines`.
+"""
 TIMING_METHOD = (
     "libtest-per-test-stamp: a test's duration is the time libtest itself "
     "reports for that test (the child is run with -Z unstable-options "
@@ -657,6 +689,40 @@ def _arm_record(label, body, dialect, values):
         "values": values,
         "raw_line": f"[mandate-smoke {label}]" + (f" {body}" if body else ""),
     }
+
+
+def parse_censoring_rows(events, instrument):
+    """One producer's per-arm readings, keyed by arm, from its instrument rows.
+
+    A duplicated arm is a failure rather than a last-one-wins: two readings for
+    one arm are two different measurements under one name, and the panel that
+    states one of them would be stating a number nothing chose.
+    """
+    rows = {}
+    problems = []
+    for event in events:
+        match = CENSORING_ROW_RE.match(event["line"])
+        if match is None or match.group("instrument") != instrument:
+            continue
+        arm = match.group("arm")
+        values = {
+            token.group("key"): _coerce_measure(token.group("value"))[0]
+            for token in ARM_TOKEN_RE.finditer(match.group("body"))
+        }
+        if not values:
+            problems.append(
+                f"[{instrument}] arm={arm} carries no <key>=<value> measurement, "
+                "so it is a reading that reads nothing"
+            )
+            continue
+        if arm in rows:
+            problems.append(
+                f"[{instrument}] arm={arm} is printed twice; two readings of one "
+                "arm are two measurements under one name"
+            )
+            continue
+        rows[arm] = values
+    return rows, problems
 
 
 def parse_arm_lines(events, problems):
@@ -1531,12 +1597,14 @@ def _kill_process_group(process):
         process.kill()
 
 
-def render_mandate(mandate, out_dir, *, rasterize, browser, run_values=None):
+def render_mandate(mandate, out_dir, *, rasterize, browser, run_values=None, run_censoring=None):
     """Render one mandate's declared panels, returning ``(summary, problems)``.
 
     ``run_values`` is this mandate's parsed ``MANDATE`` line, handed to the
     plotter so a bound whose bars cross it can name the run's own per-arm
-    guards instead of reading as a breach the verdict tolerates.
+    guards instead of reading as a breach the verdict tolerates. ``run_censoring``
+    is this mandate's per-arm instrument readings, handed over so a latency
+    panel states the verdict its pixels cannot carry.
     """
     declaration = out_dir / f"{mandate}.json"
     data = out_dir / f"{mandate}.csv"
@@ -1559,6 +1627,7 @@ def render_mandate(mandate, out_dir, *, rasterize, browser, run_values=None):
             rasterize=rasterize,
             browser=browser,
             run_values=run_values,
+            run_censoring=run_censoring,
         )
     except (MANDATE_PLOT.MandatePlotError, MANDATE_PLOT.RENDER.RenderGraphError) as error:
         return None, [f"{mandate}: {error}"]
@@ -1670,6 +1739,7 @@ def build_report(args, out_dir, declared, selected, quick, timeout):
         },
         "arms": [],
         "arm_notes": [],
+        "censoring": {},
         "arm_declaration": {
             "path": str(MODULE_DIR / ARMS_DECLARATION_NAME),
             "schema": ARMS_DECLARATION_SCHEMA,
@@ -1694,6 +1764,7 @@ def build_report(args, out_dir, declared, selected, quick, timeout):
                 "plots": [],
                 "series_counts": [],
                 "panels": 0,
+                "censoring_arms": [],
                 "finished_at_seconds": None,
                 "duration_seconds": None,
                 "duration_source": None,
@@ -1780,6 +1851,17 @@ def verdict_block(report):
             )
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
+    for producer_id, entry in sorted((report.get("censoring") or {}).items()):
+        arms = entry.get("arms") or {}
+        readings = ", ".join(
+            f"{arm}={reading.get('verdict')}" for arm, reading in sorted(arms.items())
+        )
+        lines.append(
+            f"instrument: {producer_id}  {entry.get('instrument')}"
+            f" [{entry.get('mandate')}]  {len(arms)} arm(s) read"
+            + (f": {readings}" if readings else "")
+            + " (stated on the mandate's line panel)"
+        )
     for entry in (report.get("timings") or {}).get("targets") or []:
         total = entry.get("total_seconds")
         fits = entry.get("fits")
@@ -1871,6 +1953,32 @@ def evaluate_producer(args, producer, out_dir, report, run, declaration):
         report, run.get("events") or [], declaration, producer, problems
     )
     record["arms"] = len(arms)
+    # This producer's per-arm instrument readings. They are not arms -- they
+    # measure the *series* an arm produced rather than the arm's own load -- so
+    # they are parsed separately and handed to the plotter, which states them on
+    # the panel they are about. A producer that declares M1 and prints none owns
+    # a latency panel drawn for a failure it cannot show, so that is a failure
+    # here rather than a panel quietly missing its verdict.
+    censoring = {}
+    censoring_mandate = "M1" if "M1" in producer["verdicts"] else None
+    if censoring_mandate is not None:
+        censoring, censoring_problems = parse_censoring_rows(
+            run.get("events") or [], M1_CENSORING_INSTRUMENT
+        )
+        problems.extend(censoring_problems)
+        if not censoring:
+            problems.append(
+                f"M1: the smoke set printed no '[{M1_CENSORING_INSTRUMENT}] arm=...' "
+                "reading, so the M1 latency panel has no machine verdict to state. "
+                "A peak that returned and a climb cut off by the window's end are "
+                "the same pixels, so that panel would be drawn for a failure it "
+                "cannot show"
+            )
+        report["censoring"][producer["id"]] = {
+            "instrument": M1_CENSORING_INSTRUMENT,
+            "mandate": censoring_mandate,
+            "arms": {arm: dict(reading) for arm, reading in sorted(censoring.items())},
+        }
     if run["timed_out"]:
         problems.append(
             f"the test target did not finish within {args.timeout:.0f}s and was "
@@ -1907,8 +2015,17 @@ def evaluate_producer(args, producer, out_dir, report, run, declaration):
             rasterize=args.rasterize,
             browser=args.browser,
             run_values=(records.get(mandate) or {}).get("values"),
+            run_censoring=(censoring if mandate == censoring_mandate else None),
         )
         if summary is not None:
+            stated = sorted(summary.get("censoring") or [])
+            section["censoring_arms"] = stated
+            if mandate == censoring_mandate and stated != sorted(censoring):
+                problems.append(
+                    f"M1: the plotter stated {len(stated)} of the run's "
+                    f"{len(censoring)} per-arm reading(s) ({stated}), so at least "
+                    "one arm's own verdict is not on the panel"
+                )
             section["plots"] = list(summary.get("svg") or []) + list(
                 summary.get("png") or []
             )

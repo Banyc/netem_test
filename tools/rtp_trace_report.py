@@ -257,6 +257,121 @@ def bound_label_markup(text, line_right, bound_y, plot, style, title=True):
     return "".join(parts), layout
 
 
+# -- drawing a line series honestly ----------------------------------------
+#
+# A polyline is a claim that the quantity moved from one sample to the next, and
+# across a hole in the sampling that claim is false: nothing was observed in
+# between, so the segment's steepness is an artefact of *when* the samples were
+# taken rather than of what the series did. Measured on the M1 latency panel of
+# a real `rtp_mux` run, the `lone_tail` series jumps from 13.11 s (1.8 ms) to
+# 15.76 s (2651.7 ms): a 2.65 s hole drawn as a near-vertical wall, with the
+# peak at its top and a return to 29.9 ms thirty milliseconds later. Read by
+# eye it was a climb truncated by the window's end, and the reading was the
+# opposite of what the instrument had measured. A panel that cannot tell a hole
+# from a climb is the same defect as an assertion that cannot fail
+# (`AGENTS.md`, "Read every panel").
+#
+# So a series is drawn as its samples, not as the interpolation between them: a
+# dot at every drawn sample, and no segment across a hole. A gap is a *hole*
+# when both hold:
+#
+# - it is at least `GAP_WALL_MIN_SECONDS` of elapsed time -- below that, an
+#   absence is sampling jitter rather than a period nobody watched;
+# - it is at least `GAP_WALL_STEP_MULTIPLE` times the series' own median step --
+#   a coarse but regular cadence (one sample a second) has no holes in it, and
+#   only a break in the sampling stands that far above the typical step.
+GAP_WALL_MIN_SECONDS = 0.5
+GAP_WALL_STEP_MULTIPLE = 10.0
+
+SAMPLE_MARKER_RADIUS_PX = 2.0
+"""The radius of the dot drawn at every drawn sample of a line panel.
+
+A polyline's vertices are invisible; the dots are not, so the series' own
+discreteness -- where its samples are, and therefore where they are *not* --
+is on the panel rather than inferred from the line's shape.
+"""
+
+ARM_READING_LINE_HEIGHT_PX = 13.0
+"""The line height of the per-arm reading band a line panel reserves."""
+
+ARM_READING_TOP_PX = 10.0
+"""The drop from the legend to the first baseline of the reading band."""
+
+ARM_READING_STYLE = BOUND_LABEL_STYLE
+"""The reading band's text style, shared with the bound labels."""
+
+READING_PLOT_WIDTH = WIDTH - PAD_LEFT - PAD_RIGHT
+
+
+def gap_wall_seconds(points):
+    """The least step a series would have to take to be a hole, or ``None``.
+
+    Two points are a chord, not a series with a cadence, so a series shorter
+    than three samples has no hole however wide its only step is: nothing in it
+    says what a typical step looks like.
+    """
+    if len(points) < 3:
+        return None
+    steps = sorted(after[0] - before[0] for before, after in zip(points, points[1:]))
+    median = steps[len(steps) // 2]
+    return max(GAP_WALL_MIN_SECONDS, GAP_WALL_STEP_MULTIPLE * median)
+
+
+def series_walls(points):
+    """The holes in a drawn series, as ``(index, before_x, after_x, gap)``.
+
+    ``index`` is the sample *before* the hole, so the series is split between
+    ``points[index]`` and ``points[index + 1]``. An empty list is the normal
+    answer: a series sampled at a roughly steady cadence has no holes in it.
+    """
+    wall = gap_wall_seconds(points)
+    if wall is None:
+        return []
+    return [
+        (index, before[0], after[0], after[0] - before[0])
+        for index, (before, after) in enumerate(zip(points, points[1:]))
+        if after[0] - before[0] >= wall
+    ]
+
+
+def split_at_walls(points, walls):
+    """The contiguous runs of ``points`` between its holes, in order."""
+    runs, start = [], 0
+    for index, *_ in walls:
+        runs.append(points[start : index + 1])
+        start = index + 1
+    runs.append(points[start:])
+    return [run for run in runs if run]
+
+
+def reading_lines(readings, plot_width=None):
+    """The wrapped lines of each ``(name, sentence)`` reading, in draw order.
+
+    ``svg_line_chart`` reserves one line height per line this returns, and
+    ``tools/mandate_plot.py`` measures the drawn plot against the height that
+    reservation leaves, so both read the geometry from this one function.
+    """
+    if not readings:
+        return []
+    budget = max((plot_width or READING_PLOT_WIDTH) - 2 * LABEL_INSET_PX, LABEL_FONT_PX)
+    return [wrap_label(text, budget) for _, text in readings]
+
+
+def line_plot_height(series_count, reading_rows=0):
+    """The pixel height of a line panel's plot area, as `svg_line_chart` lays it."""
+    legend_columns = min(max(series_count, 1), 4)
+    legend_rows = math.ceil(max(series_count, 1) / legend_columns)
+    return (
+        HEIGHT
+        - (
+            PAD_TOP
+            + (legend_rows - 1) * 18
+            + reading_rows * ARM_READING_LINE_HEIGHT_PX
+        )
+        - PAD_BOTTOM
+    )
+
+
 def read_csv(path):
     with path.open(newline="", encoding="utf-8") as source:
         return list(csv.DictReader(source))
@@ -378,8 +493,27 @@ def extent_including_bounds(extent, bounds):
     return (low - margin, high + margin)
 
 
-def svg_line_chart(title, x_label, y_label, series, y_extent=None, bounds=None):
-    """A line or CDF chart, with optional labelled horizontal bound lines."""
+def svg_line_chart(
+    title,
+    x_label,
+    y_label,
+    series,
+    y_extent=None,
+    bounds=None,
+    *,
+    walls=False,
+    markers=False,
+    readings=None,
+):
+    """A line or CDF chart, with optional labelled horizontal bound lines.
+
+    Three opt-in honesty features, all off by default so the paired loop's own
+    graphs are unchanged: ``walls`` breaks a series' line wherever its sampling
+    has a hole (see `series_walls`), ``markers`` dots every drawn sample, and
+    ``readings`` reserves a band above the plot for one ``(name, sentence)``
+    per line, which is where a producer's machine verdict is stated on the
+    panel it is about.
+    """
     series = [(name, decimate(points)) for name, points in series if points]
     if not series:
         return f"<section><h2>{html.escape(title)}</h2><p>No samples.</p></section>"
@@ -393,8 +527,11 @@ def svg_line_chart(title, x_label, y_label, series, y_extent=None, bounds=None):
         y_min, y_max = extent_including_bounds(finite_extent(series), bounds)
     legend_columns = min(len(series), 4)
     legend_rows = math.ceil(len(series) / legend_columns)
-    plot_top = PAD_TOP + (legend_rows - 1) * 18
+    legend_bottom = PAD_TOP + (legend_rows - 1) * 18
     plot_width = WIDTH - PAD_LEFT - PAD_RIGHT
+    wrapped = reading_lines(readings, plot_width)
+    reading_rows = sum(len(lines) for lines in wrapped)
+    plot_top = legend_bottom + reading_rows * ARM_READING_LINE_HEIGHT_PX
     plot_height = HEIGHT - plot_top - PAD_BOTTOM
 
     def sx(value):
@@ -419,8 +556,20 @@ def svg_line_chart(title, x_label, y_label, series, y_extent=None, bounds=None):
         parts.append(f"<text x=\"{PAD_LEFT - 9}\" y=\"{y + 4:.1f}\" text-anchor=\"end\">{y_value:.2f}</text>")
     for index, (name, points) in enumerate(series):
         color = COLORS[index % len(COLORS)]
-        path = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points)
-        parts.append(f"<polyline points=\"{path}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.7\"/>")
+        holes = series_walls(points) if walls else []
+        # No segment is drawn across a hole: the runs either side of it are
+        # separate polylines, so the hole is a gap in the ink and not a wall.
+        for run in split_at_walls(points, holes):
+            if len(run) < 2:
+                continue
+            path = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in run)
+            parts.append(f"<polyline points=\"{path}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.7\"/>",)
+        if markers:
+            for x, y in points:
+                parts.append(
+                    f"<circle class=\"sample\" cx=\"{sx(x):.1f}\" cy=\"{sy(y):.1f}\" "
+                    f"r=\"{SAMPLE_MARKER_RADIUS_PX}\" fill=\"{color}\"/>"
+                )
     for y_value, label in bounds or []:
         y = sy(y_value)
         parts.append(f"<line class=\"bound\" x1=\"{PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{WIDTH - PAD_RIGHT}\" y2=\"{y:.1f}\" stroke=\"{BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
@@ -432,6 +581,22 @@ def svg_line_chart(title, x_label, y_label, series, y_extent=None, bounds=None):
             BOUND_LABEL_STYLE,
         )
         parts.append(markup)
+    if wrapped:
+        # The band sits between the legend and the plot, in the space the plot's
+        # own top was pushed down by, so a reading is never drawn over the
+        # series it is about: a sentence explaining a peak must not be the
+        # thing hiding it.
+        parts.append('<g class="arm-readings">')
+        row = 0
+        for lines in wrapped:
+            for line in lines:
+                baseline = legend_bottom + ARM_READING_TOP_PX + row * ARM_READING_LINE_HEIGHT_PX
+                parts.append(
+                    f'<text class="arm-reading" x="{PAD_LEFT + LABEL_INSET_PX:.1f}" '
+                    f'y="{baseline:.1f}" style="{ARM_READING_STYLE}">{html.escape(line)}</text>'
+                )
+                row += 1
+        parts.append("</g>")
     parts.append(f"<text x=\"{WIDTH / 2}\" y=\"{HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
     parts.append(f"<text x=\"18\" y=\"{HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {HEIGHT / 2})\">{html.escape(y_label)}</text>")
     parts.append("<g class=\"legend\">")

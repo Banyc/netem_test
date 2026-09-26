@@ -93,7 +93,8 @@ contract its producer owes. It cannot tell a compliant producer from a
 changed one any other way. Rule 1 and rule 6 are owed by every producer; rules
 2, 3 and 4 are owed by a producer that declares a **verdict** section, which
 is the subset of its sections that carries a bound, a `MANDATE` line and
-plots. The `netem_test` producer declares none, so it owes rules 1, 5 and 6
+plots, and rule 7 by one of those that declares the `M1` verdict. The
+`netem_test` producer declares none, so it owes rules 1, 5 and 6
 only.
 
 1. **Target and invocation** — the target is the registry entry's, run exactly
@@ -188,6 +189,18 @@ only.
    `[mandate-smoke ...]` line matching neither shape is recorded as an arm
    *note* (prose the command does not depend on) and stays visible in the
    report instead of being dropped.
+7. **The per-arm instrument readings** — a producer whose verdict section is
+   `M1` also owes one `[m1-censoring] arm=<arm> <key>=<value> ...` row per arm
+   of its latency line panel: the arm's own censoring reading, as
+   `rtp_mux/tests/mandate_smoke.rs`'s `report_censoring` prints it (`verdict`,
+   `rungs_at_edge`, `room`, and whatever else the instrument measured). The
+   prefix is deliberately not `[mandate-smoke …]`, so the rows are instrument
+   readings rather than arms the coverage declaration carries; the command
+   parses them separately, hands them to the plotter, and refuses a run that
+   printed none. The reason is the panel, not the bookkeeping: a latency panel
+   draws a peak that returned and a climb the window's end truncated with the
+   same pixels, so unless the panel states the arm's own verdict the reader
+   has only the shape — and the shape is what was misread here.
 
 ## What a run writes
 
@@ -205,8 +218,16 @@ Into `--dir` (the path is printed, and recorded in the report):
   label that fits its plot and is drawn once, for bars that do not touch, for
   text that neither leaves the canvas nor draws an empty placeholder, and for
   a legend that names the quantity rather than the producer's column (a
-  producer that declares no verdict section writes none);
-- `mandate-check.json` — `schema` (`mandate-check/6`), `ok`, `exit_code`,
+  producer that declares no verdict section writes none); a latency line panel
+  also draws a dot at every sample, a **break** wherever its sampling has a
+  hole, and the run's own per-arm reading for each arm it draws — the verdict
+  (`Clear` / `Censored` / `EdgeRecordContained`, with the arm's `room` and
+  `rungs_at_edge`) and the pixel facts that separate a peak which returned
+  from a climb the window truncated. A single polyline across a 2.65 s hole
+  paints an absence as a near-vertical climb, and the two readings of the
+  `M1-latency` panel are the same pixels, so the panel states the instrument's
+  verdict instead of leaving it to the reader's eye;
+- `mandate-check.json` — `schema` (`mandate-check/7`), `ok`, `exit_code`,
   `verdict`, `started_at`, `duration_seconds`, `producers_declared` and
   `producers_selected`, a `producers` record per *declared* producer (`id`,
   `package`, `target`, `source`, `selected`, the resolved `path`, `sections`,
@@ -222,7 +243,10 @@ Into `--dir` (the path is printed, and recorded in the report):
   record per verdict section (`producer`, `declared`, `verdict`, the parsed
   `values`, the verbatim `raw_line`, `finished_at_seconds`,
   `duration_seconds`, `duration_source`, the `plots` paths, `series_counts`,
-  `panels`), a `timings` record whose `tests[]` carry each test's own
+  `panels`, `censoring_arms`), a `censoring` record per producer that declares
+  M1 (`instrument`, `mandate`, and one verbatim token map per arm it printed)
+  whose arms the mandate's own line panel states, a `timings` record whose
+  `tests[]` carry each test's own
   `duration_seconds` with the `duration_source` it came from (`libtest-report-time`
   for a stamp, `null` for a test that printed none — never a bracketed
   stand-in), whose `mandates[]` carry the stream bracket and say so, and whose

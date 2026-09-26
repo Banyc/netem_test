@@ -20,6 +20,7 @@ write two sibling files into one directory:
 The command::
 
     python3 tools/mandate_plot.py <mandate>.json --out <dir> [--browser <path>] [--no-rasterize]
+        [--run-values JSON|PATH] [--run-censoring JSON|PATH]
 
 It writes one verified SVG per declared panel into ``<out>``, prints
 ``panels: N`` and the written paths, and rasterizes every panel to a verified
@@ -118,6 +119,33 @@ silenced by softening a declaration:
   quantity's name. `series_label` maps the names whose prettified form is still
   cryptic and prettifies the rest; a legend that shows the CSV's spelling is a
   claim about the producer's code, not about the run.
+- **the axis-resolution test** — `check_tick_labels_distinct` reads the y tick
+  labels back out of the artifact and refuses a panel whose ticks repeat a
+  value. The measured panel is `M4-imbalance`, whose axis spans 1.3 % of the
+  share around zero: with the decimals keyed off the sign of the lower edge,
+  the report's two printed its six ticks as `0.01 0.01 0.01 0.00 0.00 0.00` — a
+  coarse axis under a panel drawn for a 1 % departure, which is the axis test's
+  own defect one level down. The resolution now comes from the step between the
+  ticks, whatever the axis starts at.
+- **the gap test** — `check_gap_honesty` measures the *drawn* geometry of a line
+  panel against the holes `rtp_trace_report.series_walls` finds in the same
+  points: a dot at every drawn sample, and no segment across a hole. A single
+  polyline drawn across a 2.65 s hole paints an absence as a near-vertical
+  climb, which is exactly how a reader took the `M1-latency` panel's
+  `lone_tail` wall for a climb the window's end truncated -- and the two
+  readings are the same pixels.
+- **the stated-reading test** — `check_readings_stated` requires every arm the
+  run read (`--run-censoring`, from the producer's own `[m1-censoring] arm=...`
+  rows, which `tools/mandate-check` parses and hands over) to be stated on the
+  line panel that draws it. The verdict (`Clear` / `Censored` /
+  `EdgeRecordContained`), the arm's own `room` and `rungs_at_edge`, and the
+  pixel facts that separate a peak which returned from a climb that did not
+  (where the maximum is, how many samples follow it, where the largest hole
+  is) are drawn in a band above the plot, so a reader cannot draw the opposite
+  conclusion from the shape. `check_censoring_drawn` refuses the render
+  outright when a reading names an arm no line panel draws, and
+  `check_reading_band` refuses a band that would leave the plot too short to
+  show the shape it explains.
 
 Two reading choices the input contract leaves open, decided here and made
 loud instead of silent:
@@ -297,6 +325,34 @@ column name the producers emit is prettified by `series_label`
 
 RAW_COLUMN_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
 """The shape of a column name: snake_case, which a legend must not show raw."""
+
+READINGS_GROUP_RE = re.compile(r'<g class="arm-readings">(.*?)</g>', re.S)
+"""The band a line panel reserves for its per-arm readings, in the artifact."""
+
+POLYLINE_ELEMENT_RE = re.compile(r"<polyline\s([^>]*?)/>")
+"""Each drawn series segment, so a panel's geometry is read from the SVG."""
+
+SAMPLE_MARKER_RE = re.compile(r'<circle class="sample"')
+"""The dot a line panel draws at every sample it plots."""
+
+AXIS_TICK_RE = re.compile(
+    rf'<text x="{REPORT.PAD_LEFT - 9}" y="[-0-9.]+" text-anchor="end">([^<]*)</text>'
+)
+"""The y tick labels a panel draws, in the report's own encoding.
+
+The tick text is how a reader reads a bar's magnitude, so it is read back out
+of the artifact rather than from the loop that printed it.
+"""
+
+ARM_READING_MIN_PLOT_PIXELS = 100.0
+"""The least plot a line panel keeps once its reading band is reserved.
+
+A line panel is read for the *shape* of a series over time, and the readings
+that explain that shape are drawn above the plot rather than over it. The two
+compete for the same 300 px canvas, so the band may not eat the shape it is
+there to explain: below this many pixels of plot the panel is refused, the same
+way an axis that cannot show its bound is.
+"""
 
 PLACEHOLDER_TEXT_RE = re.compile(r"\[\s*\]|\(\s*\)|\bNone\b|\bnull\b|\bnan\b")
 """What a template renders where the collection it names came out empty.
@@ -781,6 +837,278 @@ def run_guards(run_values, series=None, text=""):
                 continue
         guards.append((key, float(value)))
     return guards
+
+
+# -- the readings a line panel states, and the honesty of its geometry -----
+#
+# Two things a latency panel must be able to say about itself, both of them the
+# `AGENTS.md` panel rule applied to a line series rather than to a bound:
+#
+# 1. **where its samples are not.** A polyline drawn straight across a hole in
+#    the sampling paints an absence as a near-vertical climb. Measured on the
+#    `M1-latency` panel of a real run, the `lone_tail` series steps from 13.11 s
+#    (1.8 ms) to 15.76 s (2651.7 ms) -- a 2.65 s hole -- and the wall it drew
+#    was read as a climb truncated by the window's end. `check_gap_honesty`
+#    measures the artifact for it: a dot at every drawn sample, and no segment
+#    across a hole.
+# 2. **what the instrument read.** The producer's own per-arm censoring
+#    reading (`Clear` / `Censored` / `EdgeRecordContained`, with
+#    `rungs_at_edge` and the arm's own `room`) is a statement about the series
+#    that no pixel carries, so it is drawn on the panel next to the arm it is
+#    about, and `check_readings_stated` refuses a render whose artifact does
+#    not say it.
+#
+# The sentence itself is derived from the drawn series in `arm_reading`, not
+# transcribed from the log: the pixel facts (where the peak is, whether the
+# series continues after it, where the largest hole is) are computed from the
+# same points the panel plots, and only the detector's own verdict is carried
+# in from the run. That is what makes a peak-and-return distinguishable from a
+# truncation by construction -- a truncation is a series with *nothing after
+# its maximum*, and the panel then says exactly that.
+def numeric(value):
+    """Whether a parsed token is a real number rather than a bool or a string."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def arm_reading(arm, points, detector=None):
+    """The sentence one line panel states for one arm, from the arm's series.
+
+    ``points`` are the *drawn* points in plotting order. ``detector`` is the
+    run's own per-arm reading for this arm (the parsed tokens of the producer's
+    censoring row), or ``None`` when the run supplied none: the shape clauses
+    are always stated, because they are measurements of what was plotted, and
+    the detector's verdict is stated only when the run measured one.
+    """
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    peak = max(ys)
+    peak_index = len(ys) - 1 - ys[::-1].index(peak)
+    after = len(points) - 1 - peak_index
+    verdict = detector.get("verdict") if isinstance(detector, dict) else None
+    parts = [
+        f"{arm}: {verdict}" if isinstance(verdict, str) and verdict.strip() else arm
+    ]
+    parts.append(f"peak {peak:.4g} ms at {xs[peak_index]:.2f} s")
+    if after:
+        parts.append(
+            f"{after} sample(s) after it (next {ys[peak_index + 1]:.4g} ms at "
+            f"{xs[peak_index + 1]:.2f} s, last {ys[-1]:.4g} ms at {xs[-1]:.2f} s)"
+        )
+    else:
+        parts.append("nothing after it, so the series ends on its own maximum")
+    wall = REPORT.gap_wall_seconds(points)
+    # The *count* is stated as well as the largest gap: a series can have more
+    # than one hole, and a reader who is told about only one of them cannot tell
+    # the other from the end of the line. A hole at the very end leaves its last
+    # sample as a lone dot, which is the shape most easily read as a truncation.
+    holes = REPORT.series_walls(points)
+    if holes:
+        _, before_x, after_x, gap = max(holes, key=lambda hole: hole[3])
+        parts.append(
+            f"{len(holes)} sample gap(s) over {wall:.2f} s, largest {gap:.2f} s "
+            f"({before_x:.2f}-{after_x:.2f} s), drawn as breaks, not climbs"
+        )
+    else:
+        parts.append(
+            f"no sample gap over {wall:.2f} s" if wall else "no sample gap"
+        )
+    if isinstance(detector, dict):
+        measured = []
+        if numeric(detector.get("rungs_at_edge")):
+            measured.append(f"rungs_at_edge {detector['rungs_at_edge']:g}")
+        if numeric(detector.get("room")):
+            measured.append(f"room {detector['room']:g} ms")
+        if measured:
+            parts.append(f"detector {' '.join(measured)}")
+    return " - ".join(parts)
+
+
+def panel_readings(series, censoring):
+    """The ``(arm, sentence)`` readings a line panel states, in series order."""
+    if not censoring:
+        return []
+    return [
+        (name, arm_reading(name, REPORT.decimate(points), censoring.get(name)))
+        for name, points in series
+    ]
+
+
+def drawn_readings(markup):
+    """The reading lines a panel actually draws, joined into one sentence each.
+
+    Read back out of the artifact rather than from the plotter's own state, the
+    way `check_label_fit` reads the drawn label boxes: a check that trusted the
+    code that drew the text would pass on a panel whose text never reached the
+    SVG.
+    """
+    group = READINGS_GROUP_RE.search(markup)
+    if group is None:
+        return []
+    return [
+        html.unescape(BOUND_LABEL_TITLE_RE.sub("", content))
+        for _, content in TEXT_ELEMENT_RE.findall(group.group(1))
+    ]
+
+
+def drawn_polylines(markup):
+    """How many series segments a panel draws per stroke colour."""
+    counts = {}
+    for attributes in POLYLINE_ELEMENT_RE.findall(markup):
+        values = dict(TEXT_ATTRIBUTE_RE.findall(attributes))
+        if values.get("fill") != "none":
+            continue
+        counts[values.get("stroke")] = counts.get(values.get("stroke"), 0) + 1
+    return counts
+
+
+def check_gap_honesty(panel_id, series, markup):
+    """Problems that let a hole in the sampling read as a climb.
+
+    A line drawn across a hole asserts that the quantity moved from one sample
+    to the next, which the run did not measure: the segment's steepness is a
+    property of *when* the samples were taken. The measurements are taken on the
+    drawn artifact -- the dots and the segments it actually draws -- against the
+    holes `rtp_trace_report.series_walls` finds in the same drawn points, so a
+    render that skips either one is refused by name.
+    """
+    drawn = [(name, REPORT.decimate(points)) for name, points in series if points]
+    problems = []
+    expected_markers = sum(len(points) for _, points in drawn)
+    markers = len(SAMPLE_MARKER_RE.findall(markup))
+    if markers != expected_markers:
+        problems.append(
+            f"panel {panel_id!r}: it draws {markers} sample marker(s) for "
+            f"{expected_markers} drawn sample(s); without a dot at every sample "
+            "the series' own discreteness is not on the panel, so a hole in the "
+            "sampling is drawn as the line's own steepness"
+        )
+    counts = drawn_polylines(markup)
+    strokes = {}
+    for index, (name, points) in enumerate(drawn):
+        strokes.setdefault(REPORT.COLORS[index % len(REPORT.COLORS)], []).append(
+            (name, points)
+        )
+    for colour, entries in sorted(strokes.items()):
+        if len(entries) > 1:
+            problems.append(
+                f"panel {panel_id!r}: series "
+                f"{sorted(name for name, _ in entries)} are drawn in the same "
+                f"stroke {colour}, so this panel's segments cannot be attributed "
+                "to the series they belong to and its holes cannot be checked"
+            )
+            continue
+        name, points = entries[0]
+        holes = REPORT.series_walls(points)
+        runs = [
+            run for run in REPORT.split_at_walls(points, holes) if len(run) >= 2
+        ]
+        drawn_count = counts.get(colour, 0)
+        if drawn_count == len(runs):
+            continue
+        where = (
+            f"the {max(hole[3] for hole in holes):.2f} s hole between "
+            f"{max(holes, key=lambda hole: hole[3])[1]:.2f} s and "
+            f"{max(holes, key=lambda hole: hole[3])[2]:.2f} s"
+            if holes
+            else "no hole"
+        )
+        problems.append(
+            f"panel {panel_id!r}: series {name!r} is drawn as {drawn_count} "
+            f"polyline segment(s) where its {len(holes)} hole(s) require "
+            f"{len(runs)} ({where}); a segment is drawn across a hole in the "
+            "sampling, so a period nobody observed is painted as a near-vertical "
+            "climb the run never measured"
+        )
+    return problems
+
+
+def check_readings_stated(panel_id, series, readings, markup):
+    """Problems that leave a run's own reading off the panel it is about.
+
+    The detector's verdict is the one thing about a latency series that its
+    pixels cannot carry, and the two readings it arbitrates -- a peak that came
+    back down and a climb cut off by the window's end -- are the same shape on
+    the panel. So a reading the run supplied has to be on the panel, per arm,
+    and this measures the drawn text rather than trusting the call that drew it.
+    """
+    names = [name for name, _ in series]
+    stated = " ".join(drawn_readings(markup))
+    problems = []
+    for arm, text in readings:
+        if arm not in names:
+            problems.append(
+                f"panel {panel_id!r}: the run's reading for arm {arm!r} is about "
+                f"no series this panel draws (its series are {names}); a verdict "
+                "no panel carries is evidence no reader sees"
+            )
+        elif text not in stated:
+            problems.append(
+                f"panel {panel_id!r}: the run read arm {arm!r} and the panel does "
+                "not state it. As drawn, a hole in the sampling, a peak that "
+                "returned and a climb cut off by the window's end are the same "
+                f"shape, so the reader cannot draw the opposite conclusion from "
+                f"the pixels. Missing: {text!r}"
+            )
+    return problems
+
+
+def axis_tick_labels(markup):
+    """The y tick labels a panel draws, in draw order."""
+    return AXIS_TICK_RE.findall(markup)
+
+
+def check_tick_labels_distinct(panel_id, markup):
+    """Problems that make an axis unreadable: its ticks repeat a value.
+
+    The ticks are how a reader converts a bar or a line into a number, and a
+    band view spans a few percent of its unit: measured on the `M4-imbalance`
+    panel, whose axis spans 1.3 % of the share around zero, the six ticks read
+    `0.01 0.01 0.01 0.00 0.00 0.00` -- a coarse axis under a panel drawn for a
+    1 % departure, i.e. the same defect as an axis whose bound cannot be seen,
+    one level down. The resolution is a property of the step between the ticks,
+    so the sign of the axis' lower edge must not decide it; this is what keeps
+    that applied, measured on the artifact.
+    """
+    ticks = axis_tick_labels(markup)
+    repeated = sorted({tick for tick in ticks if ticks.count(tick) > 1})
+    if not repeated:
+        return []
+    return [
+        f"panel {panel_id!r}: its y axis draws {len(ticks)} tick(s) as {ticks}, so "
+        f"{len(repeated)} of them repeat ({repeated}); a tick the reader cannot "
+        "tell from its neighbour cannot carry the quantity the panel is drawn "
+        "to be read against"
+    ]
+
+
+def check_reading_band(panel_id, plot_height):
+    """Problems that make the reading band eat the shape it explains."""
+    if plot_height >= ARM_READING_MIN_PLOT_PIXELS:
+        return []
+    return [
+        f"panel {panel_id!r}: the per-arm reading band leaves the plot "
+        f"{plot_height:.0f} px of the {REPORT.HEIGHT} px canvas, under the "
+        f"{ARM_READING_MIN_PLOT_PIXELS:.0f} px a latency panel needs to show the "
+        "shape its readings are about; state fewer or shorter readings"
+    ]
+
+
+def check_censoring_drawn(panels, points, censoring):
+    """Every arm the run read must be a series some line panel actually draws."""
+    line_series = set()
+    for panel in panels:
+        if panel["chart"] != "line":
+            continue
+        for entry in panel["series"]:
+            if (panel["id"], entry["name"]) in points:
+                line_series.add(entry["name"])
+    return [
+        f"the run's per-arm reading for {arm!r} is about no series any line panel "
+        f"of this mandate draws ({sorted(line_series)}), so no panel can state "
+        "it: a machine verdict no panel carries is evidence a reader never sees"
+        for arm in sorted(censoring or {})
+        if arm not in line_series
+    ]
 
 
 def bar_plot_height(series_count):
@@ -1603,11 +1931,16 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
     # as before; on the band view the axis starts at the floor's band, so the
     # bar's length is the margin over that band — which is the reading.
     baseline = sy(max(y_min, 0.0) if y_min <= 0.0 else y_min)
-    # A band view's ticks span a few percent of the unit; the report's two
-    # decimals would print its six ticks as three values.
+    # The tick labels are how the reader converts a bar into a number, and two
+    # decimals print a band view's six ticks as three values: on
+    # `M4-imbalance`, whose axis spans 1.3 % of the unit around zero, they read
+    # `0.01 0.01 0.01 0.00 0.00 0.00`. The resolution the reader needs is set by
+    # the *step* between the ticks, so it is derived from the step whatever the
+    # axis starts at -- the sign of the lower edge no longer decides it.
+    step = (y_max - y_min) / 5.0
     y_decimals = 2
-    if y_min > 0.0:
-        y_decimals = min(6, max(2, math.ceil(-math.log10(y_max - y_min)) + 2))
+    if step > 0.0:
+        y_decimals = min(6, max(2, math.ceil(-math.log10(step)) + 1))
     parts = [
         f"<section><h2>{html.escape(title)}</h2><svg viewBox=\"0 0 {REPORT.WIDTH} {REPORT.HEIGHT}\" role=\"img\">",
         f"<rect x=\"{REPORT.PAD_LEFT}\" y=\"{plot_top}\" width=\"{plot_width}\" height=\"{plot_height}\" class=\"plot-bg\"/>",
@@ -1736,8 +2069,12 @@ def check_axis_label(panel_id, y_label, series, *, declared, carried):
     ]
 
 
-def panel_markup(title, x_label, y_label, panel, points, run_values=None):
-    """Markup for one declared panel, as exactly one ``<svg>`` document span."""
+def panel_markup(title, x_label, y_label, panel, points, run_values=None, run_censoring=None):
+    """Markup for one declared panel, as exactly one ``<svg>`` document span.
+
+    ``run_censoring`` are the run's own per-arm readings for the lines this
+    mandate draws; a line panel states them above its plot (`arm_reading`).
+    """
     chart = panel["chart"]
     chart_title = f"{title} [{panel['id']}]"
     series = [
@@ -1750,7 +2087,16 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None):
     panel_y_label = panel_y_label_for(panel, y_label, series)
     bounds = _bound_specs(panel)
     pinned = _require_extent(panel.get("y_extent"), f"panels.{panel['id']}.y_extent")
-    plot_height = bar_plot_height(len(series))
+    # A line panel reserves a band above the plot for its per-arm readings, so
+    # the plot it draws -- and therefore the axis every check below measures --
+    # is the one that band leaves.
+    readings = panel_readings(series, run_censoring) if chart == "line" else []
+    reading_rows = sum(len(lines) for lines in REPORT.reading_lines(readings))
+    plot_height = (
+        REPORT.line_plot_height(len(series), reading_rows)
+        if chart == "line"
+        else bar_plot_height(len(series))
+    )
     axis = panel_axis_extent(panel, series, bounds, run_values, plot_height)
     guards = named_guard_values(
         series, bounds, run_values, crossing=chart == "bar"
@@ -1758,6 +2104,7 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None):
     problems = (
         check_bound_governance(panel["id"], series, bounds, run_values)
         + check_bound_x_categories(panel["id"], series, bounds)
+        + check_reading_band(panel["id"], plot_height)
         + check_axis_label(
             panel["id"],
             panel_y_label,
@@ -1803,7 +2150,15 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None):
             for bound in bounds
         ]
         markup = REPORT.svg_line_chart(
-            chart_title, panel_x_label, panel_y_label, drawn, axis, labelled
+            chart_title,
+            panel_x_label,
+            panel_y_label,
+            drawn,
+            axis,
+            labelled,
+            walls=True,
+            markers=True,
+            readings=readings,
         )
     else:
         labelled = [
@@ -1818,7 +2173,14 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None):
         + check_label_overlap(panel["id"], markup)
         + check_series_labels(panel["id"], markup, series)
         + check_canvas_text_fit(panel["id"], markup)
+        + check_tick_labels_distinct(panel["id"], markup)
         + (check_bar_separation(panel["id"], markup) if chart == "bar" else [])
+        + (
+            check_gap_honesty(panel["id"], series, markup)
+            + check_readings_stated(panel["id"], series, readings, markup)
+            if chart == "line"
+            else []
+        )
     )
     if problems:
         _fail("\n  ".join(problems))
@@ -1842,7 +2204,15 @@ def standalone(markup, title):
     return document[:cut] + f"<title>{html.escape(title)}</title>" + document[cut:]
 
 
-def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None, run_values=None):
+def render_mandate(
+    declaration_path,
+    out_dir,
+    *,
+    rasterize=True,
+    browser=None,
+    run_values=None,
+    run_censoring=None,
+):
     """Validate one mandate, write and verify its panels, and rasterize them.
 
     ``run_values`` are the ``MANDATE`` line's own measurements for this
@@ -1860,7 +2230,8 @@ def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None, r
     states nothing about what it governs, any written SVG without series
     geometry, any declared bound missing from the SVG, any bound label drawn
     outside its plot or over another label, any two bars that touch, any drawn
-    text that leaves the canvas or carries an empty placeholder, and any legend
+    text that leaves the canvas or carries an empty placeholder, any y axis whose
+    ticks repeat a value, and any legend
     drawing a producer's column name; raises ``render_graph.RenderGraphError``
     (naming the browser, or the offending PNG) when rasterization was requested
     and could not be verified.
@@ -1875,6 +2246,9 @@ def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None, r
     reconcile(panels, points, data_path)
     for panel in panels:
         check_chart_domain(panel, points)
+    censoring_problems = check_censoring_drawn(panels, points, run_censoring)
+    if censoring_problems:
+        _fail("\n  ".join(censoring_problems))
 
     out_dir = Path(out_dir)
     if out_dir.exists() and not out_dir.is_dir():
@@ -1893,10 +2267,13 @@ def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None, r
         "png": [],
         "browser": None,
         "rasterized": False,
+        "censoring": sorted(run_censoring or {}),
     }
     for panel in panels:
         panel_id = panel["id"]
-        markup = panel_markup(title, x_label, y_label, panel, points, run_values)
+        markup = panel_markup(
+            title, x_label, y_label, panel, points, run_values, run_censoring
+        )
         problems = RENDER.validate_panel(0, markup)
         if problems:
             _fail(
@@ -1969,6 +2346,29 @@ def load_run_values(path_or_json):
     return values
 
 
+def load_censoring(path_or_json):
+    """The run's per-arm censoring readings, from a JSON object or a file of one.
+
+    The shape is ``{arm: {token: value}}`` -- one arm's parsed reading per line
+    panel series, as ``tools/mandate-check`` parses the producer's own
+    ``[m1-censoring] arm=...`` rows. A reading that is not an object, or an arm
+    with no name, is an error rather than a panel drawn without it: the whole
+    point of the band is that the reader cannot get the verdict from the pixels.
+    """
+    readings = load_run_values(path_or_json)
+    if readings is None:
+        return None
+    for arm, reading in readings.items():
+        if not isinstance(arm, str) or not arm.strip():
+            _fail(f"run censoring keys must be arm names, got {arm!r}")
+        if not isinstance(reading, dict) or not reading:
+            _fail(
+                f"the run's reading for arm {arm!r} must be a non-empty object of "
+                f"its measured tokens, got {reading!r}"
+            )
+    return readings
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
@@ -2017,6 +2417,16 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--run-censoring",
+        default=None,
+        metavar="JSON|PATH",
+        help=(
+            "this run's per-arm censoring readings (a JSON object of {arm: {token: "
+            "value}} or a file of one), stated on every line panel that draws the "
+            "arm; a reading for an arm no line panel draws is refused"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="print a JSON summary of the produced panels",
@@ -2030,6 +2440,7 @@ def main(argv=None):
             rasterize=args.rasterize,
             browser=args.browser,
             run_values=load_run_values(args.run_values),
+            run_censoring=load_censoring(args.run_censoring),
         )
     except (MandatePlotError, RENDER.RenderGraphError) as error:
         print(f"mandate_plot: error: {error}", file=sys.stderr)

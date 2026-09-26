@@ -274,6 +274,72 @@ M2_DELIVERY_ROWS = [
     ["delivery", "delivery", 3.0, 1.0],
 ]
 
+# The tail of the recorded `M1-latency` `lone_tail` series that caused the
+# misreading this renderer's gap rule comes from: one 2.65 s period nobody
+# observed (13.11 s -> 15.76 s), a peak at the far side of it, and a return to
+# 29.9 ms thirty milliseconds later. The thirty samples are that run's own
+# `latency,lone_tail,<x>,<y>` rows, so the fixture is the shape a real line
+# panel is asked to draw and not a shape invented to make the rule fire.
+REAL_LONE_TAIL_TAIL = (
+    (13.103597, 17.158834),
+    (13.105368, 1.772375),
+    (15.757062, 2651.693959),
+    (15.786949, 29.887334),
+    (15.799594, 12.644959),
+    (15.804529, 4.935167),
+    (15.817246, 12.717500),
+    (15.898248, 81.002500),
+    (15.902922, 4.673834),
+    (15.903107, 0.186292),
+    (16.011494, 108.387459),
+    (16.025917, 14.422792),
+    (16.056668, 30.752000),
+    (16.103649, 46.981334),
+    (16.106230, 2.581125),
+    (16.106516, 0.286167),
+    (16.120773, 14.257167),
+    (16.155288, 34.514834),
+    (16.155476, 0.187584),
+    (16.263466, 107.991250),
+    (16.321342, 57.875667),
+    (16.321571, 0.230125),
+    (16.321734, 0.162500),
+    (16.321849, 0.115959),
+    (16.370935, 49.085959),
+    (16.371099, 0.163542),
+    (16.484877, 113.779084),
+    (16.485060, 0.183000),
+    (16.485216, 0.156125),
+    (16.545019, 59.803375),
+)
+
+# A ladder the window cut off: every sample above the one before it, and the
+# last sample the series maximum. On the panel this is the *same* shape as a
+# peak that returned -- which is why the run's own verdict, and not the
+# reader's eye, has to say which one it is.
+TRUNCATED_CLIMB = tuple((index * 0.25, index * 300.0) for index in range(1, 7))
+
+LONE_TAIL_DECLARATION = {
+    "mandate": "M1",
+    "title": "M1 interactive tail latency",
+    "x_label": "elapsed time (s)",
+    "y_label": "latency (ms)",
+    "panels": [
+        {
+            "id": "latency",
+            "chart": "line",
+            "series": [{"name": "lone_tail"}],
+            "bounds": [],
+        }
+    ],
+}
+
+
+def _latency_rows(points):
+    return [["panel", "series", "x", "y"]] + [
+        ["latency", "lone_tail", x, y] for x, y in points
+    ]
+
 
 class MandatePlotTest(unittest.TestCase):
     def setUp(self):
@@ -1672,8 +1738,195 @@ class MandatePlotTest(unittest.TestCase):
         code, stderr, out = self.render_mandate(declaration, rows, "MXzero")
         self.assertEqual(code, 0, stderr)
         document = (out / "M3-fraction.svg").read_text(encoding="utf-8")
-        self.assertIn(">0.00<", document)
-        self.assertNotIn("-0.00", document)
+        ticks = MANDATE.axis_tick_labels(document)
+        self.assertEqual(len(ticks), 6, ticks)
+        # No tick carries a sign it does not mean: a value that rounds to zero
+        # is drawn without one (the negative tick here is a real -0.0003, so it
+        # keeps its sign).
+        self.assertEqual(
+            [tick for tick in ticks if tick.startswith("-") and float(tick) == 0.0],
+            [],
+        )
+        # ...and the six ticks are six values: the resolution comes from the step
+        # between them, not from the sign of the axis' lower edge.
+        self.assertEqual(len(set(ticks)), 6, ticks)
+        self.assertEqual(MANDATE.check_tick_labels_distinct("fraction", document), [])
+
+    def test_a_malformed_censoring_reading_is_an_error(self):
+        # The reading is what the panel states, so a reading that is not an
+        # object of measured tokens is an error rather than a panel drawn
+        # without one -- the whole reason the band exists.
+        declaration_path = self.write_mandate(
+            LONE_TAIL_DECLARATION, _latency_rows(TRUNCATED_CLIMB), name="M1badcens"
+        )
+        code, _, stderr = self.run_main(
+            str(declaration_path),
+            "--no-rasterize",
+            "--out",
+            str(self.out),
+            "--run-censoring",
+            '{"lone_tail": "Censored"}',
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("mandate_plot: error:", stderr)
+        self.assertIn("must be a non-empty object", stderr)
+        self.assertIn("'lone_tail'", stderr)
+
+    def test_a_band_view_whose_ticks_repeat_is_refused(self):
+        # The measured defect: `M4-imbalance` draws a 1 % departure bound over an
+        # axis spanning 1.3 % of the share around zero, and two decimals printed
+        # its six ticks as `0.01 0.01 0.01 0.00 0.00 0.00` -- an axis too coarse
+        # for the departure the panel exists to show.
+        series = [
+            ("clean", [(1.0, 0.0001), (2.0, 0.0001), (3.0, 0.0001), (4.0, -0.0002)]),
+            ("hostile", [(1.0, 0.0005), (2.0, 0.0015), (3.0, 0.0015), (4.0, -0.0027)]),
+        ]
+        bounds = [{"y": 0.01, "label": "fair-share bound 1.0%"}]
+        low, high = MANDATE.bar_axis_extent(
+            series, bounds, None, MANDATE.bar_plot_height(2)
+        )
+        span = high - low
+        # The rule the fix replaced, stated as a vacuity: it keyed the decimals
+        # off the sign of the lower edge, so a panel spanning 1.3 % of the unit
+        # around zero got two of them and collided.
+        old = [MANDATE.tick_label(low + span * tick / 5, 2) for tick in range(6)]
+        self.assertLess(len(set(old)), 6, old)
+        repeated = "".join(
+            f'<text x="63" y="0" text-anchor="end">{tick}</text>' for tick in old
+        )
+        problems = MANDATE.check_tick_labels_distinct("imbalance", repeated)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("repeat", problems[0])
+        self.assertIn("cannot carry the quantity", problems[0])
+        # The fixed rule, and the panel it renders, are both readable.
+        declaration = {
+            "mandate": "M4",
+            "title": "M4 interactive lane fairness",
+            "x_label": "flow (1..4)",
+            "y_label": "departure from the fair share",
+            "panels": [
+                {
+                    "id": "imbalance",
+                    "chart": "bar",
+                    "series": [{"name": "clean"}, {"name": "hostile"}],
+                    "bounds": bounds,
+                }
+            ],
+        }
+        rows = [["panel", "series", "x", "y"]] + [
+            ["imbalance", name, x, y] for name, points in series for x, y in points
+        ]
+        code, stderr, out = self.render_mandate(declaration, rows, "M4imb")
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-imbalance.svg").read_text(encoding="utf-8")
+        ticks = MANDATE.axis_tick_labels(document)
+        self.assertEqual(len(set(ticks)), len(ticks), ticks)
+        self.assertEqual(MANDATE.check_tick_labels_distinct("imbalance", document), [])
+
+    # -- the honesty of a line series' geometry, and its stated readings -----
+
+    def test_a_hole_in_the_sampling_is_drawn_as_a_gap_not_a_wall(self):
+        # The series that caused the misreading: the recorded `lone_tail` tail,
+        # which steps from 13.11 s (1.8 ms) to 15.76 s (2651.7 ms) -- a 2.65 s
+        # period nobody observed. Drawn as one polyline it is a near-vertical
+        # wall, and a reader took it for a climb the window's end truncated.
+        declaration = {**LONE_TAIL_DECLARATION, "panels": [dict(LONE_TAIL_DECLARATION["panels"][0], bounds=[{"y": 250.0, "label": "M1 ceiling 250 ms", "series": "lone_tail"}])]}
+        code, stderr, out = self.render_mandate(
+            declaration, _latency_rows(REAL_LONE_TAIL_TAIL), "M1hole"
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        series = [("lone_tail", list(REAL_LONE_TAIL_TAIL))]
+        self.assertEqual(MANDATE.check_gap_honesty("latency", series, document), [])
+        # Every drawn sample is a dot, so where the samples *are* (and are not)
+        # is on the panel rather than inferred from the line's steepness...
+        self.assertEqual(
+            document.count('<circle class="sample"'), len(REAL_LONE_TAIL_TAIL)
+        )
+        # ...and the line is two segments, not one drawn across the hole.
+        colours = MANDATE.drawn_polylines(document)
+        self.assertEqual(colours[MANDATE.REPORT.COLORS[0]], 2)
+        # The pre-change drawing is refused, naming the hole it paints as a
+        # climb: this is the red half of the vacuity pair.
+        continuous = MANDATE.REPORT.svg_line_chart(
+            "M1 [latency]", "elapsed time (s)", "latency (ms)", series
+        )
+        problems = MANDATE.check_gap_honesty("latency", series, continuous)
+        self.assertEqual(len(problems), 2, problems)
+        joined = "\n".join(problems)
+        self.assertIn("2.65 s hole", joined)
+        self.assertIn("near-vertical climb", joined)
+        self.assertIn("sample marker(s)", joined)
+
+    def test_a_censored_reading_cannot_be_left_off_the_panel(self):
+        # A climb the window cut off -- the shape the eye cannot tell from a
+        # peak that returned, and the shape the run's own detector classified.
+        reading = {
+            "lone_tail": {
+                "verdict": "Censored",
+                "rungs_at_edge": 1.0,
+                "room": 1200.0,
+            }
+        }
+        rows = _latency_rows(TRUNCATED_CLIMB)
+        code, stderr, out = self.render_mandate(
+            LONE_TAIL_DECLARATION,
+            rows,
+            "M1cens",
+            "--run-censoring",
+            json.dumps(reading),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        series = [("lone_tail", list(TRUNCATED_CLIMB))]
+        readings = MANDATE.panel_readings(series, reading)
+        self.assertEqual(
+            MANDATE.check_readings_stated("latency", series, readings, document), []
+        )
+        # The panel states the verdict, the room, and the fact that makes the
+        # difference: nothing follows the maximum.
+        self.assertIn("lone_tail: Censored", document)
+        self.assertIn("room 1200 ms", document)
+        self.assertIn("nothing after it", document)
+        # The red half: the same panel drawn without the run's reading is
+        # refused by name, verdict and all.
+        silent = MANDATE.REPORT.svg_line_chart(
+            "M1 [latency]",
+            "elapsed time (s)",
+            "latency (ms)",
+            series,
+        )
+        problems = MANDATE.check_readings_stated("latency", series, readings, silent)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("Censored", problems[0])
+        self.assertIn("the opposite conclusion", problems[0])
+        # And end to end: a reading about an arm no line panel draws cannot be
+        # carried by any panel, so the whole render is refused rather than
+        # silently dropping a machine verdict.
+        stray = {"clean": {"verdict": "Clear", "rungs_at_edge": -1.0, "room": 2000.0}}
+        code, stderr, _ = self.render_mandate(
+            LONE_TAIL_DECLARATION,
+            rows,
+            "M1stray",
+            "--run-censoring",
+            json.dumps(stray),
+        )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("about no series any line panel", stderr)
+
+    def test_a_reading_band_that_eats_the_plot_is_refused(self):
+        # The band and the shape it explains share one canvas, so the band may
+        # not eat the shape: three arms of readings leave most of the plot,
+        # and a band that leaves too little is refused rather than drawn.
+        self.assertEqual(
+            MANDATE.check_reading_band("latency", MANDATE.REPORT.line_plot_height(3, 6)),
+            [],
+        )
+        problems = MANDATE.check_reading_band(
+            "latency", MANDATE.REPORT.line_plot_height(3, 20)
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("shape its readings are about", problems[0])
 
 
 if __name__ == "__main__":

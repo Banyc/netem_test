@@ -551,7 +551,12 @@ hole.
 
 **`tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
 a producer printed becomes an `arms` entry in `mandate-check.json` (schema
-`mandate-check/6`, which over `/5` takes each test's `duration_seconds` from
+`mandate-check/7`, which over `/6` records the per-arm *instrument* readings a
+producer prints — for `rtp_mux` its `[m1-censoring] arm=…` rows — under
+`censoring`, and the arms a mandate's line panel was given and stated under
+`mandates.<id>.censoring_arms`, so the verdict the `M1-latency` pixels cannot
+carry is machine-checkable in the report as well as drawn on the panel; `/6`
+over `/5` takes each test's `duration_seconds` from
 libtest's own `--report-time` stamp instead of bracketing it against the
 previous completion, marks a test whose stamp is missing with a null duration
 and a null `duration_source` rather than inferring one, and adds
@@ -761,6 +766,37 @@ the reader:
   refuses a legend drawing a producer's column name (`wire_x`,
   `shaper_forwarded`); `series_label` maps the names whose prettified form is
   still cryptic and prettifies the rest.
+- **an axis whose ticks repeat a value cannot carry its own reading.**
+  `check_tick_labels_distinct` reads the y tick labels back out of the artifact
+  and refuses a panel that draws the same value twice. Measured on
+  `M4-imbalance`, whose axis spans 1.3 % of the share around zero: with the
+  decimals keyed off the sign of the lower edge, the report's two printed its
+  six ticks as `0.01 0.01 0.01 0.00 0.00 0.00` — a coarse axis under a panel
+  drawn for a 1 % departure, which is the axis test's own defect one level down.
+  The resolution now comes from the step between the ticks, whatever the axis
+  starts at.
+- **a hole in a line series must be drawn as a hole.** `check_gap_honesty`
+  measures the drawn geometry against the holes `series_walls` finds in the same
+  points: a dot at every drawn sample, and no segment across a hole. Measured on
+  the `M1-latency` panel of a real run, the `lone_tail` series steps from 13.11 s
+  (1.8 ms) to 15.76 s (2651.7 ms) — a 2.65 s period nobody observed — and one
+  polyline drawn across it is a near-vertical wall that was read as a climb the
+  window's end truncated, when the series actually peaked there and returned to
+  29.9 ms thirty milliseconds later. A gap is a hole when it is at least
+  `GAP_WALL_MIN_SECONDS` of elapsed time *and* at least
+  `GAP_WALL_STEP_MULTIPLE` times the series' own median step, so a coarse but
+  regular cadence is not mistaken for one.
+- **a run's own per-arm reading must be on the panel it is about.**
+  `check_readings_stated` requires the reading `tools/mandate-check` parsed from
+  the producer's own `[m1-censoring] arm=…` rows to be drawn, per arm, on the
+  line panel that draws that arm — the verdict, the arm's `room` and
+  `rungs_at_edge`, and the pixel facts that separate a peak which returned from
+  a climb that did not (where the maximum is, how many samples follow it, where
+  the largest hole is). A reading naming an arm no line panel draws
+  (`check_censoring_drawn`) and a band that would leave the plot too short to
+  show the shape it explains (`check_reading_band`) each refuse the render. This
+  is the strongest of the panel rules here, because the verdict is the one thing
+  about a latency series that its pixels cannot carry.
 
 ### `tools/perf-loop` — the paired A/B battery (`tools/PERF_LOOP.md`)
 
