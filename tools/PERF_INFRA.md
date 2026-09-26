@@ -46,6 +46,97 @@ failure, not a win.
   result achieved by starving a flow is not a pass. Its arms, faults and bounds
   are in `rtp_mux/GATE.md` §M4; they are not restated here.
 
+### The perf-test dual mandate (time and coverage)
+
+The tri-mandate (and M4) constitution above bounds the **product**. Every perf
+test in this workspace is additionally bound by **two mandates of its own**,
+stated in `AGENTS.md` ("The perf-test dual mandate — time and coverage") and
+not restated here:
+
+1. **Time.** A test's cost is bounded, declared and paid for by its tier. The
+always-run tier has a budget, and a test that cannot fit it belongs in a
+slower tier — not in the always-run set with a quiet overrun. Raising a test's
+cost (a longer window, more reps, another arm) is a change to its tier's
+budget and must be declared as one.
+2. **Coverage.** The space is `impairment × load shape × lane × layer ×
+metric × scale`. Arms vary **one dimension** from a stated baseline so a
+failure attributes to it; an arm that varies several is a **composite** and
+must be labelled one. Every claimed cell names the asserting test; every cell
+the set does not cover records **why**. A cell may be knowingly empty; it may
+never be *silently* empty.
+
+**The numbers are not here.** Each crate that owns perf tests states its own
+tier budgets, its own nominal per-test costs and its own baseline row in its
+own `GATE.md` — one authority per number, the same rule the product mandates
+follow. This document states the form and the check.
+
+The declarative form is three fenced blocks in that crate's `GATE.md`,
+alongside the existing ones:
+
+    gate-perf-design       <target>::<test> = <tier> | <nominal_cost_s> | <coverage>
+    gate-budgets           <tier> = <budget_s>, plus baseline/drift/drift_floor_s
+    gate-coverage-gaps     <cell> = <non-empty reason>
+
+`<coverage>` is a comma-separated list of cells, each
+`<mandate-or-property>@<dimension>=<value>[+<dimension>=<value>…]` — for
+example `M1@loss=ge5+jitter=100ms+shape=request-response` — stated relative to
+the baseline row named in `gate-budgets`. A row's tier is the tier the
+compiled test set puts the test in (`default` means not `#[ignore]`d; the other
+tiers are the `gate-manifest` tiers), and the reserved target name `lib` names
+the package's `--lib` target, which is where the harness's own wall-clock
+probes live. The exact grammar, the checker's failure modes and the fixture
+tests that pin them are in `tools/check-gate.py` and
+`tools/test_check_gate.py`.
+
+`tools/check-gate.py` enforces the declaration for any crate whose `GATE.md`
+carries the blocks: an unknown target, an unknown test, a test declared in the
+wrong tier, a tier sum over its budget, an empty or malformed coverage cell, a
+gap without a reason, and a missing `baseline` are all failures that name the
+problem. It runs the same way as the other gate checks:
+
+```sh
+python3 tools/check-gate.py
+```
+
+**The measured side** is the runner's report. `tools/mandate-check` times each
+test and each mandate as their output lines arrive (see
+`tools/MANDATE_SMOKE.md`, "The per-test timings"), so a declared cost can be
+compared with what the run took rather than with a whole-run proxy. Pass the
+report to the checker (`--mandate-check-json <run>/mandate-check.json`, or
+leave a `mandate-check.json` in the crate root) and it reports a drift past
+the crate's declared tolerance and any measured test over its tier budget;
+a report older than the declaration is skipped with a note rather than
+silently believed. A declared row the report did not time is not compared,
+and the checker prints how many of the declared rows it compared, so an
+absent measurement is visible rather than read as agreement.
+
+**The mechanism is central; the rows are not.** `tools/check-gate.py` is the
+enforcement and it lives with the harness tooling, but a crate's budgets, its
+nominal costs, its baseline and its coverage cells are that crate's own
+declaration in its own `GATE.md`. The checker can name a row it cannot resolve;
+it cannot know what another crate's tests cost or which cells they cover. The
+perf tests this mandate governs therefore mostly live **outside** the harness:
+the tri-mandate arms are `rtp_mux/tests/mandate_smoke.rs` plus that crate's
+sweep and constitution targets, `rtp` holds its burst-loss, bufferbloat and FEC
+tiers, and `mux` its benches. Those rows belong in those crates' `GATE.md`.
+Where the migration stands:
+
+- **`netem_test`** (this repository) — declared, in `tests/GATE.md`.
+- **`rtp_mux`** — pending. The exact rows, budgets and gap lines for it are
+drafted in `tools/PERF_PENDING_rtp_mux.md`, read from the landed
+`crates/rtp_mux` tree, so that crate's own iteration can apply them verbatim
+and needs only to fill the costs the draft marks for measurement.
+- **`rtp`** (16 perf-tier scenarios) and **`proxy`** (its `tests/src/stream.rs`
+perf scenario) — pending, with no draft yet.
+- **`mux`** — owes none: it keeps no opt-in scenario, and the fairness and perf
+probes that used to live there moved to `rtp_mux`.
+
+The checker's treatment of an undeclared crate is explicit and advisory — not
+silent, and not fatal. A crate whose manifest has perf-tier scenarios and whose
+`GATE.md` has no `gate-perf-design` block is reported with a one-line
+`PENDING` note, so the migration stays visible without blocking the rest of the
+gate; the checker enforces a crate's declaration the moment its blocks appear.
+
 ### Why the infrastructure exists
 
 The smoke set, the hostile and lone-tail arms, and the rule that **the plots
