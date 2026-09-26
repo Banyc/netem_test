@@ -4070,16 +4070,21 @@ mod tests {
         drop(sent);
     }
 
+    /// The iteration count each [`clean_forwarding_perf_probe`] phase runs. It
+    /// is one constant rather than two so the probe's per-arm sample count is
+    /// the number the measurement actually ran.
+    const PROBE_SAMPLES: u32 = 200_000;
+
     /// Wall-clock throughput probe helper for [`clean_forwarding_perf_probe`]:
-    /// runs `op` SAMPLES times and returns millions of operations per second.
+    /// runs `op` [`PROBE_SAMPLES`] times and returns millions of operations per
+    /// second.
     fn probe_mpps(mut op: impl FnMut()) -> f64 {
-        const SAMPLES: u32 = 200_000;
         let start = std::time::Instant::now();
-        for _ in 0..SAMPLES {
+        for _ in 0..PROBE_SAMPLES {
             op();
         }
         let elapsed = start.elapsed().as_secs_f64();
-        SAMPLES as f64 / elapsed / 1e6
+        PROBE_SAMPLES as f64 / elapsed / 1e6
     }
 
     #[test]
@@ -4130,6 +4135,12 @@ mod tests {
             direct_mpps / filter_mpps.max(1e-9),
             direct_mpps / queued_mpps.max(1e-9),
         );
+        // The per-arm measurement line `tools/mandate-check` reads. It is
+        // additive: it restates the numbers printed above plus the iteration
+        // count they ran over, and changes nothing the probe measures.
+        eprintln!(
+            "[mandate-smoke forwarding] section=probe recv={PROBE_SAMPLES} direct_mpps={direct_mpps:.3} filter_mpps={filter_mpps:.3} queued_mpps={queued_mpps:.3}"
+        );
         drop(sent);
         drop(sent_f);
         drop(sent_q);
@@ -4160,6 +4171,13 @@ mod tests {
         let median = latencies[SAMPLES / 2];
         eprintln!(
             "short_deadline_latency_perf_probe: median={median:?} (RUNNER_IDLE_POLL={RUNNER_IDLE_POLL:?})"
+        );
+        // The per-arm measurement line `tools/mandate-check` reads; additive,
+        // as in `clean_forwarding_perf_probe`.
+        eprintln!(
+            "[mandate-smoke deadline] section=probe recv={SAMPLES} median_us={:.3} idle_poll_us={:.3}",
+            median.as_secs_f64() * 1e6,
+            RUNNER_IDLE_POLL.as_secs_f64() * 1e6,
         );
         assert!(
             median < RUNNER_IDLE_POLL,
@@ -5443,11 +5461,17 @@ mod tests {
         unconnected_samples.sort_unstable();
         let connected_median = connected_samples[SAMPLES / 2];
         let unconnected_median = unconnected_samples[SAMPLES / 2];
+        let connected_rps = OPERATIONS as f64 / connected_median.as_secs_f64();
+        let unconnected_rps = OPERATIONS as f64 / unconnected_median.as_secs_f64();
+        let speedup = unconnected_median.as_secs_f64() / connected_median.as_secs_f64();
         eprintln!(
-            "[perf] connected UDP peer: connected={:.0} roundtrips/s; unconnected={:.0} roundtrips/s; speedup={:.3}x",
-            OPERATIONS as f64 / connected_median.as_secs_f64(),
-            OPERATIONS as f64 / unconnected_median.as_secs_f64(),
-            unconnected_median.as_secs_f64() / connected_median.as_secs_f64(),
+            "[perf] connected UDP peer: connected={connected_rps:.0} roundtrips/s; unconnected={unconnected_rps:.0} roundtrips/s; speedup={speedup:.3}x"
+        );
+        // The per-arm measurement line `tools/mandate-check` reads. The sample
+        // count is the number of paired medians, not the roundtrips each
+        // median was taken over; both are printed so neither is inferred.
+        eprintln!(
+            "[mandate-smoke std-udp] section=probe recv={SAMPLES} operations={OPERATIONS} connected_rps={connected_rps:.0} unconnected_rps={unconnected_rps:.0} speedup={speedup:.3}"
         );
     }
 
@@ -5669,9 +5693,14 @@ mod tests {
         let locked = started.elapsed();
         let cached_ns = cached.as_secs_f64() * 1e9 / ITERATIONS as f64;
         let locked_ns = locked.as_secs_f64() * 1e9 / ITERATIONS as f64;
+        let speedup = locked_ns / cached_ns;
         eprintln!(
-            "[perf] Learned destination: cached={cached_ns:.2} ns/packet; locked={locked_ns:.2} ns/packet; speedup={:.2}x",
-            locked_ns / cached_ns
+            "[perf] Learned destination: cached={cached_ns:.2} ns/packet; locked={locked_ns:.2} ns/packet; speedup={speedup:.2}x"
+        );
+        // The per-arm measurement line `tools/mandate-check` reads; additive,
+        // as in the other probes.
+        eprintln!(
+            "[mandate-smoke dest-cache] section=probe recv={ITERATIONS} cached_ns={cached_ns:.2} locked_ns={locked_ns:.2} speedup={speedup:.2}"
         );
         assert!(cached < locked, "cached={cached:?}, locked={locked:?}");
     }
