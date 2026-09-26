@@ -128,8 +128,11 @@ drafted in `tools/PERF_PENDING_rtp_mux.md`, read from the landed
 and needs only to fill the costs the draft marks for measurement.
 - **`rtp`** (16 perf-tier scenarios) and **`proxy`** (its `tests/src/stream.rs`
 perf scenario) — pending, with no draft yet.
-- **`mux`** — owes none: it keeps no opt-in scenario, and the fairness and perf
-probes that used to live there moved to `rtp_mux`.
+- **`mux`** — owes no perf-test declaration, not "no opt-in scenario": its
+`GATE.md` manifest keeps one `standard`-tier scenario
+(`interactive_liveness_soak::interactive_path_liveness_soak`) and no
+`perf`-tier scenario, so the checker has no perf row to enforce there. The
+fairness and perf probes that used to live in `mux` moved to `rtp_mux`.
 
 The checker's treatment of an undeclared crate is explicit and advisory — not
 silent, and not fatal. A crate whose manifest has perf-tier scenarios and whose
@@ -486,10 +489,19 @@ graph is produced by `tools/render_graph.py`.
   tiers from the compiled test binaries and fails when a crate's `GATE.md`
   manifest disagrees, so an `#[ignore]` skip cannot go unnoticed; it also
   enforces the report-only/asserting split.
-- **`tools/check-ignored.py`** (lives in `rtp/tools/`) — the same inventory
-  check for `rtp`'s lib tests and scenario targets, classifying each ignored
-  test `perf-lane` (asserting) or `probe` (report-only) and refusing an
-  assertion token in a probe body.
+- **`rtp/tools/check-ignored.py`** — the same inventory check for `rtp`'s lib
+tests and scenario targets: it re-derives every `#[ignore]`d test and
+requires `rtp/GATE.md`'s `ignored-manifest` to classify it — `perf-lane` and
+`probe` for the in-crate `src/` set, `standard`/`full`/`perf` for the
+relocated `tests/` scenario targets, with the split enforced. A `perf-lane`
+body must still carry an assertion token; a `probe` body must carry one
+**and** match the assertion-token count recorded for it in `rtp/GATE.md`'s
+`gate-probe-selfchecks` block, so a probe that stopped validating its own
+measurement, or quietly gained or lost a check under the ignore flag, fails
+with the probe and the recorded count named; the tier that must carry
+**no** assertion token is the report-only `perf` scenario, and the asserting
+helpers it reaches are `netem_test/tools/check-gate.py`'s
+`gate-perf-guard-helpers` closure, not this checker's.
 - **`tools/hygiene.py`** — report-only sweep for stale jj registrations,
   leaked test processes, stale scratch, wrong jj layout and stalled logs;
   non-zero when blocking findings exist, and it never repairs anything.
@@ -546,8 +558,20 @@ cargo test --release -p rtp --lib -- \
     --ignored probe_lone_tail_repair_deadline_latency --nocapture
 ```
 
-**Read report-only output; do not rely on it.** Several probes assert nothing
-by construction — their printed counters and percentiles are the deliverable,
-and their exit status says only that they ran. `rtp/GATE.md` carries the probe
-inventory, and `check-ignored.py` refuses an assertion token in a probe body,
-so a probe that has quietly grown a check is an error rather than a gate.
+**Read report-only output; do not rely on it.** A probe's printed counters and
+percentiles are its deliverable, and it asserts nothing about the *product* —
+no bound from `rtp/GATE.md` §Performance appears in a probe body. It is not an
+inert instrument, though: a probe asserts its own measurement (the arm ran its
+whole load, no echo missed its deadline, the counters it prints actually
+arrived and agree with the arm's label), so a zero-sample or dead-instrument
+run fails instead of printing a table of zeros a reader could mistake for a
+measurement. `rtp/GATE.md` carries the probe inventory in its
+`ignored-manifest` and each probe's assertion-token count in
+`gate-probe-selfchecks` (5 of 5 probes recorded, and
+`rtp/tools/check-ignored.py` exits 0 at this writing); that checker requires
+the count to be at least one **and** to equal the probe body's token count, so
+a probe that lost its validation, or quietly gained, lost or moved a check
+under the ignore flag, is an error that names the probe. The checkers refuse
+an assertion token in the report-only **`perf` scenario** tier —
+`netem_test/tools/check-gate.py` scans a relocated scenario's own body and the
+asserting helpers it reaches (`gate-perf-guard-helpers`) — never in a `probe`.
