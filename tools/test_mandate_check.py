@@ -656,16 +656,177 @@ class MandateCheckTest(unittest.TestCase):
         head = subprocess.run(
             ["git", "-C", str(self.crate), "rev-parse", "HEAD"], capture_output=True, text=True
         ).stdout.strip()
-        code, _, stderr = self.run_tool(self.healthy_plan())
+        head_tree = subprocess.run(
+            ["git", "-C", str(self.crate), "rev-parse", "HEAD^{tree}"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         self.assertEqual(self.report()["rtp_mux"]["revision"], head)
         self.assertEqual(self.report()["rtp_mux"]["revision_source"], "git")
+        self.assertEqual(self.report()["rtp_mux"]["tree_id"], head_tree)
+        self.assertEqual(self.report()["rtp_mux"]["tree_id_source"], "git")
+        self.assertIn(f"tree:     {head_tree} (git)", stdout)
 
-    def test_report_records_each_arm_measurement_schema_three(self):
+    def test_an_unresolvable_tree_id_is_null_in_the_report_not_fabricated(self):
+        # The commit id resolved; the tree did not. The field stays null and the
+        # block says so, because a fabricated tree id would make a committed
+        # baseline name content it never built.
+        head = "b" * 40
+
+        def capture(command, *, cwd):
+            if "log" in command:
+                return {"exit_code": 0, "stdout": head + "\n" + "c" * 32 + "\n"}
+            return {"exit_code": 128, "stdout": ""}
+
+        with mock.patch.object(MANDATE_CHECK, "_capture", capture):
+            code, stdout, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["rtp_mux"]["revision"], head)
+        self.assertEqual(report["rtp_mux"]["revision_source"], "jj")
+        self.assertIsNone(report["rtp_mux"]["tree_id"])
+        self.assertIsNone(report["rtp_mux"]["tree_id_source"])
+        self.assertIn("tree:     unresolved (no jj or git)", stdout)
+
+    def test_tree_id_follows_the_tree_and_not_the_commit_id(self):
+        # The commit id is not the content. An empty commit on top of a tree
+        # changes the commit id and leaves the tree id alone; a content change
+        # moves the tree id. This is the shape jj's `@` puts a baseline in —
+        # an auto-snapshot jj rewrites, whose tree is what a build reads.
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        environment = {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+
+        def git(*arguments):
+            run = subprocess.run(
+                ["git", "-C", str(self.crate), *arguments],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, **environment),
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return run.stdout.strip()
+
+        git("init", "-q")
+        (self.crate / "tracked.txt").write_text("first\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-q", "-m", "first")
+        first = git("rev-parse", "HEAD")
+        first_tree = git("rev-parse", "HEAD^{tree}")
+        self.assertEqual(
+            MANDATE_CHECK.resolve_tree_id(self.crate, first, "git"), (first_tree, "git")
+        )
+
+        git("commit", "-q", "--allow-empty", "-m", "empty")
+        empty = git("rev-parse", "HEAD")
+        self.assertNotEqual(empty, first)
+        self.assertEqual(
+            MANDATE_CHECK.resolve_tree_id(self.crate, empty, "git"),
+            (first_tree, "git"),
+            "an empty commit changed the commit id and the tree id with it: the "
+            "tree id is not describing the content",
+        )
+
+        (self.crate / "tracked.txt").write_text("second\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-q", "-m", "second")
+        second = git("rev-parse", "HEAD")
+        second_tree = git("rev-parse", "HEAD^{tree}")
+        self.assertNotEqual(second_tree, first_tree)
+        self.assertEqual(
+            MANDATE_CHECK.resolve_tree_id(self.crate, second, "git"),
+            (second_tree, "git"),
+            "the tree id did not move when the content did",
+        )
+
+    def test_tree_id_is_stable_across_jj_rewrites_of_the_working_copy(self):
+        # jj rewrites `@` on every operation, so a commit id read from it is
+        # throwaway: `jj new` produces a different commit id with the same
+        # tree id, and only an edit moves the tree id. A baseline that records
+        # the commit id alone therefore cannot name what it measured.
+        if shutil.which("jj") is None:
+            self.skipTest("jj is not installed")
+        repo = self.root / "jj-crate"
+        repo.mkdir()
+        (repo / "tracked.txt").write_text("first\n", encoding="utf-8")
+        environment = {
+            "JJ_EDITOR": "true",
+            "JJ_USER": "tree id test",
+            "JJ_EMAIL": "tree-id@example.invalid",
+        }
+
+        def jj(*arguments):
+            run = subprocess.run(
+                ["jj", *arguments],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, **environment),
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return run.stdout.strip()
+
+        jj("git", "init")
+        first = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
+        first_tree = MANDATE_CHECK.resolve_tree_id(repo, first, "jj")
+        self.assertEqual(first_tree[1], "jj")
+        self.assertEqual(len(first_tree[0]), 40)
+
+        # An empty commit on top: a new commit id, the same content.
+        jj("new")
+        second = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
+        self.assertNotEqual(second, first)
+        self.assertEqual(
+            MANDATE_CHECK.resolve_tree_id(repo, second, "jj"),
+            first_tree,
+            "rewriting the working-copy commit moved the tree id: the tree id "
+            "is not naming the content",
+        )
+
+        # An edit: the content moved, so the tree id must too.
+        (repo / "tracked.txt").write_text("second\n", encoding="utf-8")
+        third = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
+        third_tree = MANDATE_CHECK.resolve_tree_id(repo, third, "jj")
+        self.assertNotEqual(third_tree[0], first_tree[0])
+
+    def test_an_unresolvable_tree_id_is_recorded_as_null_not_fabricated(self):
+        # No answer from jj or git, and a tree jj reports as unresolved, both
+        # leave the field null: a fabricated tree id would make a baseline
+        # name content it never built.
+        with mock.patch.object(
+            MANDATE_CHECK, "_capture", lambda command, *, cwd: {"exit_code": 1, "stdout": ""}
+        ):
+            self.assertEqual(
+                MANDATE_CHECK.resolve_tree_id(self.crate, "0" * 40, "jj"), (None, None)
+            )
+            self.assertEqual(
+                MANDATE_CHECK.resolve_tree_id(self.crate, "0" * 40, "git"), (None, None)
+            )
+        with mock.patch.object(
+            MANDATE_CHECK,
+            "_capture",
+            lambda command, *, cwd: {
+                "exit_code": 0,
+                "stdout": "    root_tree: Unresolved(Conflict),\n",
+            },
+        ):
+            self.assertEqual(
+                MANDATE_CHECK.resolve_tree_id(self.crate, "0" * 40, "jj"), (None, None)
+            )
+        self.assertEqual(MANDATE_CHECK.resolve_tree_id(self.crate, None, None), (None, None))
+
+    def test_report_records_each_arm_measurement_schema_four(self):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         report = self.report()
-        self.assertEqual(report["schema"], "mandate-check/3")
+        self.assertEqual(report["schema"], "mandate-check/4")
         arms = {arm["id"]: arm for arm in report["arms"]}
         self.assertEqual(
             sorted(arms),

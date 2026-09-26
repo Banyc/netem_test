@@ -143,6 +143,19 @@ class MandateCompareTest(unittest.TestCase):
         self.assertIn("coverage regression(s)=0", stdout)
         self.assertIn("cells: 2 declared cell(s) exercised, 0 no longer covered", stdout)
 
+    def test_a_schema_four_candidate_still_compares_against_a_three_baseline(self):
+        # The tree id is a new provenance field, not a new comparison input: a
+        # per-arm reader keeps working across the schema bump.
+        candidate = baseline_report()
+        candidate["schema"] = "mandate-check/4"
+        candidate["rtp_mux"]["tree_id"] = "a" * 40
+        candidate["rtp_mux"]["tree_id_source"] = "jj"
+        code, stdout, stderr = self.run_tool(candidate)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("verdict: OK  exit=0", stdout)
+        self.assertIn("schema=mandate-check/3", stdout)
+        self.assertIn("schema=mandate-check/4", stdout)
+
     def test_a_statistic_move_is_reported_and_bounded_not_failed(self):
         candidate = baseline_report()
         candidate["arms"][0]["stats"]["p99"] = 150.0

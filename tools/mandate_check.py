@@ -138,16 +138,22 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   values parsed from the ``MANDATE`` lines, the per-test and per-mandate
   wall-clock timings observed on the child's output stream, the plot paths
   and the panel series counts, plus the run's exact command, the ``rtp_mux``
-  source revision (its ``jj`` or ``git`` commit when resolvable), the
-  wall-clock duration, every problem found and the exit code.
-  ``schema`` is ``mandate-check/3``: the record adds ``arms`` (one entry per
-  measured arm: ``id``, ``mandate``, ``label``, ``dialect``, ``sample_count``,
-  the normalised ``stats``/``counters``/``windows``, every parsed ``values``
-  token verbatim, the declared coverage ``cells`` and ``raw_line``),
-  ``arm_notes`` (the prose-only arm lines, with their mandate when one can be
-  attributed) and ``arm_declaration`` (the declaration the cells were read
-  from). ``timings`` and ``mandates`` are unchanged, so a reader of
-  ``mandate-check/2`` keeps working.
+  source revision (its ``jj`` or ``git`` commit and change ids, and the tree
+  that revision points at, each when resolvable), the wall-clock duration,
+  every problem found and the exit code. ``schema`` is ``mandate-check/4``:
+  over ``mandate-check/3`` the ``rtp_mux`` record gains ``tree_id`` and
+  ``tree_id_source`` — the identity of the *content* the run built, which the
+  commit id alone does not give, because ``jj`` rewrites ``@`` on every
+  operation and the working-copy commit a build reads may be an auto-snapshot
+  whose commit id is throwaway. ``mandate-check/3`` adds ``arms`` (one entry per
+  measured arm:
+  ``id``, ``mandate``, ``label``, ``dialect``, ``sample_count``, the
+  normalised ``stats``/``counters``/``windows``, every parsed ``values`` token
+  verbatim, the declared coverage ``cells`` and ``raw_line``), ``arm_notes``
+  (the prose-only arm lines, with their mandate when one can be attributed)
+  and ``arm_declaration`` (the declaration the cells were read from).
+  ``timings`` and ``mandates`` are unchanged, so a reader of
+  ``mandate-check/2`` or ``mandate-check/3`` keeps working.
 
 The eight expected evidence files, the ``plots`` directory, and this
 command's own ``mandate-check.json`` and ``mandate-smoke.log`` are removed from
@@ -205,7 +211,7 @@ DEFAULT_CARGO = "cargo"
 REPORT_NAME = "mandate-check.json"
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/3"
+REPORT_SCHEMA = "mandate-check/4"
 ARMS_DECLARATION_NAME = "mandate-arms.json"
 ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
 REVISION_TIMEOUT_SECONDS = 30.0
@@ -228,6 +234,16 @@ MANDATE_LINE_RE = re.compile(
 VALUE_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)$")
 COMMIT_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 CHANGE_ID_RE = re.compile(r"^[a-z]{10,}$")
+# `jj debug object commit <id>` prints the commit's root tree as
+# `root_tree: Resolved(\n    TreeId(\n        "<40-hex>",\n    ),\n)`; an
+# unresolved tree is left null rather than guessed. The shape after the hash
+# (a trailing comma inside the debug formatter) is deliberately not matched,
+# so only `Resolved(TreeId("<hash>"))` counts.
+JJ_ROOT_TREE_RE = re.compile(
+    r"root_tree:\s*Resolved\(\s*TreeId\(\s*\"(?P<tree>[0-9a-f]{40})\"",
+    re.S,
+)
+GIT_TREE_RE = re.compile(r"^(?P<tree>[0-9a-f]{40})$")
 # A libtest result line: `test <name> ... ok` / `... FAILED` / `... ignored,
 # <reason>`. The marker and the result are flushed together, so the result's
 # arrival is the test's end. A libtest progress note
@@ -765,6 +781,54 @@ def resolve_revision(crate):
     return None, None, None
 
 
+def resolve_tree_id(crate, revision, revision_source):
+    """``(tree_id, source)`` for a resolved commit, or ``(None, None)``.
+
+    The commit id alone does not name the content a run built. ``jj`` rewrites
+    ``@`` on every operation — an on-disk edit becomes a new commit id, and a
+    fresh ``@`` on top is another one — so the working-copy commit a build
+    reads may be an auto-snapshot whose commit id is throwaway while its tree
+    is the content. The tree id is therefore recorded next to the commit and
+    change ids, so a committed baseline names exactly what it measured. The
+    tree is read from the commit with ``jj debug object commit`` (the jj-native
+    route, no git checkout needed) when jj resolved the revision, and from
+    git's ``<commit>^{tree}`` otherwise; a tree that cannot be resolved is
+    ``null`` and never fabricated.
+    """
+    if revision is None:
+        return None, None
+    jj = shutil.which("jj")
+    if jj is not None and revision_source == "jj":
+        result = _capture(
+            [
+                jj,
+                "--no-pager",
+                "debug",
+                "object",
+                "commit",
+                # The commit is addressed by id; do not snapshot the working
+                # copy on the way to reading it.
+                "--ignore-working-copy",
+                revision,
+            ],
+            cwd=crate,
+        )
+        if result["exit_code"] == 0:
+            match = JJ_ROOT_TREE_RE.search(result["stdout"])
+            if match is not None:
+                return match.group("tree"), "jj"
+    git = shutil.which("git")
+    if git is not None:
+        result = _capture(
+            [git, "-C", str(crate), "rev-parse", f"{revision}^{{tree}}"], cwd=crate
+        )
+        if result["exit_code"] == 0:
+            match = GIT_TREE_RE.match(result["stdout"].strip())
+            if match is not None:
+                return match.group("tree"), "git"
+    return None, None
+
+
 def _capture(command, *, cwd):
     try:
         completed = subprocess.run(
@@ -1039,7 +1103,7 @@ def _log_tail(text, lines=LOG_TAIL_LINES):
     return stripped[-lines:]
 
 
-def build_report(args, crate, out_dir, command, revision, quick, timeout):
+def build_report(args, crate, out_dir, command, revision, tree, quick, timeout):
     report_path = out_dir / REPORT_NAME
     return {
         "schema": REPORT_SCHEMA,
@@ -1059,6 +1123,8 @@ def build_report(args, crate, out_dir, command, revision, quick, timeout):
             "revision": revision[0],
             "change_id": revision[1],
             "revision_source": revision[2],
+            "tree_id": tree[0],
+            "tree_id_source": tree[1],
         },
         "smoke": {"exit_code": None, "timed_out": False, "log": str(out_dir / LOG_NAME)},
         "mandates": {
@@ -1121,6 +1187,8 @@ def verdict_block(report):
         f"mandate-check: {SMOKE_TARGET} in {report['rtp_mux']['path']}",
         f"  revision: {report['rtp_mux']['revision'] or 'unresolved'}"
         f" ({report['rtp_mux']['revision_source'] or 'no jj or git'})",
+        f"  tree:     {report['rtp_mux']['tree_id'] or 'unresolved'}"
+        f" ({report['rtp_mux']['tree_id_source'] or 'no jj or git'})",
         f"  command:  {' '.join(report['command'])}",
         f"  output:   {report['out_dir']}",
         f"  quick:    {'yes' if report['quick'] else 'no'}"
@@ -1351,8 +1419,9 @@ def main(argv=None):
         return EXIT_EVIDENCE_FAILURE
 
     revision = resolve_revision(crate)
+    tree = resolve_tree_id(crate, revision[0], revision[2])
     command = smoke_command(cargo)
-    report = build_report(args, crate, out_dir, command, revision, args.quick, args.timeout)
+    report = build_report(args, crate, out_dir, command, revision, tree, args.quick, args.timeout)
     try:
         run = run_smoke(
             command,

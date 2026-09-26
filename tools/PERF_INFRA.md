@@ -384,7 +384,10 @@ hole.
 
 **`tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
 the smoke set already printed becomes an `arms` entry in `mandate-check.json`
-(schema `mandate-check/3`; the record's fields are in `tools/MANDATE_SMOKE.md`):
+(schema `mandate-check/4`, which over `/3` also records the `rtp_mux`
+`tree_id` — the content a run built, since a commit id read from `jj`'s `@` is
+an auto-snapshot jj rewrites; the record's fields are in
+`tools/MANDATE_SMOKE.md`):
 the arm id and mandate, its **sample count** (the producer's own `recv`), the
 **statistics** the assertions read (`p50`/`p90`/`p99`/`p999`/`max`/`over250`, the
 bulk rates), the **delivery and wire counters** (`sent`, `received`,

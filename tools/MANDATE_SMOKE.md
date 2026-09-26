@@ -125,11 +125,16 @@ Into `--dir` (the path is printed, and recorded in the report):
 - `plots/<mandate>-<panel>.svg`, and `.png` unless `--no-rasterize` — the
   verified panels, each checked for series geometry and for every declared
   bound;
-- `mandate-check.json` — `schema` (`mandate-check/3`), `ok`, `exit_code`,
+- `mandate-check.json` — `schema` (`mandate-check/4`), `ok`, `exit_code`,
   `verdict`, `started_at`, `duration_seconds`, the exact `command` and `cwd`,
   `rtp_mux.path` with its `revision`/`change_id`/`revision_source` (`jj` or
-  `git`, `null` when neither resolves — never fabricated), the smoke set's
-  exit code and `timed_out` flag, a `timings` record (below), a `mandates`
+  `git`, `null` when neither resolves — never fabricated) and its
+  `tree_id`/`tree_id_source` (the tree the resolved revision points at: the
+  identity of the **content**, which the commit id alone does not give, because
+  `jj` rewrites `@` on every operation and the working-copy commit a build
+  reads may be an auto-snapshot whose commit id is throwaway — also `null` when
+  it cannot be resolved, never fabricated), the smoke set's exit code and `timed_out` flag,
+  a `timings` record (below), a `mandates`
   record per mandate (`declared`, `verdict`, the parsed `values`, the verbatim
   `raw_line`, `finished_at_seconds`, `duration_seconds`, the `plots` paths,
   `series_counts`, `panels`), an `arms` record per arm (below), the prose
@@ -175,8 +180,8 @@ Into `--dir` (the path is printed, and recorded in the report):
 it parsed from the producer's stream.
 
 The verdict block printed on stdout carries the same information: the
-revision and command, one line per mandate with its measured values, the
-plot paths, the verdict, and every problem.
+revision, its tree and the command, one line per mandate with its measured
+values, the plot paths, the verdict, and every problem.
 
 The eight expected evidence files, the `plots` directory, this command's own
 `mandate-check.json`, and `mandate-smoke.log` are removed from `--dir` before
@@ -249,7 +254,8 @@ run-to-run noise: it is reported always, and is a failure (exit `5`) only under
 `--fail-on-value-drift` past `--value-tolerance`.
 
 An incomparable pair is refused (exit `2`) rather than reported as agreement: a
-report whose `schema` predates `mandate-check/3`, a report carrying no arms, a
+report whose `schema` predates `mandate-check/3` (the per-arm record; `/3` and
+`/4` are both read), a report carrying no arms, a
 candidate recorded with a different window set from the baseline's, and a
 coverage cell the gate checker's grammar rejects. The committed baseline must
 therefore be re-recorded with a current `tools/mandate-check` before it can
