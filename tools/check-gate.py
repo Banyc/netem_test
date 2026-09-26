@@ -47,7 +47,21 @@ in the tier the row declares (resolved from the compiled test binaries for an
 integration target, or from the package's `--lib` target for the reserved
 target name `lib`), the sum of the declared nominal costs per tier must fit
 that tier's declared budget, and every covered cell and gap reason must be
-non-empty and well-formed. When a fresh `mandate-check.json` is supplied
+non-empty and well-formed.
+
+Each row must also declare how it relates to the row named by
+`gate-budgets: baseline = <row>`: `baseline` for the reference row itself,
+`orthogonal` when the row's cells vary exactly one dimension from the
+baseline, `composite(<dimension>[,<dimension>...])` when they vary several,
+and `re-measurement(<reason>)` when they vary none. The dimensions a row
+varies are derived from its own cells (a key the baseline states differently,
+or does not state at all; a key the row does not name is inherited from the
+baseline), and the declared relation must agree with that derivation. An
+unlabelled row, a label that disagrees with the cells, and a row whose cells
+state one dimension twice (so its relation cannot be determined) are all
+errors that name the row and what to write instead. That check is what makes a
+composite arm visible: without it, a row varying four dimensions at once
+passes exactly like a row varying one. When a fresh `mandate-check.json` is supplied
 (`--mandate-check-json`, or `mandate-check.json` in the crate root), each
 declared row that the report measured per-test is compared with the report's
 streamed wall-clock and a drift past the declared tolerance is an error. A
@@ -92,6 +106,12 @@ TIERS = {"standard", "full", "perf"}
 # always-run default tier (a row's `default` tier is resolved from the test not
 # being `#[ignore]`d, matching `gate-default-required`).
 PERF_TIERS = frozenset(TIERS | {"default"})
+# The relation a `gate-perf-design` row declares to the `gate-budgets`
+# baseline. `baseline` is the reference row itself; `orthogonal` means the
+# row's cells vary exactly one dimension from the baseline; `composite` means
+# they vary several and the row names them; `re-measurement` means they vary
+# none and the row says why it repeats the baseline's cell.
+RELATION_KINDS = frozenset({"baseline", "orthogonal", "composite", "re-measurement"})
 LANE_ROLES = {"verdict", "diagnostic"}
 # The reserved perf-design target naming a package's `--lib` test target. In
 # harness mode it is the `netem-test` package (whose wall-clock probes are lib
@@ -102,6 +122,8 @@ LIB_TARGET = "lib"
 # stable name (`M1`, `conformance-delay`, `probe-throughput`).
 CELL_PROPERTY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 CELL_DIMENSION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*=[^=,+\s]+$")
+# A dimension's bare name, as used by a `composite(...)` relation.
+CELL_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 # The default drift tolerance (relative) and the absolute floor below which a
 # difference is not reported, overridable per crate in `gate-budgets`.
 DEFAULT_DRIFT_TOLERANCE = 0.5
@@ -784,6 +806,20 @@ def check_lane_roles() -> tuple[dict[str, str], list[str]]:
 
 
 @dataclass(frozen=True)
+class Relation:
+    """A row's declared relation to the `gate-budgets` baseline row.
+
+    ``kind`` is one of `RELATION_KINDS`; ``keys`` is the dimensions a
+    ``composite`` row names it varies; ``reason`` is why a ``re-measurement``
+    row deliberately repeats the baseline's cell.
+    """
+
+    kind: str
+    keys: tuple[str, ...] = ()
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class PerfRow:
     """One `gate-perf-design` row: a perf test, its tier, cost and coverage."""
 
@@ -791,6 +827,7 @@ class PerfRow:
     tier: str
     cost: float
     cells: tuple[str, ...]
+    relation: Relation | None = None
 
 
 @dataclass(frozen=True)
@@ -833,6 +870,65 @@ def cell_problem(cell: str) -> str | None:
     return None
 
 
+def parse_relation(text: str) -> tuple[Relation | None, str | None]:
+    """Parse a row's relation field, or say exactly what to write instead."""
+    kind, opened, argument = text.partition("(")
+    kind = kind.strip()
+    if kind not in RELATION_KINDS:
+        return None, (
+            f"relation {text!r} is not a relation this grammar knows; write "
+            "`baseline`, `orthogonal`, `composite(<dimension>[,<dimension>...])` "
+            "or `re-measurement(<reason>)`"
+        )
+    if not opened:
+        if kind in ("baseline", "orthogonal"):
+            return Relation(kind), None
+        return None, (
+            f"relation {text!r} gives no argument; write "
+            + (
+                "`composite(<dimension>[,<dimension>...])` naming the dimensions "
+                "the row's cells vary"
+                if kind == "composite"
+                else "`re-measurement(<reason>)` naming why the row repeats the "
+                "baseline's cell"
+            )
+        )
+    if not argument.endswith(")"):
+        return None, f"relation {text!r} is missing its closing ')'; write {kind}(...)"
+    inner = argument[:-1].strip()
+    if kind in ("baseline", "orthogonal"):
+        return None, f"relation {text!r} takes no argument; write `{kind}`"
+    if kind == "re-measurement":
+        if not inner:
+            return None, (
+                "`re-measurement(<reason>)` names no reason; say why the row "
+                "deliberately repeats the baseline's cell (a second tier, a "
+                "stability re-run, a seed sweep)"
+            )
+        if any(character in inner for character in ",()"):
+            return None, (
+                f"re-measurement reason {inner!r} contains ',' or parentheses; "
+                "write one reason token (e.g. `re-measurement(full-tier-rerun)`)"
+            )
+        return Relation(kind, (), inner), None
+    keys: list[str] = []
+    for part in inner.split(","):
+        key = part.strip()
+        if not key:
+            continue
+        if not CELL_KEY_RE.match(key):
+            return None, f"composite dimension {key!r} is not a name ([A-Za-z][A-Za-z0-9_-]*)"
+        if key in keys:
+            return None, f"composite(...) names the dimension {key!r} twice"
+        keys.append(key)
+    if len(keys) < 2:
+        return None, (
+            "`composite(...)` must name at least two dimensions; a row that "
+            "varies exactly one dimension from the baseline is `orthogonal`"
+        )
+    return Relation(kind, tuple(keys)), None
+
+
 def parse_perf_design(text: str, problems: list[str]) -> list[PerfRow]:
     """Parse the `gate-perf-design` rows, naming every malformed one."""
     rows: list[PerfRow] = []
@@ -843,18 +939,30 @@ def parse_perf_design(text: str, problems: list[str]) -> list[PerfRow]:
             problems.append(
                 "gate-perf-design line "
                 f"{number}: {line!r} is not '<target>::<test> = <tier> | "
-                "<nominal_cost_s> | <coverage>'",
+                "<nominal_cost_s> | <relation> | <coverage>'",
             )
             continue
         name = name.strip()
         parts = [part.strip() for part in rest.split("|")]
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             problems.append(
                 f"gate-perf-design row {name}: expected '<tier> | <cost_s> | "
-                f"<coverage>', found {len(parts)} field(s)"
+                "<relation> | <coverage>', found "
+                f"{len(parts)} field(s); a row without its relation to the "
+                "baseline is not a declaration"
             )
             continue
-        tier, cost_text, coverage_text = parts
+        if len(parts) == 4:
+            tier, cost_text, relation_text, coverage_text = parts
+        else:
+            tier, cost_text, coverage_text = parts
+            relation_text = None
+        relation: Relation | None = None
+        if relation_text is not None:
+            relation, reason = parse_relation(relation_text)
+            if reason is not None:
+                problems.append(f"gate-perf-design row {name}: {reason}")
+                relation = None
         if tier not in PERF_TIERS:
             problems.append(
                 f"gate-perf-design row {name}: unknown tier {tier!r} (one of "
@@ -889,7 +997,7 @@ def parse_perf_design(text: str, problems: list[str]) -> list[PerfRow]:
         if name in seen:
             problems.append(f"gate-perf-design: duplicate row {name}")
         seen.add(name)
-        rows.append(PerfRow(name, tier, cost, cells))
+        rows.append(PerfRow(name, tier, cost, cells, relation))
     return rows
 
 
@@ -987,6 +1095,167 @@ def parse_perf_gaps(text: str, problems: list[str]) -> list[PerfGap]:
             continue
         gaps.append(PerfGap(cell, reason))
     return gaps
+
+
+def check_perf_relations(
+    rows: list[PerfRow], budgets: PerfBudgets, problems: list[str]
+) -> list[str]:
+    """Verify each row's declared relation against the dimensions its cells vary.
+
+    The dimensions a row varies are derived from its own cells: a dimension
+    whose value differs from the baseline's, or that the baseline does not
+    state at all, is varied; a dimension the row does not name is inherited
+    from the baseline. A row labelled `composite` must name exactly those
+    dimensions. Returns the summary lines for the passing case; every failure
+    is appended to ``problems`` with the row and what to write instead.
+    """
+    summary: list[str] = []
+    if budgets.baseline is None:
+        return summary
+    baseline = next((row for row in rows if row.name == budgets.baseline), None)
+    if baseline is None:
+        # The baseline is not a row; that is already a failure of its own.
+        return summary
+
+    def cell_state(cell: str, ambiguous: list[str]) -> dict[str, str]:
+        """`dimension -> value` for one cell, naming a dimension stated twice."""
+        if "@" not in cell:
+            # A malformed cell is already named by `cell_problem`; it states no
+            # dimension this check can read.
+            return {}
+        state: dict[str, str] = {}
+        for part in cell.split("@", 1)[1].split("+"):
+            key, _, value = part.partition("=")
+            if key in state and state[key] != value:
+                ambiguous.append(
+                    f"the cell {cell!r} states {key!r} as both {state[key]!r} and "
+                    f"{value!r}"
+                )
+                continue
+            state[key] = value
+        return state
+
+    base_state: dict[str, str] = {}
+    base_conflicts: list[str] = []
+    for cell in baseline.cells:
+        for key, value in cell_state(cell, base_conflicts).items():
+            base_state[key] = value
+    if base_conflicts:
+        problems.append(
+            f"gate-perf-design baseline row {baseline.name}: its cells are not one "
+            f"point, so no row's relation to it can be determined "
+            f"({'; '.join(base_conflicts)}); state the baseline once per "
+            "dimension, with one value each"
+        )
+        return summary
+
+    varied_by_row: dict[str, tuple[str, ...]] = {}
+    counts = {kind: 0 for kind in sorted(RELATION_KINDS)}
+    for row in rows:
+        conflicted: list[str] = []
+        varied: set[str] = set()
+        for cell in row.cells:
+            state = cell_state(cell, conflicted)
+            for key, value in state.items():
+                if key not in base_state or base_state[key] != value:
+                    varied.add(key)
+        derived = tuple(sorted(varied))
+        varied_by_row[row.name] = derived
+        if conflicted:
+            problems.append(
+                f"gate-perf-design row {row.name}: its relation to the baseline "
+                f"cannot be determined ({'; '.join(conflicted)}), so the "
+                "dimensions it varies are ambiguous; state each dimension once, "
+                "with one value (split the row if it covers two points)"
+            )
+            continue
+        relation = row.relation
+        wanted = (
+            "baseline"
+            if row.name == budgets.baseline
+            else "orthogonal"
+            if len(derived) == 1
+            else "composite(" + ",".join(derived) + ")"
+            if derived
+            else "re-measurement(<reason>)"
+        )
+        if row.name == budgets.baseline:
+            if relation is None or relation.kind != "baseline":
+                problems.append(
+                    f"gate-perf-design row {row.name}: it is the gate-budgets "
+                    "baseline, so its relation is the reference every other row "
+                    f"is stated against; write `{wanted}`"
+                )
+                continue
+            counts["baseline"] += 1
+            continue
+        if relation is None:
+            problems.append(
+                f"gate-perf-design row {row.name}: it declares no relation to the "
+                f"baseline {budgets.baseline}; its cells vary "
+                f"{len(derived)} dimension(s), so write `{wanted}`"
+            )
+            continue
+        if relation.kind == "baseline":
+            problems.append(
+                f"gate-perf-design row {row.name}: it is labelled `baseline`, but "
+                f"the baseline is {budgets.baseline}; a row's cells vary "
+                f"{len(derived)} dimension(s) from it, so write `{wanted}`"
+            )
+            continue
+        problem = None
+        if not derived and relation.kind != "re-measurement":
+            problem = (
+                f"gate-perf-design row {row.name}: its cells name no dimension "
+                f"that differs from the baseline {budgets.baseline} "
+                "(every dimension it names repeats the baseline's value), so "
+                "it is a deliberate repeat and must say why; write "
+                "`re-measurement(<reason>)` (e.g. a second tier or a "
+                f"stability re-run), not `{relation.kind}`"
+            )
+        elif derived and len(derived) == 1 and relation.kind != "orthogonal":
+            problem = (
+                f"gate-perf-design row {row.name}: it varies exactly one "
+                f"dimension from the baseline ({derived[0]}), so write "
+                f"`orthogonal`, not `{relation.kind}`"
+            )
+        elif derived and len(derived) > 1 and relation.kind == "re-measurement":
+            problem = (
+                f"gate-perf-design row {row.name}: it is labelled a "
+                f"re-measurement, but its cells vary {len(derived)} dimension(s) "
+                f"from the baseline ({', '.join(derived)}), so write `{wanted}`"
+            )
+        elif derived and len(derived) > 1 and relation.kind != "composite":
+            problem = (
+                f"gate-perf-design row {row.name}: its cells vary {len(derived)} "
+                f"dimension(s) from the baseline ({', '.join(derived)}), so write "
+                f"`{wanted}`"
+            )
+        elif relation.kind == "composite" and set(relation.keys) != set(derived):
+            problem = (
+                f"gate-perf-design row {row.name}: it is labelled "
+                f"composite({','.join(relation.keys)}), but its cells vary "
+                f"{', '.join(derived) or 'nothing'}; name exactly the dimensions "
+                "the cells vary, or fix the cells"
+            )
+        if problem is not None:
+            problems.append(problem)
+            continue
+        counts[relation.kind] = counts.get(relation.kind, 0) + 1
+
+    order = ("orthogonal", "composite", "re-measurement", "baseline")
+    summary.append(
+        "  gate-perf-relations: "
+        + ", ".join(f"{counts[kind]} {kind}" for kind in order)
+        + f" of {len(rows)} row(s), stated against {budgets.baseline}"
+    )
+    for row in rows:
+        if row.relation is not None and row.relation.kind == "composite":
+            summary.append(
+                f"  gate-perf-composite: {row.name} varies "
+                f"{', '.join(varied_by_row[row.name])}"
+            )
+    return summary
 
 
 def read_mandate_report(path: Path, problems: list[str]):
@@ -1123,6 +1392,7 @@ def check_perf_gate(
     rows = parse_perf_design(design_block, problems)
     budgets = parse_perf_budgets(budgets_block or "", problems)
     gaps = parse_perf_gaps(gaps_block or "", problems)
+    relation_summary = check_perf_relations(rows, budgets, problems)
 
     listings = TargetListings()
     for row in rows:
@@ -1221,6 +1491,7 @@ def check_perf_gate(
         f"cell(s), {len(gaps)} gap(s), baseline "
         f"{budgets.baseline or 'unset'}"
     ]
+    summary.extend(relation_summary)
     for tier in sorted(by_tier):
         total = sum(row.cost for row in by_tier[tier])
         budget = budgets.tiers.get(tier)

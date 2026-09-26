@@ -73,7 +73,7 @@ follow. This document states the form and the check.
 The declarative form is three fenced blocks in that crate's `GATE.md`,
 alongside the existing ones:
 
-    gate-perf-design       <target>::<test> = <tier> | <nominal_cost_s> | <coverage>
+    gate-perf-design       <target>::<test> = <tier> | <nominal_cost_s> | <relation> | <coverage>
     gate-budgets           <tier> = <budget_s>, plus baseline/drift/drift_floor_s
     gate-coverage-gaps     <cell> = <non-empty reason>
 
@@ -84,15 +84,41 @@ the baseline row named in `gate-budgets`. A row's tier is the tier the
 compiled test set puts the test in (`default` means not `#[ignore]`d; the other
 tiers are the `gate-manifest` tiers), and the reserved target name `lib` names
 the package's `--lib` target, which is where the harness's own wall-clock
-probes live. The exact grammar, the checker's failure modes and the fixture
-tests that pin them are in `tools/check-gate.py` and
+probes live.
+
+`<relation>` is how the row stands to that baseline, and it is the coverage
+half's attribution rule made checkable:
+
+    baseline                      the reference row itself
+    orthogonal                    its cells vary exactly one dimension from it
+    composite(<dim>[,<dim>…])     they vary several; the row names which
+    re-measurement(<reason>)      they vary none; the row says why it repeats it
+
+The checker derives the dimensions the row varies from the row's own cells. A
+dimension whose value differs from the baseline's — **including one the
+baseline does not state at all** — is varied; a dimension the row does not
+name is inherited from the baseline. A row that varies more than one dimension
+must be `composite` and must name exactly the dimensions its cells vary (that
+is what makes a confounded arm impossible to file as an orthogonal one); a
+row that varies none must be a `re-measurement` with a reason, since a
+repeated cell is a deliberate act — a second tier, a stability re-run — and
+not a silent duplicate; a row whose cells state one dimension twice has no
+determinable relation and fails as ambiguous. Every one of those failures
+names the row and what to write instead, and the passing run prints the
+per-relation counts and one line per composite row naming the dimensions it
+varies, so the attribution a crate actually has is a visible number rather
+than a claim in prose.
+
+The exact grammar, the derivation rule, the checker's failure modes and the
+fixture tests that pin them are in `tools/check-gate.py` and
 `tools/test_check_gate.py`.
 
 `tools/check-gate.py` enforces the declaration for any crate whose `GATE.md`
 carries the blocks: an unknown target, an unknown test, a test declared in the
 wrong tier, a tier sum over its budget, an empty or malformed coverage cell, a
-gap without a reason, and a missing `baseline` are all failures that name the
-problem. It runs the same way as the other gate checks:
+gap without a reason, a missing `baseline`, an unlabelled row, a relation that
+disagrees with the row's cells, and an ambiguous row are all failures that
+name the problem. It runs the same way as the other gate checks:
 
 ```sh
 python3 tools/check-gate.py

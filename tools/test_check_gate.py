@@ -125,10 +125,10 @@ BASE_PLAN = {
 
 BASE_DESIGN = "\n".join(
     [
-        "alpha::t_ok = default | 0.1 | conformance-alpha@lane=loopback+layer=link",
-        "alpha::t_ig = perf | 0.2 | probe-alpha@metric=throughput+scale=200-pkt",
-        "lib::tests::probe = perf | 0.3 | probe-runner@metric=latency+layer=runner",
-        "beta::t_beta = default | 0.4 | conformance-beta@impairment=none",
+        "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+        "alpha::t_ok = default | 0.1 | orthogonal | conformance-alpha@impairment=delay20ms",
+        "alpha::t_ig = perf | 0.2 | composite(metric,scale) | probe-alpha@metric=throughput+scale=200-pkt",
+        "lib::tests::probe = perf | 0.3 | re-measurement(second-tier-repeat) | probe-runner@impairment=none",
     ]
 )
 
@@ -235,6 +235,14 @@ class CheckGatePerfTest(unittest.TestCase):
         self.assertIn("4 coverage cell(s)", output)
         self.assertIn("gate-budgets: default 0.50/30.00s", output)
         self.assertIn("gate-budgets: perf 0.50/30.00s", output)
+        self.assertIn(
+            "gate-perf-relations: 1 orthogonal, 1 composite, 1 re-measurement, "
+            "1 baseline of 4 row(s), stated against beta::t_beta",
+            output,
+        )
+        self.assertIn(
+            "gate-perf-composite: alpha::t_ig varies metric, scale", output
+        )
 
     def test_declaration_without_perf_blocks_still_passes(self):
         (self.root / "tests" / "GATE.md").write_text(
@@ -380,6 +388,157 @@ class CheckGatePerfTest(unittest.TestCase):
         self.write_gate()
         self.report_path.write_text("[1, 2, 3]", encoding="utf-8")
         self.rejects("is not a JSON object", "--mandate-check-json", str(self.report_path))
+
+    # -- the relation to the baseline (the coverage half's attribution) ----
+
+    def test_an_unlabelled_multi_dimension_row_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ok = default | 0.1 | orthogonal | conformance-alpha@impairment=delay20ms",
+                "alpha::t_ok = default | 0.1 | conformance-alpha@lane=loopback+layer=link",
+            )
+        )
+        output = self.rejects("alpha::t_ok: it declares no relation to the baseline")
+        self.assertIn("its cells vary 2 dimension(s), so write `composite(lane,layer)`", output)
+
+    def test_a_row_differing_in_no_dimension_without_a_re_measurement_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "lib::tests::probe = perf | 0.3 | re-measurement(second-tier-repeat)",
+                "lib::tests::probe = perf | 0.3 | orthogonal",
+            )
+        )
+        output = self.rejects(
+            "lib::tests::probe: its cells name no dimension that differs from the baseline"
+        )
+        self.assertIn("write `re-measurement(<reason>)`", output)
+
+    def test_an_unlabelled_row_differing_in_no_dimension_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "lib::tests::probe = perf | 0.3 | re-measurement(second-tier-repeat) | probe-runner@impairment=none",
+                "lib::tests::probe = perf | 0.3 | probe-runner@impairment=none",
+            )
+        )
+        output = self.rejects(
+            "lib::tests::probe: it declares no relation to the baseline"
+        )
+        self.assertIn("its cells vary 0 dimension(s), so write `re-measurement(<reason>)`", output)
+
+    def test_an_ambiguous_row_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "probe-alpha@metric=throughput+scale=200-pkt",
+                "probe-alpha@metric=throughput+metric=latency",
+            )
+        )
+        output = self.rejects(
+            "alpha::t_ig: its relation to the baseline cannot be determined"
+        )
+        self.assertIn("states 'metric' as both 'throughput' and 'latency'", output)
+        self.assertIn("the dimensions it varies are ambiguous", output)
+
+    def test_a_baseline_that_is_not_one_point_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "conformance-beta@impairment=none",
+                "conformance-beta@impairment=none+impairment=delay20ms",
+            )
+        )
+        output = self.rejects(
+            "baseline row beta::t_beta: its cells are not one point"
+        )
+        self.assertIn("no row's relation to it can be determined", output)
+
+    def test_a_composite_label_that_misnames_the_dimensions_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "composite(metric,scale)", "composite(metric,lane)"
+            )
+        )
+        self.rejects(
+            "alpha::t_ig: it is labelled composite(metric,lane), but its cells vary metric, scale"
+        )
+
+    def test_a_composite_label_on_a_one_dimension_row_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ok = default | 0.1 | orthogonal",
+                "alpha::t_ok = default | 0.1 | composite(lane,layer)",
+            )
+        )
+        output = self.rejects(
+            "alpha::t_ok: it varies exactly one dimension from the baseline (impairment)"
+        )
+        self.assertIn("write `orthogonal`, not `composite`", output)
+
+    def test_a_re_measurement_label_on_a_multi_dimension_row_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ig = perf | 0.2 | composite(metric,scale)",
+                "alpha::t_ig = perf | 0.2 | re-measurement(second-tier-repeat)",
+            )
+        )
+        self.rejects(
+            "alpha::t_ig: it is labelled a re-measurement, but its cells vary 2 "
+            "dimension(s) from the baseline (metric, scale)"
+        )
+
+    def test_the_baseline_row_must_be_labelled_baseline(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "beta::t_beta = default | 0.4 | baseline |",
+                "beta::t_beta = default | 0.4 | orthogonal |",
+            )
+        )
+        output = self.rejects(
+            "beta::t_beta: it is the gate-budgets baseline, so its relation is the reference"
+        )
+        self.assertIn("write `baseline`", output)
+
+    def test_a_non_baseline_row_may_not_be_labelled_baseline(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ok = default | 0.1 | orthogonal",
+                "alpha::t_ok = default | 0.1 | baseline",
+            )
+        )
+        output = self.rejects(
+            "alpha::t_ok: it is labelled `baseline`, but the baseline is beta::t_beta"
+        )
+        self.assertIn("so write `orthogonal`", output)
+
+    def test_a_re_measurement_without_a_reason_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "re-measurement(second-tier-repeat)", "re-measurement()"
+            )
+        )
+        self.rejects("re-measurement(<reason>)` names no reason")
+
+    def test_a_composite_relation_naming_one_dimension_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace("composite(metric,scale)", "composite(metric)")
+        )
+        self.rejects("`composite(...)` must name at least two dimensions")
+
+    def test_an_unknown_relation_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ok = default | 0.1 | orthogonal",
+                "alpha::t_ok = default | 0.1 | mostly-orthogonal",
+            )
+        )
+        self.rejects("is not a relation this grammar knows")
+
+    def test_a_row_without_a_relation_field_reports_it_as_a_field_count(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none | extra",
+            )
+        )
+        self.rejects("found 5 field(s)")
 
     # -- the rest of the declaration ---------------------------------------
 

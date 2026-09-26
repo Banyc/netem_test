@@ -8,10 +8,12 @@ cannot be checked by `check-gate.py` here — the rows name tests in a sibling
 checkout, and a checked-in draft must not resolve them — so this test pins the
 properties the checker would reject on the day it is applied, using only the
 draft's own text: every row parses as `<target>::<test> = <tier> | <cost> |
-<cell>[,...]` under the checker's grammar, no row is declared twice, every
-tier a row names has a budget, the baseline names a row, every gap carries a
-well-formed cell and a reason, and the rows whose cost is a number fit their
-tier's budget. A `TBD` cost is allowed by design (the draft is where the
+<relation> | <cell>[,...]` under the checker's grammar, the declared relation
+agrees with the dimensions the row's cells vary (the checker's own derivation,
+so a composite arm cannot be drafted as an orthogonal one), no row is declared
+twice, every tier a row names has a budget, the baseline names a row, every gap
+carries a well-formed cell and a reason, and the rows whose cost is a number fit
+their tier's budget. A `TBD` cost is allowed by design (the draft is where the
 measurement is still owed) and is what the checker refuses when the block lands.
 """
 
@@ -40,51 +42,11 @@ def block(name):
 class PendingDeclarationTest(unittest.TestCase):
     def setUp(self):
         self.design = block("gate-perf-design")
-        self.budgets = block("gate-budgets")
+        self.budgets_text = block("gate-budgets")
         self.gaps = block("gate-coverage-gaps")
-        self.rows = []
-        for number, line in enumerate(self.design.splitlines(), start=1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            name, separator, rest = line.partition(" = ")
-            self.assertTrue(separator, f"line {number} is not '<name> = <tier> | ...': {line!r}")
-            fields = [field.strip() for field in rest.split("|")]
-            self.assertEqual(len(fields), 3, f"{name}: expected three fields, got {fields}")
-            self.rows.append((name, fields[0], fields[1], fields[2]))
-
-    def test_the_three_blocks_exist(self):
-        for name, body in (
-            ("gate-perf-design", self.design),
-            ("gate-budgets", self.budgets),
-            ("gate-coverage-gaps", self.gaps),
-        ):
-            self.assertIsNotNone(body, f"the draft has no ```{name} block")
-
-    def test_every_row_is_a_unique_well_formed_declaration(self):
-        seen = set()
-        for name, tier, cost, coverage in self.rows:
-            self.assertIn("::", name, f"{name!r} is not '<target>::<test>'")
-            self.assertNotIn(" ", name, f"{name!r} contains whitespace")
-            self.assertNotIn(name, seen, f"{name} is declared twice")
-            seen.add(name)
-            self.assertIn(tier, CHECK_GATE.PERF_TIERS, f"{name}: unknown tier {tier!r}")
-            if cost != "TBD":
-                self.assertGreaterEqual(
-                    float(cost), 0.0, f"{name}: cost {cost!r} is not a non-negative number"
-                )
-            cells = [cell.strip() for cell in coverage.split(",") if cell.strip()]
-            self.assertTrue(cells, f"{name}: no coverage cell")
-            for cell in cells:
-                self.assertIsNone(
-                    CHECK_GATE.cell_problem(cell), f"{name}: malformed cell {cell!r}"
-                )
-        self.assertGreater(len(self.rows), 0, "the draft declares no row")
-
-    def test_every_used_tier_has_a_budget_and_a_measured_row_fits_it(self):
         budgets = {}
         baseline = None
-        for line in self.budgets.splitlines():
+        for line in self.budgets_text.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -95,17 +57,92 @@ class PendingDeclarationTest(unittest.TestCase):
                 baseline = value
             elif key in CHECK_GATE.PERF_TIERS:
                 budgets[key] = float(value)
-        names = {name for name, _, _, _ in self.rows}
-        self.assertIsNotNone(baseline, "gate-budgets names no baseline row")
-        self.assertIn(baseline, names, f"baseline {baseline!r} is not a declared row")
+        self.budgets, self.baseline = budgets, baseline
+        self.rows = []
+        for number, line in enumerate(self.design.splitlines(), start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name, separator, rest = line.partition(" = ")
+            self.assertTrue(separator, f"line {number} is not '<name> = <tier> | ...': {line!r}")
+            fields = [field.strip() for field in rest.split("|")]
+            self.assertEqual(
+                len(fields),
+                4,
+                f"{name}: expected '<tier> | <cost> | <relation> | <coverage>', "
+                f"got {fields}",
+            )
+            self.rows.append((name, fields[0], fields[1], fields[2], fields[3]))
+
+    def test_the_three_blocks_exist(self):
+        for name, body in (
+            ("gate-perf-design", self.design),
+            ("gate-budgets", self.budgets_text),
+            ("gate-coverage-gaps", self.gaps),
+        ):
+            self.assertIsNotNone(body, f"the draft has no ```{name} block")
+
+    def test_every_row_is_a_unique_well_formed_declaration(self):
+        seen = set()
+        for name, tier, cost, relation, coverage in self.rows:
+            self.assertIn("::", name, f"{name!r} is not '<target>::<test>'")
+            self.assertNotIn(" ", name, f"{name!r} contains whitespace")
+            self.assertNotIn(name, seen, f"{name} is declared twice")
+            seen.add(name)
+            self.assertIn(tier, CHECK_GATE.PERF_TIERS, f"{name}: unknown tier {tier!r}")
+            if cost != "TBD":
+                self.assertGreaterEqual(
+                    float(cost), 0.0, f"{name}: cost {cost!r} is not a non-negative number"
+                )
+            parsed, problem = CHECK_GATE.parse_relation(relation)
+            self.assertIsNone(problem, f"{name}: {problem}")
+            self.assertIsNotNone(parsed, f"{name}: relation {relation!r} did not parse")
+            cells = [cell.strip() for cell in coverage.split(",") if cell.strip()]
+            self.assertTrue(cells, f"{name}: no coverage cell")
+            for cell in cells:
+                self.assertIsNone(
+                    CHECK_GATE.cell_problem(cell), f"{name}: malformed cell {cell!r}"
+                )
+        self.assertGreater(len(self.rows), 0, "the draft declares no row")
+
+    def test_every_relation_agrees_with_the_dimensions_its_cells_vary(self):
+        """The draft's labels must be the checker's own derivation, not a guess."""
+        rows = []
+        for name, tier, cost, relation, coverage in self.rows:
+            parsed, problem = CHECK_GATE.parse_relation(relation)
+            self.assertIsNone(problem, f"{name}: {problem}")
+            rows.append(
+                CHECK_GATE.PerfRow(
+                    name,
+                    tier,
+                    float(cost) if cost != "TBD" else 0.0,
+                    tuple(cell.strip() for cell in coverage.split(",") if cell.strip()),
+                    parsed,
+                )
+            )
+        budgets = CHECK_GATE.PerfBudgets(
+            {"default": 300.0, "standard": 600.0, "full": 7200.0, "perf": 7200.0},
+            self.baseline,
+            0.5,
+            10.0,
+        )
+        problems: list[str] = []
+        summary = CHECK_GATE.check_perf_relations(rows, budgets, problems)
+        self.assertEqual(problems, [], "\n".join(problems))
+        self.assertIn("gate-perf-relations:", "\n".join(summary))
+
+    def test_every_used_tier_has_a_budget_and_a_measured_row_fits_it(self):
+        names = {name for name, _, _, _, _ in self.rows}
+        self.assertIsNotNone(self.baseline, "gate-budgets names no baseline row")
+        self.assertIn(self.baseline, names, f"baseline {self.baseline!r} is not a declared row")
         sums = {}
-        for name, tier, cost, _ in self.rows:
-            self.assertIn(tier, budgets, f"no budget declared for the {tier} tier")
+        for name, tier, cost, _, _ in self.rows:
+            self.assertIn(tier, self.budgets, f"no budget declared for the {tier} tier")
             if cost != "TBD":
                 sums[tier] = sums.get(tier, 0.0) + float(cost)
         for tier, total in sums.items():
             self.assertLessEqual(
-                total, budgets[tier], f"the {tier} rows sum to {total} over {budgets[tier]}"
+                total, self.budgets[tier], f"the {tier} rows sum to {total} over {self.budgets[tier]}"
             )
 
     def test_every_gap_names_a_cell_and_a_reason(self):

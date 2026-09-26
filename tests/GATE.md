@@ -308,40 +308,62 @@ test that asserts it and every cell it does not cover recording why.
 This block is the harness's own declaration. It is checked by
 `python3 tools/check-gate.py`, which resolves each row's `<target>::<test>`
 from the compiled test binaries and fails on an unknown target or test, a test
-in the wrong tier, a tier sum over its budget, an empty coverage cell and a gap
-without a reason. The reserved target name `lib` is the `netem-test` package's
-`--lib` target, where the harness's wall-clock probes live. The costs are
-**measured** — one release (probes) or one debug (scenarios) `cargo test`
-invocation per test, wall-clock to the nearest 0.1 s, rounded up — and they
-are per `cargo test` process, so each includes the binary's startup.
+in the wrong tier, a tier sum over its budget, an empty coverage cell, a gap
+without a reason, and a row whose declared relation to the baseline disagrees
+with the dimensions its own cells vary. The reserved target name `lib` is the
+`netem-test` package's `--lib` target, where the harness's wall-clock probes
+live. The costs are **measured** — one release (probes) or one debug
+(scenarios) `cargo test` invocation per test, wall-clock to the nearest 0.1 s,
+rounded up — and they are per `cargo test` process, so each includes the
+binary's startup.
 
 The baseline row is the unimpaired link, `lane=loopback layer=netem-link
-load=burst metric=counters scale=64-pkt`; every other row varies **one**
-dimension from it (impairment for the conformance rows, layer for the pair and
-probe rows, lane for the regime rows). No row here is a composite.
+load=burst metric=counters scale=64-pkt`. Every other row declares how it
+relates to that baseline (`orthogonal`, `composite(<dimensions>)` or
+`re-measurement(<reason>)`), and the checker derives the dimensions the row's
+cells actually vary — a dimension the row values differently from the
+baseline, or one the baseline does not state at all; a dimension the row does
+not name is inherited from the baseline — and fails an unlabelled row, a row
+whose label disagrees with that derivation, and a row whose cells state one
+dimension twice (so its relation cannot be determined). Declared: **7
+orthogonal** rows and **10 composite** rows, plus the baseline row itself; no
+row is a re-measurement.
+
+The composites are not a re-cut of the arms — every window, cadence and tier
+is immutable — they are what the mandate's six-axis space (`impairment × load
+shape × lane × layer × metric × scale`) makes of these cells.
+`netem_reorder_with_rate_jumps_ahead` varies its impairment and its rate
+together; the two `raw_netem_pair` rows vary the layer and the `impairment`
+key the baseline does not state (the clean pair row's `impairment=none` is the
+baseline's own state, stated rather than varied); the three
+`lane_regime_coverage` rows and the four `lib::tests` probes vary their lane,
+layer and metric; and the std-udp probe varies its transport as well. A
+result on those rows is attributed to the combination, not to one dimension;
+the label is what stops it from being read as a single-dimension result, and
+no arm is to be retuned to make a label simpler.
 
 The budgets are per tier, and they bound the rows declared in that tier — the
 perf-relevant tests, not the crate's correctness unit tests:
 
 ```gate-perf-design
-netem_scenarios::netem_blackout_gate_drops_then_resumes = default | 0.8 | blackout@control=blackout-gate
-netem_scenarios::netem_delay_adds_latency = default | 0.1 | conformance-delay@impairment=delay20ms
-netem_scenarios::netem_drops_all_with_max_random_loss = default | 0.4 | conformance-loss@impairment=loss100pct
-netem_scenarios::netem_duplicate_produces_extra_packets = default | 0.5 | conformance-dup@impairment=dup50pct
-netem_scenarios::netem_four_state_loss_drops_some = default | 0.9 | conformance-loss@impairment=four-state
-netem_scenarios::netem_passes_traffic_unimpaired = default | 0.6 | baseline@lane=loopback+layer=netem-link+load=burst+metric=counters+scale=64-pkt
-netem_scenarios::netem_rate_limit_throttles_burst = default | 0.3 | conformance-rate@impairment=rate-limit
-netem_scenarios::netem_reorder_with_rate_jumps_ahead = default | 0.1 | conformance-reorder@impairment=reorder+rate=rate-limit
-netem_scenarios::netem_snapshot_reports_queue_and_stats = default | 0.2 | conformance-queue@impairment=queue-limit
-raw_netem_pair::netem_pair_raw_udp_echo_clean_link = default | 0.1 | pair-echo@layer=netem-pair+impairment=none
-raw_netem_pair::netem_pair_raw_udp_latency_is_observable = default | 0.2 | pair-latency@layer=netem-pair+impairment=delay25ms
-lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on = default | 0.1 | regime-jittery@lane=jittery-short-rtt+metric=rttvar
-lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot = default | 6.2 | regime-jittery@lane=jittery-short-rtt+metric=reordering
-lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot = standard | 14.8 | regime-thin@lane=high-rtt-low-rate+metric=rto
-lib::tests::clean_forwarding_perf_probe = perf | 0.2 | probe-forwarding@metric=throughput+layer=netem-runner
-lib::tests::learned_destination_cache_perf_probe = perf | 0.2 | probe-dest-cache@metric=throughput+layer=netem-runner
-lib::tests::short_deadline_latency_perf_probe = perf | 0.1 | probe-deadline@metric=latency+layer=netem-runner
-lib::tests::std_udp_connected_peer_perf_probe = perf | 1.2 | probe-std-udp@metric=throughput+layer=netem-runner+transport=std-udp
+netem_scenarios::netem_blackout_gate_drops_then_resumes = default | 0.8 | orthogonal | blackout@control=blackout-gate
+netem_scenarios::netem_delay_adds_latency = default | 0.1 | orthogonal | conformance-delay@impairment=delay20ms
+netem_scenarios::netem_drops_all_with_max_random_loss = default | 0.4 | orthogonal | conformance-loss@impairment=loss100pct
+netem_scenarios::netem_duplicate_produces_extra_packets = default | 0.5 | orthogonal | conformance-dup@impairment=dup50pct
+netem_scenarios::netem_four_state_loss_drops_some = default | 0.9 | orthogonal | conformance-loss@impairment=four-state
+netem_scenarios::netem_passes_traffic_unimpaired = default | 0.6 | baseline | baseline@lane=loopback+layer=netem-link+load=burst+metric=counters+scale=64-pkt
+netem_scenarios::netem_rate_limit_throttles_burst = default | 0.3 | orthogonal | conformance-rate@impairment=rate-limit
+netem_scenarios::netem_reorder_with_rate_jumps_ahead = default | 0.1 | composite(impairment,rate) | conformance-reorder@impairment=reorder+rate=rate-limit
+netem_scenarios::netem_snapshot_reports_queue_and_stats = default | 0.2 | orthogonal | conformance-queue@impairment=queue-limit
+raw_netem_pair::netem_pair_raw_udp_echo_clean_link = default | 0.1 | composite(impairment,layer) | pair-echo@layer=netem-pair+impairment=none
+raw_netem_pair::netem_pair_raw_udp_latency_is_observable = default | 0.2 | composite(impairment,layer) | pair-latency@layer=netem-pair+impairment=delay25ms
+lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on = default | 0.1 | composite(lane,metric) | regime-jittery@lane=jittery-short-rtt+metric=rttvar
+lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot = default | 6.2 | composite(lane,metric) | regime-jittery@lane=jittery-short-rtt+metric=reordering
+lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot = standard | 14.8 | composite(lane,metric) | regime-thin@lane=high-rtt-low-rate+metric=rto
+lib::tests::clean_forwarding_perf_probe = perf | 0.2 | composite(layer,metric) | probe-forwarding@metric=throughput+layer=netem-runner
+lib::tests::learned_destination_cache_perf_probe = perf | 0.2 | composite(layer,metric) | probe-dest-cache@metric=throughput+layer=netem-runner
+lib::tests::short_deadline_latency_perf_probe = perf | 0.1 | composite(layer,metric) | probe-deadline@metric=latency+layer=netem-runner
+lib::tests::std_udp_connected_peer_perf_probe = perf | 1.2 | composite(layer,metric,transport) | probe-std-udp@metric=throughput+layer=netem-runner+transport=std-udp
 ```
 
 The declared sums are `default` 10.5 s of a 60 s budget, `standard` 14.8 s of
