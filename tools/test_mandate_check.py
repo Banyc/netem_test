@@ -252,19 +252,68 @@ M4_ROWS = _m4_rows()
 
 PASS_LINES = [
     "running 4 tests",
-    "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   24.5",
+    # The smoke set's per-arm lines, in the producer's own padded shape, before
+    # that arm's mandate's MANDATE line — the ordering the runner attributes by.
+    "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   25.3 "
+    "p90=   43.0 p99=   89.0 p999=   97.9 max=   102.5 over250=   0 wire=     42300B "
+    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "[mandate-smoke hostile  ] sent=  800 recv=  800 delivery=1.000 p50=   39.5 "
+    "p90=  150.6 p99=  245.1 p999=  283.6 max=   289.9 over250=  21 wire=     42300B "
+    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "[mandate-smoke lone_tail] sent=  240 recv=  240 delivery=1.000 p50=    0.3 "
+    "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
+    "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
     "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0",
     "test m1_interactive_tail_latency ... ok",
+    "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   25.3 "
+    "p90=   43.0 p99=   89.0 p999=   97.9 max=   102.5 over250=   0 wire=     42300B "
+    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "[mandate-smoke hostile  ] sent=  800 recv=  800 delivery=1.000 p50=   39.5 "
+    "p90=  150.6 p99=  245.1 p999=  283.6 max=   289.9 over250=  21 wire=     42300B "
+    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "[mandate-smoke lone_tail] sent=  240 recv=  240 delivery=1.000 p50=    0.3 "
+    "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
+    "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
     "MANDATE M2 PASS delivery=1.000 amp=3.61 budget=6.0",
     "test m2_interactive_delivery_and_wire ... ok",
+    "[mandate-smoke m3/rep1] delivered 0.963 MiB/s over 2.0004s, shaper forwarded "
+    "0.972 MiB/s, capacity 1.000 MiB/s, fraction 0.963 (820148 / 992240 bytes)",
+    "[mandate-smoke m3/rep2] delivered 0.971 MiB/s over 2.0011s, shaper forwarded "
+    "0.980 MiB/s, capacity 1.000 MiB/s, fraction 0.971 (826960 / 994352 bytes)",
+    "[mandate-smoke m3/rep3] delivered 0.958 MiB/s over 2.0008s, shaper forwarded "
+    "0.967 MiB/s, capacity 1.000 MiB/s, fraction 0.958 (815872 / 990128 bytes)",
     "MANDATE M3 PASS goodput=0.52 floor=0.35 link_mib_s=8.0",
     "test m3_bulk_goodput_fraction ... ok",
+    "[mandate-smoke m4/clean flow A] sent=  120 recv=  120 delivery=1.000 "
+    "share=0.2502 offered=1269600B delivered=1269600B p50=   22.0 p90=   41.0 "
+    "p99=  118.4 max=  240.0",
+    "[mandate-smoke m4/clean flow B] sent=  120 recv=  120 delivery=1.000 "
+    "share=0.2498 offered=1269600B delivered=1269600B p50=   23.5 p90=   42.0 "
+    "p99=  121.0 max=  244.0",
+    "[mandate-smoke m4/clean flow C] sent=  120 recv=  120 delivery=1.000 "
+    "share=0.2501 offered=1269600B delivered=1269600B p50=   21.8 p90=   40.0 "
+    "p99=  116.7 max=  238.0",
+    "[mandate-smoke m4/clean flow D] sent=  120 recv=  120 delivery=1.000 "
+    "share=0.2499 offered=1269600B delivered=1269600B p50=   24.1 p90=   43.0 "
+    "p99=  119.9 max=  246.0",
+    "[mandate-smoke m4/clean  ] ideal_share=0.2500 min_share=0.2498 "
+    "max_share=+0.2502 imbalance=0.0016 window=12s wall=24.3s",
+    "[mandate-smoke m4/hostile flow A] sent=  120 recv=  120 delivery=0.998 "
+    "share=0.2480 offered=1269600B delivered=1267000B p50=   96.0 p90=  180.0 "
+    "p99=  402.0 max=  900.0",
+    "[mandate-smoke m4/hostile] ideal_share=0.2500 min_share=0.2480 "
+    "max_share=+0.2520 imbalance=0.0080 window=12s wall=24.1s",
     "MANDATE M4 PASS flows=4 clean_delivery_min=1.000 hostile_delivery_min=0.998 "
     "clean_imbalance=0.004 hostile_imbalance=0.008 imbalance_bound=0.010 "
     "fair_share=0.2500 delivery_floor=0.995 clean_p99_max=121.0 ceiling=250.0",
     "test m4_interactive_lane_fairness ... ok",
     "test result: ok. 4 passed; 0 failed",
 ]
+
+
+def arm_lines(lines):
+    """Just the `[mandate-smoke ...]` lines of a plan's stdout, in order."""
+    return [line for line in lines if line.startswith("[mandate-smoke ")]
 
 
 class MandateCheckTest(unittest.TestCase):
@@ -576,27 +625,285 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(self.report()["rtp_mux"]["revision"], head)
         self.assertEqual(self.report()["rtp_mux"]["revision_source"], "git")
 
+    def test_report_records_each_arm_measurement_schema_three(self):
+        code, stdout, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["schema"], "mandate-check/3")
+        arms = {arm["id"]: arm for arm in report["arms"]}
+        self.assertEqual(
+            sorted(arms),
+            [
+                "M1/clean",
+                "M1/hostile",
+                "M1/lone_tail",
+                "M2/clean",
+                "M2/hostile",
+                "M2/lone_tail",
+                "M3/m3/rep1",
+                "M3/m3/rep2",
+                "M3/m3/rep3",
+                "M4/m4/clean",
+                "M4/m4/clean flow A",
+                "M4/m4/clean flow B",
+                "M4/m4/clean flow C",
+                "M4/m4/clean flow D",
+                "M4/m4/hostile",
+                "M4/m4/hostile flow A",
+            ],
+        )
+        clean = arms["M1/clean"]
+        self.assertEqual(clean["mandate"], "M1")
+        self.assertEqual(clean["label"], "clean")
+        self.assertEqual(clean["dialect"], "kv")
+        self.assertEqual(clean["sample_count"], 800)
+        self.assertEqual(clean["stats"]["p99"], 89.0)
+        self.assertEqual(clean["stats"]["over250"], 0)
+        self.assertEqual(clean["counters"]["received"], 800)
+        self.assertEqual(clean["counters"]["sent"], 800)
+        self.assertEqual(clean["counters"]["wire_bytes"], 42300)
+        self.assertEqual(clean["counters"]["bulk_wire_bytes"], 9123456)
+        self.assertEqual(clean["windows"]["window_seconds"], 12)
+        self.assertEqual(clean["values"]["x"], 2.16)
+        self.assertEqual(
+            clean["cells"],
+            [
+                "M1@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual"
+                "+shape=cadence+flows=1+scale=256B+metric=p99",
+            ],
+        )
+        self.assertIn("sent=", clean["raw_line"])
+        lone = arms["M1/lone_tail"]
+        self.assertEqual(lone["counters"]["wire_bytes"], 120000)
+        self.assertEqual(lone["stats"]["over250"], 4)
+        self.assertEqual(lone["cells"][0].split("@")[1].split("+")[3], "shape=request-response")
+        # The bulk-rep dialect: the M3 rep line carries no `recv`, so its
+        # sample count is absent rather than invented, and its shaper counter is
+        # the forwarded bytes.
+        rep = arms["M3/m3/rep2"]
+        self.assertEqual(rep["dialect"], "bulk-rep")
+        self.assertIsNone(rep["sample_count"])
+        self.assertEqual(rep["stats"]["fraction"], 0.971)
+        self.assertEqual(rep["counters"]["delivered_bytes"], 826960)
+        self.assertEqual(rep["counters"]["forwarded_bytes"], 994352)
+        self.assertEqual(rep["windows"]["elapsed_seconds"], 2.0011)
+        self.assertEqual(rep["cells"][0].split("@")[0], "M3")
+        # The M4 flow arms inherit the arm family's cells by longest prefix.
+        flow = arms["M4/m4/clean flow C"]
+        self.assertEqual(flow["sample_count"], 120)
+        self.assertEqual(flow["counters"]["offered_bytes"], 1269600)
+        self.assertEqual(flow["counters"]["delivered_bytes"], 1269600)
+        self.assertIn("flows=4", flow["cells"][0])
+        aggregate = arms["M4/m4/clean"]
+        self.assertIsNone(aggregate["sample_count"])
+        self.assertEqual(aggregate["stats"]["imbalance"], 0.0016)
+        self.assertEqual(aggregate["windows"]["wall_seconds"], 24.3)
+        self.assertEqual(report["arm_notes"], [])
+        self.assertEqual(
+            report["arm_declaration"]["schema"],
+            MANDATE_CHECK.ARMS_DECLARATION_SCHEMA,
+        )
+        self.assertGreater(report["arm_declaration"]["declared_cells"], 0)
+        self.assertIn("arms: 16 measured", stdout)
+        self.assertIn("M1 arms: 3 (clean, hostile, lone_tail), 1840 sample(s)", stdout)
+
+    def test_a_prose_arm_line_is_kept_as_a_note_rather_than_dropped(self):
+        plan = self.healthy_plan(
+            stdout=list(PASS_LINES)
+            + ["[mandate-smoke m4/clean] noted 3 flows in flight, see the panel"]
+        )
+        code, _, stderr = self.run_tool(plan)
+        # The note follows the last MANDATE line, so it is kept with no mandate
+        # rather than attributed to one by guesswork.
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(
+            report["arm_notes"],
+            [
+                {
+                    "mandate": None,
+                    "label": "m4/clean",
+                    "body": "noted 3 flows in flight, see the panel",
+                }
+            ],
+        )
+        self.assertEqual(len(report["arms"]), 16)
+
+    def test_an_arm_without_a_declared_cell_is_refused(self):
+        plan = self.healthy_plan(
+            stdout=[line.replace("clean    ", "brand_new", 1) for line in PASS_LINES]
+        )
+        code, stdout, _ = self.reject(plan, "covers no declared cell")
+        self.assertEqual(code, 2)
+        self.assertIn("'M1/brand_new'", stdout)
+
+    def test_a_dangling_arm_line_is_refused_with_the_line_named(self):
+        plan = self.healthy_plan(
+            stdout=list(PASS_LINES) + ["[mandate-smoke trailing] sent=1 recv=1 p99=1.0"]
+        )
+        code, stdout, _ = self.reject(plan, "cannot be attributed to a mandate")
+        self.assertEqual(code, 2)
+        self.assertIn("[mandate-smoke trailing]", stdout)
+
+    def test_one_absent_arm_is_recorded_as_absent_rather_than_failing_the_run(self):
+        plan = self.healthy_plan(
+            stdout=[
+                line
+                for line in PASS_LINES
+                if not line.startswith("[mandate-smoke clean    ]")
+            ]
+        )
+        # The reader fails a run whose arm lines cannot be attributed or whose
+        # mandate lost every arm; it does not invent an expected arm set, so a
+        # single absent arm is reported by the comparison against the baseline
+        # (an arm the baseline covered and the candidate did not) rather than
+        # refusing the run here.
+        code, _, stderr = self.run_tool(plan)
+        self.assertEqual(code, 0, stderr)
+        ids = [arm["id"] for arm in self.report()["arms"]]
+        self.assertNotIn("M1/clean", ids)
+        self.assertNotIn("M2/clean", ids)
+        self.assertIn("M1/hostile", ids)
+
+    def test_a_run_that_measured_no_arm_at_all_is_refused(self):
+        plan = self.healthy_plan(
+            stdout=[
+                line for line in PASS_LINES if not line.startswith("[mandate-smoke ")
+            ]
+        )
+        code, stdout, _ = self.reject(plan, "no '[mandate-smoke <arm>] ...' arm measurement")
+        self.assertEqual(code, 2)
+        for mandate in MANDATE_CHECK.MANDATE_IDS:
+            self.assertIn(f"{mandate}: no '[mandate-smoke", stdout)
+
+    def test_an_arm_line_before_a_missing_mandate_line_is_named(self):
+        plan = self.healthy_plan(
+            stdout=[
+                line for line in PASS_LINES if line != "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0"
+            ]
+        )
+        code, stdout, _ = self.reject(plan, "M1: no '[mandate-smoke")
+        self.assertEqual(code, 2)
+
+    def test_a_missing_arm_declaration_is_refused(self):
+        with mock.patch.object(
+            MANDATE_CHECK, "ARMS_DECLARATION_NAME", "mandate-arms-absent.json"
+        ):
+            code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 2)
+        self.assertIn("arm coverage declaration", stderr)
+        self.assertIn("does not exist", stderr)
+
+    def test_a_malformed_arm_declaration_is_refused(self):
+        malformed = {
+            "not an object": "[]",
+            "wrong schema": json.dumps(
+                {"schema": "mandate-arms/2", "cells": {"M1/clean": ["M1@x=1"]}}
+            ),
+            "no cells": json.dumps({"schema": "mandate-arms/1", "cells": {}}),
+            "empty cell list": json.dumps(
+                {"schema": "mandate-arms/1", "cells": {"M1/clean": []}}
+            ),
+            "non-string cell": json.dumps(
+                {"schema": "mandate-arms/1", "cells": {"M1/clean": [7]}}
+            ),
+        }
+        for case, text in malformed.items():
+            with self.subTest(case=case):
+                path = self.root / "mandate-arms-bad.json"
+                path.write_text(text, encoding="utf-8")
+                problems = []
+                self.assertIsNone(MANDATE_CHECK.load_arm_declaration(path, problems))
+                self.assertTrue(problems, case)
+        good = self.root / "mandate-arms-good.json"
+        good.write_text(
+            json.dumps({"schema": "mandate-arms/1", "cells": {"M1/clean": ["M1@x=1"]}}),
+            encoding="utf-8",
+        )
+        problems = []
+        self.assertIsNotNone(MANDATE_CHECK.load_arm_declaration(good, problems))
+        self.assertEqual(problems, [])
+
+    def test_grammar_normalises_units_stats_counters_and_windows(self):
+        arm = MANDATE_CHECK.parse_arm_line(
+            "[mandate-smoke m4/clean flow A] sent=  120 recv=  120 delivery=1.000 "
+            "share=0.2502 offered=1269600B delivered=1269600B p50=   22.0 wall=24.3s"
+        )
+        self.assertEqual(arm["dialect"], "kv")
+        self.assertEqual(arm["sample_count"], 120)
+        self.assertEqual(arm["counters"]["offered_bytes"], 1269600)
+        self.assertEqual(arm["counters"]["delivered_bytes"], 1269600)
+        self.assertEqual(arm["stats"]["share"], 0.2502)
+        self.assertEqual(arm["windows"]["wall_seconds"], 24.3)
+        self.assertNotIn("wall", arm["counters"])
+        rep = MANDATE_CHECK.parse_arm_line(
+            "[mandate-smoke m3/rep1] delivered 0.963 MiB/s over 2.0004s, shaper "
+            "forwarded 0.972 MiB/s, capacity 1.000 MiB/s, fraction 0.963 "
+            "(820148 / 992240 bytes)"
+        )
+        self.assertEqual(rep["dialect"], "bulk-rep")
+        self.assertEqual(rep["counters"]["forwarded_bytes"], 992240)
+        self.assertEqual(rep["stats"]["delivered_mib_s"], 0.963)
+        self.assertIsNone(
+            MANDATE_CHECK.parse_arm_line("a line that is not an arm line at all")
+        )
+        note = MANDATE_CHECK.parse_arm_line("[mandate-smoke x] three flows in flight")
+        self.assertTrue(note["note"])
+
+    def test_declared_cells_match_the_longest_arm_prefix(self):
+        cells = {"M1": ["mandate"], "M1/clean": ["arm"], "M1/cleanup": ["other"]}
+        self.assertEqual(MANDATE_CHECK.declared_cells("M1/clean", cells), ["arm"])
+        self.assertEqual(MANDATE_CHECK.declared_cells("M1/hostile", cells), ["mandate"])
+        self.assertEqual(MANDATE_CHECK.declared_cells("M1/cleanup", cells), ["other"])
+        self.assertEqual(MANDATE_CHECK.declared_cells("M1/clean/flow-A", cells), ["arm"])
+        self.assertEqual(MANDATE_CHECK.declared_cells("M2/clean", cells), [])
+
+    def test_parse_arm_lines_attributes_by_the_next_mandate_line(self):
+        events = [
+            {"seconds": 1.0, "line": "[mandate-smoke clean] sent=1 recv=1 p99=1.0"},
+            {"seconds": 2.0, "line": "MANDATE M1 PASS p99=1.0"},
+            {"seconds": 3.0, "line": "[mandate-smoke m3/rep1] delivered 1.0 MiB/s "
+             "over 2.0s, shaper forwarded 1.0 MiB/s, capacity 1.0 MiB/s, fraction "
+             "1.0 (1 / 2 bytes)"},
+            {"seconds": 4.0, "line": "MANDATE M2 PASS delivery=1.0"},
+        ]
+        problems = []
+        arms, notes = MANDATE_CHECK.parse_arm_lines(events, problems)
+        self.assertEqual(problems, [])
+        self.assertEqual([arm["id"] for arm in arms], ["M1/clean", "M2/m3/rep1"])
+        self.assertEqual([arm["mandate"] for arm in arms], ["M1", "M2"])
+        self.assertEqual(notes, [])
+        guard = []
+        MANDATE_CHECK.check_arm_coverage(arms, notes, guard)
+        self.assertEqual(len(guard), 2)
+        self.assertIn("M3: no '[mandate-smoke", guard[0])
+        self.assertIn("M4: no '[mandate-smoke", guard[1])
+
     # -- a measured mandate failure is not an evidence failure -------------
 
     def test_failing_mandate_exit_is_three_and_names_the_measured_values(self):
+        # The per-arm lines stay in the plan: the extended contract requires a
+        # measured arm for every mandate, and this case is about a measured
+        # FAIL being a verdict rather than an evidence failure.
         plan = self.healthy_plan(
             stdout=[
-                "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0",
-                "MANDATE M2 FAIL delivery=0.998 amp=7.2 budget=6.0",
-                "MANDATE M3 PASS goodput=0.52 floor=0.35 link_mib_s=8.0",
-                "MANDATE M4 PASS flows=4 clean_imbalance=0.004 fair_share=0.2500",
+                line.replace(
+                    "MANDATE M2 PASS delivery=1.000",
+                    "MANDATE M2 FAIL delivery=0.998",
+                )
+                for line in PASS_LINES
             ]
         )
         code, stdout, stderr = self.run_tool(plan)
         self.assertEqual(code, 3, stderr)
-        self.assertIn("M2 FAIL  delivery=0.998 amp=7.2 budget=6.0", stdout)
+        self.assertIn("M2 FAIL  delivery=0.998 amp=3.61 budget=6.0", stdout)
         self.assertIn("exit=3", stdout)
         report = self.report()
         self.assertFalse(report["ok"])
         self.assertEqual(report["exit_code"], 3)
         self.assertEqual(report["problems"], [])
         self.assertEqual(report["mandates"]["M2"]["verdict"], "FAIL")
-        self.assertEqual(report["mandates"]["M2"]["values"]["amp"], 7.2)
+        self.assertEqual(report["mandates"]["M2"]["values"]["amp"], 3.61)
         self.assertEqual(len(report["mandates"]["M2"]["plots"]), 2)
 
     # -- every rejection: non-zero, and naming the problem -----------------

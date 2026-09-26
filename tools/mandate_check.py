@@ -8,9 +8,10 @@ command runs it with ``--release``, renders each mandate's panels through
 can verify from a machine, not from prose, that the mandated checks ran and
 what they measured.
 
-It also times the run per test and per mandate. The smoke set is read as a
-stream (not waited on and then read whole), so the arrival of every libtest
-completion line and every ``MANDATE`` line is timestamped against the child's
+It also times the run per test and per mandate, and records what each perf
+*arm* measured. The smoke set is read as a stream (not waited on and then read
+whole), so the arrival of every libtest completion line, every ``MANDATE`` line
+and every ``[mandate-smoke <arm>]`` line is timestamped against the child's
 start. Those arrivals give each test and each mandate a wall-clock duration
 bracketed between two observed lines: the smoke set serialises its own
 measurements, so the completions arrive in run order, and a per-test duration
@@ -20,6 +21,16 @@ measured, and a declared nominal cost that has drifted from this measured
 wall-clock is visible rather than assumed (the owning crate's
 ``gate-perf-design`` block states the declared cost, ``check-gate.py``
 compares them).
+
+The per-arm record is the other half. A mandate verdict says a bound was
+crossed; it does not say what the arm *measured*, so a shortened arm can pass
+every assertion while quietly halving its own sample count. ``arms`` therefore
+records, per arm, the sample count, the distribution statistics the assertions
+read, the delivery and wire counters, the measured windows and the coverage
+cells the arm is declared to exercise (``tools/mandate-arms.json``), so that a
+later run's arms can be diffed against a committed baseline and a sample count
+that fell can be called a coverage regression rather than noise. ``arms`` is a
+record of what the producer printed; it invents nothing.
 
     ./tools/mandate-check [--rtp-mux <path>] [--dir <out>] [--quick]
 
@@ -87,6 +98,35 @@ target owes it:
    all eight evidence files. A quick run is a tripwire on the assertions, not a
    substitute for the full set: read the plots.
 
+5. **The per-arm measurement lines.** The smoke set must print, on stdout or
+   stderr, one line per arm it measured, before that arm's mandate's
+   ``MANDATE`` line, in one of two shapes:
+
+   - a key/value arm line, ``[mandate-smoke <arm>] <key>=<value> ...`` with at
+     least one measurement token, ``<key>`` matching
+     ``[A-Za-z_][A-Za-z0-9_]*`` and ``<value>`` a whitespace-free token, an
+     optional trailing ``B`` or ``s`` unit and leading spaces allowed
+     (``recv=  800``, ``wire=   12345B``, ``wall=12.3s``);
+   - the M3 bulk-rep line,
+     ``[mandate-smoke <arm>] delivered <f> MiB/s over <f>s, shaper forwarded
+     <f> MiB/s, capacity <f> MiB/s, fraction <f> (<n> / <n> bytes)``.
+
+   ``<arm>`` is the producer's own label (``clean``, ``hostile``,
+   ``lone_tail``, ``m3/rep1``, ``m4/clean flow A``, ...). An arm line belongs
+   to the mandate whose ``MANDATE`` line next follows it. For a key/value arm
+   the sample count is its ``recv`` — the producer's own sample count.
+
+   This is a record of the arms a run measured, so it is required, not
+   optional: a key/value arm line that no ``MANDATE`` line follows cannot be
+   attributed and is a failure, a mandate with no arm line at all is a failure
+   (its arms were never measured), an arm whose coverage cell is not declared
+   in ``tools/mandate-arms.json`` is a failure (a cell may be knowingly empty,
+   never silently empty), and a run with no arm measurement at all is a
+   failure. A ``[mandate-smoke `` line that matches neither shape is recorded
+   as an arm *note*: prose the command does not depend on, kept visible in the
+   report — and, when every arm line degrades that way, the missing-arm
+   failures above fire rather than the record quietly emptying.
+
 ## What it writes
 
 Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
@@ -100,6 +140,14 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   and the panel series counts, plus the run's exact command, the ``rtp_mux``
   source revision (its ``jj`` or ``git`` commit when resolvable), the
   wall-clock duration, every problem found and the exit code.
+  ``schema`` is ``mandate-check/3``: the record adds ``arms`` (one entry per
+  measured arm: ``id``, ``mandate``, ``label``, ``dialect``, ``sample_count``,
+  the normalised ``stats``/``counters``/``windows``, every parsed ``values``
+  token verbatim, the declared coverage ``cells`` and ``raw_line``),
+  ``arm_notes`` (the prose-only arm lines, with their mandate when one can be
+  attributed) and ``arm_declaration`` (the declaration the cells were read
+  from). ``timings`` and ``mandates`` are unchanged, so a reader of
+  ``mandate-check/2`` keeps working.
 
 The six expected evidence files and the ``plots`` directory are removed from
 ``--dir`` before the smoke set runs, so evidence found afterwards was
@@ -111,8 +159,9 @@ produced by this run rather than left behind by an earlier one.
 - ``2`` — the command could not do its job: missing/empty ``rtp_mux``
   checkout, missing smoke-set source, cargo not found, a compile or test
   failure, a timeout, a missing/malformed/multiple ``MANDATE`` line, a
-  missing/empty/mis-shaped declaration or data file, or a panel that could
-  not be rendered or verified. The evidence is not trustworthy, whatever the
+  missing/empty/mis-shaped declaration or data file, a malformed,
+  unattributable, undeclared or absent arm line, or a panel that could not be
+  rendered or verified. The evidence is not trustworthy, whatever the
   verdicts said.
 - ``3`` — the evidence is complete and at least one mandate reports ``FAIL``.
 
@@ -152,7 +201,9 @@ DEFAULT_CARGO = "cargo"
 REPORT_NAME = "mandate-check.json"
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/2"
+REPORT_SCHEMA = "mandate-check/3"
+ARMS_DECLARATION_NAME = "mandate-arms.json"
+ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
 REVISION_TIMEOUT_SECONDS = 30.0
 LOG_TAIL_LINES = 20
 # How long the line reader may take to drain after the child exits or is
@@ -181,6 +232,60 @@ CHANGE_ID_RE = re.compile(r"^[a-z]{10,}$")
 TEST_RESULT_RE = re.compile(r"^test (?P<name>\S+) \.\.\. ?(?P<tail>.*)$")
 TEST_STATES = ("ok", "FAILED", "ignored")
 MANDATE_TIMING_RE = re.compile(r"^MANDATE (?P<mandate>M[0-9]+) ")
+# An arm line: `[mandate-smoke <label>] <body>`. The label is the producer's
+# own arm name and may carry alignment padding, so it is stripped.
+ARM_LINE_RE = re.compile(r"^\[mandate-smoke (?P<label>[^\]]*)\](?:[ \t]+(?P<body>.*?))?[ \t]*$")
+# `recv=  800`, `wire=   12345B`, `max_share=+0.2502`: the value's own leading
+# spaces are alignment from the producer's format string, not a separator.
+ARM_TOKEN_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=[ \t]*(?P<value>[^\s=]+)")
+# The M3 per-rep line, the one arm line whose body is prose rather than
+# key=value tokens. `shaper forwarded` is the shaper's forwarded-byte counter.
+ARM_BULK_REP_RE = re.compile(
+    r"^delivered (?P<delivered_mib_s>[0-9.]+) MiB/s over (?P<elapsed_seconds>[0-9.]+)s, "
+    r"shaper forwarded (?P<shaper_mib_s>[0-9.]+) MiB/s, "
+    r"capacity (?P<capacity_mib_s>[0-9.]+) MiB/s, "
+    r"fraction (?P<fraction>[0-9.]+) \((?P<delivered_bytes>[0-9]+) / (?P<forwarded_bytes>[0-9]+) bytes\)$"
+)
+# How a parsed token is normalised. A key here is a *measurement* the arm
+# record distinguishes from the verbatim `values` map; anything not named is
+# still recorded verbatim. `stats` are the distribution/rate quantities whose
+# movement is a value (latency, goodput, shares); `counters` are the delivery
+# and wire quantities whose *fall* is a coverage regression; `windows` are the
+# measurement geometry, also coverage.
+ARM_STAT_KEYS = (
+    "p50", "p90", "p99", "p999", "max", "min", "mean", "std", "over250",
+    "delivery", "fraction", "share", "imbalance", "min_share", "max_share",
+    "ideal_share", "delivered_mib_s", "shaper_mib_s", "capacity_mib_s",
+)
+ARM_COUNTER_KEYS = {
+    "sent": "sent",
+    "recv": "received",
+    "received": "received",
+    "wire": "wire_bytes",
+    "wire_bytes": "wire_bytes",
+    "bulk_sink": "bulk_sink_bytes",
+    "bulk_sink_bytes": "bulk_sink_bytes",
+    "bulk_wire": "bulk_wire_bytes",
+    "bulk_wire_bytes": "bulk_wire_bytes",
+    "forwarded": "forwarded_bytes",
+    "forwarded_bytes": "forwarded_bytes",
+    "delivered": "delivered_bytes",
+    "delivered_bytes": "delivered_bytes",
+    "offered": "offered_bytes",
+    "offered_bytes": "offered_bytes",
+}
+ARM_WINDOW_KEYS = {
+    "window": "window_seconds",
+    "window_s": "window_seconds",
+    "wall": "wall_seconds",
+    "wall_s": "wall_seconds",
+    "elapsed": "elapsed_seconds",
+    "elapsed_seconds": "elapsed_seconds",
+    "measured_s": "measured_seconds",
+}
+# A value's optional unit suffix: the producer prints `12345B` and `12.3s`. The
+# number is recorded; the unit is not a second quantity to compare.
+ARM_UNIT_SUFFIXES = ("B", "s")
 TIMING_METHOD = (
     "streamed-line-arrival: a test's completion is the arrival of its libtest "
     "result line, and its duration is bracketed against the previous "
@@ -296,6 +401,306 @@ def _parse_values(mandate, values_text, line_number):
             "checked"
         )
     return values, problems
+
+
+def _coerce_measure(token):
+    """A measurement token as ``(value, unit)``: `12345B` -> (12345, "B").
+
+    The producer's format strings pad a value (`recv=  800`) and suffix a unit
+    (`wire=   12345B`, `wall=12.3s`); the number is what a comparison reads, so
+    the unit is returned alongside rather than kept in the token.
+    """
+    unit = None
+    body = token
+    if len(token) > 1 and token[-1] in ARM_UNIT_SUFFIXES:
+        candidate = token[:-1]
+        if _is_number(candidate):
+            body, unit = candidate, token[-1]
+    return _coerce_value(body), unit
+
+
+def _is_number(text):
+    try:
+        return math.isfinite(float(text))
+    except ValueError:
+        return False
+
+
+def parse_arm_line(line):
+    """One ``[mandate-smoke <arm>]`` line as an arm record, or ``None``.
+
+    Either shape in the contract is an arm: the key/value form, whose
+    measurement tokens are normalised into ``stats``/``counters``/``windows``,
+    and the M3 bulk-rep form, whose prose fields are the same three kinds. A
+    ``[mandate-smoke ...]`` line matching neither is a *note* — prose the
+    command does not depend on — and is returned as ``{"note": ...}`` so the
+    caller can keep it visible instead of dropping it silently. A line that is
+    not an arm line at all is ``None``.
+    """
+    match = ARM_LINE_RE.match(line)
+    if match is None:
+        return None
+    label = match.group("label").strip()
+    body = (match.group("body") or "").strip()
+    if not label:
+        return {"label": label, "body": body, "values": {}, "dialect": None, "note": True}
+    repeated = []
+    bulk = ARM_BULK_REP_RE.match(body)
+    if bulk is not None and len(bulk.group(0)) == len(body):
+        values = {
+            key: _coerce_value(text) for key, text in bulk.groupdict().items()
+        }
+        dialect = "bulk-rep"
+    else:
+        values = {}
+        for token in ARM_TOKEN_RE.finditer(body):
+            key, raw = token.group("key"), token.group("value")
+            if key in values:
+                repeated.append(key)
+                continue
+            values[key] = _coerce_measure(raw)[0]
+        if not values:
+            return {
+                "label": label,
+                "body": body,
+                "values": {},
+                "dialect": None,
+                "note": True,
+            }
+        dialect = "kv"
+    record = _arm_record(label, body, dialect, values)
+    if repeated:
+        record["repeated_keys"] = sorted(set(repeated))
+    return record
+
+
+def _arm_record(label, body, dialect, values):
+    """The normalised arm record for a parsed arm line.
+
+    ``sample_count`` is the producer's own sample count — for a cadence or
+    request/response arm that is exactly its ``recv`` (the smoke set sets
+    ``received = samples.len()``), and ``null`` where the arm measures no
+    per-sample distribution (the M4 per-arm aggregate).
+    """
+    stats = {}
+    counters = {}
+    windows = {}
+    for key, value in values.items():
+        if key in ARM_STAT_KEYS:
+            stats[key] = value
+        if key in ARM_COUNTER_KEYS:
+            counters[ARM_COUNTER_KEYS[key]] = value
+        if key in ARM_WINDOW_KEYS:
+            windows[ARM_WINDOW_KEYS[key]] = value
+    sample_count = counters.get("received")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, (int, float)):
+        sample_count = None
+    else:
+        sample_count = int(sample_count)
+    return {
+        "id": None,
+        "mandate": None,
+        "label": label,
+        "dialect": dialect,
+        "sample_count": sample_count,
+        "stats": stats,
+        "counters": counters,
+        "windows": windows,
+        "cells": [],
+        "values": values,
+        "raw_line": f"[mandate-smoke {label}]" + (f" {body}" if body else ""),
+    }
+
+
+def parse_arm_lines(events, problems):
+    """The run's arms, attributed to the mandate each one precedes.
+
+    Every ``[mandate-smoke ...]`` line is a candidate; the mandate is the id
+    of the ``MANDATE`` line that next arrives, which is the order the smoke set
+    emits (one mandate's arm lines, then its ``MANDATE`` line). Returns
+    ``(arms, notes)`` with ``arms`` sorted by id.
+
+    The guards are vacuity guards: an arm line that can never be attributed, a
+    mandate with no arm line, an arm with no declared coverage cell, and a run
+    with no arm measurement at all are all problems, so an arm set that
+    quietly empties is a failure rather than a report with an empty ``arms``.
+    """
+    arms = []
+    notes = []
+    pending = []
+
+    def flush(mandate):
+        for entry in pending:
+            if entry.get("note"):
+                notes.append(_public_arm_note(entry, mandate))
+                continue
+            entry.pop("note", None)
+            entry["mandate"] = mandate
+            entry["id"] = f"{mandate}/{entry['label']}"
+            arms.append(entry)
+        pending.clear()
+
+    for event in events:
+        line = event["line"].rstrip()
+        if line != "MANDATE" and line.startswith("MANDATE "):
+            matched = MANDATE_LINE_RE.match(line)
+            mandate = matched.group("mandate") if matched is not None else None
+            if mandate in MANDATE_IDS:
+                flush(mandate)
+            continue
+        parsed = parse_arm_line(line)
+        if parsed is not None:
+            pending.append(parsed)
+    for entry in pending:
+        if entry.get("note"):
+            notes.append(_public_arm_note(entry, None))
+            continue
+        problems.append(
+            f"the arm line {entry['raw_line']!r} follows the last 'MANDATE' line "
+            "and cannot be attributed to a mandate; the smoke set must print an "
+            "arm's line before that arm's mandate's MANDATE line"
+        )
+    pending.clear()
+    arms.sort(key=lambda arm: arm["id"])
+    return arms, notes
+
+
+def _public_arm_note(entry, mandate):
+    """A prose ``[mandate-smoke ...]`` line, kept visible rather than dropped."""
+    return {
+        "mandate": mandate,
+        "label": entry["label"],
+        "body": entry["body"],
+    }
+
+def declared_cells(arm_id, cells):
+    """The declared cells for an arm id: the longest matching prefix.
+
+    A declaration key names an arm id or an arm-id prefix (`M1/clean`,
+    `M4/m4/clean`, `M3/m3`), so a family of arms — one per flow, one per rep,
+    `m4/clean flow A` — is declared once and the most specific entry wins. The
+    match ends at a word boundary: the character after the prefix must be
+    neither alphanumeric nor `_`/`-`, so `M4/m4/clean` covers `M4/m4/clean flow
+    A` while `M1/clean` does not cover `M1/cleanup`. An arm no key matches has
+    no declared cell, which the caller reports: a cell may be knowingly empty,
+    never silently empty.
+    """
+    best = None
+    for key in cells:
+        if not arm_id.startswith(key):
+            continue
+        if len(arm_id) > len(key) and (arm_id[len(key)].isalnum() or arm_id[len(key)] in "_-"):
+            continue
+        if best is None or len(key) > len(best):
+            best = key
+    return sorted(cells[best]) if best is not None else []
+
+
+def load_arm_declaration(path, problems):
+    """The arm coverage declaration, or a named failure.
+
+    It is this command's own file (it declares what the producer's arms cover),
+    so a missing or malformed one is a failure: without it, no arm's coverage
+    cells can be recorded and the comparison would have nothing to compare.
+    """
+    if not path.is_file():
+        problems.append(
+            f"the arm coverage declaration {path} does not exist, so no arm's "
+            "coverage cells can be recorded; it travels with this command"
+        )
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        problems.append(f"the arm coverage declaration {path} cannot be read: {error}")
+        return None
+    if not isinstance(payload, dict):
+        problems.append(f"the arm coverage declaration {path} is not a JSON object")
+        return None
+    if payload.get("schema") != ARMS_DECLARATION_SCHEMA:
+        problems.append(
+            f"the arm coverage declaration {path} declares schema "
+            f"{payload.get('schema')!r}, not {ARMS_DECLARATION_SCHEMA!r}"
+        )
+        return None
+    cells = payload.get("cells")
+    if not isinstance(cells, dict) or not cells:
+        problems.append(
+            f"the arm coverage declaration {path} declares no cells, so no arm "
+            "can claim a covered cell"
+        )
+        return None
+    for key, value in cells.items():
+        if not isinstance(key, str) or not key:
+            problems.append(f"the arm coverage declaration {path} has a non-string key")
+            return None
+        if not isinstance(value, list) or not value or not all(
+            isinstance(cell, str) and cell for cell in value
+        ):
+            problems.append(
+                f"the arm coverage declaration {path} gives {key!r} no cell; a "
+                "cell may be knowingly empty but never silently empty"
+            )
+            return None
+    return payload
+
+
+def stamp_arm_coverage(arms, declaration, problems):
+    """Attach each arm's declared coverage cells, failing on an undeclared arm."""
+    if declaration is None:
+        return
+    cells = declaration["cells"]
+    for arm in arms:
+        arm["cells"] = declared_cells(arm["id"], cells)
+        if not arm["cells"]:
+            problems.append(
+                f"the arm {arm['id']!r} covers no declared cell; add it to the "
+                f"arm coverage declaration ({ARMS_DECLARATION_NAME}), because a "
+                "cell may be knowingly empty but never silently empty"
+            )
+
+
+def check_arm_coverage(arms, notes, problems):
+    """Require every mandate's arms to have been measured, or say which not.
+
+    A mandate whose arm lines are absent has had its coverage silently deleted,
+    so it is a problem; a run with no arm measurement at all is the same
+    failure stated once.
+    """
+    measured = {arm["mandate"] for arm in arms}
+    seen = {note["mandate"] for note in notes if note["mandate"] is not None}
+    for mandate in MANDATE_IDS:
+        if mandate not in measured:
+            problems.append(
+                f"{mandate}: no '[mandate-smoke <arm>]' measurement line was "
+                "attributed to it, so the mandate's arms were never measured"
+            )
+    if not arms:
+        problems.append(
+            "the run printed no '[mandate-smoke <arm>] ...' arm measurement at "
+            "all, so no arm's coverage was recorded; an instrument that "
+            "returns nothing has deleted the coverage it exists to provide"
+        )
+
+
+def _arm_summary(arms, notes):
+    """One line per mandate: how many arms it measured and how many samples."""
+    lines = []
+    for mandate in MANDATE_IDS:
+        of_mandate = [arm for arm in arms if arm["mandate"] == mandate]
+        if not of_mandate:
+            lines.append(f"  {mandate} arms: none measured")
+            continue
+        counts = [arm["sample_count"] for arm in of_mandate]
+        known = [count for count in counts if count is not None]
+        samples = f"{sum(known)} sample(s)" if known else "no per-sample count"
+        labels = ", ".join(arm["label"] for arm in of_mandate)
+        lines.append(
+            f"  {mandate} arms: {len(of_mandate)} ({labels}), {samples}"
+        )
+    if notes:
+        lines.append(f"  arm notes (prose, not compared): {len(notes)}")
+    return lines
 
 
 def default_crate_path():
@@ -654,6 +1059,14 @@ def build_report(args, crate, out_dir, command, revision, quick, timeout):
             for mandate in MANDATE_IDS
         },
         "timings": {"method": TIMING_METHOD, "origin": "smoke-child-start", "tests": [], "mandates": []},
+        "arms": [],
+        "arm_notes": [],
+        "arm_declaration": {
+            "path": str(MODULE_DIR / ARMS_DECLARATION_NAME),
+            "schema": ARMS_DECLARATION_SCHEMA,
+            "source": None,
+            "declared_cells": 0,
+        },
         "problems": [],
     }
 
@@ -662,6 +1075,27 @@ def write_report(out_dir, report):
     path = out_dir / REPORT_NAME
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def apply_arm_records(report, events, declaration):
+    """Record the run's per-arm measurements, or name why they are missing.
+
+    Every guard here is a vacuity guard: the record must be non-empty, every
+    arm must be attributable to a mandate, and every arm must claim a declared
+    coverage cell. An empty or partial record is a failure, not an empty list.
+    """
+    problems = report["problems"]
+    if declaration is not None:
+        report["arm_declaration"]["source"] = declaration.get("source")
+        report["arm_declaration"]["declared_cells"] = sum(
+            1 for cells in declaration["cells"].values() for cell in cells
+        )
+    arms, notes = parse_arm_lines(events, problems)
+    stamp_arm_coverage(arms, declaration, problems)
+    check_arm_coverage(arms, notes, problems)
+    report["arms"] = arms
+    report["arm_notes"] = notes
+    return arms
 
 
 def verdict_block(report):
@@ -685,6 +1119,14 @@ def verdict_block(report):
             lines.append(f"  duration: {duration:.2f}s (bracketed wall-clock)")
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
+    lines.append(f"arms: {len(report.get('arms') or [])} measured")
+    lines.extend(_arm_summary(report.get("arms") or [], report.get("arm_notes") or []))
+    declaration = report.get("arm_declaration") or {}
+    if declaration.get("source") is not None:
+        lines.append(
+            f"  cells: {declaration.get('declared_cells', 0)} declared in "
+            f"{Path(declaration.get('path') or '').name}"
+        )
     duration = report["duration_seconds"]
     passed = sum(
         1 for mandate in MANDATE_IDS if report["mandates"][mandate]["verdict"] == "PASS"
@@ -708,7 +1150,7 @@ def verdict_block(report):
     return lines
 
 
-def evaluate(args, out_dir, report, run):
+def evaluate(args, out_dir, report, run, declaration):
     """Parse and verify the run, filling ``report`` and returning the exit code."""
     log_path = out_dir / LOG_NAME
     log_path.write_text(run["output"], encoding="utf-8")
@@ -721,6 +1163,9 @@ def evaluate(args, out_dir, report, run):
     # stream, so a cost the declaration claims can be compared with what the
     # run actually took, per test, rather than only in total.
     apply_mandate_timings(report, derive_timings(run.get("events") or [], SMOKE_TARGET))
+    # What each arm measured, so a later run's coverage can be diffed against a
+    # committed baseline instead of argued about.
+    apply_arm_records(report, run.get("events") or [], declaration)
     problems = report["problems"]
     if run["timed_out"]:
         problems.append(
@@ -876,6 +1321,15 @@ def main(argv=None):
         print(f"mandate-check: error: {error}", file=sys.stderr)
         return EXIT_EVIDENCE_FAILURE
 
+    declaration_problems = []
+    declaration = load_arm_declaration(
+        MODULE_DIR / ARMS_DECLARATION_NAME, declaration_problems
+    )
+    if declaration_problems:
+        for problem in declaration_problems:
+            print(f"mandate-check: error: {problem}", file=sys.stderr)
+        return EXIT_EVIDENCE_FAILURE
+
     revision = resolve_revision(crate)
     command = smoke_command(cargo)
     report = build_report(args, crate, out_dir, command, revision, args.quick, args.timeout)
@@ -887,7 +1341,7 @@ def main(argv=None):
             quick=args.quick,
             timeout=args.timeout,
         )
-        exit_code = evaluate(args, out_dir, report, run)
+        exit_code = evaluate(args, out_dir, report, run, declaration)
         report["duration_seconds"] = round(time.monotonic() - started, 3)
         write_report(out_dir, report)
     except OSError as error:
