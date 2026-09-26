@@ -169,12 +169,92 @@ M3_ROWS = [
     ["goodput", "bulk", 31.0, 0.47],
 ]
 
+# M4 is the interactive lane's split across several flows. The fixture mirrors
+# the real declaration's four panels and its clean/hostile arms, at four flows.
+M4_DECLARATION = {
+    "mandate": "M4",
+    "title": "M4 interactive lane fairness: 4 flows on one interactive lane",
+    "x_label": "flow (1..4)",
+    "y_label": "share of the lane's delivered bytes",
+    "panels": [
+        {
+            "id": "shares",
+            "chart": "bar",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [{"y": 0.25, "label": "fair share 25.0%"}],
+        },
+        {
+            "id": "imbalance",
+            "chart": "bar",
+            "y_label": "departure from the fair share",
+            "x_label": "flow (1..4)",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [{"y": 0.01, "label": "fair-share bound 1.0%"}],
+        },
+        {
+            "id": "delivery",
+            "chart": "bar",
+            "y_label": "delivery (received / offered)",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [{"y": 0.995, "label": "M4 per-flow delivery floor 0.995"}],
+        },
+        {
+            "id": "latency",
+            "chart": "bar",
+            "y_label": "latency (ms)",
+            "series": [
+                {"name": "clean_p50"},
+                {"name": "clean_p99"},
+                {"name": "hostile_p50"},
+                {"name": "hostile_p99"},
+            ],
+            "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+        },
+    ],
+}
+
+
+def _m4_rows():
+    rows = [["panel", "series", "x", "y"]]
+    per_arm = {
+        "clean": {
+            "shares": [0.251, 0.249, 0.250, 0.250],
+            "imbalance": [0.004, -0.004, 0.002, -0.002],
+            "delivery": [1.0, 1.0, 1.0, 1.0],
+        },
+        "hostile": {
+            "shares": [0.248, 0.252, 0.251, 0.249],
+            "imbalance": [-0.008, 0.008, 0.004, -0.004],
+            "delivery": [0.998, 0.999, 0.998, 0.999],
+        },
+    }
+    latency = {
+        "clean_p50": [22.0, 23.5, 21.8, 24.1],
+        "clean_p99": [118.4, 121.0, 116.7, 119.9],
+        "hostile_p50": [96.0, 102.5, 88.4, 110.2],
+        "hostile_p99": [402.0, 388.7, 431.5, 399.2],
+    }
+    for arm, panel_values in per_arm.items():
+        for panel, values in panel_values.items():
+            for flow, value in enumerate(values, start=1):
+                rows.append([panel, arm, flow, value])
+    for series, values in latency.items():
+        for flow, value in enumerate(values, start=1):
+            rows.append(["latency", series, flow, value])
+    return rows
+
+
+M4_ROWS = _m4_rows()
+
 PASS_LINES = [
-    "running 3 tests",
+    "running 4 tests",
     "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0",
     "MANDATE M2 PASS delivery=1.000 amp=3.61 budget=6.0",
     "MANDATE M3 PASS goodput=0.52 floor=0.35 link_mib_s=8.0",
-    "test result: ok. 3 passed; 0 failed",
+    "MANDATE M4 PASS flows=4 clean_delivery_min=1.000 hostile_delivery_min=0.998 "
+    "clean_imbalance=0.004 hostile_imbalance=0.008 imbalance_bound=0.010 "
+    "fair_share=0.2500 delivery_floor=0.995 clean_p99_max=121.0 ceiling=250.0",
+    "test result: ok. 4 passed; 0 failed",
 ]
 
 
@@ -211,6 +291,7 @@ class MandateCheckTest(unittest.TestCase):
                 "M1": {"json": M1_DECLARATION, "csv": M1_ROWS},
                 "M2": {"json": M2_DECLARATION, "csv": M2_ROWS},
                 "M3": {"json": M3_DECLARATION, "csv": M3_ROWS},
+                "M4": {"json": M4_DECLARATION, "csv": M4_ROWS},
             },
         }
         plan.update(overrides)
@@ -261,10 +342,11 @@ class MandateCheckTest(unittest.TestCase):
     def test_healthy_run_passes_and_writes_machine_checkable_evidence(self):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
-        for mandate in ("M1", "M2", "M3"):
+        for mandate in ("M1", "M2", "M3", "M4"):
             self.assertIn(f"{mandate} PASS", stdout)
         self.assertIn("p99=31.5 ceiling=250.0 over250=0", stdout)
         self.assertIn("delivery=1.0 amp=3.61 budget=6.0", stdout)
+        self.assertIn("flows=4 clean_delivery_min=1.0", stdout)
         report = self.report()
         self.assertTrue(report["ok"], report["problems"])
         self.assertEqual(report["exit_code"], 0)
@@ -327,6 +409,13 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(m3["values"], {"goodput": 0.52, "floor": 0.35, "link_mib_s": 8.0})
         self.assertEqual(len(m3["plots"]), 1)
         self.assertEqual(report["mandates"]["M2"]["values"]["delivery"], 1.0)
+        m4 = report["mandates"]["M4"]
+        self.assertEqual(m4["verdict"], "PASS")
+        self.assertEqual(m4["values"]["flows"], 4)
+        self.assertEqual(m4["values"]["clean_p99_max"], 121.0)
+        self.assertEqual(m4["panels"], 4)
+        self.assertEqual(len(m4["plots"]), 4)
+        self.assertEqual(m4["series_counts"], [8, 8, 8, 16])
 
     def test_verdict_block_names_every_plot_and_the_report(self):
         code, stdout, _ = self.run_tool(self.healthy_plan())
@@ -337,6 +426,10 @@ class MandateCheckTest(unittest.TestCase):
             ("M2", "delivery"),
             ("M2", "wire"),
             ("M3", "goodput"),
+            ("M4", "shares"),
+            ("M4", "imbalance"),
+            ("M4", "delivery"),
+            ("M4", "latency"),
         ):
             path = (self.out / "plots" / f"{mandate}-{panel}.svg").resolve()
             self.assertIn(f"plot: {path}", stdout)
@@ -425,6 +518,7 @@ class MandateCheckTest(unittest.TestCase):
                 "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0",
                 "MANDATE M2 FAIL delivery=0.998 amp=7.2 budget=6.0",
                 "MANDATE M3 PASS goodput=0.52 floor=0.35 link_mib_s=8.0",
+                "MANDATE M4 PASS flows=4 clean_imbalance=0.004 fair_share=0.2500",
             ]
         )
         code, stdout, stderr = self.run_tool(plan)
@@ -442,20 +536,31 @@ class MandateCheckTest(unittest.TestCase):
     # -- every rejection: non-zero, and naming the problem -----------------
 
     def test_missing_mandate_line_is_refused(self):
-        plan = self.healthy_plan(
-            stdout=[line for line in PASS_LINES if not line.startswith("MANDATE M3")]
-        )
-        code, stdout, _ = self.reject(plan, "no 'MANDATE M3")
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
-        self.assertIn("M3", stdout)
-        self.assertIn("never measured", stdout)
-        self.assertEqual(self.report()["mandates"]["M3"]["declared"], False)
+        # Extended from M1/M2/M3 to every id in MANDATE_IDS: a missing M4 line is
+        # the failure mode the fourth id introduces, and it must be refused with
+        # the same non-zero, evidence-incomplete treatment and name M4.
+        for mandate in MANDATE_CHECK.MANDATE_IDS:
+            with self.subTest(mandate=mandate):
+                plan = self.healthy_plan(
+                    stdout=[
+                        line
+                        for line in PASS_LINES
+                        if not line.startswith(f"MANDATE {mandate} ")
+                    ]
+                )
+                code, stdout, _ = self.reject(plan, f"no 'MANDATE {mandate}")
+                self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+                self.assertIn(f"{mandate}: the smoke set printed no", stdout)
+                self.assertIn("never measured", stdout)
+                self.assertEqual(
+                    self.report()["mandates"][mandate]["declared"], False
+                )
 
     def test_no_mandate_lines_at_all_is_refused(self):
-        plan = self.healthy_plan(stdout=["running 3 tests", "test result: ok. 3 passed"])
+        plan = self.healthy_plan(stdout=["running 4 tests", "test result: ok. 4 passed"])
         code, stdout, _ = self.reject(plan, "no 'MANDATE M1")
         self.assertEqual(code, 2)
-        for mandate in ("M1", "M2", "M3"):
+        for mandate in MANDATE_CHECK.MANDATE_IDS:
             self.assertIn(f"{mandate}: the smoke set printed no", stdout)
 
     def test_malformed_mandate_line_is_refused(self):
@@ -464,7 +569,7 @@ class MandateCheckTest(unittest.TestCase):
         )
         code, stdout, _ = self.reject(plan, "does not match the contract grammar")
         self.assertEqual(code, 2)
-        self.assertIn("not one of M1, M2, M3", stdout)
+        self.assertIn("not one of M1, M2, M3, M4", stdout)
 
     def test_mandate_line_without_a_measurement_is_refused(self):
         plan = self.healthy_plan(
@@ -472,13 +577,14 @@ class MandateCheckTest(unittest.TestCase):
                 "MANDATE M1 PASS",
                 "MANDATE M2 PASS delivery=1.000",
                 "MANDATE M3 PASS goodput=0.52",
+                "MANDATE M4 PASS flows=4",
             ]
         )
         self.reject(plan, "without a single key=value measurement")
 
     def test_duplicate_mandate_line_is_refused(self):
         plan = self.healthy_plan(
-            stdout=["MANDATE M1 PASS p99=1.0", "MANDATE M1 PASS p99=2.0"]
+            stdout=list(PASS_LINES) + ["MANDATE M1 PASS p99=2.0"]
         )
         self.reject(plan, "M1 is declared twice")
 
@@ -588,6 +694,7 @@ class MandateCheckTest(unittest.TestCase):
             "MANDATE M1 FAIL p99=478.1 ceiling=250.0 over250=46\n"
             "MANDATE M2 PASS delivery=1.000\n"
             "MANDATE M3 PASS goodput=0.52 floor=0.35 note=clean-lane\n"
+            "MANDATE M4 PASS flows=4 clean_imbalance=0.004 fair_share=0.2500\n"
             "noise: MANDATE-ish text is ignored\n"
         )
         self.assertEqual(problems, [])
@@ -596,6 +703,10 @@ class MandateCheckTest(unittest.TestCase):
             records["M1"]["values"], {"p99": 478.1, "ceiling": 250.0, "over250": 46}
         )
         self.assertEqual(records["M3"]["values"]["note"], "clean-lane")
+        self.assertEqual(
+            records["M4"]["values"],
+            {"flows": 4, "clean_imbalance": 0.004, "fair_share": 0.25},
+        )
 
     def test_grammar_rejects_repeated_keys_and_unparsable_tokens(self):
         _, problems = MANDATE_CHECK.parse_mandate_lines(

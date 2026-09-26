@@ -70,8 +70,8 @@ target owes it:
 4. **``--quick``.** When ``--quick`` is passed this command sets
    ``MANDATE_SMOKE_QUICK=1`` in the child environment and unsets it
    otherwise. The smoke set must honour it by taking its shortest
-   measurement windows — while still emitting all three ``MANDATE`` lines and
-   all six evidence files. A quick run is a tripwire on the assertions, not a
+   measurement windows — while still emitting all four ``MANDATE`` lines and
+   all eight evidence files. A quick run is a tripwire on the assertions, not a
    substitute for the full set: read the plots.
 
 ## What it writes
@@ -93,7 +93,7 @@ produced by this run rather than left behind by an earlier one.
 
 ## Exit codes
 
-- ``0`` — all three mandates ``PASS``, every series and plot present.
+- ``0`` — all four mandates ``PASS``, every series and plot present.
 - ``2`` — the command could not do its job: missing/empty ``rtp_mux``
   checkout, missing smoke-set source, cargo not found, a compile or test
   failure, a timeout, a missing/malformed/multiple ``MANDATE`` line, a

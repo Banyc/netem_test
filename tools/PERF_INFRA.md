@@ -16,7 +16,7 @@ Three entry points lead here: the tri-mandate section of `AGENTS.md`,
 
 ## Half 1 — the intention
 
-### The three mandates
+### The mandates
 
 The product's acceptance criterion is a **tri-mandate constitution**, jointly
 binding: a change that improves one mandate while violating another is a
@@ -39,6 +39,12 @@ failure, not a win.
   So M2 exists to stop M1 from winning at the lane's expense.
 - **M3 — bulk goodput** as a fraction of the configured link rate, on the same
   production dual-lane topology.
+- **M4 — the interactive lane's split across several flows.** M1 and M2 each
+  measure **one** interactive flow, so a design that starves one of several
+  flows sharing the interactive lane can satisfy all three of the mandates
+  above. M4 measures four interactive flows on the same lane, so a mandate
+  result achieved by starving a flow is not a pass. Its arms, faults and bounds
+  are in `rtp_mux/GATE.md` §M4; they are not restated here.
 
 ### Why the infrastructure exists
 
@@ -92,10 +98,13 @@ Where it is covered today:
 - `mux/GATE.md` records that the fairness floors moved with these scenarios to
   `rtp_mux`; the floors themselves are the constants in the owning tests.
 
-**Where it is not yet covered:** every one of those is opt-in. A plain
-`cargo test -p rtp_mux` never measures fairness, and the tri-mandate smoke set
-measures none at all — its three mandates can be satisfied by a design that
-starves a flow. The always-run set has no fairness gate.
+**Where the always-run set covers it:** M4 in the smoke set —
+`rtp_mux`'s `mandate_smoke::m4_interactive_lane_fairness`, default tier and
+listed in `gate-default-required` — measures the interactive lane's split across
+four flows on both the clean and hostile arms, so a plain `cargo test -p rtp_mux`
+and `tools/mandate-check` both gate on per-flow fairness. Its bounds, arms and
+faults are in `rtp_mux/GATE.md` (§M4) and are not restated here. The bulleted
+instruments above remain opt-in additional coverage.
 
 ### What is frozen, and what is not
 
@@ -238,8 +247,9 @@ tools/mandate-check
 
 It runs `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`,
 renders one validated SVG+PNG per panel through `tools/mandate_plot.py`, prints
-a verdict block and writes `mandate-check.json` alongside the six evidence
-files. Measured cost: **177.7 s** on a warm build (12 plots). It **refuses
+a verdict block and writes `mandate-check.json` alongside the eight evidence
+files. Measured cost: **205.9 s** on a warm build (10 panels, 20 SVG+PNG plot
+files). It **refuses
 loudly rather than reporting success on absent evidence** — it fails when it
 cannot produce the evidence as well as when a mandate fails. The contract,
 what it writes and its exit codes are in `tools/MANDATE_SMOKE.md`.
@@ -278,7 +288,9 @@ reference and prior panel state is recoverable. It was taken with
 `tools/mandate-check` (no arguments) on 2026-09-26, with `netem_test` at
 `c7c297f6` and the sibling `rtp_mux` at `b4c4faea8f08` (change
 `wmrkurmovoouxvsyuwpozsuovvkwmrrx`), which pins `rtp v0.0.94`; the run took
-**182.7 s**, passed all three mandates, and rendered 12 plots. The checked-in
+**182.7 s**, passed all three mandates, and rendered 12 plots. The baseline
+predates M4, so its report records three mandates; a fresh `tools/mandate-check`
+run writes a four-mandate report. The checked-in
 copy is the run's JSON with machine-local absolute paths replaced by tokens —
 every measured value, the command, the revisions and the duration are
 verbatim. The plots themselves are not committed; re-run the command to

@@ -92,8 +92,8 @@ cannot tell a compliant run from a non-compliant one any other way.
    skips those cannot tell a compliant producer from a changed one, and a
    verdict that measures nothing cannot be checked.
 4. **`--quick`** — honour `MANDATE_SMOKE_QUICK=1` by taking the shortest
-   measurement windows, while still printing all three `MANDATE` lines and
-   writing all six evidence files.
+   measurement windows, while still printing all four `MANDATE` lines and
+   writing all eight evidence files.
 
 ## What a run writes
 
@@ -127,7 +127,7 @@ rather than trimmed.
 
 | code | meaning |
 | --- | --- |
-| `0` | all three mandates `PASS`, every series and plot present |
+| `0` | all four mandates `PASS`, every series and plot present |
 | `2` | the command could not do its job — missing `rtp_mux` checkout, missing smoke-set source, cargo not found, compile or test failure, timeout, a missing/malformed/duplicated `MANDATE` line, a missing/empty/mis-shaped declaration or data file, or a panel that could not be rendered or verified. The evidence is not trustworthy whatever the verdicts said |
 | `3` | the evidence is complete and at least one mandate reports `FAIL` |
 
