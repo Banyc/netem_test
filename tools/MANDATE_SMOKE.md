@@ -335,10 +335,18 @@ producer's arms is not a green diff but a coverage regression.
 
 A **coverage regression** (exit `4`) is a movement that means the arm no longer
 covers what the baseline covered — the arm is gone, its sample count fell by
-half or more, a delivery or wire counter fell that far or stopped being
-measured, a measured window shrank by more than 1 %, a statistic the assertions
-read stopped being measured, the delivery ratio fell, or a declared coverage
-cell is covered by no arm any more. A **value change** is a statistics move —
+half or more, a load-bearing delivery or wire counter fell that far or stopped
+being measured, a measured window shrank by more than 1 %, a statistic the
+assertions read stopped being measured, the delivery ratio fell, or a declared
+coverage cell is covered by no arm any more. A counter is **load-bearing** when
+its baseline sits at or above the measured noise band the comparison prints for
+its key (`COUNT_NOISE_BANDS_BYTES`, currently the two bulk-lane byte counters at
+64 KiB); below that the value is the fixture's incidental traffic rather than
+the workload the arm claims, so a fall in it — even one past the 50 % tolerance —
+is reported in the arm's line, with the band named, and the verdict stays green.
+The band is derived from the spread real runs of the unchanged tree recorded for
+that key, not chosen to make a comparison pass; every key without a band is
+compared exactly as before. A **value change** is a statistics move —
 a latency percentile, a goodput rate, a share — which on a shared host is
 run-to-run noise: it is reported always, and is a failure (exit `5`) only under
 `--fail-on-value-drift` past `--value-tolerance`.

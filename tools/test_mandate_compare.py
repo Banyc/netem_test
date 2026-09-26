@@ -339,6 +339,85 @@ class MandateCompareTest(unittest.TestCase):
         self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stderr)
         self.assertIn("wire_bytes 126000 -> 50000 (-60.3%)", stdout)
 
+    # -- the measured noise band: below it a count is reported, not failed -
+
+    def test_a_residue_bulk_counter_fall_is_reported_and_stays_green(self):
+        # The real false positive: a bulk-lane counter the arm's cell does not
+        # claim (the request-response arms declare no bulk workload) sat at
+        # 1920 B and read 785 B on the next run of the unchanged tree. Both
+        # values are inside the band, so the 59 % fall is visible and green.
+        base = baseline_report()
+        base["arms"][0]["counters"]["bulk_wire_bytes"] = 1920
+        base_path = self.write_baseline(base)
+        candidate = baseline_report()
+        candidate["arms"][0]["counters"]["bulk_wire_bytes"] = 785
+        code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("bulk_wire_bytes 1920 -> 785 (-59.1%)", stdout)
+        self.assertIn("reported, not a regression", stdout)
+        self.assertIn("coverage regression(s)=0", stdout)
+        self.assertIn("verdict: OK  exit=0", stdout)
+
+    def test_an_absent_residue_bulk_counter_is_reported_and_stays_green(self):
+        base = baseline_report()
+        base["arms"][0]["counters"]["bulk_sink_bytes"] = 0
+        base_path = self.write_baseline(base)
+        candidate = baseline_report()
+        candidate["arms"][0]["counters"].pop("bulk_sink_bytes", None)
+        code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("bulk_sink_bytes 0 -> not measured", stdout)
+        self.assertIn("absent, not a regression", stdout)
+
+    def test_a_load_bearing_bulk_counter_fall_is_still_a_coverage_regression(self):
+        # The same key on an arm that does drive the bulk lane stays a tooth:
+        # 8 MiB is far above the band, so halving it is coverage loss.
+        base = baseline_report()
+        base["arms"][0]["counters"]["bulk_wire_bytes"] = 8482399
+        base_path = self.write_baseline(base)
+        candidate = baseline_report()
+        candidate["arms"][0]["counters"]["bulk_wire_bytes"] = 4241199
+        code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stderr)
+        self.assertIn("bulk_wire_bytes 8482399 -> 4241199 (-50.0%)", stdout)
+        self.assertNotIn("reported, not a regression", stdout)
+
+    def test_a_load_bearing_bulk_counter_absent_is_still_a_coverage_regression(self):
+        base = baseline_report()
+        base["arms"][0]["counters"]["bulk_wire_bytes"] = 8482399
+        base_path = self.write_baseline(base)
+        candidate = baseline_report()
+        candidate["arms"][0]["counters"].pop("bulk_wire_bytes", None)
+        code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stderr)
+        self.assertIn("bulk_wire_bytes 8482399 -> not measured", stdout)
+        self.assertNotIn("reported, not a regression", stdout)
+
+    def test_the_noise_bands_are_printed_and_written_to_the_diff(self):
+        out = self.root / "bands.json"
+        code, stdout, stderr = self.run_tool(baseline_report(), "--json-out", str(out))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("bands: bulk_sink_bytes 65536, bulk_wire_bytes 65536", stdout)
+        diff = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(
+            diff["count_noise_bands"],
+            {"bulk_wire_bytes": 65536, "bulk_sink_bytes": 65536},
+        )
+
+    def test_a_counter_without_a_band_is_compared_at_the_count_tolerance(self):
+        # Only the two bulk-lane byte counters carry a band; every other
+        # counter keeps the plain 50 % criterion however small it is.
+        self.assertEqual(MANDATE_COMPARE.noise_band_bytes("received"), 0)
+        self.assertEqual(MANDATE_COMPARE.noise_band_bytes("wire_bytes"), 0)
+        self.assertGreater(MANDATE_COMPARE.noise_band_bytes("bulk_wire_bytes"), 0)
+
+    def test_every_banded_key_is_a_byte_counter(self):
+        # The band is a byte floor and the diagnostic says so, so a key whose
+        # unit is not bytes may not be listed.
+        for key in MANDATE_COMPARE.COUNT_NOISE_BANDS_BYTES:
+            self.assertTrue(key.endswith("_bytes"), key)
+            self.assertIn(key, MANDATE_COMPARE.COVERAGE_COUNTER_KEYS)
+
     def test_a_counter_that_stopped_being_measured_is_a_coverage_regression(self):
         candidate = baseline_report()
         del candidate["arms"][0]["counters"]["wire_bytes"]

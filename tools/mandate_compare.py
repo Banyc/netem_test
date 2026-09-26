@@ -53,12 +53,25 @@ sharp shortening signal** and is compared at 1 %, so a window reduced from 12 s
 to 4 s is a regression whoever reports the sample counts. Everything the
 comparison reads comes from the two reports; nothing is re-measured here.
 
+That relative tolerance is only meaningful where the baseline value is
+load-bearing, and a counter has no absolute floor: below the magnitude at which
+the counter's own run-to-run noise lives, half of it is a handful of datagrams
+and a fall past 50 % says nothing about coverage. The comparison therefore
+carries a **measured noise band per counted quantity**
+(`COUNT_NOISE_BANDS_BYTES`, printed with the tolerances): a counter whose
+baseline sits inside its band is
+not a workload the arm's cell claims, so a movement in it — including a
+disappearance — is *reported* and never a coverage regression. The band is
+derived from the spread real runs of the unchanged tree recorded for that key,
+not chosen to make the comparison pass; the derivation is stated with the band.
+
 **The detection limit**, stated so a green diff is not read as more than it is:
-this comparison sees an arm that disappeared, a sample count or delivery/wire
-counter that fell by half or more, a counter that stopped being measured, a
-measured window that shrank by more than 1 %, a statistic the assertions read
-that stopped being measured, the delivery ratio falling past its tolerance, a
-coverage cell no arm covers any more, and a mandate that vanished. It does
+this comparison sees an arm that disappeared, a load-bearing sample count or
+delivery/wire counter that fell by half or more, a load-bearing counter that
+stopped being measured, a measured window that shrank by more than 1 %, a
+statistic the assertions read that stopped being measured, the delivery ratio
+falling past its tolerance, a coverage cell no arm covers any more, and a
+mandate that vanished. It does
 **not** see an arm that keeps its sample count and its counters while its
 impairment was quietly weakened — a 2 % loss arm retuned to 1 % measures the
 same shape under a milder regime. That is a change to a frozen perf-test
@@ -67,17 +80,22 @@ arm against its declared coverage cell in `tools/mandate-arms.json`, not this
 comparison. Nor does it see a shortening that leaves the window in place, keeps
 at least half the samples and drops no cell.
 
-It can also report a regression there is not, and the counts are where. A
-counter has no absolute floor, so one small enough that half of it is a handful
-of datagrams crosses the 50 % tolerance on an **unchanged** tree. Measured: on
-the `M1/lone_tail` arm of two real full runs of the unchanged tree,
-`bulk_wire_bytes` read 1920 in one and 785 in the next (-59 %), red-flagging
-two arms — and that counter is not one the arm claims (the arm declares no bulk
-lane, so the few kilobytes are not the workload it covers). So a count
-regression on a counter the arm's own cell does not name is a candidate false
-positive, to be read against the arm before it is acted on; a floor for such a
-key would remove it, and adding one is a change to this comparison's noise band
-and not to its detection.
+A regression it reported there is not, and how the counts are bounded now. The
+counts once had no absolute floor, so one small enough that half of it is a
+handful of datagrams crossed the 50 % tolerance on an **unchanged** tree: on
+the `M1/lone_tail`/`M2/lone_tail` arms of two real full runs of the unchanged
+tree, `bulk_wire_bytes` read 1920 in one and 785 in the next (-59 %),
+red-flagging two arms whose cells declare no bulk workload — the few kilobytes
+are the fixture's incidental bulk-lane traffic, not the coverage the arm
+exists to measure. That is what `COUNT_NOISE_BANDS_BYTES` removes: a counter
+whose baseline is inside its measured band is not load-bearing for the arm, so
+its movement stays *visible* in the arm's line (with the band named) while the
+verdict stays green. The band's cost is stated with it: a counter below its
+band is not compared for coverage at all, so a fall in a genuinely tiny
+counter is reported and not failed. No such counter exists among the recorded
+arms — every load-bearing counter is orders of magnitude above its band, and
+the keys that have no band (all but the two bulk-lane byte counters) are
+compared exactly as before.
 
 ## What it refuses
 
@@ -169,6 +187,28 @@ VALUE_STAT_KEYS = (
 # p99 is. It is compared absolutely, with the slope the M2/M4 floors allow.
 DELIVERY_KEY = "delivery"
 
+# The measured run-to-run noise band of a counted quantity, in **bytes**, below
+# which a count is not a workload its arm's cell claims: its value is the
+# fixture's incidental traffic, so a movement in it — including a
+# disappearance — is reported and never a coverage regression. The band is an
+# absolute floor because the noise is quantisation noise (a few datagrams): it
+# dominates a small counter and is invisible in a large one. Only byte counters
+# may be listed here; every other key is compared with no floor at all.
+#
+# Derived, not chosen. Over every full-run report recorded on disk, the two
+# bulk-lane counters read 0..3525 B on an arm whose cell declares no bulk lane
+# (the `M1/lone_tail`/`M2/lone_tail` request-response arms — 56 observations
+# across 15 runs, 6 of them of one unchanged tree, tree
+# 937a25b06400b83124c7b99d114379999a800a65), and 2097152..8484001 B on every
+# arm whose cell drives the bulk lane (112 observations) — a 595x gap. The
+# band is the largest power of two inside that gap (geometric midpoint 85978
+# B), leaving an 18.6x margin below the observed residue ceiling and a 32x
+# margin above the smallest observed real bulk workload.
+COUNT_NOISE_BANDS_BYTES = {
+    "bulk_wire_bytes": 65536,
+    "bulk_sink_bytes": 65536,
+}
+
 SCHEMA_RE = re.compile(r"^mandate-check/(?P<version>[0-9]+)$")
 
 
@@ -251,20 +291,49 @@ def relative_change(baseline, candidate):
     return (candidate - baseline) / baseline
 
 
-def compare_counter(key, baseline, candidate, tolerance):
+def noise_band_bytes(key):
+    """The measured byte noise band of one counted quantity, 0 when none."""
+    return COUNT_NOISE_BANDS_BYTES.get(key, 0)
+
+
+def compare_counter(key, baseline, candidate, tolerance, band=0):
     """One counted quantity as ``("regression"|"move"|None, text)``.
 
     The fall is compared with ``<=`` so that a shortening which takes exactly
     half an arm's samples — the case the instrument exists for — is a
     regression, and the tolerance is the run-to-run band the comparison is not
     allowed to read as coverage loss.
+
+    ``band`` is the counter's measured noise band in bytes. When the baseline
+    sits inside it the counter is not a workload the arm claims, so a fall or a
+    disappearance is a *move* to report, never a coverage regression, and the
+    text says why and names the band.
     """
+    inside = (
+        band
+        and isinstance(baseline, (int, float))
+        and not isinstance(baseline, bool)
+        and baseline < band
+    )
     if candidate is None:
+        if inside:
+            return (
+                "move",
+                f"{key} {baseline} -> not measured [inside the measured "
+                f"{band}-byte noise band: absent, not a regression]",
+            )
         return "regression", f"{key} {baseline} -> not measured"
     change = relative_change(baseline, candidate)
     if change is None:
         return (None, None) if candidate == baseline else ("move", f"{key} {baseline} -> {candidate}")
     if change <= -tolerance:
+        if inside:
+            return (
+                "move",
+                f"{key} {baseline} -> {candidate} ({change:+.1%}), past the "
+                f"{tolerance:.0%} tolerance but inside the measured {band}-byte "
+                "noise band: reported, not a regression",
+            )
         return (
             "regression",
             f"{key} {baseline} -> {candidate} ({change:+.1%}), past the {tolerance:.0%} tolerance",
@@ -325,7 +394,11 @@ def compare_arm(baseline_arm, candidate_arm, tolerances):
         if key not in baseline_counters:
             continue
         outcome, text = compare_counter(
-            key, baseline_counters[key], candidate_counters.get(key), tolerances["count"]
+            key,
+            baseline_counters[key],
+            candidate_counters.get(key),
+            tolerances["count"],
+            band=noise_band_bytes(key),
         )
         if outcome is not None:
             (regressions if outcome == "regression" else moves).append(text)
@@ -502,6 +575,7 @@ def compare(args):
         "baseline": str(baseline["path"]),
         "candidate": str(candidate["path"]),
         "tolerances": tolerances,
+        "count_noise_bands": dict(COUNT_NOISE_BANDS_BYTES),
         "baseline_summary": summary_of(baseline),
         "candidate_summary": summary_of(candidate),
         "arms": arms,
@@ -581,6 +655,14 @@ def verdict_lines(diff):
         f"{tolerances['window']:.1%}, delivery {tolerances['delivery']:.3f}, "
         f"value {tolerances['value']:.0%}"
     )
+    bands = diff["count_noise_bands"]
+    if bands:
+        lines.append(
+            "    bands: "
+            + ", ".join(f"{key} {value}" for key, value in sorted(bands.items()))
+            + " (a count at or above its band is compared for coverage; below it "
+            "is reported, not failed)"
+        )
     lines.append("arms:")
     for entry in diff["arms"][:MAX_ARM_LINES]:
         status = "LOSS" if entry["regressions"] else "ok  "
