@@ -61,7 +61,8 @@ cannot tell a compliant run from a non-compliant one any other way.
    smoke set fails with a message naming the file instead of a cargo error.
 2. **Where the evidence goes** — the smoke set writes, into the directory
    named by `$MANDATE_CHECK_DIR` (always set and cleared by this command):
-   `M1.json`/`M1.csv`, `M2.json`/`M2.csv`, `M3.json`/`M3.csv`, in exactly
+   `M1.json`/`M1.csv`, `M2.json`/`M2.csv`, `M3.json`/`M3.csv`,
+   `M4.json`/`M4.csv`, in exactly
    the shape `tools/mandate_plot.py` consumes — the `<mandate>.json` panel
    declaration (`mandate`, `title`, `x_label`, `y_label`, a non-empty
    `panels` list of `id`/`chart`/`series`/`bounds`) and the `<mandate>.csv`
@@ -70,7 +71,7 @@ cannot tell a compliant run from a non-compliant one any other way.
    `--nocapture`:
 
    ```
-   MANDATE <M1|M2|M3> <PASS|FAIL> <key>=<value> [<key>=<value> ...]
+   MANDATE <M1|M2|M3|M4> <PASS|FAIL> <key>=<value> [<key>=<value> ...]
    ```
 
    `MANDATE` starts at column 1, fields are one ASCII space apart, the

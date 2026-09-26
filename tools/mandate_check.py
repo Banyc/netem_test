@@ -29,7 +29,7 @@ target owes it:
    always sets and clears it, so a run never depends on an inherited value),
 
        <dir>/M1.json <dir>/M1.csv <dir>/M2.json <dir>/M2.csv
-       <dir>/M3.json <dir>/M3.csv
+       <dir>/M3.json <dir>/M3.csv <dir>/M4.json <dir>/M4.csv
 
    in exactly the shape ``tools/mandate_plot.py`` consumes: ``<mandate>.json``
    is the panel declaration (``mandate``, ``title``, ``x_label``, ``y_label``
@@ -46,7 +46,8 @@ target owes it:
    with
 
    - ``MANDATE`` at column 1, one ASCII space between fields;
-   - ``<ID>`` one of ``M1``, ``M2``, ``M3`` — no other id is accepted;
+   - ``<ID>`` one of ``M1``, ``M2``, ``M3``, ``M4`` — no other id is
+     accepted;
    - ``<PASS|FAIL>`` exactly, in upper case;
    - at least one ``<key>=<value>`` measurement token, whitespace separated,
      ``<key>`` matching ``[A-Za-z_][A-Za-z0-9_]*`` and ``<value>`` a
@@ -125,7 +126,7 @@ from pathlib import Path
 MODULE_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = MODULE_DIR.parent
 
-MANDATE_IDS = ("M1", "M2", "M3")
+MANDATE_IDS = ("M1", "M2", "M3", "M4")
 SMOKE_PACKAGE = "rtp_mux"
 SMOKE_TARGET = "mandate_smoke"
 SMOKE_SOURCE = Path("tests") / f"{SMOKE_TARGET}.rs"
@@ -210,7 +211,7 @@ def parse_mandate_lines(text):
             problems.append(
                 f"line {line_number}: {line!r} starts with MANDATE but does not "
                 "match the contract grammar "
-                "'MANDATE <M1|M2|M3> <PASS|FAIL> <key>=<value> ...'"
+                "'MANDATE <M1|M2|M3|M4> <PASS|FAIL> <key>=<value> ...'"
             )
             continue
         mandate = match.group("mandate")
