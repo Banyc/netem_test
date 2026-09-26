@@ -3550,7 +3550,13 @@ def main() -> int:
     # in the scenario directory, so it is derived beside — never instead of —
     # those targets: the scenario set stays mandatory, a `lib::…` entry stops
     # being an unexplained STALE and resolves against the package's `--lib`
-    # target, and an ignored lib test no block names is reported by name.
+    # target, and an ignored lib test no block names is reported by name. A
+    # `lib::…` opt-in is classified by a `gate-manifest` line or by a
+    # `gate-perf-design` row naming the reserved `lib` target -- the two
+    # remedies the note below states. A design row that names one classifies
+    # it, and the row's family, coverage and budget are checked later in the
+    # same run, so a note still calling it unclassified is a false alarm; the
+    # note stays advisory and is never fatal.
     actual_lib = ignored_scenarios(LIB_TARGET)
 
     bad = False
@@ -3566,7 +3572,16 @@ def main() -> int:
             print(f"STALE manifest entry (no longer ignored): {name}")
         bad = True
 
-    undeclared_lib = sorted(actual_lib - manifest.keys())
+    undeclared_lib = sorted(
+        actual_lib
+        - manifest.keys()
+        - {
+            row.name
+            for row in parse_perf_design(
+                manifest_block("gate-perf-design") or "", []
+            )
+        }
+    )
     for name in undeclared_lib:
         print(
             f"note: unclassified ignored lib scenario {name}; a lib opt-in is "
@@ -3730,7 +3745,8 @@ def main() -> int:
     if actual_lib:
         print(
             f"  lib target: {len(actual_lib)} ignored scenario(s), "
-            f"{len(actual_lib) - len(undeclared_lib)} named in gate-manifest"
+            f"{len(actual_lib) - len(undeclared_lib)} named in gate-manifest or "
+            "a gate-perf-design row"
         )
     print(f"  default-required: {len(required)} asserting scenario(s) present")
     print(f"  gate-asserting: {len(expected_asserting)} asserting scenario(s) recorded")

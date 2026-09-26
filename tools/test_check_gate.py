@@ -338,9 +338,30 @@ class CheckGatePerfTest(CheckGatePerfFixture):
         )
         self.assertNotIn("STALE manifest entry", output)
 
+    def test_a_lib_opt_in_a_perf_design_row_names_is_not_called_unclassified(self):
+        """A design row naming the reserved target is one of the two remedies.
+
+        The note names both remedies, and a design row resolves the opt-in on
+        the same run (its family, coverage and budget are checked), so firing
+        the note while the design block names it is a false alarm.
+        """
+        self.write_gate()
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("unclassified ignored lib scenario", output)
+        self.assertIn(
+            "lib target: 1 ignored scenario(s), 1 named in gate-manifest or "
+            "a gate-perf-design row",
+            output,
+        )
+
     def test_an_undeclared_lib_opt_in_is_reported_by_name(self):
         """The lib target's ignored set is advisory, but it is not silent."""
-        self.write_gate()
+        self.write_gate(
+            design="\n".join(
+                row for row in BASE_DESIGN.splitlines() if "lib::" not in row
+            )
+        )
         code, output = self.check()
         self.assertEqual(code, 0, output)
         self.assertIn(
