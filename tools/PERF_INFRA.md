@@ -115,6 +115,24 @@ The exact grammar, the derivation rule, the checker's failure modes and the
 fixture tests that pin them are in `tools/check-gate.py` and
 `tools/test_check_gate.py`.
 
+**What the relation check cannot see**, stated so its green is not read as more
+than it is. It verifies the **declaration**, never the code: it cannot tell
+whether an arm's implementation still measures the cell the row names, so an
+arm retuned to a milder impairment while its declared cell keeps the old value
+reads exactly like an unchanged one — that is what the settings' immutability
+and `tools/mandate-compare`'s per-arm record are for. Its dimensions are the
+cell's own keys, so a row that spells one physical axis under two names (a
+`loss=none` beside an `impairment=…`, or an `impairment` that already carries
+the loss) is derived as varying two dimensions: the confound is reported, the
+redundancy is not. A relation is defined to the one `baseline` row, so a
+re-measurement *of another row* — a stability re-run or a second tier of an arm
+that is itself a composite — has no label of its own and is filed under that
+arm's composite relation. And the derivation assumes a dimension the row does
+not name is inherited from the baseline: a row whose cell silently omits an
+axis it actually moved is invisible here, while a row that names an axis the
+baseline never states is counted as varying it even when the value is the
+baseline's own state (the two `raw_netem_pair` rows' `impairment=none`).
+
 `tools/check-gate.py` enforces the declaration for any crate whose `GATE.md`
 carries the blocks: an unknown target, an unknown test, a test declared in the
 wrong tier, a tier sum over its budget, an empty or malformed coverage cell, a
