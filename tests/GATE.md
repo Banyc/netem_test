@@ -294,3 +294,86 @@ never run by `cargo test` and are listed here so their skip is explicit:
 
 A target that is never run is an unstated gap: run these explicitly when the
 property they cover is in scope, and report the numbers, not just a pass.
+
+## The perf-test dual mandate — time and coverage
+
+Every perf test is bound by the dual mandate stated in `AGENTS.md` and
+explained in `tools/PERF_INFRA.md` ("The perf-test dual mandate (time and
+coverage)"): its **cost** must be bounded, declared and paid for by its tier,
+and its **coverage** must be declared, with every cell it claims naming the
+test that asserts it and every cell it does not cover recording why.
+
+This block is the harness's own declaration. It is checked by
+`python3 tools/check-gate.py`, which resolves each row's `<target>::<test>`
+from the compiled test binaries and fails on an unknown target or test, a test
+in the wrong tier, a tier sum over its budget, an empty coverage cell and a gap
+without a reason. The reserved target name `lib` is the `netem-test` package's
+`--lib` target, where the harness's wall-clock probes live. The costs are
+**measured** — one release (probes) or one debug (scenarios) `cargo test`
+invocation per test, wall-clock to the nearest 0.1 s, rounded up — and they
+are per `cargo test` process, so each includes the binary's startup.
+
+The baseline row is the unimpaired link, `lane=loopback layer=netem-link
+load=burst metric=counters scale=64-pkt`; every other row varies **one**
+dimension from it (impairment for the conformance rows, layer for the pair and
+probe rows, lane for the regime rows). No row here is a composite.
+
+The budgets are per tier, and they bound the rows declared in that tier — the
+perf-relevant tests, not the crate's correctness unit tests:
+
+```gate-perf-design
+netem_scenarios::netem_blackout_gate_drops_then_resumes = default | 0.8 | blackout@control=blackout-gate
+netem_scenarios::netem_delay_adds_latency = default | 0.1 | conformance-delay@impairment=delay20ms
+netem_scenarios::netem_drops_all_with_max_random_loss = default | 0.4 | conformance-loss@impairment=loss100pct
+netem_scenarios::netem_duplicate_produces_extra_packets = default | 0.5 | conformance-dup@impairment=dup50pct
+netem_scenarios::netem_four_state_loss_drops_some = default | 0.9 | conformance-loss@impairment=four-state
+netem_scenarios::netem_passes_traffic_unimpaired = default | 0.6 | baseline@lane=loopback+layer=netem-link+load=burst+metric=counters+scale=64-pkt
+netem_scenarios::netem_rate_limit_throttles_burst = default | 0.3 | conformance-rate@impairment=rate-limit
+netem_scenarios::netem_reorder_with_rate_jumps_ahead = default | 0.1 | conformance-reorder@impairment=reorder+rate=rate-limit
+netem_scenarios::netem_snapshot_reports_queue_and_stats = default | 0.2 | conformance-queue@impairment=queue-limit
+raw_netem_pair::netem_pair_raw_udp_echo_clean_link = default | 0.1 | pair-echo@layer=netem-pair+impairment=none
+raw_netem_pair::netem_pair_raw_udp_latency_is_observable = default | 0.2 | pair-latency@layer=netem-pair+impairment=delay25ms
+lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on = default | 0.1 | regime-jittery@lane=jittery-short-rtt+metric=rttvar
+lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot = default | 6.2 | regime-jittery@lane=jittery-short-rtt+metric=reordering
+lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot = standard | 14.8 | regime-thin@lane=high-rtt-low-rate+metric=rto
+lib::tests::clean_forwarding_perf_probe = perf | 0.2 | probe-forwarding@metric=throughput+layer=netem-runner
+lib::tests::learned_destination_cache_perf_probe = perf | 0.2 | probe-dest-cache@metric=throughput+layer=netem-runner
+lib::tests::short_deadline_latency_perf_probe = perf | 0.1 | probe-deadline@metric=latency+layer=netem-runner
+lib::tests::std_udp_connected_peer_perf_probe = perf | 1.2 | probe-std-udp@metric=throughput+layer=netem-runner+transport=std-udp
+```
+
+The declared sums are `default` 10.5 s of a 60 s budget, `standard` 14.8 s of
+120 s, `perf` 1.7 s of 60 s, and no row in `full`, whose 300 s budget is
+declared so a later row cannot be added without one. `drift` is the relative
+tolerance `tools/check-gate.py` applies when it is handed a fresh
+`mandate-check.json` (50 %, with a 2 s absolute floor, so a sub-second probe
+measured a second slower is a note and not a false alarm): a declared cost
+that no longer matches the measured wall-clock is reported.
+
+```gate-budgets
+default = 60
+standard = 120
+full = 300
+perf = 60
+baseline = netem_scenarios::netem_passes_traffic_unimpaired
+drift = 0.5
+drift_floor_s = 2.0
+```
+
+Each line below is a cell the harness does **not** claim, with the reason it is
+empty. The product mandates' cells are named with their pending owner rather
+than left out, so the gap is a record and not an omission:
+
+```gate-coverage-gaps
+M1@lane=dual-lane+metric=p99 = owned by rtp_mux's mandate_smoke; the harness supplies the impairment instrument and asserts none of the product's mandate bounds. Declaration pending (tools/PERF_INFRA.md, "Where the migration stands").
+M2@lane=dual-lane+metric=own-wire = owned by rtp_mux's mandate_smoke, as above: the harness has no lane of its own to assert a wire budget on.
+M3@lane=dual-lane+metric=goodput-fraction = owned by rtp_mux's dual_lane_mandates, as above.
+M4@lane=dual-lane+metric=per-flow-share = owned by rtp_mux's mandate_smoke M4 arm, as above.
+conformance-delay@impairment=correlated-delay = no conformance test asserts the delay-correlation draw distribution; the correlated knobs surface only through the four-state loss test's aggregate counters.
+conformance-queue@impairment=bufferbloat = queue behaviour is asserted only by netem_snapshot_reports_queue_and_stats at one scale; no standing-queue (bufferbloat) scenario exists at the harness layer, where the battery's bufferbloat arms are rtp-level.
+pair-echo@impairment=loss = the raw pair is exercised only on a clean link and at a fixed delay; lossy pair behaviour is covered by the link scenarios instead.
+regime-thin@lane=high-rtt-low-rate+metric=goodput = the thin-link lane's goodput is not measurable - its transport session tears down about 36 s into every run (tools/PERF_INFRA.md, the perf-loop lane roles) - so only the RTO-reach property is claimed there.
+probe-forwarding@scale=multi-megabyte = the probes measure single-datagram and 200-packet cost; transfer-scale cost is measured by the perf-loop battery, not by a harness test.
+probe-forwarding@metric=cpu-attribution = per-datagram CPU cost is measured by owning-symbol attribution (tools/samply_hotspots.py), not by a wall-clock probe.
+probe-forwarding@load=request-response = the probes drive the runner directly, so no load shape exists at this layer; request/response is a transport-lane shape owned by rtp_mux.
+```
