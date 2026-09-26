@@ -17,7 +17,7 @@ records:
 | `rtp_bufferbloat`, `rtp_burst_loss`, `rtp_fec`, `rtp_gentle`, `rtp_liveness`, `rtp_loss`, `rtp_mss`, `rtp_padding_bench` | `rtp/tests` | `rtp/GATE.md` |
 | `hol_verify4` (raw `rtp` arms), `shared_bottleneck` | `rtp/tests` | `rtp/GATE.md` |
 | `contested_latency`, `perf_probe` | `rtp_mux/tests` | `rtp_mux/GATE.md` |
-| `mux_over_rtp`, `mux_over_rtp_perf`, `rtp_and_mux`, `mux_bulk_clean_stall`, `mux_stream_fairness`, `hol_verify4` (mux bulk arms) | `mux/tests` | `mux/GATE.md` |
+| `mux_over_rtp`, `mux_over_rtp_perf`, `rtp_and_mux`, `mux_bulk_clean_stall`, `mux_stream_fairness`, `hol_verify4` (mux bulk arms) | `rtp_mux/tests` | `rtp_mux/GATE.md` |
 | `dynamic_contested`, `hol_probe`, `rtp_longrun`, `rtp_mux_jitter`, `dual_lane_mandates`, `rtp_mux`, `explorer`, … | `rtp_mux/tests` | `rtp_mux/GATE.md` |
 
 Each mandate has exactly one asserting authority, so the tri-mandate
@@ -36,9 +36,10 @@ THIS package, and each owning crate's `GATE.md` for the floors.
 
 The bounds and their derivations are stated in `rtp_mux/GATE.md`
 ("Performance") and module-level in `rtp_mux/tests/dual_lane_mandates.rs` —
-never restated here. The mux layer's per-stream contributions are in
-`mux/GATE.md` (default tier: delivered == the offered payload; standard tier:
-loopback bulk ceilings; full tier: fairness floors). The harness tooling gates
+never restated here. The mux layer keeps only the memory floor and its
+mux-only targets in `mux/GATE.md`; mux has no opt-in scenario left, so the
+loopback bulk ceilings, the fairness floors and the mux-over-rtp scenarios
+moved with those topologies to `rtp_mux/GATE.md`. The harness tooling gates
 stay with the tooling: `perf-loop run|analyze --fail-on-phase-drift` and
 `--fail-on-wakes-cap` (see `tools/PERF_LOOP.md`).
 
