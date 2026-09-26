@@ -300,6 +300,11 @@ ARM_READING_TOP_PX = 10.0
 ARM_READING_STYLE = BOUND_LABEL_STYLE
 """The reading band's text style, shared with the bound labels."""
 
+NOTE_LABEL_STYLE = (
+    BOUND_LABEL_STYLE + ";stroke:#ffffff;stroke-width:3;paint-order:stroke"
+)
+"""A note's style, haloed white: a note usually lands across the data it explains."""
+
 READING_PLOT_WIDTH = WIDTH - PAD_LEFT - PAD_RIGHT
 
 
@@ -504,6 +509,7 @@ def svg_line_chart(
     walls=False,
     markers=False,
     readings=None,
+    note="",
 ):
     """A line or CDF chart, with optional labelled horizontal bound lines.
 
@@ -512,7 +518,8 @@ def svg_line_chart(
     has a hole (see `series_walls`), ``markers`` dots every drawn sample, and
     ``readings`` reserves a band above the plot for one ``(name, sentence)``
     per line, which is where a producer's machine verdict is stated on the
-    panel it is about.
+    panel it is about. ``note`` is prose the frame owes its reader -- what the
+    frame cannot show about itself -- and is reserved and drawn the same way.
     """
     series = [(name, decimate(points)) for name, points in series if points]
     if not series:
@@ -531,7 +538,11 @@ def svg_line_chart(
     plot_width = WIDTH - PAD_LEFT - PAD_RIGHT
     wrapped = reading_lines(readings, plot_width)
     reading_rows = sum(len(lines) for lines in wrapped)
-    plot_top = legend_bottom + reading_rows * ARM_READING_LINE_HEIGHT_PX
+    note_rows = wrap_label(note, plot_width - 2 * LABEL_INSET_PX) if note else []
+    plot_top = (
+        legend_bottom
+        + (reading_rows + len(note_rows)) * ARM_READING_LINE_HEIGHT_PX
+    )
     plot_height = HEIGHT - plot_top - PAD_BOTTOM
 
     def sx(value):
@@ -597,6 +608,12 @@ def svg_line_chart(
                 )
                 row += 1
         parts.append("</g>")
+    for index, line in enumerate(note_rows):
+        parts.append(
+            f'<text class="panel-note" x="{PAD_LEFT + LABEL_INSET_PX:.1f}" '
+            f'y="{plot_top + 13 + index * ARM_READING_LINE_HEIGHT_PX:.1f}" '
+            f'style="{NOTE_LABEL_STYLE}">{html.escape(line)}</text>'
+        )
     parts.append(f"<text x=\"{WIDTH / 2}\" y=\"{HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
     parts.append(f"<text x=\"18\" y=\"{HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {HEIGHT / 2})\">{html.escape(y_label)}</text>")
     parts.append("<g class=\"legend\">")
@@ -655,14 +672,16 @@ def cdf_points(samples):
     ]
 
 
-def svg_cdf_chart(title, x_label, y_label, series, bounds=None):
+def svg_cdf_chart(title, x_label, y_label, series, bounds=None, note=""):
     """One or more empirical CDFs on a fixed 0-100% percentile axis.
 
     ``series`` is ``[(name, points)]`` with the percentile already carried in
     each point's y; this is the shape the mandate plotter reads straight from
     its CSV, while ``svg_cdf`` derives those points from raw samples.
     """
-    return svg_line_chart(title, x_label, y_label, series, (0.0, 100.0), bounds)
+    return svg_line_chart(
+        title, x_label, y_label, series, (0.0, 100.0), bounds, note=note
+    )
 
 
 def svg_cdf(samples):

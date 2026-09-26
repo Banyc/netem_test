@@ -2188,9 +2188,9 @@ class MandatePlotTest(unittest.TestCase):
             "shares", panels[0], panels, points, bare
         )
         self.assertEqual(len(problems), 1, problems)
-        self.assertIn("cannot show the departure", problems[0])
+        self.assertIn("cannot carry the failure its mandate is read for", problems[0])
         self.assertIn("'imbalance'", problems[0])
-        self.assertIn("no departure to draw", problems[0])
+        self.assertIn("no failure to draw", problems[0])
         # The other red half: a note whose numbers came from somewhere else is
         # not the note this panel's own data derives, so it is refused too.
         code, stderr, out = self.render_mandate(
@@ -2217,7 +2217,7 @@ class MandatePlotTest(unittest.TestCase):
                 declaration, SHARES_IMBALANCE_ROWS, "M4depart3"
             )
         self.assertNotEqual(code, 0, stderr)
-        self.assertIn("cannot show the departure", stderr)
+        self.assertIn("cannot carry the failure", stderr)
 
     def test_a_panel_whose_bound_a_bar_can_fail_owes_no_note(self):
         # The check is about a bound the bars *straddle*, not about every bar
@@ -2401,6 +2401,63 @@ class MandatePlotTest(unittest.TestCase):
             MANDATE.effective_bounds(wire, wire_series, wire_bounds, M2_RUN_VALUES),
             [{"y": 6.0, "label": "M2 wire budget 6x"}],
         )
+
+    def test_a_panel_with_no_bound_says_where_the_bound_is_drawn(self):
+        # `M1-cdf` draws the latency distribution and no line at all: the
+        # mandate's ceiling is on the sibling latency panel, so the CDF's
+        # reader has no mark to read the distribution against. A panel whose
+        # frame cannot carry the failure its mandate is read for says where
+        # that failure is drawn -- the same debt a share panel owes for a
+        # departure it cannot contain.
+        panels = HEALTHY_DECLARATION["panels"]
+        points = _points(HEALTHY_ROWS)
+        self.assertEqual(
+            MANDATE.bound_reference_note(panels[1], panels, points),
+            "composition view - this panel draws the quantity; the mandate's "
+            "bound 'M1 ceiling 250 ms' is drawn on panel 'latency'",
+        )
+        code, stderr, out = self.render_mandate(HEALTHY_DECLARATION, HEALTHY_ROWS, "M1cdf")
+        self.assertEqual(code, 0, stderr)
+        for name in ("M1-latency", "M1-cdf"):
+            with self.subTest(panel=name):
+                document = (out / f"{name}.svg").read_text(encoding="utf-8")
+                self.assertEqual(MANDATE.check_note_fit(name.split("-")[1], document), [])
+        cdf = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        self.assertEqual(
+            MANDATE.drawn_notes(cdf),
+            [
+                "composition view - this panel draws the quantity; the "
+                "mandate's bound 'M1 ceiling 250 ms' is drawn on panel 'latency'"
+            ],
+        )
+        # The latency panel draws its own bound, so it owes no note.
+        self.assertEqual(
+            MANDATE.drawn_notes((out / "M1-latency.svg").read_text(encoding="utf-8")),
+            [],
+        )
+        # The red half: the pre-change drawing, with no note, is refused.
+        bare = MANDATE.REPORT.svg_cdf_chart(
+            "M1 [cdf]", "latency (ms)", "percentile (%)", [("cdf", [(12.5, 50.0)])]
+        )
+        self.assertEqual(MANDATE.drawn_notes(bare), [])
+        problems = MANDATE.check_departure_view_stated(
+            "cdf", panels[1], panels, points, bare
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("draws no bound at all", problems[0])
+        self.assertIn("'latency'", problems[0])
+        # End to end: a chart that drops the note does not write the panel.
+        drawn_cdf = MANDATE.REPORT.svg_cdf_chart
+
+        def cdf_without_its_note(*arguments, **keywords):
+            return drawn_cdf(*arguments, **{**keywords, "note": ""})
+
+        with mock.patch.object(MANDATE.REPORT, "svg_cdf_chart", cdf_without_its_note):
+            code, stderr, _ = self.render_mandate(
+                HEALTHY_DECLARATION, HEALTHY_ROWS, "M1cdf2"
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("cannot carry the failure", stderr)
 
     def test_a_reading_band_that_eats_the_plot_is_refused(self):
         # The band and the shape it explains share one canvas, so the band may

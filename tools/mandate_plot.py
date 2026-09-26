@@ -158,18 +158,22 @@ silenced by softening a declaration:
   the rest, each segment naming the arms it governs. A run that restates
   nothing, a panel whose arms the run does not enumerate, and a quantity whose
   bound the run never restates are all left with their single declared line.
-- **the departure-view test** — `check_departure_view_stated` refuses a bar
-  panel whose bound is a value its own bars *straddle*. Such a bound is a
-  reference rather than a line a bar can cross, so the mandate behind the panel
-  fails on a *departure* from it, and a departure of the bound's size is
-  invisible on an axis whose whole span is the share. The panel therefore
-  either draws that departure or says on its own face that it is a composition
-  view, names the panel that carries it, and states the run's own worst
-  departure and the bound it is read against. The companion is derived from the
-  two panels' drawn points — a panel is this one's departure view when every
-  point it draws is `(mine - y) / y` — so the note names a panel the relation
-  actually holds for, and the check refuses a silent panel rather than a
-  missing one.
+- **the departure-view test** — `check_departure_view_stated` refuses a panel
+  whose own frame cannot carry the failure its mandate is read for. Two
+  shapes, one rule. A bar panel whose bound is a value its own bars *straddle*
+  draws a reference rather than a line a bar can cross, and the mandate behind
+  the panel fails on a *departure* from it — a departure of the bound's size is
+  invisible on an axis whose whole span is the share, so the panel either draws
+  that departure or says on its own face that it is a composition view, names
+  the panel that carries it, and states the run's own worst departure and the
+  bound it is read against. The companion is derived from the two panels' drawn
+  points — a panel is this one's departure view when every point it draws is
+  `(mine - y) / y` — so the note names a panel the relation actually holds for.
+  A panel that draws **no bound at all** while a sibling of the same mandate
+  draws one (`M1-cdf` under `M1-latency`) has no mark to read its own quantity
+  against either, and names the sibling and the bound it carries. The check
+  refuses a silent panel in both shapes, because a panel drawn silently reads
+  as evidence that there is no failure to draw.
 - **the stated-number test** — `check_reading_numbers` reads the numbers back
   out of that drawn band and measures them against the drawn points. A band is
   the part of a latency panel a reader trusts *instead of* the pixels, so a
@@ -300,9 +304,7 @@ departure is asserted against.
 GUARD_KEY_SUFFIX = "_guard"
 """The `MANDATE` line's per-arm guard measurements: `hostile_wire_guard=10`."""
 
-BAR_BOUND_LABEL_STYLE = (
-    REPORT.BOUND_LABEL_STYLE + ";stroke:#ffffff;stroke-width:3;paint-order:stroke"
-)
+BAR_BOUND_LABEL_STYLE = REPORT.NOTE_LABEL_STYLE
 """A bar panel's bound label, haloed white.
 
 The label names what the line governs now, so it is longer than the bound's own
@@ -1974,6 +1976,37 @@ def departure_view_note(panel, panels, points):
     return ""
 
 
+def bound_reference_note(panel, panels, points):
+    """The note a panel with no bound of its own owes: where the bound is drawn.
+
+    A panel that draws no line at all cannot show a breach of the mandate's
+    bound however faithfully it draws its quantity: the reader has no mark to
+    read the quantity against. So it says which panel of the mandate carries
+    the bound, and which bound that is -- the same debt a share panel owes for
+    a departure it cannot contain.
+    """
+    if panel.get("bounds"):
+        return ""
+    for other in panels:
+        if other["id"] == panel["id"]:
+            continue
+        bounds = other.get("bounds") or []
+        if not bounds:
+            continue
+        return (
+            f"composition view - this panel draws the quantity; the mandate's "
+            f"bound '{bounds[0]['label']}' is drawn on panel '{other['id']}'"
+        )
+    return ""
+
+
+def composition_note(panel, panels, points):
+    """The note a panel owes for the failure its own frame cannot carry."""
+    return departure_view_note(panel, panels, points) or bound_reference_note(
+        panel, panels, points
+    )
+
+
 def drawn_notes(markup):
     """The lines of the notes a panel draws on its own face, in draw order."""
     return [
@@ -2045,26 +2078,28 @@ def check_note_fit(panel_id, markup):
 def check_departure_view_stated(panel_id, panel, panels, points, markup):
     """Problems that leave a composition panel silent about the failure it cannot show.
 
-    The panel's bound is a value its own bars straddle, so no bar can fail it
-    and the mandate behind the panel -- which fails on a *departure* from that
-    value -- has no failure this frame can contain. Either the departure is
-    drawn here, or the panel says on its own face that it is a composition view
-    and names the panel that carries it together with the numbers there. What
-    is refused is neither of those, because a share panel drawn without one
-    reads as evidence that there is no departure to draw.
+    Two shapes, one rule. A panel whose bound is a value its own bars straddle
+    cannot fail it, and the mandate behind the panel fails on a *departure*
+    from it; a panel that draws no bound at all has no mark to read its own
+    quantity against. Either way the panel's frame does not contain the failure
+    it exists under, so it either draws that failure or says on its own face
+    where the failure is drawn and what it measures. What is refused is
+    neither, because a panel drawn silently reads as evidence that there is no
+    failure to draw.
     """
-    expected = departure_view_note(panel, panels, points)
+    expected = composition_note(panel, panels, points)
     if not expected:
         return []
     drawn = " ".join(drawn_notes(markup))
     if expected in drawn:
         return []
     return [
-        f"panel {panel_id!r}: its bound is a value its own bars straddle, so this "
-        "frame cannot show the departure the mandate fails on, and the panel says "
-        "neither where that failure is drawn nor what it measures. Expected on the "
-        f"panel: {expected!r}; drawn: {drawn!r}. A share panel drawn silently is "
-        "read as evidence that there is no departure to draw"
+        f"panel {panel_id!r}: its own frame cannot carry the failure its mandate "
+        "is read for -- either its bound is a value its bars straddle, or it "
+        "draws no bound at all -- and the panel says neither where that failure "
+        "is drawn nor what it measures. Expected on the panel: "
+        f"{expected!r}; drawn: {drawn!r}. A panel drawn silently is read as "
+        "evidence that there is no failure to draw"
     ]
 
 
@@ -2865,9 +2900,11 @@ def panel_markup(
     # is the one that band leaves.
     readings = panel_readings(series, run_censoring) if chart == "line" else []
     reading_rows = sum(len(lines) for lines in REPORT.reading_lines(readings))
+    note = composition_note(panel, panels or [panel], points)
+    note_rows = len(REPORT.wrap_label(note, REPORT.READING_PLOT_WIDTH)) if note else 0
     plot_height = (
-        REPORT.line_plot_height(len(series), reading_rows)
-        if chart == "line"
+        REPORT.line_plot_height(len(series), reading_rows + note_rows)
+        if chart != "bar"
         else bar_plot_height(len(series))
     )
     axis = panel_axis_extent(panel, series, drawn_bounds, run_values, plot_height)
@@ -2918,12 +2955,12 @@ def panel_markup(
             drawn_bounds,
             axis,
             run_values,
-            note=departure_view_note(panel, panels or [panel], points),
+            note=note,
         )
     elif chart == "line":
         labelled = [
             (bound["y"], governed_label(bound, series, run_values, crossing=False))
-            for bound in bounds
+            for bound in drawn_bounds
         ]
         markup = REPORT.svg_line_chart(
             chart_title,
@@ -2935,14 +2972,15 @@ def panel_markup(
             walls=True,
             markers=True,
             readings=readings,
+            note=note,
         )
     else:
         labelled = [
             (bound["y"], governed_label(bound, series, run_values, crossing=False))
-            for bound in bounds
+            for bound in drawn_bounds
         ]
         markup = REPORT.svg_cdf_chart(
-            chart_title, panel_x_label, panel_y_label, drawn, labelled
+            chart_title, panel_x_label, panel_y_label, drawn, labelled, note=note
         )
     problems = (
         check_label_fit(panel["id"], markup)
@@ -2960,7 +2998,9 @@ def panel_markup(
             )
             + check_bar_separation(panel["id"], markup)
             if chart == "bar"
-            else []
+            else check_departure_view_stated(
+                panel["id"], panel, panels or [panel], points, markup
+            )
         )
         + (
             check_gap_honesty(panel["id"], series, markup)
