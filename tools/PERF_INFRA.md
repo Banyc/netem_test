@@ -61,9 +61,11 @@ budget and must be declared as one.
 2. **Coverage.** The space is `impairment × load shape × lane × layer ×
 metric × scale`. Arms vary **one dimension** from a stated baseline so a
 failure attributes to it; an arm that varies several is a **composite** and
-must be labelled one. Every claimed cell names the asserting test; every cell
-the set does not cover records **why**. A cell may be knowingly empty; it may
-never be *silently* empty.
+must be labelled one (the `composite(<dimension>…)` relation in the block
+below, whose dimensions the checker derives from the row's own cells and
+refuses to take on trust). Every claimed cell names the asserting test; every
+cell the set does not cover records **why**. A cell may be knowingly empty; it
+may never be *silently* empty.
 
 **The numbers are not here.** Each crate that owns perf tests states its own
 tier budgets, its own nominal per-test costs and its own baseline row in its
@@ -152,8 +154,13 @@ Where the migration stands:
 drafted in `tools/PERF_PENDING_rtp_mux.md`, read from the landed
 `crates/rtp_mux` tree, so that crate's own iteration can apply them verbatim
 and needs only to fill the costs the draft marks for measurement.
-- **`rtp`** (16 perf-tier scenarios) and **`proxy`** (its `tests/src/stream.rs`
-perf scenario) — pending, with no draft yet.
+- **`rtp`** — pending, with no draft yet. The crate's own checkers count what a
+declaration would owe: 8 `perf`-tier scenarios, plus 9 in-crate opt-ins (4
+asserting `perf-lane` tests and 5 self-validating probes), out of 32
+`#[ignore]`d tests in all — `perf` 8, `standard` 5, `full` 10, `perf-lane` 4,
+`probe` 5, re-derived and printed by `crates/rtp/tools/check-ignored.py`.
+**`proxy`** (its `tests/src/stream.rs` perf scenario) — pending, with no draft
+yet.
 - **`mux`** — owes no perf-test declaration, not "no opt-in scenario": its
 `GATE.md` manifest keeps one `standard`-tier scenario
 (`interactive_liveness_soak::interactive_path_liveness_soak`) and no
