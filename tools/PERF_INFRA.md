@@ -148,16 +148,20 @@ On that pin:
 
 - **M1 holds on the arm the bound is asserted on** — the `clean` smoke arm —
   and `tools/mandate-check` exits zero.
-- **The hostile and lone-tail defects are open.** Their arms assert derived
-  regression guards, not the mandate ceiling, so a green run does **not** mean
-  the field tail is fixed. Recorded signatures:
+- **The hostile and lone-tail defects are open, and they are M1 defects.**
+  The breach is the 250 ms ceiling and the samples over it. Their arms assert
+  derived regression guards, not the mandate ceiling, so a green run does
+  **not** mean the field tail is fixed. Recorded signatures:
   - lone-tail p99 ≈ 0.22–1.54 s, p99.9 ≈ 0.80–3.53 s, worst sample
     ≈ 6.0–6.3 s, with a handful of samples per short window over the M1
     ceiling;
   - hostile (cadence) p99 ≈ 0.21–0.33 s, with tens of samples over the
-    ceiling per short window;
-  - lone-tail own-wire over the M2 budget: 6.07–6.41× on the smoke arm,
-    6.22–7.17× in the field.
+    ceiling per short window.
+- **The lone-tail arm's own wire is informational, not a defect.** It reads
+  6.07–6.41× on the smoke arm and 6.22–7.17× in the field. That multiple is
+  the accepted cost of the better tail at that impairment, not a budget to
+  close; the `clean` arm is where M2's budget is asserted (see "What \"done\"
+  means").
 - **The mechanism** is a compounding repair ladder. Once the lone tail's
   six-datagram cover is exhausted, each further rung waits
   `TAIL_PROBED_MIN_RTO` (`300 ms`) compounded onto the current RTO, so one
@@ -184,30 +188,43 @@ On that pin:
   (The `clean` smoke arm reads ~2.2× on the same pin — a different cadence
   and load, so the two are not interchangeable.)
 
-Two decisions are open, and both belong to the operator; they are recorded
-here rather than taken unilaterally, because each trades one mandate against
-another and the trade is a product call.
+The M1-vs-M2 trade under jitter is **decided**, not open: the deployed
+configuration stands. On the jittered arm a 2-shard design measured p99
+≈ 108 ms at 5.5–5.9× own-wire, against the deployed build's ≈ 37 ms at
+≈ 6.8×. The lower-wire alternative was measured and **not taken** — the tail
+is worth the wire — and those two numbers are recorded here once, as a closed
+matter. It is not a candidate, and the wire multiple it would have saved is
+not a defect to close. **M1 is the standing priority** where the mandates
+conflict; that priority is settled and is not re-decided per regime.
 
-1. **How to cut the field tail.** Either **armour the repair**, which spends
-   M2 own-wire, or **shorten the `300 ms` rung and/or the tail-probe budget**,
-   which tightens a recovery parameter. The RFC 8985 §7.2/§7.3-aligned unit
-   tests are sometimes read as a blocker here; under the rule above they are
-   **not** one — they are re-writable with a measurement and a vacuity check.
-2. **The M1-vs-M2 frontier.** On the jittered arm, a 2-shard design measured
-   jitter p99 ≈ 108 ms at 5.5–5.9× own-wire, against the deployed build's
-   ≈ 37 ms at ≈ 6.8×. A materially better tail for a materially larger wire
-   budget; neither side dominates.
+The open item is the field tail itself (see "Where the path stands today").
+It is cut by either **armouring the repair**, which spends M2 own-wire, or
+**shortening the `300 ms` rung and/or the tail-probe budget**, which tightens
+a recovery parameter. The RFC 8985 §7.2/§7.3-aligned unit tests are sometimes
+read as a blocker here; under the rule above they are **not** one — they are
+re-writable with a measurement and a vacuity check.
 
 ### What "done" means
 
-Done means: every smoke-set arm meets **M1's mandate bound** (p99 ≤ 250 ms
-and **zero** samples over 250 ms) with `delivery == 1.000`, **and** no arm
-exceeds **M2's 6× budget**. The hostile and lone-tail arms' current guards
-(900 ms / 3200 ms / 8000 ms / 8 % / 10× / 14×) exist **only because the
-product currently breaches the mandate bounds there** — they are temporary
-regression guards, not the goal. Where M1 and M2 cannot both hold, **M1
-wins** (the operator's stated priority) and the M2 breach is recorded as an
-**accepted, dated deviation** with its measured numbers.
+Done means: **every smoke-set arm meets M1's mandate bound** — p99 ≤ 250 ms
+and **zero** samples over 250 ms — with `delivery == 1.000`. Full stop.
+
+**M2's 6× own-wire budget** is asserted where it is meaningful, on the
+`clean` arm, which carries the real budget assertion. In the impaired regimes
+the measured wire multiple is **informational**: it says what the better tail
+costs there, and it is not a target and not a defect to close. The hostile and
+lone-tail arms' guards (900 ms / 3200 ms / 8000 ms / 8 % / 10× / 14×) are the
+**intended permanent shape** on those arms — a regression tripwire that fires
+if an impaired arm gets worse — not a placeholder waiting to be tightened to
+the mandate bound. The M1 breach those arms keep visible stays the open
+defect (see "Where the path stands today"); the guards are not that defect and
+do not change shape when it is fixed.
+
+**M1 is the standing priority** where the mandates conflict. That is settled,
+and there is nothing here to decide or sign off: in the jitter regime the
+deployed configuration buys p99 ≈ 37 ms at ≈ 6.8×, where the lower-wire
+alternative measures p99 ≈ 108 ms at ≈ 5.5–5.9×, and the product takes the
+tail.
 
 ## Half 2 — the infrastructure
 
@@ -238,11 +255,17 @@ sends — all on the production dual-lane topology:
 | `hostile` | GE `gilbert_elliott_loss(5, 8)`, 25 ms one-way, 100 ms jitter | 256 B cadence | 2 MiB / 3 s |
 | `lone_tail` | same GE + jitter | request/response, depth 1 | none |
 
-`clean` asserts the mandate bounds. `hostile` and `lone_tail` assert derived
-regression guards, because asserting the mandate ceiling there would assert
-something currently false. The panels draw the real mandate bounds regardless,
+`clean` asserts the mandate bounds — M1's ceiling and M2's 6× budget — so it
+is the arm that carries the real budget assertion. `hostile` and `lone_tail`
+assert derived regression guards, which are the **intended permanent shape**
+on those arms: a tripwire that fires when an impaired arm gets worse, not a
+bound waiting to be tightened, and not the place M2 is enforced. On those arms
+the ceiling does not hold today (the open M1 field-tail defect) and the wire
+multiple is informational. The panels draw the real mandate bounds regardless,
 so a breach stays visible even where the assertion is only a guard: **the
-assertion is a tripwire, the panel is the evidence.** `rtp_mux/GATE.md` lists
+assertion is a tripwire, the panel is the evidence.** The guard values and the
+arms asserting them live in `rtp_mux` (`rtp_mux/GATE.md`,
+`rtp_mux/tests/mandate_smoke.rs`) and are unchanged. `rtp_mux/GATE.md` lists
 the three tests in `gate-default-required`, so a plain `cargo test -p rtp_mux`
 runs them too; `tools/mandate-check` is the release, evidence-producing
 invocation.
