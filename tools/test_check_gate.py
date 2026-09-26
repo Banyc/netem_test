@@ -674,7 +674,9 @@ class CheckGatePerfTest(unittest.TestCase):
 
         Against the default (``impairment=none``) the member would vary two
         dimensions (``metric``, ``scale``); against its own family's reference
-        (``impairment=delay20ms``) it varies exactly one.
+        (``impairment=delay20ms``) it varies exactly one. The family's two rows
+        share the ``conformance-alpha`` cell name, which is what
+        ``members.delay`` declares as the family's namespace.
         """
         self.write_gate(
             design="\n".join(
@@ -682,10 +684,11 @@ class CheckGatePerfTest(unittest.TestCase):
                     "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
                     "alpha::t_ok = default | 0.1 | baseline@delay | conformance-alpha@impairment=delay20ms",
                     "alpha::t_ig = perf | 0.2 | composite(metric,scale) | probe-alpha@metric=throughput+scale=200-pkt",
-                    "lib::tests::probe = perf | 0.3 | orthogonal@delay | probe-runner@impairment=none",
+                    "lib::tests::probe = perf | 0.3 | orthogonal@delay | conformance-alpha@impairment=none",
                 ]
             ),
-            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+            budgets=BASE_BUDGETS
+            + "\nbaseline.delay = alpha::t_ok\nmembers.delay = conformance-alpha",
         )
         code, output = self.check()
         self.assertEqual(code, 0, output)
@@ -702,6 +705,17 @@ class CheckGatePerfTest(unittest.TestCase):
         self.assertIn(
             "gate-perf-composite: alpha::t_ig varies metric, scale against "
             "beta::t_beta",
+            output,
+        )
+        self.assertIn(
+            "gate-perf-namespace: delay(conformance-alpha) 2 row(s), cells: "
+            "conformance-alpha",
+            output,
+        )
+        self.assertIn(
+            "gate-perf-membership: 1 cell-name namespace(s) declared, 1 cell "
+            "name(s) claimed, 0 row(s) stated outside the namespace of the "
+            "family they name",
             output,
         )
 
@@ -751,6 +765,213 @@ class CheckGatePerfTest(unittest.TestCase):
             "'delay' (impairment)"
         )
         self.assertIn("so write `orthogonal@delay`, not `composite`", output)
+
+    # -- family membership: the cells decide the family ---------------------
+
+    # One named family whose two rows share the `conformance-alpha` cell name,
+    # so the family has a namespace and the declaration is well formed.
+    MEMBER_DESIGN = "\n".join(
+        [
+            "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+            "alpha::t_ok = default | 0.1 | baseline@delay | conformance-alpha@impairment=delay20ms",
+            "alpha::t_ig = perf | 0.2 | composite(metric,scale) | probe-alpha@metric=throughput+scale=200-pkt",
+            "lib::tests::probe = perf | 0.3 | orthogonal@delay | conformance-alpha@impairment=none",
+        ]
+    )
+    MEMBER_BUDGETS = BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok\nmembers.delay = conformance-alpha"
+
+    def test_a_named_family_without_a_namespace_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+        )
+        output = self.rejects(
+            "gate-budgets: baseline.delay declares a family whose cell-name "
+            "namespace is not declared"
+        )
+        self.assertIn("write `members.delay = conformance-alpha`", output)
+
+    def test_a_family_whose_cells_share_no_prefix_says_so(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN.replace(
+                "conformance-alpha@impairment=none", "probe-runner@impairment=none"
+            ),
+            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+        )
+        output = self.rejects(
+            "baseline.delay declares a family whose cell-name namespace is not "
+            "declared"
+        )
+        self.assertIn(
+            "its rows' cells are named conformance-alpha, probe-runner and share "
+            "no prefix",
+            output,
+        )
+
+    def test_a_namespace_for_an_undeclared_family_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=self.MEMBER_BUDGETS + "\nmembers.ghost = probe-*",
+        )
+        output = self.rejects(
+            "gate-budgets: members.ghost = probe-* declares the cell-name "
+            "namespace of a family gate-budgets does not declare"
+        )
+        self.assertIn("declare `baseline.ghost = <row>` or remove the line", output)
+
+    def test_a_malformed_namespace_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=BASE_BUDGETS
+            + "\nbaseline.delay = alpha::t_ok\nmembers.delay = conformance alpha",
+        )
+        output = self.rejects("members.delay = 'conformance alpha' does not name a cell-name namespace")
+        self.assertIn("optionally followed by '*' to make it the prefix", output)
+
+    def test_a_bare_members_line_declares_no_family(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=self.MEMBER_BUDGETS + "\nmembers = conformance-*",
+        )
+        output = self.rejects("'members' names no family")
+        self.assertIn("the default family's namespace is the residual", output)
+        self.assertIn("write `members.<family> = <prefix>`", output)
+
+    def test_a_duplicate_namespace_for_a_family_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=self.MEMBER_BUDGETS + "\nmembers.delay = conformance-alpha*",
+        )
+        self.rejects("duplicate members line for family 'delay'")
+
+    def test_a_namespace_matching_no_row_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=BASE_BUDGETS
+            + "\nbaseline.delay = alpha::t_ok\nmembers.delay = zzz-*",
+        )
+        output = self.rejects(
+            "members.delay = zzz-* matches no row's cell name, so it declares a "
+            "namespace nothing occupies"
+        )
+        self.assertIn("write the prefix the family's cells carry (conformance-alpha)", output)
+
+    def test_a_namespace_not_covering_its_own_family_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN.replace(
+                "conformance-alpha@impairment=none", "probe-runner@impairment=none"
+            ),
+            budgets=self.MEMBER_BUDGETS,
+        )
+        output = self.rejects(
+            "members.delay = conformance-alpha does not cover the family's own "
+            "cells (probe-runner)"
+        )
+        self.assertIn("write `members.delay = <prefix>`", output)
+
+    def test_a_reference_row_outside_its_familys_namespace_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN.replace(
+                "conformance-alpha@impairment=none", "probe-runner@impairment=none"
+            ),
+            budgets=BASE_BUDGETS
+            + "\nbaseline.delay = alpha::t_ok\nmembers.delay = probe-runner",
+        )
+        output = self.rejects(
+            "gate-perf-design row alpha::t_ok is the reference of baseline.delay, "
+            "but its cells are named conformance-alpha, which members.delay = "
+            "probe-runner does not claim"
+        )
+        self.assertIn("the family's namespace must contain its own reference", output)
+
+    def test_a_row_outside_its_familys_namespace_fails(self):
+        """The row's cell name is unique, so the fix is the family's declaration."""
+        self.write_gate(
+            design=self.MEMBER_DESIGN.replace(
+                "conformance-alpha@impairment=none", "probe-runner@impairment=none"
+            ),
+            budgets=self.MEMBER_BUDGETS,
+        )
+        output = self.rejects(
+            "gate-perf-design row lib::tests::probe: its cells are named "
+            "probe-runner, which members.delay = conformance-alpha does not "
+            "claim"
+        )
+        self.assertIn(
+            "declare it as this family's own cell name: `members.delay = <prefix>`",
+            output,
+        )
+
+    def test_a_row_whose_cell_name_belongs_to_another_family_fails(self):
+        self.write_gate(
+            design="\n".join(
+                [
+                    "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                    "alpha::t_ok = default | 0.1 | baseline@delay | conformance-alpha@impairment=delay20ms",
+                    "alpha::t_ig = perf | 0.2 | baseline@other | probe-alpha@metric=throughput+scale=200-pkt",
+                    "lib::tests::probe = perf | 0.3 | orthogonal@delay | probe-alpha@impairment=none",
+                ]
+            ),
+            budgets=BASE_BUDGETS
+            + "\nbaseline.delay = alpha::t_ok\nmembers.delay = conformance-alpha"
+            + "\nbaseline.other = alpha::t_ig\nmembers.other = probe-alpha",
+        )
+        output = self.rejects(
+            "gate-perf-design row lib::tests::probe: its cells are named "
+            "probe-alpha, which members.delay = conformance-alpha does not claim"
+        )
+        self.assertIn(
+            "those cells belong to family 'other' (members.other = probe-alpha), "
+            "so state the row against `@other` or move the name out",
+            output,
+        )
+
+    def test_a_cell_name_claimed_by_two_families_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=self.MEMBER_BUDGETS + "\nmembers.other = conformance-*",
+        )
+        output = self.rejects(
+            "gate-budgets: the cell name 'conformance-alpha' is claimed by 2 "
+            "families (members.delay = conformance-alpha, members.other = "
+            "conformance-*)"
+        )
+        self.assertIn("a cell name belongs to exactly one family", output)
+        self.assertIn(
+            "gate-perf-design row alpha::t_ok: its cells are named "
+            "conformance-alpha, which 2 families claim",
+            output,
+        )
+
+    def test_a_default_row_inside_a_named_namespace_fails(self):
+        self.write_gate(
+            design=self.MEMBER_DESIGN,
+            budgets=self.MEMBER_BUDGETS.replace(
+                "members.delay = conformance-alpha", "members.delay = conformance-*"
+            ),
+        )
+        output = self.rejects(
+            "gate-perf-design row beta::t_beta names no family, but its cells are "
+            "named conformance-beta, which belong to family 'delay'"
+        )
+        self.assertIn("write `@delay`", output)
+
+    def test_the_default_familys_residual_namespace_is_a_derivation(self):
+        """A default row whose cell name no family claims is in the family."""
+        self.write_gate(design=self.MEMBER_DESIGN, budgets=self.MEMBER_BUDGETS)
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn(
+            "gate-perf-namespace: default(residual) 2 row(s), cells: "
+            "conformance-beta, probe-alpha",
+            output,
+        )
+        self.assertIn(
+            "gate-perf-membership: 1 cell-name namespace(s) declared, 1 cell "
+            "name(s) claimed, 0 row(s) stated outside the namespace of the "
+            "family they name",
+            output,
+        )
 
 
 if __name__ == "__main__":

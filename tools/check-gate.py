@@ -73,6 +73,18 @@ M1-clean baseline states four dimensions it does not. A relation that names an
 undeclared family, a row whose `baseline`-label does not name the family it is
 the reference of, and a declared baseline no row states a relation against are
 all errors; the last one is how a stale reference is caught before it rots.
+
+Stating a relation against a family is itself a claim that the row belongs to
+that family, so each named family must also declare the **cell-name namespace**
+its rows live in: `members.<family> = <prefix>` names the prefix a cell's
+property (the part before `@`) starts with, one namespace per family. Membership
+is then a property of the row rather than a free label: every cell of a row must
+be named by the namespace of the family it names, a cell name may not be claimed
+by two families, the family's own reference row must be inside its namespace, and
+a row whose cells occupy a family's namespace must state against it. The default
+family is the **residual** - every cell name no `members.<family>` claims - which
+is what a crate's own conformance (or mandate) vocabulary is; the run summary
+prints those residual names so a new one is visible rather than silent.
 When a fresh `mandate-check.json` is supplied
 (`--mandate-check-json`, or `mandate-check.json` in the crate root), each
 declared row that the report measured per-test is compared with the report's
@@ -136,6 +148,10 @@ CELL_PROPERTY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 CELL_DIMENSION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*=[^=,+\s]+$")
 # A dimension's bare name, as used by a `composite(...)` relation.
 CELL_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+# A family's cell-name namespace: a cell property name (`[A-Za-z][A-Za-z0-9_.-]*`,
+# the part before the cell's `@`) optionally followed by one `*`, which makes it
+# a prefix. A bare name is its own (exact) namespace; `*` alone declares nothing.
+MEMBERSHIP_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*\*?$")
 # The default drift tolerance (relative) and the absolute floor below which a
 # difference is not reported, overridable per crate in `gate-budgets`.
 DEFAULT_DRIFT_TOLERANCE = 0.5
@@ -851,7 +867,10 @@ class PerfBudgets:
 
     ``baseline`` is the default reference every row inherits when its relation
     names no family; ``named`` maps each `baseline.<family>` line's family to
-    the row it references.
+    the row it references; ``members`` maps each named family to the cell-name
+    prefix (`members.<family> = <prefix>`) its rows' cells are named by. The
+    default family has no entry: its namespace is the residual, every cell name
+    no ``members`` prefix claims.
     """
 
     tiers: dict[str, float]
@@ -859,6 +878,7 @@ class PerfBudgets:
     drift: float
     drift_floor_seconds: float
     named: dict[str, str] = field(default_factory=dict)
+    members: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1065,11 +1085,15 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
 
     `baseline = <row>` is the default reference a row inherits when its
     relation names no family; each `baseline.<family> = <row>` line declares a
-    named reference a row opts into with `@<family>`.
+    named reference a row opts into with `@<family>`, and each
+    `members.<family> = <prefix>` line declares that family's cell-name
+    namespace. The default family's namespace is the residual and is not
+    declared: a bare `members` line is refused with that reason.
     """
     tiers: dict[str, float] = {}
     baseline: str | None = None
     named: dict[str, str] = {}
+    members: dict[str, str] = {}
     drift = DEFAULT_DRIFT_TOLERANCE
     floor = DEFAULT_DRIFT_FLOOR_SECONDS
     for number, line in _perf_lines(text):
@@ -1103,6 +1127,38 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
                 continue
             named[family] = value
             continue
+        if key == "members":
+            problems.append(
+                f"gate-budgets line {number}: {key!r} names no family, and the "
+                "default family's namespace is the residual (every cell name no "
+                "`members.<family>` claims), so it needs no declaration; write "
+                "`members.<family> = <prefix>` for each named family"
+            )
+            continue
+        if key.startswith("members."):
+            family = key[len("members.") :].strip()
+            if not CELL_KEY_RE.match(family):
+                problems.append(
+                    f"gate-budgets line {number}: {key!r} does not name a family; "
+                    "write `members.<family> = <prefix>` with a family name "
+                    "([A-Za-z][A-Za-z0-9_-]*)"
+                )
+                continue
+            if not MEMBERSHIP_PREFIX_RE.match(value):
+                problems.append(
+                    f"gate-budgets line {number}: members.{family} = {value!r} does "
+                    "not name a cell-name namespace; write a cell name "
+                    "([A-Za-z][A-Za-z0-9_.-]*), optionally followed by '*' to make "
+                    "it the prefix its family's cell names start with"
+                )
+                continue
+            if family in members:
+                problems.append(
+                    f"gate-budgets: duplicate members line for family {family!r}"
+                )
+                continue
+            members[family] = value
+            continue
         if key in ("drift", "drift_floor_s"):
             try:
                 parsed = float(value)
@@ -1120,7 +1176,8 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
         if key not in PERF_TIERS:
             problems.append(
                 f"gate-budgets line {number}: {key!r} is neither a tier nor one "
-                "of baseline/drift/drift_floor_s (nor a `baseline.<family>` line)"
+                "of baseline/drift/drift_floor_s (nor a `baseline.<family>`, "
+                "`members.<family>` line)"
             )
             continue
         if key in tiers:
@@ -1140,7 +1197,7 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
             "gate-budgets declares no 'baseline = <row>' line; every design row's "
             "coverage must be stated relative to a named baseline row"
         )
-    return PerfBudgets(tiers, baseline, drift, floor, named)
+    return PerfBudgets(tiers, baseline, drift, floor, named, members)
 
 
 def parse_perf_gaps(text: str, problems: list[str]) -> list[PerfGap]:
@@ -1480,6 +1537,252 @@ def check_perf_relations(
     return summary
 
 
+def cell_name(cell: str) -> str:
+    """A cell's property name: the part before its `@<dimension>=<value>`."""
+    return cell.partition("@")[0]
+
+
+def prefix_matches(pattern: str, name: str) -> bool:
+    """Whether a cell name falls in a `members.<family>` namespace.
+
+    `foo` matches only itself; `foo*` matches every name starting with `foo`.
+    """
+    return name.startswith(pattern[:-1]) if pattern.endswith("*") else name == pattern
+
+
+def prefix_hint(names: list[str]) -> str:
+    """The narrowest prefix namespace covering ``names``, or '' if none does.
+
+    The longest common prefix of the names, made a prefix namespace with `*`.
+    An empty common prefix has no namespace at all (`*` alone declares
+    nothing), so the diagnostic falls back to naming the cells instead.
+    """
+    if not names:
+        return ""
+    prefix = names[0]
+    for name in names[1:]:
+        index = 0
+        while index < min(len(prefix), len(name)) and prefix[index] == name[index]:
+            index += 1
+        prefix = prefix[:index]
+    if not prefix:
+        return ""
+    return prefix if len(set(names)) == 1 else prefix + "*"
+
+
+def check_perf_membership(
+    rows: list[PerfRow], budgets: PerfBudgets, problems: list[str]
+) -> list[str]:
+    """Verify each row's cells name the family its relation states against.
+
+    Membership is a property of the row, derived from its own cells: a cell's
+    property is the name, a named family declares the namespace those names
+    start with (`members.<family> = <prefix>`), and the default family owns the
+    residual. A row's every cell name must fall in the namespace of the family
+    it names, a cell name may not be claimed by two families, a family's
+    namespace must contain its own reference row (the family is identified by
+    the cells its reference carries), and a row whose cells occupy a family's
+    namespace must name that family. Every failure names the row or the line
+    and what to write instead. Returns the summary lines for the passing case.
+    """
+    summary: list[str] = []
+    if budgets.baseline is None:
+        return summary
+    by_name = {row.name: row for row in rows}
+    families: dict[str | None, str] = {None: budgets.baseline}
+    families.update(budgets.named)
+
+    row_names = [cell_name(cell) for row in rows for cell in row.cells]
+    all_names = sorted(set(row_names))
+    family_rows: dict[str | None, list[PerfRow]] = {}
+    for row in rows:
+        family = row.relation.family if row.relation is not None else None
+        family_rows.setdefault(family, []).append(row)
+
+    def names_of(family: str | None) -> list[str]:
+        return sorted({cell_name(cell) for row in family_rows.get(family, ()) for cell in row.cells})
+
+    def write_members(family: str | None) -> str:
+        label = "members" if family is None else f"members.{family}"
+        hint = prefix_hint(names_of(family))
+        return f"`{label} = {hint}`" if hint else f"`{label} = <prefix>`"
+
+    # Declaration side: a namespace for every named family, none for an
+    # undeclared one, and a namespace that its own cells actually occupy.
+    for family in sorted(budgets.named):
+        if family in budgets.members:
+            continue
+        names = names_of(family)
+        hint = prefix_hint(names)
+        wanted = (
+            f"`members.{family} = {hint}`"
+            if hint
+            else "a shared cell name (`members.<family> = <prefix>`), because its "
+            f"rows' cells are named {', '.join(names)} and share no prefix"
+        )
+        problems.append(
+            f"gate-budgets: baseline.{family} declares a family whose cell-name "
+            f"namespace is not declared; write {wanted} so a row's cells decide "
+            "whether it belongs to the family"
+        )
+    for family in sorted(set(budgets.members) - set(budgets.named)):
+        problems.append(
+            f"gate-budgets: members.{family} = {budgets.members[family]} declares "
+            "the cell-name namespace of a family gate-budgets does not declare; "
+            f"declare `baseline.{family} = <row>` or remove the line"
+        )
+    claimed: dict[str, list[str]] = {}
+    for family, pattern in budgets.members.items():
+        for name in all_names:
+            if prefix_matches(pattern, name):
+                claimed.setdefault(name, []).append(family)
+    for family in sorted(budgets.members):
+        pattern = budgets.members[family]
+        matches = [name for name in all_names if prefix_matches(pattern, name)]
+        if not matches:
+            problems.append(
+                f"gate-budgets: members.{family} = {pattern} matches no row's cell "
+                "name, so it declares a namespace nothing occupies; write the "
+                "prefix the family's cells carry "
+                f"({', '.join(names_of(family)) or 'none'}) or remove the line"
+            )
+            continue
+        if not family_rows.get(family):
+            continue
+        outside = [name for name in names_of(family) if not prefix_matches(pattern, name)]
+        if outside:
+            problems.append(
+                f"gate-budgets: members.{family} = {pattern} does not cover the "
+                f"family's own cells ({', '.join(outside)}); a family's namespace "
+                f"is where its rows live, so write {write_members(family)}"
+            )
+    for name, owners in sorted(claimed.items()):
+        if len(owners) < 2:
+            continue
+        declared = ", ".join(
+            f"members.{family} = {budgets.members[family]}" for family in owners
+        )
+        problems.append(
+            f"gate-budgets: the cell name {name!r} is claimed by {len(owners)} "
+            f"families ({declared}); a cell name belongs to exactly one family, "
+            "so narrow one namespace until the cell names are disjoint"
+        )
+
+    # Row side: the reference row of a family is inside its namespace, and
+    # every row's cells decide the family it belongs to.
+    for family, name in sorted(families.items(), key=lambda item: (item[0] is not None, item[0] or "")):
+        row = by_name.get(name)
+        pattern = budgets.members.get(family or "")
+        if row is None or family is None or pattern is None:
+            continue
+        outside = sorted({cell_name(cell) for cell in row.cells if not prefix_matches(pattern, cell_name(cell))})
+        if outside:
+            problems.append(
+                f"gate-perf-design row {row.name} is the reference of "
+                f"baseline.{family}, but its cells are named {', '.join(outside)}, "
+                f"which members.{family} = {pattern} does not claim; the family's "
+                f"namespace must contain its own reference, so write "
+                f"{write_members(family)}"
+            )
+
+    def owner_phrase(owners: list[str]) -> str:
+        return ", ".join(
+            f"family {family!r} (members.{family} = {budgets.members[family]})"
+            for family in owners
+        )
+
+    misfiled = 0
+    for row in rows:
+        family = row.relation.family if row.relation is not None else None
+        names = sorted({cell_name(cell) for cell in row.cells})
+        owners: list[str] = []
+        for name in names:
+            for owner in claimed.get(name, ()):
+                if owner not in owners:
+                    owners.append(owner)
+        pattern = budgets.members.get(family or "")
+        if family is not None and pattern is None:
+            # The missing declaration is already named; the row cannot be
+            # checked against a namespace that does not exist.
+            continue
+        if family is not None and any(
+            not prefix_matches(pattern, name) for name in names
+        ):
+            misfiled += 1
+            outside = [name for name in names if not prefix_matches(pattern, name)]
+            if len(owners) == 1:
+                hint = (
+                    f"; those cells belong to {owner_phrase(owners)}, so state the "
+                    f"row against `@{owners[0]}` or move the name out of that "
+                    "namespace"
+                )
+            elif len(owners) > 1:
+                hint = (
+                    f", and {len(owners)} families claim them "
+                    f"({owner_phrase(owners)}), so one namespace must be narrowed "
+                    "before the row can be filed"
+                )
+            else:
+                hint = (
+                    f"; declare it as this family's own cell name: "
+                    f"{write_members(family)}"
+                )
+            problems.append(
+                f"gate-perf-design row {row.name}: its cells are named "
+                f"{', '.join(outside)}, which members.{family} = {pattern} does "
+                "not claim, so the row's cells and the family it names "
+                f"disagree{hint}"
+            )
+            continue
+        if len(owners) > 1:
+            misfiled += 1
+            problems.append(
+                f"gate-perf-design row {row.name}: its cells are named "
+                f"{', '.join(names)}, which {len(owners)} families claim "
+                f"({owner_phrase(owners)}); a cell name belongs to one family, so "
+                "the row cannot be filed by its cells until one namespace is "
+                "narrowed"
+            )
+            continue
+        if owners and family != owners[0]:
+            misfiled += 1
+            if family is None:
+                problems.append(
+                    f"gate-perf-design row {row.name} names no family, but its "
+                    f"cells are named {', '.join(names)}, which belong to "
+                    f"{owner_phrase(owners)}; a row whose cells occupy a family's "
+                    f"namespace must state against it - write `@{owners[0]}`"
+                )
+            else:
+                problems.append(
+                    f"gate-perf-design row {row.name}: its cells are named "
+                    f"{', '.join(names)}, which belong to {owner_phrase(owners)} "
+                    f"rather than family {family!r}; state the row against "
+                    f"`@{owners[0]}` or move the name out of that namespace"
+                )
+
+    if not budgets.members:
+        return summary
+    residual = sorted(name for name in all_names if name not in claimed)
+    summary.append(
+        f"  gate-perf-membership: {len(budgets.members)} cell-name namespace(s) "
+        f"declared, {len(claimed)} cell name(s) claimed, {misfiled} row(s) stated "
+        "outside the namespace of the family they name"
+    )
+    for family in sorted(budgets.members):
+        rows_in = family_rows.get(family, [])
+        summary.append(
+            f"  gate-perf-namespace: {family}({budgets.members[family]}) "
+            f"{len(rows_in)} row(s), cells: {', '.join(names_of(family))}"
+        )
+    if residual:
+        summary.append(
+            "  gate-perf-namespace: default(residual) "
+            f"{len(family_rows.get(None, []))} row(s), cells: {', '.join(residual)}"
+        )
+    return summary
+
+
 def read_mandate_report(path: Path, problems: list[str]):
     """The per-test timings of a `mandate-check.json`, or None with a problem."""
     if not path.is_file():
@@ -1615,6 +1918,7 @@ def check_perf_gate(
     budgets = parse_perf_budgets(budgets_block or "", problems)
     gaps = parse_perf_gaps(gaps_block or "", problems)
     relation_summary = check_perf_relations(rows, budgets, problems)
+    membership_summary = check_perf_membership(rows, budgets, problems)
 
     listings = TargetListings()
     for row in rows:
@@ -1719,6 +2023,7 @@ def check_perf_gate(
         f"{budgets.baseline or 'unset'}{named}"
     ]
     summary.extend(relation_summary)
+    summary.extend(membership_summary)
     for tier in sorted(by_tier):
         total = sum(row.cost for row in by_tier[tier])
         budget = budgets.tiers.get(tier)

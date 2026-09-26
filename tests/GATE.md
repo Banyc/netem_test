@@ -331,24 +331,44 @@ disagrees with that derivation, a row whose cells state one dimension twice
 does not exist, and a declared baseline no row states a relation against (a
 stale reference).
 
-The harness declares four baselines, one per measurement family:
+Stating a relation against a family is also a claim that the row **belongs** to
+that family, so each named family declares the cell-name namespace its rows
+live in: `members.<family> = <prefix>` names the prefix a cell's property (the
+part before `@`) starts with, and membership is then a property of the row —
+every cell of a row must be named by the namespace of the family it names, a
+cell name may not be claimed by two families, the family's own reference row
+must be inside its namespace, and a row whose cells occupy a family's namespace
+must state against it. The **default** family is the **residual**: it owns every
+cell name no `members.<family>` claims, which is why it needs no line (its
+conformance vocabulary — `baseline`, `blackout`, `conformance-*` — shares no
+prefix), and the run summary prints those residual names so a new one is
+visible rather than silent.
+
+The harness declares four baselines, one per measurement family, and three
+namespaces:
 
 - **default** — `netem_passes_traffic_unimpaired`, the unimpaired conformance
   link (`lane=loopback layer=netem-link load=burst metric=counters
   scale=64-pkt`); the seven other `netem_scenarios` rows are stated against it.
+  Its cells are named `baseline`, `blackout` and `conformance-*`, so the
+  namespace it owns is the residual, and `members` declares no prefix for it.
 - **`pair`** — `raw_netem_pair::netem_pair_raw_udp_echo_clean_link`, the raw
-  pair's clean cell. The pair's latency row differs from it in exactly one
-  dimension (`impairment`), so it is `orthogonal@pair` — read against the
-  conformance link it looked like a `composite(impairment,layer)`, which was
-  the baseline's problem, not the arm's.
+  pair's clean cell, in the `pair-*` namespace (`members.pair = pair-*`: the
+  `pair-echo` and `pair-latency` cells). The pair's latency row differs from it
+  in exactly one dimension (`impairment`), so it is `orthogonal@pair` — read
+  against the conformance link it looked like a `composite(impairment,layer)`,
+  which was the baseline's problem, not the arm's.
 - **`lane`** —
   `lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on`,
-  the jittery-short-rtt variance cell. The reordering row differs in exactly
-  `metric`; the thin-link row differs in `lane` **and** `metric` together, and
-  is honestly composite: it is measured in another regime, not as a second
-  axis of the jittery one.
+  the jittery-short-rtt variance cell, in the `regime-*` namespace
+  (`members.lane = regime-*`: the `regime-jittery` and `regime-thin` cells). The
+  reordering row differs in exactly `metric`; the thin-link row differs in
+  `lane` **and** `metric` together, and is honestly composite: it is measured in
+  another regime, not as a second axis of the jittery one.
 - **`probe`** — `lib::tests::clean_forwarding_perf_probe`, the harness's
-  wall-clock probe cell (`metric=throughput layer=netem-runner`). The deadline
+  wall-clock probe cell (`metric=throughput layer=netem-runner`), in the
+  `probe-*` namespace (`members.probe = probe-*`: `probe-forwarding`,
+  `probe-dest-cache`, `probe-deadline`, `probe-std-udp`). The deadline
   probe differs in `metric` and the std-udp probe in `transport`, so both are
   orthogonal; the destination-cache probe declares the reference's own cell
   point, so it is a `re-measurement(second-arm-same-declared-point)` — a
@@ -414,6 +434,9 @@ baseline = netem_scenarios::netem_passes_traffic_unimpaired
 baseline.pair = raw_netem_pair::netem_pair_raw_udp_echo_clean_link
 baseline.lane = lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
 baseline.probe = lib::tests::clean_forwarding_perf_probe
+members.pair = pair-*
+members.lane = regime-*
+members.probe = probe-*
 drift = 0.5
 drift_floor_s = 2.0
 ```
