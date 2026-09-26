@@ -342,7 +342,7 @@ tools/mandate-check
 It runs `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`,
 renders one validated SVG+PNG per panel through `tools/mandate_plot.py`, prints
 a verdict block and writes `mandate-check.json` alongside the eight evidence
-files. Measured cost: **205.9 s** on a warm build (10 panels, 20 SVG+PNG plot
+files. Measured cost: **216.3 s** on a warm build (10 panels, 20 SVG+PNG plot
 files). It **refuses
 loudly rather than reporting success on absent evidence** — it fails when it
 cannot produce the evidence as well as when a mandate fails. The contract,
@@ -438,18 +438,22 @@ arm against its declared cell, not this comparison.
 `tools/mandate-check` run, checked in so that `tools/mandate-compare` has a
 reference: it records the per-arm measurements a later run's coverage is
 compared against. It was taken with `tools/mandate-check` (no arguments, so no
-`--quick`) on 2026-09-26, with this workspace's runner at change `sznyxuozrm`
-and the sibling `rtp_mux` at `8f5d83909bf2` (change
-`wmrkurmovoouxvsyuwpozsuovvkwmrrx`), which pins `rtp v0.0.94`; the run took
-**213.9 s**, passed all four mandates, and recorded **19 arms** — 3 M1, 3 M2,
-3 M3 reps, 8 M4 flows and 2 M4 aggregates. The checked-in copy is the run's
-JSON with machine-local absolute paths replaced by tokens (`<baseline run
+`--quick`) on 2026-09-26, with the runner at commit `e3644df7` (change
+`yprpylpz`) and the sibling `rtp_mux` at commit `e4b5ee4f` (change
+`wmrkurmovoouxvsyuwpozsuovvkwmrrx`) — an empty working-copy snapshot, so the
+recorded `tree_id` `a0648702` is what actually names the content it built —
+which pins `rtp v0.0.94`; the run took **216.3 s**, passed all four mandates,
+and recorded **19 arms** — 3 M1, 3 M2, 3 M3 reps, 8 M4 flows and 2 M4
+aggregates. The checked-in copy is the run's JSON with machine-local absolute
+paths replaced by tokens (`<baseline run
  dir>`, `<rtp_mux checkout>`, `<netem_test checkout>`, `<cargo>`); every
-measured value, the command, the revisions and the duration are verbatim. The
-plots themselves are not committed; re-run the command to regenerate them.
+measured value, the command, the revisions, the tree and the duration are
+verbatim. The plots themselves are not committed; re-run the command to
+regenerate them.
 Because the comparison refuses a baseline whose schema predates the per-arm
 record, this file has to be re-recorded with a current `tools/mandate-check`
-(no `--quick`) whenever the runner or the smoke set changes shape.
+(no `--quick`) whenever the runner or the smoke set changes shape; the
+checked-in file is schema `mandate-check/4`.
 
 ### `tools/mandate_plot.py` — the validated panel renderer
 
