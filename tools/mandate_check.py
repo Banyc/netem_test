@@ -1308,8 +1308,13 @@ def _kill_process_group(process):
         process.kill()
 
 
-def render_mandate(mandate, out_dir, *, rasterize, browser):
-    """Render one mandate's declared panels, returning ``(summary, problems)``."""
+def render_mandate(mandate, out_dir, *, rasterize, browser, run_values=None):
+    """Render one mandate's declared panels, returning ``(summary, problems)``.
+
+    ``run_values`` is this mandate's parsed ``MANDATE`` line, handed to the
+    plotter so a bound whose bars cross it can name the run's own per-arm
+    guards instead of reading as a breach the verdict tolerates.
+    """
     declaration = out_dir / f"{mandate}.json"
     data = out_dir / f"{mandate}.csv"
     problems = []
@@ -1330,6 +1335,7 @@ def render_mandate(mandate, out_dir, *, rasterize, browser):
             out_dir / PLOTS_DIRNAME,
             rasterize=rasterize,
             browser=browser,
+            run_values=run_values,
         )
     except (MANDATE_PLOT.MandatePlotError, MANDATE_PLOT.RENDER.RenderGraphError) as error:
         return None, [f"{mandate}: {error}"]
@@ -1649,6 +1655,7 @@ def evaluate_producer(args, producer, out_dir, report, run, declaration):
             out_dir,
             rasterize=args.rasterize,
             browser=args.browser,
+            run_values=(records.get(mandate) or {}).get("values"),
         )
         if summary is not None:
             section["plots"] = list(summary.get("svg") or []) + list(

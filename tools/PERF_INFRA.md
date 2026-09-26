@@ -664,6 +664,35 @@ declaration, a zero-series or empty panel, a CSV row naming an undeclared
 panel or series, and a declared bound that did not reach the SVG. A panel that
 cannot be produced is an error, not a file to skim past.
 
+It also **refuses a panel that cannot show the failure it is drawn for**
+(`AGENTS.md`, "Read every panel"; `crates/AUDIT_COVERAGE.md`, "Plots that
+cannot show their own failure"), which is machine-checked rather than left to
+the reader:
+
+- **the axis**, for a bar panel, is chosen by the tool rather than inherited
+  from the data's min/max. A fraction panel (`[0, 1]` quantity) whose *floor
+  sits at the top of that unit*, or whose bound a minority of the bars has
+  crossed, is drawn as a **band view**: the axis spans the bound's own band
+  either side of it (`MIN_UNIT_SPAN` of the unit at least), and its label says
+  it is not zero-based. Every other bar panel keeps the zero baseline. Every
+  bound the panel draws at its own scale must then resolve at least
+  `MIN_BOUND_PIXELS` of the axis height, or the render is refused by name —
+  the delivery panels failed that at `0.5 %`, i.e. half a pixel. A pinned
+  `y_extent` that reintroduces the failure is refused the same way.
+- **a crossed bound must be attributable.** A bound with at most a third of
+  the bars beyond it is read as a departure, and whether that departure is a
+  breach or an arm's tolerated tripwire is a property of *the run*: the panel
+  names the run's own per-arm `*_guard` measurements (which
+  `tools/mandate-check` passes in with `--run-values`), and a declaration can
+  state its own governance with `bounds[i].series` (a declared series) and/or
+  `bounds[i].x` (a category, a list, or `{"min", "max"}`, which must be
+  categories the panel draws — the line is then drawn only over that window).
+  A run that supplies neither is refused for such a panel, because as drawn the
+  M2 wire budget line made a budget breach of a crossing the verdict tolerates.
+  A crossing nothing in the run asserts a looser guard against — a per-flow
+  delivery floor — stands as the breach it draws, so a failing run still
+  renders its evidence.
+
 ### `tools/perf-loop` — the paired A/B battery (`tools/PERF_LOOP.md`)
 
 Validates a **change**, not a state: it freezes a baseline and a candidate

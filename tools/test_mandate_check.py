@@ -322,7 +322,11 @@ PASS_LINES = [
     "max_share=+0.2520 imbalance=0.0080 window=12s wall=24.1s",
     "MANDATE M4 PASS flows=4 clean_delivery_min=1.000 hostile_delivery_min=0.998 "
     "clean_imbalance=0.004 hostile_imbalance=0.008 imbalance_bound=0.010 "
-    "fair_share=0.2500 delivery_floor=0.995 clean_p99_max=121.0 ceiling=250.0",
+    "fair_share=0.2500 delivery_floor=0.995 clean_p99_max=121.0 ceiling=250.0 "
+    # The real line prints the hostile arm's own p99 guard beside the mandate
+    # ceiling, and that measurement is what names the series the latency panel's
+    # ceiling bound governs; the plotter refuses a crossed bound without it.
+    "hostile_p99_guard=900.0",
     "test m4_interactive_lane_fairness ... ok",
     "test result: ok. 4 passed; 0 failed",
 ]

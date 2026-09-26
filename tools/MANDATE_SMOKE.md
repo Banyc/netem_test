@@ -135,6 +135,15 @@ only.
    id the producer does not declare, and a verdict with no measurement behind
    it: a reader that skips those cannot tell a compliant producer from a
    changed one, and a verdict that measures nothing cannot be checked.
+
+   A measurement whose key ends in `_guard` is read as that arm's own
+   regression guard for the quantity the key names (`hostile_wire_guard=10.0`),
+   and the plotter names it on the bound the arm's bars cross, so a crossing
+   the verdict tolerates cannot be read as a budget breach. A producer that
+   asserts a looser guard on an arm therefore owes the key: the run's
+   measurements are what the panel attributes a crossing with, and a read of
+   those measurements that names no guard for the crossed quantity is a
+   crossing the panel draws as the breach it is.
 4. **`--quick`** — honour `MANDATE_SMOKE_QUICK=1` by taking the shortest
    measurement windows, while still printing all four `MANDATE` lines and
    writing all eight evidence files.
@@ -185,8 +194,10 @@ Into `--dir` (the path is printed, and recorded in the report):
   that producer's combined stdout and stderr, so a compile failure or a panic
   is inspectable after the fact;
 - `plots/<mandate>-<panel>.svg`, and `.png` unless `--no-rasterize` — the
-  verified panels, each checked for series geometry and for every declared
-  bound (a producer that declares no verdict section writes none);
+  verified panels, each checked for series geometry, for every declared
+  bound, for an axis that resolves the bounds it draws, and for what each
+  crossed bound is attributed to (a producer that declares no verdict section
+  writes none);
 - `mandate-check.json` — `schema` (`mandate-check/5`), `ok`, `exit_code`,
   `verdict`, `started_at`, `duration_seconds`, `producers_declared` and
   `producers_selected`, a `producers` record per *declared* producer (`id`,

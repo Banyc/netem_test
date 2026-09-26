@@ -35,6 +35,34 @@ panel/series (and the reverse), a malformed ``chart``, a non-numeric or
 non-finite ``x``/``y``, a written SVG that carries no series geometry, and a
 declared bound that did not make it into the SVG.
 
+**A panel that cannot show the failure it is drawn for is refused, not
+rendered.** `AGENTS.md` ("Read every panel") makes that a defect of the same
+family as an assertion that cannot fail, and two panels of the run that became
+`rtp_mux v0.0.22` were drawn that way (`AUDIT_COVERAGE.md`, "Plots that cannot
+show their own failure"). Two checks enforce it here, and neither can be
+silenced by softening a declaration:
+
+- **the axis test** — a bar panel's axis is chosen by `bar_axis_extent`, and
+  then measured: a bound the panel draws at its own scale needs a band of at
+  least `MIN_BOUND_PIXELS` of the axis height, because a departure of the size
+  the bound exists to catch must not be sub-pixel. The delivery floors failed
+  it: over `0..2` for a `0..1` quantity, the M4 floor's 0.5 % band was 1.1
+  pixels. A panel that fails is an error naming the axis and the bound.
+- **the governance test** — a bound drawn across a bar panel whose bars split
+  around it (an outlier split: at most a third of them beyond it, the rest not)
+  is a departure whose meaning lives in *the run*: an arm's own guard may
+  tolerate what the mandate bound forbids. The run's own per-arm guard
+  measurements (`*_guard` keys of the `MANDATE` line, passed in as `run_values`
+  by `tools/mandate-check`) are therefore named on the line, and a render that
+  is *not* given the run's measurements, for a bound a minority of the bars
+  crosses, is refused: without them the label would read as a breach the verdict
+  tolerates (the M2 wire budget line across the hostile and lone-tail arms). A
+  declaration may state its own governance instead with `bounds[i].series`
+  and/or `bounds[i].x` (which also clips the drawn line to the x-window it
+  governs). A crossing the run asserts nothing loosely against — a per-flow
+  delivery floor with no guard — stands as the breach it draws and is not
+  refused: the evidence survives a failing run.
+
 Two reading choices the input contract leaves open, decided here and made
 loud instead of silent:
 
@@ -87,6 +115,55 @@ CSV_COLUMNS = ("panel", "series", "x", "y")
 PANEL_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 LEGEND_COLUMNS = 4
 
+# -- the bar-panel axis policy --------------------------------------------
+#
+# A bar panel's y axis is *chosen*, not inherited from the data's min/max,
+# because the choice decides whether the panel can show its own bound.
+MIN_UNIT_SPAN = 0.01
+"""The smallest span a fraction panel (`[0, 1]` quantity) may be drawn over.
+
+Without it, a quantity pinned at its ideal has no span to draw, and the zoom
+would amplify sampling noise into an apparent departure.
+"""
+
+MIN_BOUND_PIXELS = 6.0
+"""The least height, in pixels, a one-sided bound's own region must be drawn in.
+
+`AGENTS.md`'s test is "would a regression be visible at this scale?": the
+region around a one-sided bound is the only place its failure can show, and
+`AUDIT_COVERAGE.md` records the delivery panels failing it at half a pixel.
+Six pixels is three line widths — a step, not a smudge — and it is measured in
+pixels rather than as a share of the axis because the defect it catches is
+sub-*pixel*: a floor 19 % of the way up an axis is not the same defect as one
+0.5 % of the way up.
+"""
+
+FRAME_HEADROOM = 0.05
+"""The share of the span kept between the frame and the nearest datum/bound."""
+
+CROSSING_BULK_SHARE = 1.0 / 3.0
+"""Above this share on the far side, a split is a target, not a crossing.
+
+A bound the bars split around evenly (the fair share of `M4-shares`) is a
+value the bars are expected to sit at, and no attribution of it is owed; a
+bound with at most a third of the bars beyond it (`M2-wire`'s lone 6.6x bar
+against the 6x budget) is read as a departure, and the panel must say what the
+departure is asserted against.
+"""
+
+GUARD_KEY_SUFFIX = "_guard"
+"""The `MANDATE` line's per-arm guard measurements: `hostile_wire_guard=10`."""
+
+BAR_BOUND_LABEL_STYLE = (
+    REPORT.BOUND_LABEL_STYLE + ";stroke:#ffffff;stroke-width:3;paint-order:stroke"
+)
+"""A bar panel's bound label, haloed white.
+
+The label names what the line governs now, so it is longer than the bound's own
+name and usually lands across the bars it describes; the halo keeps it legible
+there instead of asking the reader to decode dark text on a saturated bar.
+"""
+
 
 class MandatePlotError(Exception):
     """A mandate-panel production failure that must surface as a non-zero exit."""
@@ -109,6 +186,47 @@ def _require_number(value, where):
     if not math.isfinite(number):
         _fail(f"{where} must be finite, got {value!r}")
     return number
+
+
+def _require_extent(value, where):
+    """A pinned `[low, high]` axis, or ``None`` when not declared."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        _fail(f"{where} must be a two-element [low, high] list when present")
+    low = _require_number(value[0], f"{where}[0]")
+    high = _require_number(value[1], f"{where}[1]")
+    if not low < high:
+        _fail(f"{where} must be [low, high] with low < high, got {value!r}")
+    return (low, high)
+
+
+def bound_governed_x(bound):
+    """The x-window a bound declares it governs, or ``None`` for the panel's own.
+
+    ``x`` is one category, a list of categories, or ``{"min", "max"}``; the
+    categories themselves are checked against the CSV's own x values when the
+    panel is rendered, because the declaration does not carry them.
+    """
+    governed = bound.get("x")
+    if governed is None:
+        return None
+    if isinstance(governed, dict):
+        low = _require_number(governed.get("min"), "bound.x.min")
+        high = _require_number(governed.get("max"), "bound.x.max")
+        if not low <= high:
+            _fail(f"bound.x must be min <= max, got {governed!r}")
+        return (low, high)
+    if isinstance(governed, (int, float)) and not isinstance(governed, bool):
+        value = float(governed)
+        return (value, value)
+    if isinstance(governed, (list, tuple)) and governed:
+        values = [_require_number(item, "bound.x[]") for item in governed]
+        return (min(values), max(values))
+    _fail(
+        "bound.x must be a number, a non-empty list of numbers, or "
+        f"{{'min': .., 'max': ..}}, got {governed!r}"
+    )
 
 
 def load_declaration(path):
@@ -200,6 +318,15 @@ def validate_declaration(document, path):
                 _fail(f"{bound_where} must be an object, got {type(bound).__name__}")
             _require_number(bound.get("y"), f"{bound_where}.y")
             _require_text(bound.get("label"), f"{bound_where}.label")
+            if bound.get("series") is not None:
+                _require_text(bound["series"], f"{bound_where}.series")
+            bound_governed_x(bound)
+        _require_extent(panel.get("y_extent"), f"{where}.y_extent")
+        if panel.get("chart") == "cdf" and panel.get("y_extent") is not None:
+            _fail(
+                f"{where}.y_extent cannot pin a cdf panel: its axis is the fixed "
+                "0-100 percentile axis the CSV's y is already carried on"
+            )
     return mandate, title, x_label, y_label, panels
 
 
@@ -322,27 +449,350 @@ def check_chart_domain(panel, points):
                 )
 
 
-def _bounds(panel):
-    return [(float(bound["y"]), bound["label"]) for bound in panel.get("bounds") or []]
+def _bound_specs(panel):
+    """The panel's declared bounds as dicts with a numeric ``y``."""
+    specs = []
+    for bound in panel.get("bounds") or []:
+        spec = dict(bound)
+        spec["y"] = float(bound["y"])
+        specs.append(spec)
+    return specs
 
 
-def svg_bar_chart(title, x_label, y_label, series, bounds=None):
-    """Grouped bars for ``[(name, [(x, y)])]`` on a zero baseline.
+def _bound_values(series):
+    return [value for _, points in series for _, value in points]
+
+
+def unit_span(values, bounds):
+    """The quantity's unit (1.0) when every value and bound lies in ``[0, 1]``.
+
+    A panel of fractions of a whole — a delivery ratio, a share, a fraction of
+    the shaped clock — has a natural top. Detecting it is what lets the axis
+    policy below tell a floor at the top of that unit from a floor in the
+    middle of a range, which is the difference between `M4-delivery` (whose
+    bound *is* the top) and `M3-fraction` (whose bound has half the axis between
+    it and the data).
+    """
+    if not values:
+        return None
+    if all(0.0 <= value <= 1.0 for value in values) and all(
+        0.0 <= y <= 1.0 for y in bounds
+    ):
+        return 1.0
+    return None
+
+
+def bound_side(values, y):
+    """``floor``/``cap`` when every value is on one side of ``y``, else ``None``.
+
+    A bound the values straddle is a *target* the panel is read against (a fair
+    share, a symmetric departure band), not a line a bar can fail, so it is
+    drawn as it stands and owes the axis test nothing.
+    """
+    if not values:
+        return None
+    if all(value >= y for value in values):
+        return "floor"
+    if all(value <= y for value in values):
+        return "cap"
+    return None
+
+
+def bound_band(values, y, unit):
+    """The width of the region the axis must resolve for a one-sided bound.
+
+    The nearest value on the bound's own side is how close a failing departure
+    begins; a bound sitting at its ideal has no such distance at all, and there
+    the unit's own resolution floor (`MIN_UNIT_SPAN`) is what the axis has to
+    show in its place — `M2`'s delivery floor is `1.000`, so nothing below it is
+    tolerated and the axis still has to make a small loss visible.
+    """
+    nearest = min((abs(value - y) for value in values), default=0.0)
+    return max(nearest, MIN_UNIT_SPAN * unit if unit else 0.0)
+
+
+def crossing_values(values, y):
+    """The values beyond ``y`` that the panel reads as a departure.
+
+    Empty unless at most `CROSSING_BULK_SHARE` of the bars are beyond the
+    bound: a bound the bars split around evenly is the value they are expected
+    to sit at (`M4-shares`' fair share), while a lone bar past the line is a
+    crossing whose attribution the panel owes its reader (`M2-wire`).
+    """
+    below = [value for value in values if value < y]
+    above = [value for value in values if value > y]
+    total = len(below) + len(above)
+    if not total:
+        return []
+    if len(above) <= CROSSING_BULK_SHARE * total:
+        return above
+    if len(below) <= CROSSING_BULK_SHARE * total:
+        return below
+    return []
+
+
+def run_guards(run_values, series=None, text=""):
+    """The run's own per-arm guards, from the `MANDATE` line's `*_guard` keys.
+
+    Only a guard about *this* panel's quantity is named: the guard's last
+    underscore token has to appear in one of the panel's series names or in the
+    text the bound carries, so `hostile_wire_guard` is named on the wire panel
+    while a `hostile_p99_guard` is not named on a delivery panel whose series
+    are `clean`/`hostile`. A guard named against the wrong quantity would be
+    worse than no attribution: it would look like evidence.
+    """
+    if not isinstance(run_values, dict):
+        return []
+    haystack = [name for name, _ in series or []] + [text]
+    guards = []
+    for key in sorted(run_values):
+        value = run_values[key]
+        if not isinstance(key, str) or not key.endswith(GUARD_KEY_SUFFIX):
+            continue
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        if series is not None:
+            token = key[: -len(GUARD_KEY_SUFFIX)].rsplit("_", 1)[-1]
+            if token and not any(token in entry for entry in haystack):
+                continue
+        guards.append((key, float(value)))
+    return guards
+
+
+def bar_plot_height(series_count):
+    """The pixel height of a bar panel's plot area, as `svg_bar_chart` lays it out."""
+    legend_columns = min(max(series_count, 1), LEGEND_COLUMNS)
+    legend_rows = math.ceil(max(series_count, 1) / legend_columns)
+    return REPORT.HEIGHT - (REPORT.PAD_TOP + (legend_rows - 1) * 18) - REPORT.PAD_BOTTOM
+
+
+def bound_is_the_scale(values, y, unit):
+    """Whether this bound is what the panel's axis has to resolve.
+
+    Two shapes: a **floor at the top of the unit**, where the quantity's ideal
+    is the bound itself or a hair below it (`M2`/`M4` delivery), and a
+    **crossing**, where a minority of the bars has passed the bound and the
+    band around it is the whole reading (`M2-wire`'s lone bar past the budget).
+    A bound the bars split around evenly is a target (`M4-shares`), and an
+    untouched bound far from every bar is not the panel's scale either.
+    """
+    if bound_side(values, y) == "floor" and unit is not None:
+        if unit - y <= FRAME_HEADROOM * unit:
+            return True
+    return bool(crossing_values(values, y))
+
+
+def bar_axis_extent(series, bounds):
+    """The y extent for one bar panel, as ``(low, high)``.
+
+    Two shapes, and the choice between them is the whole point:
+
+    - **the band view**, for a fraction of a unit whose floor sits at the top of
+      that unit (within `FRAME_HEADROOM`). The zero baseline is meaningless
+      there — a delivery ratio cannot fail towards zero — and it is exactly what
+      left `M4-delivery`'s 0.5 % floor band at half a pixel of a 0..2 axis. The
+      axis is drawn around the floor instead: as far below it as its own band is
+      wide (never less than `MIN_UNIT_SPAN` of the unit), so the floor splits the
+      plot into the region it tolerates and the region it fails.
+    - **the zero baseline**, every other bar panel's shape, because there the
+      bar's length from zero is the reading. Unchanged from the data-driven
+      extent of `rtp_trace_report`.
+    """
+    values = _bound_values(series)
+    ys = [bound["y"] for bound in bounds]
+    unit = unit_span(values, ys)
+    if unit is not None:
+        for bound in bounds:
+            if bound_is_the_scale(values, bound["y"], unit):
+                band = bound_band(values, bound["y"], unit)
+                span = 2.0 * band
+                headroom = FRAME_HEADROOM * span
+                return (unit - span - headroom, unit + headroom)
+    low, high = REPORT.extent_including_bounds(
+        REPORT.finite_extent(series), [(y, "") for y in ys]
+    )
+    return (min(low, 0.0), max(high, 0.0))
+
+
+def check_panel_axis(panel_id, series, bounds, extent, plot_height=None):
+    """Problems that make an axis unable to show a bound drawn on it.
+
+    This is `AGENTS.md`'s first panel test — "would a regression be visible at
+    this scale?" — as a measurement: the band around a bound the panel draws as
+    its scale must be at least `MIN_BOUND_PIXELS` tall, or the failure the bound
+    exists to catch is sub-pixel. The delivery panels failed it at 0.5 %, which
+    is why `bar_axis_extent` draws them as a band view now; a pinned `y_extent`
+    that reintroduces the failure is refused by name.
+    """
+    problems = []
+    low, high = extent
+    span = high - low
+    if not span > 0:
+        return [f"panel {panel_id!r}: the axis {low!r}..{high!r} has no span"]
+    if plot_height is None:
+        plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    values = _bound_values(series)
+    unit = unit_span(values, [bound["y"] for bound in bounds])
+    for bound in bounds:
+        y = bound["y"]
+        if bound_side(values, y) is None and not crossing_values(values, y):
+            continue
+        band = bound_band(values, y, unit)
+        pixels = band / span * plot_height
+        if pixels < MIN_BOUND_PIXELS:
+            problems.append(
+                f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} leaves the "
+                f"bound {bound['label']!r} (y={y:g}) a band of {band:.4g} "
+                f"({band / span:.1%} of its height, {pixels:.1f} px of "
+                f"{plot_height:.0f}), under the {MIN_BOUND_PIXELS:.0f} px a bound "
+                "needs to show the departure it exists to catch, so that "
+                "departure would be sub-pixel"
+            )
+    return problems
+
+
+def check_bound_governance(panel_id, series, bounds, run_values):
+    """Problems that make a crossed bound unreadable: nothing says what governs it.
+
+    `AGENTS.md`'s second panel test — "does each drawn bound apply to every
+    series it crosses?" — as a measurement. A bound a minority of the bars sit
+    beyond is read as a departure, and whether that departure is a breach or an
+    arm's tolerated tripwire is a property of *the run*, held in the run's own
+    per-arm guards. The panel therefore needs the run's measurements: without
+    them it must not guess, and the render is refused rather than drawn so a
+    reader cannot conclude a breach the verdict tolerates (the `M2-wire`
+    defect).
+
+    A crossing is *not* refused when the run's measurements are supplied but
+    hold no guard for this panel's quantity: a mandate bound nothing is asserted
+    loosely against (a per-flow delivery floor) then stands as the breach it
+    draws, and the panel keeps its evidence.
+    """
+    problems = []
+    values = _bound_values(series)
+    for bound in bounds:
+        crossing = crossing_values(values, bound["y"])
+        if not crossing:
+            continue
+        if bound.get("series") or bound.get("x"):
+            continue
+        if run_values is not None:
+            continue
+        problems.append(
+            f"panel {panel_id!r} draws the bound {bound['label']!r} "
+            f"(y={bound['y']:g}) with {len(crossing)} of {len(values)} bar(s) "
+            "beyond it, and the run's own measurements were not supplied, so the "
+            "panel cannot say whether that crossing is a breach or an arm's "
+            "tolerated guard; pass the run's MANDATE values (tools/mandate-check "
+            "does) or declare which series the bound governs with "
+            "bounds[].series / bounds[].x"
+        )
+    return problems
+
+
+def check_bound_x_categories(panel_id, series, bounds):
+    """Every x a bound declares it governs must be a category the panel draws."""
+    problems = []
+    categories = sorted({x for _, points in series for x, _ in points})
+    names = {name for name, _ in series}
+    for bound in bounds:
+        window = bound_governed_x(bound)
+        if window is not None:
+            low, high = window
+            governed = [x for x in categories if low <= x <= high]
+            if not governed:
+                problems.append(
+                    f"panel {panel_id!r}: the bound {bound['label']!r} declares it "
+                    f"governs x={low:g}..{high:g}, and the panel draws no category "
+                    f"there (its categories are {categories})"
+                )
+            elif len(governed) < len(categories) and (
+                low != min(governed) or high != max(governed)
+            ):
+                problems.append(
+                    f"panel {panel_id!r}: the bound {bound['label']!r} declares it "
+                    f"governs x={low:g}..{high:g}, which is not a boundary between "
+                    f"the panel's categories {categories}"
+                )
+        if bound.get("series") and bound["series"] not in names:
+            problems.append(
+                f"panel {panel_id!r}: the bound {bound['label']!r} declares it "
+                f"governs series {bound['series']!r}, which the panel does not "
+                f"declare (its series are {sorted(names)})"
+            )
+    return problems
+
+
+def axis_label(y_label, extent):
+    """The y label, plus a note when the axis is a truncated band view.
+
+    A bar's length is a claim about its value, so an axis that does not start
+    at zero has to say so on its own face; the ticks alone leave the reader to
+    notice, and the figure is read long after the tick range is.
+    """
+    low, high = extent
+    if low > 0.0:
+        decimals = max(2, math.ceil(-math.log10(high - low)) + 2)
+        return (
+            f"{y_label} [band view {low:.{decimals}g}..{high:.{decimals}g}, "
+            "not 0-based]"
+        )
+    return y_label
+
+
+def governed_label(bound, series, run_values, crossing=True):
+    """A bound's label plus the clause naming what the line governs.
+
+    The crossing clause is for bar panels, where one line is drawn across many
+    bars and the bars' own guards are the only thing that distinguishes a
+    breach from a tolerated tripwire. A line panel's series carry their own
+    legend entries, so its bounds are labelled with their declared governance
+    and left at that.
+    """
+    clauses = []
+    if bound.get("series"):
+        clauses.append(f"governs series {bound['series']}")
+    window = bound_governed_x(bound)
+    if window is not None:
+        low, high = window
+        clauses.append(
+            f"governs x={low:g}" if low == high else f"governs x={low:g}..{high:g}"
+        )
+    values = _bound_values(series)
+    crossed = crossing_values(values, bound["y"]) if crossing else []
+    if crossed:
+        clause = f"{len(crossed)} of {len(values)} bars beyond it"
+        guards = run_guards(run_values, series, bound["label"])
+        if guards:
+            clause += "; run guards " + " ".join(
+                f"{key}={value:g}" for key, value in guards
+            )
+        clauses.append(clause)
+    if not clauses:
+        return bound["label"]
+    return f"{bound['label']} [{'; '.join(clauses)}]"
+
+
+def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run_values=None):
+    """Grouped bars for ``[(name, [(x, y)])]`` on the axis ``bar_axis_extent`` picks.
 
     ``rtp_trace_report.svg_histogram`` buckets raw samples, which is a
     different contract from declared x/y points, so the bars are drawn here
-    with the report's own axis constants, palette and extent helper.
+    with the report's own axis constants, palette and extent helper. ``bounds``
+    are declaration dicts: each is drawn across the x-window it governs (the
+    whole plot unless it declares ``x``), and labelled with that governance.
     """
     series = [(name, points) for name, points in series if points]
+    bounds = bounds or []
     if not series:
         return f"<section><h2>{html.escape(title)}</h2><p>No samples.</p></section>"
     xs = [x for _, points in series for x, _ in points]
     x_min, x_max = min(xs), max(xs)
     if x_min == x_max:
         x_min, x_max = x_min - 0.5, x_max + 0.5
-    y_min, y_max = REPORT.extent_including_bounds(REPORT.finite_extent(series), bounds)
-    y_min = min(y_min, 0.0)
-    y_max = max(y_max, 0.0)
+    if extent is None:
+        extent = bar_axis_extent(series, bounds)
+    y_min, y_max = extent
     legend_columns = min(len(series), LEGEND_COLUMNS)
     legend_rows = math.ceil(len(series) / legend_columns)
     plot_top = REPORT.PAD_TOP + (legend_rows - 1) * 18
@@ -364,7 +814,15 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None):
     # larger than the plot's pixel width.
     group_width = min((slot / (x_max - x_min)) * plot_width * 0.8, plot_width / 2)
     bar_width = group_width / len(series)
-    baseline = sy(0.0)
+    # Bars rise from the axis' own bottom. On a zero-baseline axis that is zero,
+    # as before; on the band view the axis starts at the floor's band, so the
+    # bar's length is the margin over that band — which is the reading.
+    baseline = sy(max(y_min, 0.0) if y_min <= 0.0 else y_min)
+    # A band view's ticks span a few percent of the unit; the report's two
+    # decimals would print its six ticks as three values.
+    y_decimals = 2
+    if y_min > 0.0:
+        y_decimals = min(6, max(2, math.ceil(-math.log10(y_max - y_min)) + 2))
     parts = [
         f"<section><h2>{html.escape(title)}</h2><svg viewBox=\"0 0 {REPORT.WIDTH} {REPORT.HEIGHT}\" role=\"img\">",
         f"<rect x=\"{REPORT.PAD_LEFT}\" y=\"{plot_top}\" width=\"{plot_width}\" height=\"{plot_height}\" class=\"plot-bg\"/>",
@@ -378,7 +836,7 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None):
         y_value = y_min + (y_max - y_min) * fraction
         y = sy(y_value)
         parts.append(f"<line x1=\"{REPORT.PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{REPORT.WIDTH - REPORT.PAD_RIGHT}\" y2=\"{y:.1f}\" class=\"grid\"/>")
-        parts.append(f"<text x=\"{REPORT.PAD_LEFT - 9}\" y=\"{y + 4:.1f}\" text-anchor=\"end\">{y_value:.2f}</text>")
+        parts.append(f"<text x=\"{REPORT.PAD_LEFT - 9}\" y=\"{y + 4:.1f}\" text-anchor=\"end\">{y_value:.{y_decimals}f}</text>")
     for index, (name, points) in enumerate(series):
         color = REPORT.COLORS[index % len(REPORT.COLORS)]
         for x_value, y_value in points:
@@ -392,12 +850,26 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None):
             left += index * bar_width
             top = sy(y_value)
             parts.append(f"<rect x=\"{left:.1f}\" y=\"{min(top, baseline):.1f}\" width=\"{bar_width * 0.9:.1f}\" height=\"{abs(top - baseline):.1f}\" fill=\"{color}\"/>")
-    for y_value, label in bounds or []:
-        y = sy(y_value)
-        parts.append(f"<line class=\"bound\" x1=\"{REPORT.PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{REPORT.WIDTH - REPORT.PAD_RIGHT}\" y2=\"{y:.1f}\" stroke=\"{REPORT.BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
-        parts.append(f"<text class=\"bound-label\" x=\"{REPORT.WIDTH - REPORT.PAD_RIGHT - 4}\" y=\"{y - 5:.1f}\" text-anchor=\"end\" style=\"{REPORT.BOUND_LABEL_STYLE}\">{html.escape(label)}</text>")
+    for bound in bounds or []:
+        y = sy(bound["y"])
+        window = bound_governed_x(bound)
+        if window is None:
+            left, right = REPORT.PAD_LEFT, REPORT.WIDTH - REPORT.PAD_RIGHT
+        else:
+            left = max(
+                min(sx(window[0]) - group_width / 2, sx(window[1]) + group_width / 2),
+                REPORT.PAD_LEFT,
+            )
+            right = min(
+                max(sx(window[0]) - group_width / 2, sx(window[1]) + group_width / 2),
+                REPORT.WIDTH - REPORT.PAD_RIGHT,
+            )
+            left, right = min(left, right), max(left, right)
+        label = governed_label(bound, series, run_values)
+        parts.append(f"<line class=\"bound\" x1=\"{left:.1f}\" y1=\"{y:.1f}\" x2=\"{right:.1f}\" y2=\"{y:.1f}\" stroke=\"{REPORT.BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
+        parts.append(f"<text class=\"bound-label\" x=\"{right - 4:.1f}\" y=\"{y - 5:.1f}\" text-anchor=\"end\" style=\"{BAR_BOUND_LABEL_STYLE}\">{html.escape(label)}</text>")
     parts.append(f"<text x=\"{REPORT.WIDTH / 2}\" y=\"{REPORT.HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
-    parts.append(f"<text x=\"18\" y=\"{REPORT.HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {REPORT.HEIGHT / 2})\">{html.escape(y_label)}</text>")
+    parts.append(f"<text x=\"18\" y=\"{REPORT.HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {REPORT.HEIGHT / 2})\">{html.escape(axis_label(y_label, extent))}</text>")
     parts.append("<g class=\"legend\">")
     for index, (name, _) in enumerate(series):
         column = index % legend_columns
@@ -411,7 +883,7 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None):
     return "".join(parts)
 
 
-def panel_markup(title, x_label, y_label, panel, points):
+def panel_markup(title, x_label, y_label, panel, points, run_values=None):
     """Markup for one declared panel, as exactly one ``<svg>`` document span."""
     chart = panel["chart"]
     chart_title = f"{title} [{panel['id']}]"
@@ -421,13 +893,48 @@ def panel_markup(title, x_label, y_label, panel, points):
         (entry["name"], sorted(points[(panel["id"], entry["name"])]))
         for entry in panel["series"]
     ]
-    bounds = _bounds(panel)
-    if chart == "line":
-        markup = REPORT.svg_line_chart(chart_title, panel_x_label, panel_y_label, series, None, bounds)
-    elif chart == "cdf":
-        markup = REPORT.svg_cdf_chart(chart_title, panel_x_label, panel_y_label, series, bounds)
+    bounds = _bound_specs(panel)
+    extent = _require_extent(panel.get("y_extent"), f"panels.{panel['id']}.y_extent")
+    if chart == "bar":
+        axis = extent if extent is not None else bar_axis_extent(series, bounds)
+        problems = (
+            check_panel_axis(
+                panel["id"],
+                series,
+                bounds,
+                axis,
+                bar_plot_height(len(series)),
+            )
+            + check_bound_governance(panel["id"], series, bounds, run_values)
+            + check_bound_x_categories(panel["id"], series, bounds)
+        )
+        if problems:
+            _fail("\n  ".join(problems))
+        markup = svg_bar_chart(
+            chart_title,
+            panel_x_label,
+            panel_y_label,
+            series,
+            bounds,
+            axis,
+            run_values,
+        )
+    elif chart == "line":
+        labelled = [
+            (bound["y"], governed_label(bound, series, run_values, crossing=False))
+            for bound in bounds
+        ]
+        markup = REPORT.svg_line_chart(
+            chart_title, panel_x_label, panel_y_label, series, extent, labelled
+        )
     else:
-        markup = svg_bar_chart(chart_title, panel_x_label, panel_y_label, series, bounds)
+        labelled = [
+            (bound["y"], governed_label(bound, series, run_values, crossing=False))
+            for bound in bounds
+        ]
+        markup = REPORT.svg_cdf_chart(
+            chart_title, panel_x_label, panel_y_label, series, labelled
+        )
     panels = RENDER.extract_svg_panels(markup)
     if len(panels) != 1:
         _fail(
@@ -448,14 +955,22 @@ def standalone(markup, title):
     return document[:cut] + f"<title>{html.escape(title)}</title>" + document[cut:]
 
 
-def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None):
+def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None, run_values=None):
     """Validate one mandate, write and verify its panels, and rasterize them.
 
+    ``run_values`` are the ``MANDATE`` line's own measurements for this
+    mandate, as parsed by ``tools/mandate-check``. They are used for exactly
+    one thing: naming the run's per-arm guards (`*_guard`) on a bound whose
+    bars cross it, so the panel cannot read as a breach the verdict tolerates.
+    They change no plotted point, series or bound value.
+
     Raises MandatePlotError naming the problem for any invalid declaration or
-    data file, any empty panel or undeclared series, any written SVG without
-    series geometry, or any declared bound missing from the SVG; raises
-    ``render_graph.RenderGraphError`` (naming the browser, or the offending
-    PNG) when rasterization was requested and could not be verified.
+    data file, any empty panel or undeclared series, any axis that cannot show
+    a bound it carries, any crossed bound that states nothing about what it
+    governs, any written SVG without series geometry, or any declared bound
+    missing from the SVG; raises ``render_graph.RenderGraphError`` (naming the
+    browser, or the offending PNG) when rasterization was requested and could
+    not be verified.
     """
     declaration_path = Path(declaration_path)
     document = load_declaration(declaration_path)
@@ -488,7 +1003,7 @@ def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None):
     }
     for panel in panels:
         panel_id = panel["id"]
-        markup = panel_markup(title, x_label, y_label, panel, points)
+        markup = panel_markup(title, x_label, y_label, panel, points, run_values)
         problems = RENDER.validate_panel(0, markup)
         if problems:
             _fail(
@@ -537,6 +1052,30 @@ def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None):
     return summary
 
 
+def load_run_values(path_or_json):
+    """The run's `MANDATE` measurements, from a JSON object or a file of one.
+
+    The label it feeds is prose about the run, so an unreadable or non-object
+    value is an error rather than a silently unattributed panel.
+    """
+    if path_or_json is None:
+        return None
+    text = path_or_json
+    candidate = Path(path_or_json)
+    if candidate.is_file():
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError as error:
+            _fail(f"run values unreadable: {candidate}: {error}")
+    try:
+        values = json.loads(text)
+    except json.JSONDecodeError as error:
+        _fail(f"run values are neither a JSON object nor a file of one: {error}")
+    if not isinstance(values, dict):
+        _fail(f"run values must be a JSON object, got {type(values).__name__}")
+    return values
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
@@ -575,6 +1114,16 @@ def main(argv=None):
         "a known Chrome/Chromium path)",
     )
     parser.add_argument(
+        "--run-values",
+        default=None,
+        metavar="JSON|PATH",
+        help=(
+            "this run's MANDATE measurements (a JSON object or a file of one), "
+            "used only to name the run's own per-arm * _guard values on a bound "
+            "whose bars cross it"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="print a JSON summary of the produced panels",
@@ -587,6 +1136,7 @@ def main(argv=None):
             args.out,
             rasterize=args.rasterize,
             browser=args.browser,
+            run_values=load_run_values(args.run_values),
         )
     except (MandatePlotError, RENDER.RenderGraphError) as error:
         print(f"mandate_plot: error: {error}", file=sys.stderr)

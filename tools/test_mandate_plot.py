@@ -99,6 +99,123 @@ NULL_BROWSER = """#!/usr/bin/env python3
 """
 
 
+# The M2 and M4 panels of the preserved battery run in which the audit found
+# panels drawn so that their own bound could not be seen (`AUDIT_COVERAGE.md`,
+# "Plots that cannot show their own failure"). These declarations and rows are
+# that run's own, so the axis tests below are about that run's numbers.
+DELIVERY_DECLARATION = {
+    "mandate": "M4",
+    "title": "M4 interactive lane fairness: 4 flows on one interactive lane",
+    "x_label": "flow (1..4)",
+    "y_label": "share of the lane's delivered bytes",
+    "panels": [
+        {
+            "id": "delivery",
+            "chart": "bar",
+            "y_label": "delivery (received / offered)",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [
+                {"y": 0.995, "label": "M4 per-flow delivery floor 0.995"}
+            ],
+        }
+    ],
+}
+
+DELIVERY_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["delivery", "clean", 1.0, 1.0],
+    ["delivery", "clean", 2.0, 1.0],
+    ["delivery", "clean", 3.0, 1.0],
+    ["delivery", "clean", 4.0, 1.0],
+    ["delivery", "hostile", 1.0, 1.0],
+    ["delivery", "hostile", 2.0, 1.0],
+    ["delivery", "hostile", 3.0, 1.0],
+    ["delivery", "hostile", 4.0, 1.0],
+]
+
+WIRE_DECLARATION = {
+    "mandate": "M2",
+    "title": "M2 interactive delivery and own-wire multiple",
+    "x_label": "arm (1=clean 2=hostile 3=lone_tail)",
+    "y_label": "value",
+    "panels": [
+        {
+            "id": "wire",
+            "chart": "bar",
+            "series": [{"name": "wire_x"}],
+            "bounds": [{"y": 6, "label": "M2 wire budget 6x"}],
+        }
+    ],
+}
+
+WIRE_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["wire", "wire_x", 1.0, 2.151595],
+    ["wire", "wire_x", 2.0, 5.000262],
+    ["wire", "wire_x", 3.0, 6.633134],
+]
+
+# The run's own verdict measurements for M2, whose per-arm guards are what the
+# wire panel's label names instead of reading as a breach the verdict tolerates.
+WIRE_RUN_VALUES = {
+    "budget": 6.0,
+    "clean_wire_x": 2.15,
+    "hostile_wire_guard": 10.0,
+    "hostile_wire_x": 5.0,
+    "lone_wire_guard": 14.0,
+    "lone_wire_x": 6.63,
+}
+
+SHARES_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["shares", "clean", 1.0, 0.250059],
+    ["shares", "clean", 2.0, 0.250059],
+    ["shares", "clean", 3.0, 0.249941],
+    ["shares", "clean", 4.0, 0.249941],
+    ["shares", "hostile", 1.0, 0.250173],
+    ["shares", "hostile", 2.0, 0.249365],
+    ["shares", "hostile", 3.0, 0.250289],
+    ["shares", "hostile", 4.0, 0.250173],
+]
+
+SHARES_DECLARATION = {
+    "mandate": "M4",
+    "title": "M4 interactive lane fairness: 4 flows on one interactive lane",
+    "x_label": "flow (1..4)",
+    "y_label": "share of the lane's delivered bytes",
+    "panels": [
+        {
+            "id": "shares",
+            "chart": "bar",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [{"y": 0.250000, "label": "fair share 25.0%"}],
+        }
+    ],
+}
+
+FRACTION_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["fraction", "fraction", 1.0, 0.958217],
+    ["fraction", "fraction", 2.0, 0.958271],
+    ["fraction", "fraction", 3.0, 0.963341],
+]
+
+FRACTION_DECLARATION = {
+    "mandate": "M3",
+    "title": "M3 bulk goodput vs the shaped clock and the configured link rate",
+    "x_label": "seed",
+    "y_label": "fraction of link rate",
+    "panels": [
+        {
+            "id": "fraction",
+            "chart": "bar",
+            "series": [{"name": "fraction"}],
+            "bounds": [{"y": 0.35, "label": "M3 floor 0.35x link rate"}],
+        }
+    ],
+}
+
+
 class MandatePlotTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/tmp"))
@@ -145,6 +262,293 @@ class MandatePlotTest(unittest.TestCase):
         self.assertIn("mandate_plot: error:", stderr)
         self.assertIn(fragment, stderr)
         return stderr
+
+    # -- the axis test: a panel must be able to show its own bound -----------
+
+    def render_mandate(self, declaration, rows, name, *arguments):
+        """Render one declaration and return ``(exit code, stderr, out dir)``."""
+        out = self.root / f"out-{name}"
+        declaration_path = self.write_mandate(declaration, rows, name=name)
+        code, _, stderr = self.run_main(
+            str(declaration_path),
+            "--no-rasterize",
+            "--out",
+            str(out),
+            *arguments,
+        )
+        return code, stderr, out
+
+    def test_the_delivery_floor_that_was_sub_pixel_is_now_the_axis_feature(self):
+        # The audit's measurement: over the old 0..2 axis, M4's 0.5 % floor band
+        # was 0.25 % of the height. The band view has to spend a real share of
+        # the axis on it, or the panel cannot show the failure it is drawn for.
+        series = [
+            ("clean", [(x, 1.0) for x in (1.0, 2.0, 3.0, 4.0)]),
+            ("hostile", [(x, 1.0) for x in (1.0, 2.0, 3.0, 4.0)]),
+        ]
+        bounds = [{"y": 0.995, "label": "M4 per-flow delivery floor 0.995"}]
+        extent = MANDATE.bar_axis_extent(series, bounds)
+        low, high = extent
+        self.assertGreater(low, 0.0, "the delivery axis cannot be 0-based")
+        self.assertLessEqual(high - low, 4 * (high - 0.995) + 1e-12)
+        self.assertEqual(MANDATE.check_panel_axis("delivery", series, bounds, extent), [])
+        # A 0.5 % loss has to be a visible step, not half a pixel.
+        band = max(1.0 - 0.995, MANDATE.MIN_UNIT_SPAN)
+        pixels = band / (high - low) * MANDATE.bar_plot_height(2)
+        self.assertGreaterEqual(pixels, MANDATE.MIN_BOUND_PIXELS)
+        # and the old axis, the one the audit measured, is refused by name
+        old = MANDATE.check_panel_axis("delivery", series, bounds, (0.0, 2.0))
+        self.assertEqual(len(old), 1, old)
+        self.assertIn("0.5%", old[0])
+        self.assertIn("sub-pixel", old[0])
+        self.assertIn("M4 per-flow delivery floor 0.995", old[0])
+
+    def test_a_mis_scaled_axis_fails_the_whole_render(self):
+        # The vacuity half: the same unchanged data on the axis the audit found
+        # cannot be rendered at all, rather than silently drawn at half scale.
+        declaration = {
+            **DELIVERY_DECLARATION,
+            "panels": [
+                {
+                    **DELIVERY_DECLARATION["panels"][0],
+                    "y_extent": [0.0, 2.0],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(declaration, DELIVERY_ROWS, "M4bad")
+        self.assertNotEqual(code, 0)
+        self.assertIn("mandate_plot: error:", stderr)
+        self.assertIn("M4 per-flow delivery floor 0.995", stderr)
+        self.assertIn("sub-pixel", stderr)
+
+    def test_the_real_delivery_panel_renders_a_band_view(self):
+        code, stderr, out = self.render_mandate(
+            DELIVERY_DECLARATION, DELIVERY_ROWS, "M4"
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-delivery.svg").read_text(encoding="utf-8")
+        self.assertIn("band view", document)
+        self.assertIn("not 0-based", document)
+        # A delivery floor the run meets exactly still has to resolve its band:
+        # a 0.5 % loss is a large visible step, not half a pixel.
+        self.assertIn("M4 per-flow delivery floor 0.995", document)
+        self.assertNotIn(">2.00<", document)
+
+    def test_panels_whose_axis_can_already_show_their_bound_are_unchanged(self):
+        # The deliberate coarse view, whose fine counterpart is M4-imbalance,
+        # and a floor with half the axis between it and the data: both keep the
+        # zero baseline and the data-driven extent they had.
+        for name, declaration, rows, expected in (
+            ("M4shares", SHARES_DECLARATION, SHARES_ROWS, (0.0, 0.2503)),
+            ("M3frac", FRACTION_DECLARATION, FRACTION_ROWS, (0.0, 0.9942)),
+        ):
+            with self.subTest(panel=name):
+                code, stderr, out = self.render_mandate(declaration, rows, name)
+                self.assertEqual(code, 0, stderr)
+                panel_id = declaration["panels"][0]["id"]
+                document = (out / f"{declaration['mandate']}-{panel_id}.svg").read_text(
+                    encoding="utf-8"
+                )
+                self.assertNotIn("band view", document)
+                ticks = [
+                    float(value)
+                    for value in MANDATE.re.findall(
+                        r'text-anchor="end">([-0-9.]+)<', document
+                    )
+                ]
+                self.assertAlmostEqual(ticks[0], expected[0], places=2)
+                self.assertAlmostEqual(ticks[-1], expected[1], places=2)
+
+    def test_a_floor_far_below_the_data_keeps_the_zero_baseline(self):
+        series = [("fraction", [(1.0, 0.958217), (2.0, 0.958271)])]
+        bounds = [{"y": 0.35, "label": "M3 floor 0.35x link rate"}]
+        self.assertEqual(MANDATE.bar_axis_extent(series, bounds)[0], 0.0)
+
+    def test_a_bound_the_bars_split_around_is_a_target_not_a_crossing(self):
+        # M4-shares' fair share: the bars straddle it, so it is the value they are
+        # read against and owes no attribution. M2-wire's lone bar past the
+        # budget is the crossing the panel has to explain.
+        shares = [0.250059, 0.250059, 0.249941, 0.249941, 0.250173, 0.249365,
+                  0.250289, 0.250173]
+        self.assertEqual(MANDATE.crossing_values(shares, 0.25), [])
+        wire = [2.151595, 5.000262, 6.633134]
+        self.assertEqual(MANDATE.crossing_values(wire, 6.0), [6.633134])
+
+    # -- the governance test: a crossed bound must say what it governs -------
+
+    def test_a_crossed_bound_without_the_run_is_refused(self):
+        # The vacuity half: the M2 wire panel's own numbers, with the run's
+        # measurements not supplied, is the panel the audit found misleading — a
+        # crossing the panel cannot attribute. It is refused, not drawn.
+        code, stderr, _ = self.render_mandate(WIRE_DECLARATION, WIRE_ROWS, "M2bare")
+        self.assertNotEqual(code, 0)
+        self.assertIn("M2 wire budget 6x", stderr)
+        self.assertIn("run's own measurements were not supplied", stderr)
+        self.assertIn("tolerated guard", stderr)
+
+    def test_the_run_s_own_guards_attribute_the_crossed_wire_bound(self):
+        out = self.root / "out-M2"
+        declaration_path = self.write_mandate(
+            WIRE_DECLARATION, WIRE_ROWS, name="M2run"
+        )
+        code, _, stderr = self.run_main(
+            str(declaration_path),
+            "--no-rasterize",
+            "--out",
+            str(out),
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+        # Every drawn bound now says who is beyond it and by which guard, so the
+        # crossing lone bar can no longer be read as a budget breach.
+        self.assertIn("1 of 3 bars beyond it", document)
+        self.assertIn("hostile_wire_guard=10", document)
+        self.assertIn("lone_wire_guard=14", document)
+        # the data itself is untouched: the same three bars, at the same heights
+        rects = MANDATE.re.findall(r'<rect x="[-0-9.]+\w*"', document)
+        self.assertTrue(rects)
+
+    def test_a_declared_governance_attributes_the_bound_without_a_run(self):
+        declaration = {
+            **WIRE_DECLARATION,
+            "panels": [
+                {
+                    **WIRE_DECLARATION["panels"][0],
+                    "bounds": [
+                        {"y": 6, "label": "M2 wire budget 6x", "series": "wire_x", "x": [1]}
+                    ],
+                }
+            ],
+        }
+        code, stderr, out = self.render_mandate(declaration, WIRE_ROWS, "M2decl")
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+        self.assertIn("governs series wire_x", document)
+        self.assertIn("governs x=1", document)
+        bounds = MANDATE.re.findall(
+            r'class="bound" x1="([0-9.]+)" y1="[0-9.]+" x2="([0-9.]+)"', document
+        )
+        self.assertEqual(len(bounds), 1, bounds)
+        left, right = (float(value) for value in bounds[0])
+        # governed by x=1 alone, so the line stops over the first bar group
+        # instead of running to the plot's right edge as a panel-wide one does
+        self.assertGreater(right - left, 0.0)
+        self.assertLess(right, MANDATE.REPORT.WIDTH - MANDATE.REPORT.PAD_RIGHT)
+
+    def test_a_governed_x_the_panel_does_not_draw_is_an_error(self):
+        declaration = {
+            **WIRE_DECLARATION,
+            "panels": [
+                {
+                    **WIRE_DECLARATION["panels"][0],
+                    "bounds": [{"y": 6, "label": "b", "x": [9]}],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(declaration, WIRE_ROWS, "M2x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("draws no category", stderr)
+
+    def test_a_governed_series_the_panel_does_not_declare_is_an_error(self):
+        declaration = {
+            **WIRE_DECLARATION,
+            "panels": [
+                {
+                    **WIRE_DECLARATION["panels"][0],
+                    "bounds": [{"y": 6, "label": "b", "series": "clean"}],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(declaration, WIRE_ROWS, "M2s")
+        self.assertNotEqual(code, 0)
+        self.assertIn("governs series 'clean'", stderr)
+
+    def test_a_malformed_governed_x_is_an_error(self):
+        for value, fragment in (
+            ("all", "bound.x must be a number"),
+            ([], "bound.x must be a number"),
+            ({"min": 1}, "bound.x.max must be a number"),
+            ({"min": 2, "max": 1}, "min <= max"),
+        ):
+            with self.subTest(x=value):
+                declaration = {
+                    **WIRE_DECLARATION,
+                    "panels": [
+                        {
+                            **WIRE_DECLARATION["panels"][0],
+                            "bounds": [{"y": 6, "label": "b", "x": value}],
+                        }
+                    ],
+                }
+                code, stderr, _ = self.render_mandate(declaration, WIRE_ROWS, "M2bad")
+                self.assertNotEqual(code, 0)
+                self.assertIn(fragment, stderr)
+
+    def test_a_malformed_pinned_extent_is_an_error(self):
+        for value, fragment in (
+            ([1.0], "two-element [low, high] list"),
+            ([2.0, 1.0], "low < high"),
+            ([1.0, "high"], "must be a number"),
+        ):
+            with self.subTest(extent=value):
+                declaration = {
+                    **DELIVERY_DECLARATION,
+                    "panels": [
+                        {**DELIVERY_DECLARATION["panels"][0], "y_extent": value}
+                    ],
+                }
+                code, stderr, _ = self.render_mandate(declaration, DELIVERY_ROWS, "M4e")
+                self.assertNotEqual(code, 0)
+                self.assertIn(fragment, stderr)
+
+    def test_a_pinned_extent_on_a_cdf_panel_is_an_error(self):
+        panel = dict(HEALTHY_DECLARATION["panels"][1], y_extent=[0.0, 100.0])
+        declaration = dict(
+            HEALTHY_DECLARATION,
+            panels=[HEALTHY_DECLARATION["panels"][0], panel],
+        )
+        self.reject(declaration, fragment="cannot pin a cdf panel")
+
+    def test_a_breached_delivery_floor_still_renders_and_shows_the_breach(self):
+        # The other half of that rule: a floor the run asserts no looser guard
+        # against is a breach when a bar crosses it, so the panel must keep its
+        # evidence on the run that fails rather than refuse to be drawn. The
+        # crossing also makes the panel a band view, so the breach is at scale.
+        rows = [
+            row if row[:3] != ["delivery", "hostile", 2.0] else ["delivery", "hostile", 2.0, 0.994]
+            for row in DELIVERY_ROWS
+        ]
+        declaration_path = self.write_mandate(DELIVERY_DECLARATION, rows, name="M4breach")
+        out = self.root / "out-M4breach"
+        code, _, stderr = self.run_main(
+            str(declaration_path),
+            "--no-rasterize",
+            "--out",
+            str(out),
+            "--run-values",
+            json.dumps({"delivery_floor": 0.995, "hostile_p99_guard": 900.0}),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-delivery.svg").read_text(encoding="utf-8")
+        # the breach is named, and no unrelated guard is pulled in by name
+        self.assertIn("1 of 8 bars beyond it", document)
+        self.assertNotIn("hostile_p99_guard", document)
+        self.assertIn("band view", document)
+
+    def test_run_values_that_are_not_an_object_are_an_error(self):
+        declaration_path = self.write_mandate(WIRE_DECLARATION, WIRE_ROWS, name="M2v")
+        code, _, stderr = self.run_main(
+            str(declaration_path),
+            "--no-rasterize",
+            "--out",
+            str(self.out),
+            "--run-values",
+            "[1, 2]",
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("run values must be a JSON object", stderr)
 
     # -- healthy renders ---------------------------------------------------
 
