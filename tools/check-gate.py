@@ -12,6 +12,17 @@ that MUST run in the default (`cargo test`, non-`#[ignore]`d) tier. The default
 tier is defined by the absence of `#[ignore]`, so without this an asserting
 scenario can silently be re-ignored and stop running.
 
+The reserved target name `lib` names the package's `--lib` target, and it is a
+real opt-in surface: the `gate-manifest`, `gate-default-required` and
+`gate-asserting` blocks may name `lib::<module>::<test>` the same way they name
+an integration target, and their ignored tests are resolved from
+`cargo test -p <package> --lib -- --list --ignored` rather than dying as an
+unexplained STALE entry or a `--test lib` cargo failure. A `lib` entry is
+resolved beside the scenario directory's targets, never instead of them: the
+scenario targets are still required to be classified, while an ignored lib test
+no block names is reported by name (advisory, since a lib target is a separate
+surface and a declaration written before this one existed must not fail).
+
 Finally it enforces the report-only/asserting split. `standard` and `full`
 scenarios assert a property; `perf` scenarios are report-only by definition and
 must not contain an assertion in their own body. The `gate-asserting` block
@@ -246,6 +257,16 @@ class CrateLayout:
         return "netem-test" if self.is_harness else self.package
 
     @property
+    def lib_root(self) -> Path:
+        """The package root of the `--lib` target (``<lib_root>/src`` is its tree).
+
+        In harness mode the reserved target is the `netem-test` member, which
+        is a subdirectory of the workspace root; in per-crate mode it is the
+        checked package's own root.
+        """
+        return self.root / "netem-test" if self.is_harness else self.root
+
+    @property
     def kit_dir(self) -> Path:
         return self.crates_root / "netem_test" / "netem-test" / "src" / "kit"
 
@@ -347,9 +368,8 @@ def asserting_entries() -> list[str]:
     ]
 
 
-def test_bodies(target: str) -> dict[str, str]:
-    """Map each top-level `fn NAME` to its brace-balanced body."""
-    text = (layout().dir / f"{target}.rs").read_text(encoding="utf-8")
+def function_bodies(text: str) -> dict[str, str]:
+    """Map each `fn NAME` in ``text`` to its brace-balanced body."""
     bodies: dict[str, str] = {}
     for match in FN_RE.finditer(text):
         start = text.find("{", match.end())
@@ -370,15 +390,49 @@ def test_bodies(target: str) -> dict[str, str]:
     return bodies
 
 
+def target_source_label(target: str) -> str:
+    """The source a target's tests live in, for a diagnostic."""
+    if target == LIB_TARGET:
+        return str(layout().lib_root / "src")
+    return str(layout().dir / f"{target}.rs")
+
+
+def test_bodies(target: str) -> dict[str, str]:
+    """Map each top-level `fn NAME` of a target's sources to its body.
+
+    The reserved `lib` target has no `<dir>/<target>.rs`; its bodies come from
+    the lib package's `src/` tree, so a report-only `lib::…` scenario is
+    scanned for assertion tokens the same way an integration scenario is.
+    """
+    if target == LIB_TARGET:
+        bodies: dict[str, str] = {}
+        for path in lib_source_files():
+            bodies.update(function_bodies(path.read_text(encoding="utf-8")))
+        return bodies
+    text = (layout().dir / f"{target}.rs").read_text(encoding="utf-8")
+    return function_bodies(text)
+
+
 def found_tokens(body: str | None) -> list[str]:
     """The assertion tokens in ``body``, in source order."""
     return list(ASSERTION_TOKENS.findall(body or ""))
 
 
 def body_asserts(target: str, name: str, bodies: dict[str, str]) -> bool:
-    """True when the test function's own body contains an assertion token."""
-    body = bodies.get(name)
+    """True when the test function's own body contains an assertion token.
+
+    A `lib::<module>::<test>` name states its module path as well as its `fn`
+    name, and the lib bodies are keyed by the `fn` name alone, since the module
+    path is the source file's own (an inline `mod tests` adds no path segment
+    to the file that holds it).
+    """
+    body = bodies.get(lib_bare_name(target, name))
     return bool(body) and ASSERTION_TOKENS.search(body) is not None
+
+
+def lib_bare_name(target: str, test: str) -> str:
+    """A target test name's bare `fn` name: its last `::` segment for `lib`."""
+    return test.rsplit("::", 1)[-1] if target == LIB_TARGET else test
 
 
 def source_module(path: Path) -> str | None:
@@ -404,10 +458,65 @@ def source_module(path: Path) -> str | None:
                 return None
             stem = kit_parts[0][:-3]
             return prefix if stem == "mod" else f"{prefix}::{stem}"
+        if _is_lib_source(path):
+            return _lib_module_name(path)
         return None
     if len(parts) == 1:
         return ""
     return None
+
+
+def _is_lib_source(path: Path) -> bool:
+    """Whether ``path`` is a `.rs` file of the package's `--lib` target tree."""
+    try:
+        parts = path.relative_to(layout().lib_root / "src").parts
+    except ValueError:
+        return False
+    return bool(parts) and parts[-1].endswith(".rs")
+
+
+def _lib_module_name(path: Path) -> str:
+    """The Rust module path of a lib source file, from its own path.
+
+    A lib unit test is named `<module>::<test>` in `cargo test --lib -- --list`,
+    so a `lib::…` manifest entry can only be resolved (and its own body scanned
+    for assertion tokens) when the file that defines it carries the module path
+    the test name states.
+    """
+    parts = list(path.relative_to(layout().lib_root / "src").parts)
+    stem = parts[-1][:-3]
+    directory = parts[:-1]
+    return "::".join(directory if stem in ("lib", "mod") else [*directory, stem])
+
+
+def lib_source_files() -> list[Path]:
+    """Every `.rs` file shipped into the package's `--lib` test target.
+
+    The tree is read from the lib package's own root, so the harness's
+    `netem-test` member and a per-crate check's package both resolve.
+    """
+    root = layout().lib_root / "src"
+    if not root.is_dir():
+        return []
+    return sorted(root.rglob("*.rs"))
+
+
+def lib_test_identity(test: str) -> str | None:
+    """The identity of the lib source function ``test`` defines, if exactly one.
+
+    A lib test name states its module path, but the module path is the file's
+    own (an inline `mod tests` adds none), so the file is found by the `fn`
+    name it defines: two candidates leave the test unlocatable rather than
+    picking one.
+    """
+    name = lib_bare_name(LIB_TARGET, test)
+    found = [
+        function.identity
+        for path in lib_source_files()
+        for function in parse_functions(path)
+        if function.name == name
+    ]
+    return found[0] if len(found) == 1 else None
 
 
 def source_identity(path: Path) -> str:
@@ -449,6 +558,13 @@ def source_identity(path: Path) -> str:
         # one checkout location (e.g. a session worktree) stays valid when
         # the same tree lands at `crates/<crate>`.
         return f"{layout().package}/src/testkit/{path.name}"
+    if _is_lib_source(path):
+        # A lib source is identified relative to the checked root too
+        # (`netem-test/src/lib.rs` in harness mode, `src/lib.rs` per crate):
+        # a recording made against a session worktree must not name the
+        # worktree, so a `gate-perf-guard-helpers` entry a lib test reaches
+        # stays valid once the tree lands.
+        return str(path.relative_to(layout().root))
     return str(path.relative_to(layout().crates_root))
 
 
@@ -587,10 +703,23 @@ def target_source_files(target: str) -> list[Path]:
     perf tier's reach into them stays declared; every crate shares the sibling
     checkout layout, so Cargo assumes exactly that layout.
     """
-    files = [layout().dir / f"{target}.rs"]
+    if target == LIB_TARGET:
+        files = list(lib_source_files())
+    else:
+        files = [layout().dir / f"{target}.rs"]
     for kit_dir, _ in layout().kit_source_dirs():
         files.extend(sorted(kit_dir.glob("*.rs")))
-    return [path for path in files if path.exists()]
+    # The lib tree contains the harness kit when the checked package *is* the
+    # harness member, so the kit dirs are added on top of it: de-duplicate by
+    # resolved path or the same function is scanned twice.
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in files:
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
 
 
 def target_functions(paths: list[Path]) -> list[SourceFunction]:
@@ -732,8 +861,11 @@ def helper_scan(manifest: dict[str, str]) -> tuple[dict[str, int], dict[str, lis
         graph = TargetGraph(target_functions(paths), paths)
         seeds = []
         for test in tests:
-            ident = f"{source_identity(layout().dir / f'{target}.rs')}::{test}"
-            if ident in graph.functions:
+            if target == LIB_TARGET:
+                ident = lib_test_identity(test)
+            else:
+                ident = f"{source_identity(layout().dir / f'{target}.rs')}::{test}"
+            if ident is not None and ident in graph.functions:
                 seeds.append(ident)
             else:
                 unlocatable.append(f"{target}::{test}")
@@ -2842,7 +2974,13 @@ def listed_test_names(
 
 
 def listed_scenarios(target: str, *, ignored: bool) -> set[str]:
-    return listed_test_names(target, ignored=ignored)
+    """A target's test names, resolving the reserved `lib` name to `--lib`."""
+    return listed_test_names(
+        target,
+        ignored=ignored,
+        lib=(target == LIB_TARGET),
+        package=layout().lib_package if target == LIB_TARGET else None,
+    )
 
 
 def ignored_scenarios(target: str) -> set[str]:
@@ -2898,15 +3036,33 @@ def main() -> int:
     for target in targets:
         actual |= ignored_scenarios(target)
 
+    # The reserved `lib` target is an opt-in surface too, but it is not a file
+    # in the scenario directory, so it is derived beside — never instead of —
+    # those targets: the scenario set stays mandatory, a `lib::…` entry stops
+    # being an unexplained STALE and resolves against the package's `--lib`
+    # target, and an ignored lib test no block names is reported by name.
+    actual_lib = ignored_scenarios(LIB_TARGET)
+
     bad = False
     missing = sorted(actual - manifest.keys())
-    stale = sorted(manifest.keys() - actual)
+    stale = sorted(manifest.keys() - actual - actual_lib)
     if missing or stale:
         for name in missing:
             print(f"UNCLASSIFIED ignored scenario: {name}")
         for name in stale:
             print(f"STALE manifest entry (no longer ignored): {name}")
         bad = True
+
+    undeclared_lib = sorted(actual_lib - manifest.keys())
+    for name in undeclared_lib:
+        print(
+            f"note: unclassified ignored lib scenario {name}; a lib opt-in is "
+            "recorded as a `lib::<module>::<test> = <tier>` line of the "
+            "```gate-manifest block or as a ```gate-perf-design row naming the "
+            "reserved `lib` target (advisory, because the lib target is a "
+            "separate opt-in surface and a declaration written before it was "
+            "nameable must not fail for omitting one)"
+        )
 
     required = required_default_entries()
     for entry in required:
@@ -2956,8 +3112,8 @@ def main() -> int:
             print(
                 f"ASSERTING scenario in report-only perf tier "
                 f"(re-tier to standard/full/default or make it report-only): {name} "
-                f"[file {layout().dir / f'{target}.rs'}, token(s): "
-                f"{', '.join(sorted(set(found_tokens(bodies.get(test)))))}]"
+                f"[file {target_source_label(target)}, token(s): "
+                f"{', '.join(sorted(set(found_tokens(bodies.get(lib_bare_name(target, test))))))}]"
             )
             bad = True
 
@@ -3048,6 +3204,11 @@ def main() -> int:
     print(f"gate manifest OK: {len(actual)} ignored scenarios classified")
     for tier in sorted(by_tier):
         print(f"  {tier}: {by_tier[tier]}")
+    if actual_lib:
+        print(
+            f"  lib target: {len(actual_lib)} ignored scenario(s), "
+            f"{len(actual_lib) - len(undeclared_lib)} named in gate-manifest"
+        )
     print(f"  default-required: {len(required)} asserting scenario(s) present")
     print(f"  gate-asserting: {len(expected_asserting)} asserting scenario(s) recorded")
     print(

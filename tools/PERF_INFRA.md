@@ -88,6 +88,19 @@ tiers are the `gate-manifest` tiers), and the reserved target name `lib` names
 the package's `--lib` target, which is where the harness's own wall-clock
 probes live.
 
+The reserved target is a declaration surface in its own right, not only a
+`gate-perf-design` row name: `gate-manifest`, `gate-default-required` and
+`gate-asserting` may each carry a `lib::<module>::<test>` line, which the
+checker resolves through `cargo test -p <package> --lib` rather than
+`--test lib`. The scenario directory's targets stay mandatory — every target
+under it must be classified — while the lib target's ignored set is derived
+beside them: a `lib::…` line resolves and is body-scanned for the report-only
+tier exactly as an integration scenario is, and an ignored lib test no block
+names is printed by name as an advisory note, because a manifest written before
+the lib target was nameable must not fail for omitting one. A declaration that
+names a `lib` test the compiled target does not report is still refused, and a
+removed one is still STALE.
+
 **One reference cannot serve every family, so a declaration may carry several
 baselines.** `baseline = <row>` is the **default** reference a row inherits
 when its relation names none; each `baseline.<family> = <row>` line declares a

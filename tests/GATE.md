@@ -64,7 +64,13 @@ battery lanes cannot separate. Nothing else lives here — the layer scenarios a
 in the crates that own the code they exercise.
 
 The `gate-default-required` block names the asserting scenarios that must stay
-in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
+in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. It may
+name the reserved `lib` target beside the scenario targets — the harness's own
+`--lib` unit tests — and the checker resolves such an entry against
+`cargo test -p netem-test --lib` rather than `--test lib`:
+`lib::tests::a_closed_blackout_gate_consumes_no_prng_draws` is the one lib
+property pinned here, so the PRNG-draw conformance rule the emulation is
+reproducible from cannot be silently dropped from the always-run tier. The
 `gate-asserting` block records the report-only/asserting split.
 
 ```gate-default-required
@@ -81,6 +87,7 @@ raw_netem_pair::netem_pair_raw_udp_echo_clean_link
 raw_netem_pair::netem_pair_raw_udp_latency_is_observable
 lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot
 lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
+lib::tests::a_closed_blackout_gate_consumes_no_prng_draws
 ```
 
 ## Opt-in manifest
@@ -118,6 +125,7 @@ raw_netem_pair::netem_pair_raw_udp_latency_is_observable
 lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot
 lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
 lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot
+lib::tests::a_closed_blackout_gate_consumes_no_prng_draws
 ```
 
 ## Perf-tier reach into asserting helpers

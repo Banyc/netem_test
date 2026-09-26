@@ -82,6 +82,27 @@ fn t_beta() {
 }
 """
 
+# The reserved `lib` target's tree: one report-only `#[ignore]`d probe and one
+# always-run test, so a `lib::…` entry in either manifest block resolves from
+# the lib source the way cargo reports it.
+LIB_RS = """pub fn helper() -> u8 {
+    1
+}
+
+mod tests {
+    #[test]
+    fn t_lib_default() {
+        assert_eq!(super::helper(), 1);
+    }
+
+    #[test]
+    #[ignore = "release perf probe"]
+    fn probe() {
+        println!("report only");
+    }
+}
+"""
+
 GATE_TEMPLATE = """# the fixture gate
 
 ```gate-manifest
@@ -119,7 +140,7 @@ BASE_PLAN = {
     "lists": {
         "tests|alpha": {"default": ["t_ok"], "ignored": ["t_ig"]},
         "tests|beta": {"default": ["t_beta"], "ignored": []},
-        "tests|lib": {"default": [], "ignored": ["tests::probe"]},
+        "tests|lib": {"default": ["tests::t_lib_default"], "ignored": ["tests::probe"]},
     }
 }
 
@@ -152,6 +173,8 @@ class CheckGatePerfTest(unittest.TestCase):
         (self.root / "tests" / "tests").mkdir(parents=True)
         (self.root / "tests" / "tests" / "alpha.rs").write_text(ALPHA_RS, encoding="utf-8")
         (self.root / "tests" / "tests" / "beta.rs").write_text(BETA_RS, encoding="utf-8")
+        (self.root / "src").mkdir(parents=True)
+        (self.root / "src" / "lib.rs").write_text(LIB_RS, encoding="utf-8")
         self.bin_dir = Path(self._tmp.name) / "bin"
         self.bin_dir.mkdir()
         cargo = self.bin_dir / "cargo"
@@ -243,6 +266,45 @@ class CheckGatePerfTest(unittest.TestCase):
         self.assertIn(
             "gate-perf-composite: alpha::t_ig varies metric, scale", output
         )
+
+    # -- the reserved `lib` target ------------------------------------------
+
+    def test_a_lib_entry_in_the_manifest_resolves(self):
+        """A `lib::…` opt-in is declared, not refused as an unexplained STALE."""
+        self.write_gate(manifest="alpha::t_ig = perf\nlib::tests::probe = perf")
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn(
+            "lib target: 1 ignored scenario(s), 1 named in gate-manifest", output
+        )
+        self.assertNotIn("STALE manifest entry", output)
+
+    def test_an_undeclared_lib_opt_in_is_reported_by_name(self):
+        """The lib target's ignored set is advisory, but it is not silent."""
+        self.write_gate()
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn(
+            "note: unclassified ignored lib scenario lib::tests::probe", output
+        )
+        self.assertIn("lib target: 1 ignored scenario(s), 0 named", output)
+
+    def test_a_lib_entry_in_gate_default_required_resolves(self):
+        """`gate-default-required` resolves the reserved target through `--lib`."""
+        self.write_gate(
+            required="alpha::t_ok\nlib::tests::t_lib_default",
+            asserting="alpha::t_ok\nlib::tests::t_lib_default",
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("default-required: 2 asserting scenario(s) present", output)
+
+    def test_a_lib_entry_that_is_not_an_ignored_test_is_still_stale(self):
+        """The new resolution does not turn `gate-manifest` into a free-form list."""
+        self.write_gate(
+            manifest="alpha::t_ig = perf\nlib::tests::probe = perf\nlib::tests::t_nope = perf"
+        )
+        self.rejects("STALE manifest entry (no longer ignored): lib::tests::t_nope")
 
     def test_declaration_without_perf_blocks_still_passes(self):
         (self.root / "tests" / "GATE.md").write_text(
