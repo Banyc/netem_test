@@ -39,7 +39,7 @@ declared bound that did not make it into the SVG.
 rendered.** `AGENTS.md` ("Read every panel") makes that a defect of the same
 family as an assertion that cannot fail, and two panels of the run that became
 `rtp_mux v0.0.22` were drawn that way (`AUDIT_COVERAGE.md`, "Plots that cannot
-show their own failure"). Three checks enforce it here, and none can be
+show their own failure"). Every check below enforces it, and none can be
 silenced by softening a declaration:
 
 - **the axis test** — a bar panel's axis is chosen by `bar_axis_extent`, and
@@ -77,6 +77,47 @@ silenced by softening a declaration:
   widths real Chrome measured), so a font wider than that bound is outside what
   it can catch; the vertical extent needs no width and is caught whatever font
   draws it.
+- **the axis-range test** — `check_named_values_in_axis` measures every value a
+  panel *names* against the axis it draws: every bound, and every per-arm guard
+  its own label names. A `M2-wire` panel that announced
+  `hostile_wire_guard=10` and `lone_wire_guard=14` on an axis topping out at
+  6.6 was naming two values the reader could not see, and the region between
+  the budget and the guard — the region the crossing it explains lives in — was
+  off the frame with them. An axis that does not resolve a value the panel
+  names is an error, and so is a named value drawn on the frame's own edge.
+- **the headroom test** — `check_bound_headroom` requires `MIN_HEADROOM_PIXELS`
+  of axis above the highest value a panel names, so the bar that crosses that
+  value has somewhere to go. An axis topping out *at* the bound draws a breach
+  and a value exactly at the bound as the same picture: `M4-shares` was drawn
+  over `0..0.25` — the fair share itself — so a flow over the share could not
+  be drawn at all. `axis_with_headroom` spends the span's own 5 % and then the
+  pixel floor, because a fair share pinned at 25 % has a data spread of a
+  ten-thousandth and the span's 5 % of it is a third of a pixel.
+- **the label-overlap test** — `check_label_overlap` refuses a label drawn
+  twice on one anchor or any two labels sharing ink. The preserved run drew
+  `fair share 25.0%fair share 25.0%` at a single anchor, leaving the text of
+  neither readable; wrapped lines of one label are exempt, since they are
+  stacked a line height apart.
+- **the bar-separation test** — `check_bar_separation` refuses two bars that
+  touch, because flush bars read as one continuously growing quantity rather
+  than as separate values. It measures the geometry that produced the
+  staircase: the old placement clamped each category's group towards the middle
+  so the outermost groups overlapped their neighbours by 52 px, and one
+  series then painted a rising ribbon. Bars are laid out in category bands with
+  the domain padded by half a band at each end, so no placement is clamped and
+  every pair keeps `MIN_BAR_GAP_PIXELS`.
+- **the canvas-text test** — `check_canvas_text_fit` refuses a drawn text that
+  leaves the canvas (a label the reader cannot finish, including the *rotated*
+  y label, whose length runs along the panel's height) and a text carrying an
+  empty template (`[]`, `()`, `None`), which draws the absence of the evidence
+  its own label claims. The band-view note is drawn inside the plot for this
+  reason: appended to the y label it was 66 characters rotated down a 300 px
+  margin.
+- **the legend test** — `check_series_labels` refuses a legend that draws a
+  producer's column name (`wire_x`, `shaper_forwarded`) instead of the
+  quantity's name. `series_label` maps the names whose prettified form is still
+  cryptic and prettifies the rest; a legend that shows the CSV's spelling is a
+  claim about the producer's code, not about the run.
 
 Two reading choices the input contract leaves open, decided here and made
 loud instead of silent:
@@ -142,6 +183,20 @@ PLOT_BG_RE = re.compile(
 BOUND_LABEL_RE = re.compile(r'<text class="bound-label"([^>]*)>(.*?)</text>', re.S)
 BOUND_LABEL_TITLE_RE = re.compile(r"<title>.*?</title>", re.S)
 TEXT_ATTRIBUTE_RE = re.compile(r'([A-Za-z][\w-]*)="([^"]*)"')
+TEXT_ELEMENT_RE = re.compile(r"<text\b([^>]*)>(.*?)</text>", re.S)
+ROTATE_RE = re.compile(r"rotate\(\s*[-0-9.]+\s+([-0-9.]+)\s+([-0-9.]+)\s*\)")
+BAR_RECT_RE = re.compile(
+    r'<rect x="([-0-9.]+)" y="([-0-9.]+)" width="([-0-9.]+)" '
+    r'height="([-0-9.]+)" fill="(#[0-9A-Fa-f]{6})"'
+)
+LEGEND_GROUP_RE = re.compile(r'<g class="legend">(.*?)</g>', re.S)
+LABEL_OVERLAP_PX2 = 1.0
+"""The area two drawn labels may share before the panel is refused.
+
+One square pixel of shared ink is a rendering artefact at this scale; more than
+that is a label the reader cannot read, and the run that drew
+`fair share 25.0%fair share 25.0%` at one anchor shared all of it.
+"""
 
 # -- the bar-panel axis policy --------------------------------------------
 #
@@ -191,6 +246,80 @@ The label names what the line governs now, so it is longer than the bound's own
 name and usually lands across the bars it describes; the halo keeps it legible
 there instead of asking the reader to decode dark text on a saturated bar.
 """
+
+MIN_HEADROOM_PIXELS = 6.0
+"""The least height, in pixels, an axis keeps above the highest bound it names.
+
+The standing rule is that the failure a panel is drawn for must be drawable
+inside its frame. A bound drawn flush with the top of its axis leaves the bar
+that crosses it nowhere to go: a breach and a value exactly at the bound paint
+the same picture, and the reader cannot tell which one the run measured. Six
+pixels is `MIN_BOUND_PIXELS`, for the same reason — below it an over-bound bar
+is a smudge against the frame rather than a bar.
+"""
+
+MIN_AXIS_INSET_PIXELS = 2.0
+"""The least distance, in pixels, a named bound keeps from the frame's own edge.
+
+A bound drawn *on* the frame is not inside the axis range: it reads as the
+frame's border, and the region it governs is off the panel.
+"""
+
+MIN_BAR_GAP_PIXELS = 1.0
+"""The least gap between two drawn bars.
+
+Bars drawn flush read as one continuously growing quantity — the staircase a
+reader sees as a ribbon — rather than as three values, so the gap is a property
+of the panel rather than a matter of taste.
+"""
+
+BAR_BAND_INSET_SHARE = 0.12
+"""The share of a category's band kept clear at each end of it."""
+
+BAR_GAP_SHARE = 0.18
+"""The share of a bar's slot left as the gap to its neighbour."""
+
+SERIES_LABEL_VOCABULARY = {
+    "wire_x": "own-wire multiple",
+    "fraction": "fraction of link rate",
+}
+"""Human names for the producer columns whose prettified form is still cryptic.
+
+`wire_x` is this battery's own-wire multiple: the `x` is the multiple, not a
+run of the series, and no mechanical rule recovers that. `fraction` is a
+*dimensionless* fraction of the configured link rate, and it is the panel's own
+`y_label` too (a panel with one series names that series' quantity), so a reader
+is never shown `MiB/s` — the sibling goodput panel's unit — over it. Every other
+column name the producers emit is prettified by `series_label`
+(`shaper_forwarded` -> `shaper forwarded`), and a name that is already a word
+(`delivery`, `hostile`) is left alone.
+"""
+
+RAW_COLUMN_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+"""The shape of a column name: snake_case, which a legend must not show raw."""
+
+PLACEHOLDER_TEXT_RE = re.compile(r"\[\s*\]|\(\s*\)|\bNone\b|\bnull\b|\bnan\b")
+"""What a template renders where the collection it names came out empty.
+
+A panel drawing `[]` where a list of guards belongs is drawing the absence of
+the evidence its label claims, so it is refused the way a missing bound is.
+"""
+
+
+def series_label(name):
+    """The human label a series is drawn with, never its raw column name.
+
+    The legend is how a reader tells one series from another, and a column name
+    is not a name for a quantity: `shaper_forwarded` is the shaper's forwarded
+    rate, and the reader should not have to decode the producer's spelling to
+    learn that. The vocabulary is for the names a mechanical prettification
+    still leaves cryptic; everything else snake_case is prettified.
+    """
+    if name in SERIES_LABEL_VOCABULARY:
+        return SERIES_LABEL_VOCABULARY[name]
+    if RAW_COLUMN_NAME_RE.match(name):
+        return name.replace("_", " ")
+    return name
 
 
 class MandatePlotError(Exception):
@@ -526,7 +655,26 @@ def bound_side(values, y):
     return None
 
 
-def bound_band(values, y, unit):
+def failure_side(values, y):
+    """The side of ``y`` on which a departure begins, or ``0.0`` when neither is.
+
+    A **crossing** says so itself: the minority beyond the bound is the side a
+    bar failed towards. A one-sided bound says so too — a cap fails upwards, a
+    floor downwards. A bound the bars split around evenly has no failing side at
+    all: it is the value they are read at.
+    """
+    crossing = crossing_values(values, y)
+    if crossing:
+        return 1.0 if max(crossing) > y else -1.0
+    side = bound_side(values, y)
+    if side == "cap":
+        return 1.0
+    if side == "floor":
+        return -1.0
+    return 0.0
+
+
+def bound_band(values, y, unit, tolerances=()):
     """The width of the region the axis must resolve for a one-sided bound.
 
     The nearest value on the bound's own side is how close a failing departure
@@ -534,9 +682,53 @@ def bound_band(values, y, unit):
     the unit's own resolution floor (`MIN_UNIT_SPAN`) is what the axis has to
     show in its place — `M2`'s delivery floor is `1.000`, so nothing below it is
     tolerated and the axis still has to make a small loss visible.
+
+    That margin is a proxy for the departure that matters, and it is the wrong
+    proxy when the run asserts a looser guard for the arms: a value inside its
+    guard is not a departure, so where the run names one the region the axis
+    owes the reader is the tolerance the guards open between the reference and
+    the point where a departure begins. `M2-wire` is exactly that panel, and it
+    is the reason the axis range cannot be derived from the data: an arm sitting
+    0.09 under a 6x budget makes the observed margin a sliver by construction,
+    and the tool refused the panel for a departure that is *tolerated* — three
+    times over, in three runs whose worst arm was 6.63, 6.05 and 5.91. The
+    margin rule is unchanged for every bound with no such guard (the delivery
+    floors, the fair-share bounds), which is where a small departure really
+    is the failure.
     """
+    side = failure_side(values, y)
+    if side:
+        tolerated = sorted(
+            abs(tolerance - y)
+            for tolerance in tolerances
+            if (tolerance - y) * side > 0.0
+        )
+        if tolerated:
+            return max(tolerated[0], MIN_UNIT_SPAN * unit if unit else 0.0)
     nearest = min((abs(value - y) for value in values), default=0.0)
     return max(nearest, MIN_UNIT_SPAN * unit if unit else 0.0)
+
+
+def clustered_around(values, y):
+    """Whether the values sit as a cluster around a bound in the middle of a unit.
+
+    The shape that makes a bound a *target* — `M4-shares`' fair share, whose
+    flows land on either side of 25 % by a ten-thousandth, and which the old
+    rule therefore labelled `1 of 8 bars beyond it` and drew as a crossing.
+    A fraction panel has a sampling resolution of its own (`MIN_UNIT_SPAN` of the
+    unit), and a bound every value sits within that resolution of is the value
+    the bars are read *at*.
+
+    None of this applies at the top of the unit, where a cluster is what
+    delivery looks like and the one bar below it is the breach the floor exists
+    to catch: `M4-delivery`'s seven bars at 1.000 and one at 0.994 against a
+    0.995 floor is clustered on the same scale, and reading it as a target would
+    lose the only failure that panel has.
+    """
+    unit = unit_span(values, [y])
+    if unit is None or unit - y <= FRAME_HEADROOM * unit:
+        return False
+    return all(abs(value - y) <= MIN_UNIT_SPAN * unit for value in values)
 
 
 def crossing_values(values, y):
@@ -545,8 +737,12 @@ def crossing_values(values, y):
     Empty unless at most `CROSSING_BULK_SHARE` of the bars are beyond the
     bound: a bound the bars split around evenly is the value they are expected
     to sit at (`M4-shares`' fair share), while a lone bar past the line is a
-    crossing whose attribution the panel owes its reader (`M2-wire`).
+    crossing whose attribution the panel owes its reader (`M2-wire`). A bound
+    the values are *clustered* around (`clustered_around`) has no crossing at
+    all: it is the target they are read at, not a line any of them failed.
     """
+    if clustered_around(values, y):
+        return []
     below = [value for value in values if value < y]
     above = [value for value in values if value > y]
     total = len(below) + len(above)
@@ -597,20 +793,72 @@ def bar_plot_height(series_count):
 def bound_is_the_scale(values, y, unit):
     """Whether this bound is what the panel's axis has to resolve.
 
-    Two shapes: a **floor at the top of the unit**, where the quantity's ideal
-    is the bound itself or a hair below it (`M2`/`M4` delivery), and a
-    **crossing**, where a minority of the bars has passed the bound and the
-    band around it is the whole reading (`M2-wire`'s lone bar past the budget).
-    A bound the bars split around evenly is a target (`M4-shares`), and an
-    untouched bound far from every bar is not the panel's scale either.
+    One shape: a **floor at the top of the unit** — the quantity's ideal is the
+    unit, the bound sits within `FRAME_HEADROOM` of it, and the bars *reach* for
+    it, so the axis is drawn around the top rather than from zero. The reaching
+    is tested on a majority rather than on every bar, because a delivery floor
+    that has just been breached is still the panel's scale (`M4-delivery`'s one
+    bar at 0.994 against a 0.995 floor) and drawing it from zero would put the
+    breach the panel exists for under a fifth of a pixel.
+
+    A **crossing** (`M2-wire`'s lone bar past the budget) is deliberately *not*
+    this shape: the band view draws the axis around the top of the unit, so a
+    crossing bound that is not at that top would be drawn off the axis entirely
+    — which is how `M4-shares`' fair share at 0.25 came to be labelled 7553 px
+    below its own plot. A bound the bars split around evenly is a target
+    (`M4-shares`), and an untouched bound far from every bar is not the panel's
+    scale either.
     """
-    if bound_side(values, y) == "floor" and unit is not None:
-        if unit - y <= FRAME_HEADROOM * unit:
-            return True
-    return bool(crossing_values(values, y))
+    if unit is None or unit - y > FRAME_HEADROOM * unit:
+        return False
+    reaching = [value for value in values if value >= y]
+    return len(reaching) * 2 > len(values)
 
 
-def bar_axis_extent(series, bounds):
+def named_guard_values(series, bounds, run_values, *, crossing):
+    """The run's own guards the panel's drawn labels will name.
+
+    Only what a label actually says counts as named. A bar panel's bound carries
+    the guards for the quantity it governs, so the axis has to carry them too —
+    whether or not a bar has crossed yet, because the range is the reason the
+    crossing is drawable at all when it comes. A line panel's label carries no
+    such clause, so the M1 latency panel does not silently inherit
+    `lone_p999_guard=8000` and blow its axis up to eight thousand milliseconds.
+    `governed_label` builds both labels the same way.
+    """
+    if not crossing or not isinstance(run_values, dict):
+        return []
+    guards = set()
+    for bound in bounds:
+        guards.update(
+            value for _, value in run_guards(run_values, series, bound["label"])
+        )
+    return sorted(guards)
+
+
+def axis_with_headroom(low, high, top, plot_height):
+    """Widen an axis so a value over its highest named bound is still drawable.
+
+    Two margins, because they answer different questions. `FRAME_HEADROOM` of
+    the span is the frame's own breathing room, so a line or tick at the top of
+    an axis does not merge with its border. `MIN_HEADROOM_PIXELS` is the
+    reader's: the highest bound the panel names needs enough axis above it that
+    a bar which crosses it is a bar, not a smudge — and on a panel whose data
+    spread is tiny against the bound (a fair share pinned at 25 %) the span's
+    own 5 % is under a pixel, so the pixel floor is what does the work.
+    """
+    span = high - low
+    if span > 0:
+        high = high + FRAME_HEADROOM * span
+    minimum = MIN_HEADROOM_PIXELS / plot_height
+    if top > high:
+        return (low, high)
+    if minimum < 1.0 and high - top < minimum * (high - low):
+        high = max(high, (top - minimum * low) / (1.0 - minimum))
+    return (low, high)
+
+
+def bar_axis_extent(series, bounds, run_values=None, plot_height=None):
     """The y extent for one bar panel, as ``(low, high)``.
 
     Two shapes, and the choice between them is the whole point:
@@ -623,11 +871,18 @@ def bar_axis_extent(series, bounds):
       wide (never less than `MIN_UNIT_SPAN` of the unit), so the floor splits the
       plot into the region it tolerates and the region it fails.
     - **the zero baseline**, every other bar panel's shape, because there the
-      bar's length from zero is the reading. Unchanged from the data-driven
-      extent of `rtp_trace_report`.
+      bar's length from zero is the reading. The extent carries every bound the
+      panel draws *and* every guard its own label names, because a panel that
+      announces `lone_wire_guard=14` on an axis topping out at 6.7 is naming a
+      value it does not draw — the guard is then off the chart, and so is the
+      region between the budget and it, which is where the crossing the panel
+      exists to explain actually lies.
     """
     values = _bound_values(series)
     ys = [bound["y"] for bound in bounds]
+    guards = named_guard_values(series, bounds, run_values, crossing=True)
+    if plot_height is None:
+        plot_height = bar_plot_height(len(series))
     unit = unit_span(values, ys)
     if unit is not None:
         for bound in bounds:
@@ -636,13 +891,41 @@ def bar_axis_extent(series, bounds):
                 span = 2.0 * band
                 headroom = FRAME_HEADROOM * span
                 return (unit - span - headroom, unit + headroom)
-    low, high = REPORT.extent_including_bounds(
-        REPORT.finite_extent(series), [(y, "") for y in ys]
+    named = [*ys, *guards]
+    low = min([0.0, *values, *named])
+    high = max([0.0, *values, *named])
+    return axis_with_headroom(low, high, max(named) if named else high, plot_height)
+
+
+def line_axis_extent(series, bounds, pinned=None):
+    """The y extent of a line or CDF panel, as the report's own chart lays it out."""
+    if pinned is not None:
+        return pinned
+    return REPORT.extent_including_bounds(
+        REPORT.finite_extent(series), [(bound["y"], "") for bound in bounds]
     )
-    return (min(low, 0.0), max(high, 0.0))
 
 
-def check_panel_axis(panel_id, series, bounds, extent, plot_height=None):
+def panel_axis_extent(panel, series, bounds, run_values, plot_height):
+    """The axis a panel is drawn on, so the checks measure the drawn axis.
+
+    One function for both the drawing and the checks: a check reading a
+    different extent from the one the chart used would be measuring nothing.
+    """
+    chart = panel["chart"]
+    if chart == "cdf":
+        return (0.0, 100.0)
+    pinned = _require_extent(
+        panel.get("y_extent"), f"panels.{panel['id']}.y_extent"
+    )
+    if chart == "bar":
+        if pinned is not None:
+            return pinned
+        return bar_axis_extent(series, bounds, run_values, plot_height)
+    return line_axis_extent(series, bounds, pinned)
+
+
+def check_panel_axis(panel_id, series, bounds, extent, plot_height=None, run_values=None):
     """Problems that make an axis unable to show a bound drawn on it.
 
     This is `AGENTS.md`'s first panel test — "would a regression be visible at
@@ -651,6 +934,10 @@ def check_panel_axis(panel_id, series, bounds, extent, plot_height=None):
     exists to catch is sub-pixel. The delivery panels failed it at 0.5 %, which
     is why `bar_axis_extent` draws them as a band view now; a pinned `y_extent`
     that reintroduces the failure is refused by name.
+
+    The band is measured with the run's own guards, because they are part of the
+    question: a crossing a named guard tolerates is not a departure, and what the
+    reader then has to be able to see is the tolerance (`bound_band`).
     """
     problems = []
     low, high = extent
@@ -665,7 +952,10 @@ def check_panel_axis(panel_id, series, bounds, extent, plot_height=None):
         y = bound["y"]
         if bound_side(values, y) is None and not crossing_values(values, y):
             continue
-        band = bound_band(values, y, unit)
+        tolerances = [
+            value for _, value in run_guards(run_values, series, bound["label"])
+        ]
+        band = bound_band(values, y, unit, tolerances)
         pixels = band / span * plot_height
         if pixels < MIN_BOUND_PIXELS:
             problems.append(
@@ -677,6 +967,78 @@ def check_panel_axis(panel_id, series, bounds, extent, plot_height=None):
                 "departure would be sub-pixel"
             )
     return problems
+
+
+def check_named_values_in_axis(panel_id, bounds, guards, extent, plot_height=None):
+    """Problems that make a named value unreadable: the axis does not resolve it.
+
+    A panel whose label announces `lone_wire_guard=14` while its axis tops out
+    at 6.7 is announcing a value the reader cannot see — the guard, and with it
+    the whole region between the bound and the guard, are outside the frame, and
+    that region is where the crossing the panel exists to explain actually lies.
+    A verdict line cannot show this and neither can a summary, so it is measured
+    on the drawn axis instead of left to the eye: *every* bound the panel draws
+    and *every* guard its own labels name has to sit inside the range, with the
+    frame's own edge kept clear.
+    """
+    low, high = extent
+    span = high - low
+    if not span > 0:
+        return [f"panel {panel_id!r}: the axis {low!r}..{high!r} has no span"]
+    if plot_height is None:
+        plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    problems = []
+    named = [(bound["y"], f"bound {bound['label']!r}") for bound in bounds]
+    named += [(value, f"named guard {value:g}") for value in guards]
+    for value, what in named:
+        if low <= value <= high:
+            clear = min(value - low, high - value) * plot_height / span
+            if clear >= MIN_AXIS_INSET_PIXELS:
+                continue
+            where = f"only {clear:.1f} px from the nearest edge of it"
+        elif value > high:
+            where = f"{(value - high) * plot_height / span:.1f} px above it"
+        else:
+            where = f"{(low - value) * plot_height / span:.1f} px below it"
+        problems.append(
+            f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} does not resolve "
+            f"the {what} (y={value:g}) that the panel names: it is {where}, and a "
+            f"named value the axis does not show is a claim the reader has no way "
+            "to check"
+        )
+    return problems
+
+
+def check_bound_headroom(panel_id, bounds, guards, extent, plot_height=None):
+    """Problems that make an over-bound bar undrawable: the axis is too short.
+
+    An axis that tops out at the highest bound it names leaves the bar that
+    crosses that bound nowhere to go — a breach and a value exactly at the bound
+    paint the same picture — so the frame has to keep `MIN_HEADROOM_PIXELS`
+    above every value it names. A pinned `y_extent` is where this bites, and on
+    a panel whose data spread is a ten-thousandth of its bound (a fair share
+    pinned at 25 %) it bites on the automatic extent too, which is why the
+    policy spends a pixel floor on it as well as the span's own share.
+    """
+    if not bounds and not guards:
+        return []
+    low, high = extent
+    span = high - low
+    if not span > 0:
+        return [f"panel {panel_id!r}: the axis {low!r}..{high!r} has no span"]
+    if plot_height is None:
+        plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    top = max([bound["y"] for bound in bounds] + list(guards))
+    headroom = (high - top) / span * plot_height
+    if headroom >= MIN_HEADROOM_PIXELS:
+        return []
+    return [
+        f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} keeps {headroom:.1f} "
+        f"px above the highest value it names (y={top:g}), under the "
+        f"{MIN_HEADROOM_PIXELS:.0f} px an over-bound bar needs: a breach and a "
+        "value exactly at that bound would be drawn as the same picture, so the "
+        "panel could not show the failure it exists for"
+    ]
 
 
 def check_bound_governance(panel_id, series, bounds, run_values):
@@ -751,21 +1113,235 @@ def check_bound_x_categories(panel_id, series, bounds):
     return problems
 
 
-def axis_label(y_label, extent):
-    """The y label, plus a note when the axis is a truncated band view.
+def band_view_note(extent):
+    """The note an axis that is not 0-based has to carry, or ``""``.
 
-    A bar's length is a claim about its value, so an axis that does not start
-    at zero has to say so on its own face; the ticks alone leave the reader to
-    notice, and the figure is read long after the tick range is.
+    A bar's length is a claim about its value, so an axis that does not start at
+    zero has to say so on its own face; the ticks alone leave the reader to
+    notice, and the figure is read long after the tick range is. The note is
+    drawn *inside* the plot rather than appended to the y label: a rotated label
+    runs down the 300 px left margin, where a note long enough to state both ends
+    of the band (a delivery band view's is ~66 characters) is drawn off the top
+    of the canvas. Inside the plot, the note has the plot's own 864 px and
+    `check_canvas_text_fit` measures it there.
     """
     low, high = extent
-    if low > 0.0:
-        decimals = max(2, math.ceil(-math.log10(high - low)) + 2)
-        return (
-            f"{y_label} [band view {low:.{decimals}g}..{high:.{decimals}g}, "
-            "not 0-based]"
+    if low <= 0.0:
+        return ""
+    decimals = max(2, math.ceil(-math.log10(high - low)) + 2)
+    return f"band view {low:.{decimals}g}..{high:.{decimals}g}, not 0-based"
+
+
+def box_overlap(first, second):
+    """The area, in square pixels, two ``(x0, y0, x1, y1)`` boxes share."""
+    width = min(first[2], second[2]) - max(first[0], second[0])
+    height = min(first[3], second[3]) - max(first[1], second[1])
+    return max(width, 0.0) * max(height, 0.0)
+
+
+def check_label_overlap(panel_id, markup):
+    """Problems that make a bound label unreadable: it shares pixels with another.
+
+    A label is the part of the panel that says what its line governs, so two
+    labels over one another are the text of neither — the run that drew
+    `fair share 25.0%fair share 25.0%` at a single anchor left the reader unable
+    to read either copy. Wrapped lines of *one* label are exempt: they are
+    stacked a line height apart, so they touch at most and never overlap.
+    """
+    problems = []
+    boxes = label_boxes(markup)
+    for index, (declared, line, box) in enumerate(boxes):
+        for other_declared, other_line, other in boxes[index + 1 :]:
+            area = box_overlap(box, other)
+            if area <= LABEL_OVERLAP_PX2:
+                continue
+            same_anchor = (
+                declared == other_declared
+                and abs(box[1] - other[1]) < REPORT.LABEL_LINE_HEIGHT_PX - 0.5
+            )
+            what = (
+                f"the bound label {declared!r} is drawn twice on the same anchor"
+                if same_anchor
+                else f"the bound labels {declared!r} and {other_declared!r} overlap"
+            )
+            problems.append(
+                f"panel {panel_id!r}: {what} -- their boxes share {area:.0f} of "
+                f"{min((box[2] - box[0]) * (box[3] - box[1]), (other[2] - other[0]) * (other[3] - other[1])):.0f} "
+                "px, so both names are drawn where neither can be read"
+                + (
+                    f" (on the drawn lines {line!r} and {other_line!r})"
+                    if line != declared or other_line != other_declared
+                    else ""
+                )
+            )
+    return problems
+
+
+def bar_boxes(markup):
+    """Each drawn bar as ``(x0, y0, x1, y1)``, in document order."""
+    return [
+        (float(x), float(y), float(x) + float(width), float(y) + float(height))
+        for x, y, width, height, _ in BAR_RECT_RE.findall(markup)
+    ]
+
+
+def check_bar_separation(panel_id, markup):
+    """Problems that let bars read as one ribbon instead of as values.
+
+    Bars drawn flush against one another are a *continuously growing* quantity —
+    a staircase the eye completes into a ribbon — and no reader can recover the
+    values from it. The panel must keep `MIN_BAR_GAP_PIXELS` between any two
+    bars, which is also the check on the layout that produced the staircase: a
+    bar placement that clamps the first and last groups towards the middle
+    overlaps its neighbours, and an overlap is exactly what this measures.
+    """
+    bars = sorted(bar_boxes(markup))
+    problems = []
+    for index, first in enumerate(bars):
+        for second in bars[index + 1 :]:
+            gap = max(second[0] - first[2], first[0] - second[2])
+            if gap >= MIN_BAR_GAP_PIXELS:
+                continue
+            stated = (
+                f"overlap by {-gap:.1f} px"
+                if gap < 0.0
+                else f"are {gap:.2f} px apart"
+            )
+            problems.append(
+                f"panel {panel_id!r}: two drawn bars {stated}, under the "
+                f"{MIN_BAR_GAP_PIXELS:.0f} px a reader needs to tell one value from "
+                "the next; drawn flush they read as one constantly growing "
+                "quantity rather than as separate values"
+            )
+    return problems
+
+
+def drawn_text_boxes(markup):
+    """Each drawn ``<text>`` as ``(text, (x0, y0, x1, y1))``.
+
+    The box is modelled the way `label_boxes` models a bound label (the anchor
+    the element carries, extended by the text style's ascent and descent), and a
+    text rotated about its own anchor — the panel's y label — is modelled on the
+    axis it runs along, so a label longer than the canvas is caught instead of
+    being exempted from the fit for being sideways.
+    """
+    boxes = []
+    for attributes, content in TEXT_ELEMENT_RE.findall(markup):
+        values = dict(TEXT_ATTRIBUTE_RE.findall(attributes))
+        text = html.unescape(BOUND_LABEL_TITLE_RE.sub("", content)).strip()
+        width = REPORT.label_text_width(text)
+        x = float(values.get("x", 0.0))
+        y = float(values.get("y", 0.0))
+        rotation = ROTATE_RE.search(values.get("transform", ""))
+        if rotation is not None:
+            centre_x, centre_y = (float(value) for value in rotation.groups())
+            boxes.append(
+                (
+                    text,
+                    (
+                        centre_x - REPORT.LABEL_ASCENT_PX,
+                        centre_y - width / 2,
+                        centre_x + REPORT.LABEL_DESCENT_PX,
+                        centre_y + width / 2,
+                    ),
+                )
+            )
+            continue
+        anchor = values.get("text-anchor", "start")
+        left = x
+        if anchor == "middle":
+            left = x - width / 2
+        elif anchor == "end":
+            left = x - width
+        boxes.append(
+            (
+                text,
+                (
+                    left,
+                    y - REPORT.LABEL_ASCENT_PX,
+                    left + width,
+                    y + REPORT.LABEL_DESCENT_PX,
+                ),
+            )
         )
-    return y_label
+    return boxes
+
+
+def legend_text(markup):
+    """The label each legend entry draws, in document order."""
+    group = LEGEND_GROUP_RE.search(markup)
+    if group is None:
+        return []
+    return [
+        html.unescape(BOUND_LABEL_TITLE_RE.sub("", content)).strip()
+        for _, content in TEXT_ELEMENT_RE.findall(group.group(1))
+    ]
+
+
+def check_series_labels(panel_id, markup, series):
+    """Problems that make a series unnamed to a human reader.
+
+    The legend is how a reader tells one series from another, and a column name
+    is not the name of a quantity: `wire_x` is the own-wire multiple and
+    `shaper_forwarded` is the shaper's forwarded rate. `series_label` is what
+    turns those into labels, and this is what keeps it applied -- a legend that
+    shows the CSV's own spelling is the producer's *schema* leaking into the
+    panel, which is a claim about the code rather than about the run.
+    """
+    drawn = legend_text(markup)
+    expected = [series_label(name) for name, _ in series]
+    problems = []
+    if drawn != expected:
+        problems.append(
+            f"panel {panel_id!r}: the legend draws {drawn}, not the labels its "
+            f"series have {expected}; every series needs a human name"
+        )
+    for text in drawn:
+        if RAW_COLUMN_NAME_RE.match(text):
+            problems.append(
+                f"panel {panel_id!r}: the legend draws the raw column name "
+                f"{text!r}; a reader is told the producer's spelling instead of "
+                "the quantity's name"
+            )
+    return problems
+
+
+def check_canvas_text_fit(panel_id, markup):
+    """Problems that make a drawn text unreadable or uninformative.
+
+    Two defects of the same family as a clipped bound label. A text that leaves
+    the canvas is truncated — the reader sees a sentence that ends mid-word, and
+    the value or unit it lost is not recoverable — and a text carrying an empty
+    template (``[]``, ``()``, ``None``) is *drawing the absence of the evidence
+    its own label claims*, which is worse than drawing nothing because it reads
+    as a measurement. Both are measured on the artifact, at the font the panel
+    declares, the way `check_label_fit` measures bound labels.
+    """
+    problems = []
+    for text, (x0, y0, x1, y1) in drawn_text_boxes(markup):
+        placeholder = PLACEHOLDER_TEXT_RE.search(text)
+        if placeholder is not None:
+            problems.append(
+                f"panel {panel_id!r}: the drawn text {text!r} carries the empty "
+                f"placeholder {placeholder.group(0)!r}; a panel must draw the "
+                "measurement, not the template its absent evidence left behind"
+            )
+        if x0 < 0.0 or y0 < 0.0 or x1 > REPORT.WIDTH or y1 > REPORT.HEIGHT:
+            outside = []
+            if x0 < 0.0:
+                outside.append(f"{-x0:.1f} px past the left edge")
+            if x1 > REPORT.WIDTH:
+                outside.append(f"{x1 - REPORT.WIDTH:.1f} px past the right edge")
+            if y0 < 0.0:
+                outside.append(f"{-y0:.1f} px above it")
+            if y1 > REPORT.HEIGHT:
+                outside.append(f"{y1 - REPORT.HEIGHT:.1f} px below it")
+            problems.append(
+                f"panel {panel_id!r}: the drawn text {text!r} is {', '.join(outside)}, "
+                f"so the {REPORT.WIDTH}x{REPORT.HEIGHT} canvas draws it clipped; a "
+                "label the reader cannot finish is not a label"
+            )
+    return problems
 
 
 def panel_plot_rect(panel_id, markup):
@@ -877,6 +1453,12 @@ def governed_label(bound, series, run_values, crossing=True):
     breach from a tolerated tripwire. A line panel's series carry their own
     legend entries, so its bounds are labelled with their declared governance
     and left at that.
+
+    The guard clause is *not* conditional on a crossing: the guards are the
+    arms' own bounds, and the axis has to carry them whether or not one of them
+    has been reached yet (a run whose worst arm sits 0.09 under the budget is
+    the same panel as one whose worst arm sits 0.05 over it). Naming them is
+    also what makes the range honest — a panel may draw what it names.
     """
     clauses = []
     if bound.get("series"):
@@ -887,19 +1469,81 @@ def governed_label(bound, series, run_values, crossing=True):
         clauses.append(
             f"governs x={low:g}" if low == high else f"governs x={low:g}..{high:g}"
         )
-    values = _bound_values(series)
-    crossed = crossing_values(values, bound["y"]) if crossing else []
-    if crossed:
-        clause = f"{len(crossed)} of {len(values)} bars beyond it"
+    if crossing:
+        values = _bound_values(series)
+        crossing_clauses = []
+        crossed = crossing_values(values, bound["y"])
+        if crossed:
+            crossing_clauses.append(f"{len(crossed)} of {len(values)} bars beyond it")
         guards = run_guards(run_values, series, bound["label"])
         if guards:
-            clause += "; run guards " + " ".join(
-                f"{key}={value:g}" for key, value in guards
+            crossing_clauses.append(
+                "run guards "
+                + " ".join(f"{key}={value:g}" for key, value in guards)
             )
-        clauses.append(clause)
+        if crossing_clauses:
+            clauses.append("; ".join(crossing_clauses))
     if not clauses:
         return bound["label"]
     return f"{bound['label']} [{'; '.join(clauses)}]"
+
+
+def repeated_category_index(categories, run_values):
+    """The run's repetition count when a panel draws exactly its ``1..reps``.
+
+    The ``MANDATE`` line's own vocabulary is the check on a declaration's prose:
+    `M3` measures `reps=3` and draws one bar per repetition at x=1..3, so the
+    categories *are* the run's repetitions — and a reader told they are `seed`
+    is told something the run does not say. A declaration that labels the panel
+    itself keeps its word; only the mandate's shared default is overridden.
+    """
+    if not isinstance(run_values, dict):
+        return None
+    reps = run_values.get("reps")
+    if isinstance(reps, bool) or not isinstance(reps, int) or reps < 2:
+        return None
+    if sorted(set(categories)) != list(range(1, reps + 1)):
+        return None
+    return reps
+
+
+def panel_x_label_for(panel, mandate_x_label, categories, run_values):
+    """The x label a panel draws: its own, or the run's own vocabulary."""
+    if "x_label" in panel:
+        return panel["x_label"]
+    reps = repeated_category_index(categories, run_values)
+    if reps is not None:
+        return f"rep (1..{reps})"
+    return mandate_x_label
+
+
+def panel_y_label_for(panel, mandate_y_label, series):
+    """The y label a panel draws: its own, or its single series' own quantity.
+
+    The mandate's `y_label` is a default shared by every panel of the mandate,
+    and a panel whose axes differ from its siblings must not inherit one of
+    theirs: `M3-fraction` was drawn on the goodput panel's `MiB/s`, telling the
+    reader a dimensionless fraction of the link rate was a rate. A panel with
+    one series has one quantity and says so; a panel with several has no single
+    quantity to name and keeps the mandate's default.
+    """
+    if "y_label" in panel:
+        return panel["y_label"]
+    if len(series) == 1:
+        return series_label(series[0][0])
+    return mandate_y_label
+
+
+def tick_label(value, decimals):
+    """A y tick, with a value that rounds to zero printed without its sign.
+
+    A band view whose lower edge is a few ten-thousandths below zero printed it
+    as `-0.00`: a negative axis label under a panel that is entirely positive,
+    which a reader has to stop and decode. The tick is still *at* the negative
+    value -- only its rounded text loses a sign it does not mean.
+    """
+    label = f"{value:.{decimals}f}"
+    return label.lstrip("-") if float(label) == 0.0 else label
 
 
 def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run_values=None):
@@ -916,9 +1560,25 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
     if not series:
         return f"<section><h2>{html.escape(title)}</h2><p>No samples.</p></section>"
     xs = [x for _, points in series for x, _ in points]
-    x_min, x_max = min(xs), max(xs)
-    if x_min == x_max:
-        x_min, x_max = x_min - 0.5, x_max + 0.5
+    # -- the x axis: one band per distinct x --------------------------------
+    #
+    # Each category owns a band, and the domain is padded by half a band at both
+    # ends so every band lies inside the plot. The padding is what lets the bars
+    # be placed without clamping them: the placement that clamped the first and
+    # last groups towards the middle is what made a single-series panel read as
+    # a staircase -- the clamp moved the outer bars until they overlapped their
+    # neighbours, and the overlap painted a rising ribbon instead of three
+    # values (`check_bar_separation` now measures the overlap itself).
+    categories = sorted(set(xs))
+    slot = min(
+        (
+            after - before
+            for before, after in zip(categories, categories[1:])
+            if after > before
+        ),
+        default=1.0,
+    )
+    x_min, x_max = categories[0] - slot / 2, categories[-1] + slot / 2
     if extent is None:
         extent = bar_axis_extent(series, bounds)
     y_min, y_max = extent
@@ -934,15 +1594,11 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
     def sy(value):
         return plot_top + (y_max - value) / (y_max - y_min) * plot_height
 
-    distinct = sorted(set(xs))
-    gaps = [after - before for before, after in zip(distinct, distinct[1:]) if after > before]
-    slot = min(gaps) if gaps else (x_max - x_min)
-    # One slot per distinct x holds that x's bars side by side. The slot is a
-    # data-space measure, so it is converted to pixels before any placement;
-    # using it directly would draw sub-pixel bars whenever the x values are
-    # larger than the plot's pixel width.
-    group_width = min((slot / (x_max - x_min)) * plot_width * 0.8, plot_width / 2)
-    bar_width = group_width / len(series)
+    band = plot_width / len(categories)
+    inset = min(band * BAR_BAND_INSET_SHARE, band / 2)
+    bar_slot = max((band - 2 * inset) / len(series), 0.0)
+    bar_gap = min(bar_slot * BAR_GAP_SHARE, bar_slot / 2)
+    bar_width = max(bar_slot - bar_gap, 0.0)
     # Bars rise from the axis' own bottom. On a zero-baseline axis that is zero,
     # as before; on the band view the axis starts at the floor's band, so the
     # bar's length is the margin over that band — which is the reading.
@@ -965,20 +1621,21 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
         y_value = y_min + (y_max - y_min) * fraction
         y = sy(y_value)
         parts.append(f"<line x1=\"{REPORT.PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{REPORT.WIDTH - REPORT.PAD_RIGHT}\" y2=\"{y:.1f}\" class=\"grid\"/>")
-        parts.append(f"<text x=\"{REPORT.PAD_LEFT - 9}\" y=\"{y + 4:.1f}\" text-anchor=\"end\">{y_value:.{y_decimals}f}</text>")
-    for index, (name, points) in enumerate(series):
-        color = REPORT.COLORS[index % len(REPORT.COLORS)]
-        for x_value, y_value in points:
-            # The group is centred on its x and then clamped to the plot, so
-            # the first and last categories stay inside the canvas.
-            left = sx(x_value) - group_width / 2
-            left = min(
-                max(left, REPORT.PAD_LEFT),
-                REPORT.PAD_LEFT + plot_width - group_width,
-            )
-            left += index * bar_width
-            top = sy(y_value)
-            parts.append(f"<rect x=\"{left:.1f}\" y=\"{min(top, baseline):.1f}\" width=\"{bar_width * 0.9:.1f}\" height=\"{abs(top - baseline):.1f}\" fill=\"{color}\"/>")
+        parts.append(f"<text x=\"{REPORT.PAD_LEFT - 9}\" y=\"{y + 4:.1f}\" text-anchor=\"end\">{tick_label(y_value, y_decimals)}</text>")
+    for category_index, category in enumerate(categories):
+        for index, (name, points) in enumerate(series):
+            color = REPORT.COLORS[index % len(REPORT.COLORS)]
+            for x_value, y_value in points:
+                if x_value != category:
+                    continue
+                left = (
+                    REPORT.PAD_LEFT
+                    + category_index * band
+                    + inset
+                    + index * bar_slot
+                )
+                top = sy(y_value)
+                parts.append(f"<rect x=\"{left:.1f}\" y=\"{min(top, baseline):.1f}\" width=\"{bar_width:.1f}\" height=\"{abs(top - baseline):.1f}\" fill=\"{color}\"/>")
     for bound in bounds or []:
         y = sy(bound["y"])
         window = bound_governed_x(bound)
@@ -986,11 +1643,11 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
             left, right = REPORT.PAD_LEFT, REPORT.WIDTH - REPORT.PAD_RIGHT
         else:
             left = max(
-                min(sx(window[0]) - group_width / 2, sx(window[1]) + group_width / 2),
+                min(sx(window[0]) - band / 2, sx(window[1]) + band / 2),
                 REPORT.PAD_LEFT,
             )
             right = min(
-                max(sx(window[0]) - group_width / 2, sx(window[1]) + group_width / 2),
+                max(sx(window[0]) - band / 2, sx(window[1]) + band / 2),
                 REPORT.WIDTH - REPORT.PAD_RIGHT,
             )
             left, right = min(left, right), max(left, right)
@@ -1009,8 +1666,15 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
             BAR_BOUND_LABEL_STYLE,
         )
         parts.append(markup)
+    note = band_view_note(extent)
+    if note:
+        parts.append(
+            f"<text class=\"axis-note\" x=\"{REPORT.PAD_LEFT + 5:.1f}\" "
+            f"y=\"{plot_top + 13:.1f}\" style=\"{BAR_BOUND_LABEL_STYLE}\">"
+            f"{html.escape(note)}</text>"
+        )
     parts.append(f"<text x=\"{REPORT.WIDTH / 2}\" y=\"{REPORT.HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
-    parts.append(f"<text x=\"18\" y=\"{REPORT.HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {REPORT.HEIGHT / 2})\">{html.escape(axis_label(y_label, extent))}</text>")
+    parts.append(f"<text x=\"18\" y=\"{REPORT.HEIGHT / 2}\" text-anchor=\"middle\" transform=\"rotate(-90 18 {REPORT.HEIGHT / 2})\">{html.escape(y_label)}</text>")
     parts.append("<g class=\"legend\">")
     for index, (name, _) in enumerate(series):
         column = index % legend_columns
@@ -1019,38 +1683,111 @@ def svg_bar_chart(title, x_label, y_label, series, bounds=None, extent=None, run
         y = 14 + row * 18
         color = REPORT.COLORS[index % len(REPORT.COLORS)]
         parts.append(f"<line x1=\"{x:.1f}\" y1=\"{y}\" x2=\"{x + 20:.1f}\" y2=\"{y}\" stroke=\"{color}\" stroke-width=\"4\"/>")
-        parts.append(f"<text x=\"{x + 25:.1f}\" y=\"{y + 4}\">{html.escape(name)}</text>")
+        parts.append(f"<text x=\"{x + 25:.1f}\" y=\"{y + 4}\">{html.escape(series_label(name))}</text>")
     parts.append("</g></svg></section>")
     return "".join(parts)
+
+
+def check_x_axis_label(panel_id, x_label, categories, run_values):
+    """Problems that let an axis label contradict the run's own vocabulary.
+
+    The run's `MANDATE` line is the one place that says what its categories are,
+    and `M3` measures `reps=3` while drawing one bar per repetition at x=1..3.
+    Both of its panels were labelled `seed`. The renderer labels them with what
+    the run measured; this is what keeps that applied, because a panel whose
+    axis names a quantity the run did not measure is a claim about the
+    producer's wording rather than about the run.
+    """
+    reps = repeated_category_index(categories, run_values)
+    if reps is None:
+        return []
+    expected = f"rep (1..{reps})"
+    if x_label == expected:
+        return []
+    return [
+        f"panel {panel_id!r}: the run measured reps={reps} and this panel draws a "
+        f"bar at each of 1..{reps}, but its x axis is labelled {x_label!r}: those "
+        "categories are the run's repetitions, and a reader told they are "
+        f"{x_label!r} is told something the run never measured"
+    ]
+
+
+def check_axis_label(panel_id, y_label, series, *, declared, carried):
+    """Problems that label a panel's axis with a sibling panel's quantity.
+
+    The mandate's `y_label` is a default shared by its panels, so a panel whose
+    axes differ from its siblings must not inherit one of theirs: `M3-fraction`
+    was drawn on the goodput panel's `MiB/s`, telling a reader that a
+    dimensionless fraction of the link rate was a rate. A single-series panel
+    has exactly one quantity, and `panel_y_label` names it; this refuses a drawn
+    label that is the carried default instead.
+    """
+    if declared is not None or len(series) != 1:
+        return []
+    expected = series_label(series[0][0])
+    if y_label == expected:
+        return []
+    return [
+        f"panel {panel_id!r}: its y axis is labelled {y_label!r} — the mandate's "
+        f"shared y_label, carried over from a sibling panel — while its only "
+        f"series is {expected!r}: a single-series panel names its own quantity, "
+        f"and a reader told the axis is {y_label!r} is told a unit the run never "
+        "measured"
+    ]
 
 
 def panel_markup(title, x_label, y_label, panel, points, run_values=None):
     """Markup for one declared panel, as exactly one ``<svg>`` document span."""
     chart = panel["chart"]
     chart_title = f"{title} [{panel['id']}]"
-    panel_x_label = panel.get("x_label", x_label)
-    panel_y_label = panel.get("y_label", y_label)
     series = [
         (entry["name"], sorted(points[(panel["id"], entry["name"])]))
         for entry in panel["series"]
     ]
+    panel_x_label = panel_x_label_for(
+        panel, x_label, [x for _, points in series for x, _ in points], run_values
+    )
+    panel_y_label = panel_y_label_for(panel, y_label, series)
     bounds = _bound_specs(panel)
-    extent = _require_extent(panel.get("y_extent"), f"panels.{panel['id']}.y_extent")
-    if chart == "bar":
-        axis = extent if extent is not None else bar_axis_extent(series, bounds)
-        problems = (
-            check_panel_axis(
-                panel["id"],
-                series,
-                bounds,
-                axis,
-                bar_plot_height(len(series)),
-            )
-            + check_bound_governance(panel["id"], series, bounds, run_values)
-            + check_bound_x_categories(panel["id"], series, bounds)
+    pinned = _require_extent(panel.get("y_extent"), f"panels.{panel['id']}.y_extent")
+    plot_height = bar_plot_height(len(series))
+    axis = panel_axis_extent(panel, series, bounds, run_values, plot_height)
+    guards = named_guard_values(
+        series, bounds, run_values, crossing=chart == "bar"
+    )
+    problems = (
+        check_bound_governance(panel["id"], series, bounds, run_values)
+        + check_bound_x_categories(panel["id"], series, bounds)
+        + check_axis_label(
+            panel["id"],
+            panel_y_label,
+            series,
+            declared=panel.get("y_label"),
+            carried=y_label,
         )
-        if problems:
-            _fail("\n  ".join(problems))
+        + check_x_axis_label(
+            panel["id"],
+            panel_x_label,
+            [x for _, points in series for x, _ in points],
+            run_values,
+        )
+    )
+    if chart == "bar":
+        # The axis test is the bar panel's own: a *bar* panel's axis is chosen
+        # by `bar_axis_extent`, and the band a bound needs is the reading of the
+        # bar's length against it. A line panel draws a trajectory whose
+        # crossing of a ceiling is the line poking above it, so it owes the
+        # axis-range and headroom checks (which it gets) rather than a band.
+        problems += check_panel_axis(
+            panel["id"], series, bounds, axis, plot_height, run_values
+        )
+    problems += check_named_values_in_axis(
+        panel["id"], bounds, guards, axis, plot_height
+    ) + check_bound_headroom(panel["id"], bounds, guards, axis, plot_height)
+    if problems:
+        _fail("\n  ".join(problems))
+    drawn = [(series_label(name), points) for name, points in series]
+    if chart == "bar":
         markup = svg_bar_chart(
             chart_title,
             panel_x_label,
@@ -1066,7 +1803,7 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None):
             for bound in bounds
         ]
         markup = REPORT.svg_line_chart(
-            chart_title, panel_x_label, panel_y_label, series, extent, labelled
+            chart_title, panel_x_label, panel_y_label, drawn, axis, labelled
         )
     else:
         labelled = [
@@ -1074,9 +1811,15 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None):
             for bound in bounds
         ]
         markup = REPORT.svg_cdf_chart(
-            chart_title, panel_x_label, panel_y_label, series, labelled
+            chart_title, panel_x_label, panel_y_label, drawn, labelled
         )
-    problems = check_label_fit(panel["id"], markup)
+    problems = (
+        check_label_fit(panel["id"], markup)
+        + check_label_overlap(panel["id"], markup)
+        + check_series_labels(panel["id"], markup, series)
+        + check_canvas_text_fit(panel["id"], markup)
+        + (check_bar_separation(panel["id"], markup) if chart == "bar" else [])
+    )
     if problems:
         _fail("\n  ".join(problems))
     panels = RENDER.extract_svg_panels(markup)
@@ -1103,18 +1846,24 @@ def render_mandate(declaration_path, out_dir, *, rasterize=True, browser=None, r
     """Validate one mandate, write and verify its panels, and rasterize them.
 
     ``run_values`` are the ``MANDATE`` line's own measurements for this
-    mandate, as parsed by ``tools/mandate-check``. They are used for exactly
-    one thing: naming the run's per-arm guards (`*_guard`) on a bound whose
-    bars cross it, so the panel cannot read as a breach the verdict tolerates.
+    mandate, as parsed by ``tools/mandate-check``. They are used for three
+    things, all of them the panel's own honesty: naming the run's per-arm guards
+    (`*_guard`) on a bound whose bars cross it, extending the axis to cover
+    every guard the panel's labels name, and measuring a guarded bound's band
+    against its tolerance instead of against a crossing that tolerance absorbs.
     They change no plotted point, series or bound value.
 
     Raises MandatePlotError naming the problem for any invalid declaration or
-    data file, any empty panel or undeclared series, any axis that cannot show
-    a bound it carries, any crossed bound that states nothing about what it
-    governs, any written SVG without series geometry, or any declared bound
-    missing from the SVG; raises ``render_graph.RenderGraphError`` (naming the
-    browser, or the offending PNG) when rasterization was requested and could
-    not be verified.
+    data file, any empty panel or undeclared series, any axis that cannot show a
+    bound it carries — a sub-pixel band, a named guard or bound outside the
+    range, no headroom above the highest value named — any crossed bound that
+    states nothing about what it governs, any written SVG without series
+    geometry, any declared bound missing from the SVG, any bound label drawn
+    outside its plot or over another label, any two bars that touch, any drawn
+    text that leaves the canvas or carries an empty placeholder, and any legend
+    drawing a producer's column name; raises ``render_graph.RenderGraphError``
+    (naming the browser, or the offending PNG) when rasterization was requested
+    and could not be verified.
     """
     declaration_path = Path(declaration_path)
     document = load_declaration(declaration_path)

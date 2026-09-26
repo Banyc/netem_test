@@ -396,10 +396,13 @@ class MandatePlotTest(unittest.TestCase):
     def test_panels_whose_axis_can_already_show_their_bound_are_unchanged(self):
         # The deliberate coarse view, whose fine counterpart is M4-imbalance,
         # and a floor with half the axis between it and the data: both keep the
-        # zero baseline and the data-driven extent they had.
-        for name, declaration, rows, expected in (
-            ("M4shares", SHARES_DECLARATION, SHARES_ROWS, (0.0, 0.2503)),
-            ("M3frac", FRACTION_DECLARATION, FRACTION_ROWS, (0.0, 0.9942)),
+        # zero baseline they had. What they no longer keep is the axis that
+        # topped out on the bound itself (M4-shares drew 0..0.2503, so a flow
+        # *over* the fair share was clipped by the frame): the axis now carries
+        # `MIN_HEADROOM_PIXELS` above every value it names.
+        for name, declaration, rows, bound in (
+            ("M4shares", SHARES_DECLARATION, SHARES_ROWS, 0.25),
+            ("M3frac", FRACTION_DECLARATION, FRACTION_ROWS, 0.35),
         ):
             with self.subTest(panel=name):
                 code, stderr, out = self.render_mandate(declaration, rows, name)
@@ -415,8 +418,23 @@ class MandatePlotTest(unittest.TestCase):
                         r'text-anchor="end">([-0-9.]+)<', document
                     )
                 ]
-                self.assertAlmostEqual(ticks[0], expected[0], places=2)
-                self.assertAlmostEqual(ticks[-1], expected[1], places=2)
+                self.assertEqual(ticks[0], 0.0)
+                self.assertGreater(ticks[-1], bound, "no room above the bound")
+                headroom = (
+                    (ticks[-1] - bound) / (ticks[-1] - ticks[0])
+                    * MANDATE.bar_plot_height(1)
+                )
+                self.assertGreaterEqual(headroom, MANDATE.MIN_HEADROOM_PIXELS)
+
+    def test_the_headroom_policy_spends_the_pixel_floor_not_the_span_share(self):
+        # A fair share pinned at 25 % has a data spread of a ten-thousandth, so
+        # the span's own 5 % of headroom is a third of a pixel: the pixel floor
+        # is the only thing that keeps an over-share bar drawable.
+        values = [0.250029, 0.249914]
+        low, high = MANDATE.axis_with_headroom(0.0, max(values), 0.25, 228)
+        self.assertGreater((high - 0.25) / (high - low) * 228, MANDATE.MIN_HEADROOM_PIXELS)
+        span_share_only = 0.25 + MANDATE.FRAME_HEADROOM * 0.25
+        self.assertGreater(high, span_share_only)
 
     def test_a_floor_far_below_the_data_keeps_the_zero_baseline(self):
         series = [("fraction", [(1.0, 0.958217), (2.0, 0.958271)])]
@@ -871,9 +889,11 @@ class MandatePlotTest(unittest.TestCase):
     def test_every_bar_beyond_the_bound_is_not_labelled_as_a_crossing(self):
         # A boundary case of the attribution rule: when *every* bar is past the
         # bound the crossing is the verdict's, not one arm's tolerated guard, so
-        # the panel draws the bound's own name and no `N of M` clause. Uniform
-        # failure is read from the bars; a single bar past it is the case the
-        # clause exists for.
+        # the panel draws no `N of M` clause. Uniform failure is read from the
+        # bars; a single bar past it is the case the clause exists for. The
+        # guards are still named -- they are the arms' own bounds, and the axis
+        # has to carry them whether or not a bar has been past the budget yet --
+        # but no crossing is attributed.
         rows = [
             ["panel", "series", "x", "y"],
             ["wire", "wire_x", 1.0, 7.2],
@@ -888,8 +908,22 @@ class MandatePlotTest(unittest.TestCase):
             json.dumps(WIRE_FOUR_ARM_RUN_VALUES),
         )
         self.assertEqual(len(boxes), 1)
-        self.assertEqual(boxes[0][1], "M2 wire budget 6x")
+        self.assertIn("M2 wire budget 6x", boxes[0][1])
         self.assertNotIn("beyond it", document)
+        self.assertIn("run guards", boxes[0][1])
+        ticks = [
+            float(value)
+            for value in MANDATE.re.findall(r'text-anchor="end">([-0-9.]+)<', document)
+        ]
+        self.assertGreater(
+            ticks[-1],
+            max(value for _, value in MANDATE.run_guards(
+                WIRE_FOUR_ARM_RUN_VALUES,
+                [("wire_x", [])],
+                "M2 wire budget 6x",
+            )),
+            "the axis must carry every guard the label names",
+        )
         for _, _, (x0, y0, x1, y1) in boxes:
             self.assertGreaterEqual(x0, plot[0])
             self.assertLessEqual(x1, plot[2])
@@ -1253,6 +1287,393 @@ class MandatePlotTest(unittest.TestCase):
         override = Path(sys.executable)
         with mock.patch.dict(os.environ, {MANDATE.RENDER.BROWSER_ENV: str(override)}):
             self.assertEqual(MANDATE.RENDER.find_browser(), str(override))
+
+    # -- the readings that only the eye made, now measurements ----------------
+    #
+    # Every defect below was found by *looking at* a run whose four mandate
+    # lines passed: the `M2-wire` panel announced guards at 10x and 14x on an
+    # axis that topped out at 6.6; `M4-shares` drew its fair share at the very
+    # top of its own axis, so a flow over the share could not be drawn at all;
+    # one series' three bars were drawn flush and read as a staircase; the
+    # legend said `wire_x`; and a label long enough to run off the canvas was
+    # drawn anyway. Each test renders the broken input and requires the refusal
+    # (red), then renders the real input and requires the check to pass (green).
+
+    def test_a_guard_the_panel_names_outside_its_axis_is_refused(self):
+        broken = {
+            **WIRE_DECLARATION,
+            "panels": [{**WIRE_DECLARATION["panels"][0], "y_extent": [0.0, 7.0]}],
+        }
+        code, stderr, _ = self.render_mandate(
+            broken,
+            WIRE_ROWS,
+            "M2pin",
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("named guard 14", stderr)
+        self.assertIn("does not resolve", stderr)
+        # green: the automatic axis carries both guards, inside the frame
+        document, _, _ = self.rendered_labels(
+            WIRE_DECLARATION,
+            WIRE_ROWS,
+            "M2carry",
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        ticks = [
+            float(value)
+            for value in MANDATE.re.findall(r'text-anchor="end">([-0-9.]+)<', document)
+        ]
+        self.assertGreater(ticks[-1], 14.0, "the axis tops out below the guard named")
+        self.assertEqual(
+            MANDATE.check_named_values_in_axis(
+                "wire",
+                [{"y": 6.0, "label": "M2 wire budget 6x"}],
+                [10.0, 14.0],
+                (ticks[0], ticks[-1]),
+            ),
+            [],
+        )
+
+    def test_a_bound_with_no_room_above_it_is_refused(self):
+        # The axis the audit found on M4-shares: 0..0.25, the fair share itself,
+        # so every bar is clipped at the line the panel exists to watch.
+        broken = {
+            **SHARES_DECLARATION,
+            "panels": [
+                {**SHARES_DECLARATION["panels"][0], "y_extent": [0.0, 0.25]}
+            ],
+        }
+        code, stderr, _ = self.render_mandate(broken, SHARES_ROWS, "M4flat")
+        self.assertNotEqual(code, 0)
+        self.assertIn("over-bound bar", stderr)
+        self.assertIn("same picture", stderr)
+        # green: the automatic extent keeps MIN_HEADROOM_PIXELS over the bound
+        document, _, _ = self.rendered_labels(
+            SHARES_DECLARATION, SHARES_ROWS, "M4room"
+        )
+        ticks = [
+            float(value)
+            for value in MANDATE.re.findall(r'text-anchor="end">([-0-9.]+)<', document)
+        ]
+        self.assertGreater(ticks[-1], 0.25)
+        self.assertEqual(
+            MANDATE.check_bound_headroom(
+                "shares",
+                [{"y": 0.25, "label": "fair share 25.0%"}],
+                [],
+                (ticks[0], ticks[-1]),
+            ),
+            [],
+        )
+
+    def test_a_bound_label_drawn_twice_at_one_anchor_is_refused(self):
+        code, stderr, out = self.render_mandate(SHARES_DECLARATION, SHARES_ROWS, "M4dup")
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-shares.svg").read_text(encoding="utf-8")
+        self.assertEqual(MANDATE.check_label_overlap("shares", document), [])
+        element = MANDATE.re.search(
+            r'<text class="bound-label".*?</text>', document, MANDATE.re.S
+        ).group(0)
+        # red: the artifact the run drew, with its label element duplicated on
+        # the same anchor -- the `fair share 25.0%fair share 25.0%` reading
+        problems = MANDATE.check_label_overlap("shares", document.replace(element, element + element, 1))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("drawn twice on the same anchor", problems[0])
+        # and two *different* labels over one another are refused as an overlap
+        other = element.replace("fair share 25.0%", "fair-share bound")
+        overlap = MANDATE.check_label_overlap("shares", document.replace(element, element + other, 1))
+        self.assertEqual(len(overlap), 1, overlap)
+        self.assertIn("overlap", overlap[0])
+
+    def test_bars_drawn_flush_are_refused(self):
+        # red: the geometry the preserved run drew -- three 311 px bars whose
+        # rectangles overlapped by 52 px, which the eye read as one staircase.
+        staircase = (
+            '<svg viewBox="0 0 960 300">'
+            '<rect x="72.0" y="178.2" width="311.0" height="73.8" fill="#2563eb"/>'
+            '<rect x="331.2" y="90.1" width="311.0" height="161.9" fill="#2563eb"/>'
+            '<rect x="590.4" y="31.3" width="311.0" height="220.7" fill="#2563eb"/>'
+            "</svg>"
+        )
+        problems = MANDATE.check_bar_separation("wire", staircase)
+        self.assertTrue(problems)
+        self.assertIn("overlap by 51.8 px", problems[0])
+        # green: the rendered panel's three bars are separate
+        code, stderr, out = self.render_mandate(
+            WIRE_DECLARATION,
+            WIRE_ROWS,
+            "M2gap",
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+        self.assertEqual(len(MANDATE.bar_boxes(document)), 3)
+        self.assertEqual(MANDATE.check_bar_separation("wire", document), [])
+
+    def test_a_legend_that_draws_a_column_name_is_refused(self):
+        code, stderr, out = self.render_mandate(
+            WIRE_DECLARATION,
+            WIRE_ROWS,
+            "M2legend",
+            "--run-values",
+            json.dumps(WIRE_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+        self.assertEqual(MANDATE.legend_text(document), ["own-wire multiple"])
+        series = [("wire_x", [(1.0, 2.0)])]
+        self.assertEqual(MANDATE.check_series_labels("wire", document, series), [])
+        # red: the same panel with the producer's column name in the legend --
+        # the label the preserved run drew
+        raw = document.replace("own-wire multiple", "wire_x")
+        problems = MANDATE.check_series_labels("wire", raw, series)
+        self.assertTrue(problems)
+        self.assertIn("wire_x", problems[0])
+
+    def test_a_clipped_label_and_a_placeholder_are_refused(self):
+        # red: the y label with the band-view note the old renderer appended,
+        # which is 66 characters long and runs off the top and bottom of the
+        # 300 px canvas when it is rotated down the 18 px left margin
+        long_label = {
+            **M2_DELIVERY_DECLARATION,
+            "panels": [
+                {
+                    **M2_DELIVERY_DECLARATION["panels"][0],
+                    "y_label": "delivery (received / offered) [band view 0.979..1.001, "
+                    "not 0-based]",
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(long_label, M2_DELIVERY_ROWS, "M2clip")
+        self.assertNotEqual(code, 0)
+        self.assertIn("draws it clipped", stderr)
+        self.assertIn("px above it", stderr)
+        # red: a label carrying the empty template its absent evidence left
+        broken = {
+            **M2_DELIVERY_DECLARATION,
+            "panels": [
+                {
+                    **M2_DELIVERY_DECLARATION["panels"][0],
+                    "bounds": [
+                        {
+                            "y": 1.0,
+                            "label": "M2 delivery floor 1.000 []",
+                        }
+                    ],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(broken, M2_DELIVERY_ROWS, "M2empty")
+        self.assertNotEqual(code, 0)
+        self.assertIn("empty placeholder", stderr)
+        # green: the real panel's every text is inside the canvas
+        document, _, _ = self.rendered_labels(
+            M2_DELIVERY_DECLARATION, M2_DELIVERY_ROWS, "M2txt"
+        )
+        self.assertEqual(MANDATE.check_canvas_text_fit("delivery", document), [])
+        self.assertEqual(MANDATE.band_view_note((0.979, 1.001)),
+                         "band view 0.979..1.001, not 0-based")
+        self.assertEqual(MANDATE.band_view_note((0.0, 0.26)), "")
+
+
+    def test_the_wire_panel_renders_on_a_run_whose_worst_arm_touches_the_budget(self):
+        # The runs the tool refused (2.12 / 4.91 / 5.91 and / 6.05): the band the
+        # axis test measures is now the tolerance the run's guards open between
+        # the budget and the arm's own limit, not the sliver between the budget
+        # and the worst arm -- which is a sliver *by construction* on any run
+        # whose worst arm lands near the budget. The range is the bound plus a
+        # margin, not the observed maximum, so the panel draws the crossing it
+        # is named for on both runs.
+        for name, worst in (("below", 5.91), ("above", 6.05)):
+            with self.subTest(worst_arm=worst):
+                rows = [
+                    ["panel", "series", "x", "y"],
+                    ["wire", "wire_x", 1.0, 2.12],
+                    ["wire", "wire_x", 2.0, 4.91],
+                    ["wire", "wire_x", 3.0, worst],
+                ]
+                code, stderr, out = self.render_mandate(
+                    WIRE_DECLARATION,
+                    rows,
+                    f"M2{name}",
+                    "--run-values",
+                    json.dumps(WIRE_RUN_VALUES),
+                )
+                self.assertEqual(code, 0, stderr)
+                document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+                ticks = [
+                    float(value)
+                    for value in MANDATE.re.findall(
+                        r'text-anchor="end">([-0-9.]+)<', document
+                    )
+                ]
+                self.assertGreater(ticks[-1], 14.0)
+                self.assertIn("hostile_wire_guard=10", document)
+                self.assertIn("lone_wire_guard=14", document)
+
+    def test_a_bound_with_no_tolerance_and_a_sliver_margin_is_still_refused(self):
+        # The vacuity half of the tolerance rule: the same run, with the guards
+        # the label would name not supplied. The observed margin is then the only
+        # band there is -- 0.09 of a 6x budget over a 6.2 axis, 3.3 px -- and it
+        # is still refused. The rule decides *which* region the axis owes the
+        # reader; it does not relax the threshold.
+        rows = [
+            ["panel", "series", "x", "y"],
+            ["wire", "wire_x", 1.0, 2.12],
+            ["wire", "wire_x", 2.0, 4.91],
+            ["wire", "wire_x", 3.0, 5.91],
+        ]
+        code, stderr, _ = self.render_mandate(WIRE_DECLARATION, rows, "M2noguard")
+        self.assertNotEqual(code, 0)
+        self.assertIn("sub-pixel", stderr)
+        self.assertIn("M2 wire budget 6x", stderr)
+
+    def test_a_panel_labelled_with_a_sibling_s_unit_is_refused(self):
+        series = [("fraction", [(1.0, 0.958217), (2.0, 0.958271)])]
+        # red: the label the preserved run drew on the fraction panel -- the
+        # goodput panel's unit, carried over the mandate's shared y_label
+        problems = MANDATE.check_axis_label(
+            "fraction", "MiB/s", series, declared=None, carried="MiB/s"
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("MiB/s", problems[0])
+        # green: the label a single-series panel draws for itself
+        self.assertEqual(
+            MANDATE.check_axis_label(
+                "fraction",
+                "fraction of link rate",
+                series,
+                declared=None,
+                carried="MiB/s",
+            ),
+            [],
+        )
+        # a panel that states its own label keeps its word, and a panel with
+        # several series has no single quantity to name
+        self.assertEqual(
+            MANDATE.check_axis_label(
+                "fraction", "MiB/s", series, declared="MiB/s", carried="MiB/s"
+            ),
+            [],
+        )
+        self.assertEqual(
+            MANDATE.check_axis_label(
+                "goodput",
+                "MiB/s",
+                [("delivered", []), ("shaper_forwarded", [])],
+                declared=None,
+                carried="MiB/s",
+            ),
+            [],
+        )
+
+    def test_an_x_axis_that_contradicts_the_run_s_categories_is_refused(self):
+        run = {"reps": 3, "measured_s": 18.0}
+        # red: M3 draws one bar per repetition at x=1..3 and labelled both its
+        # panels `seed`
+        problems = MANDATE.check_x_axis_label(
+            "fraction", "seed", [1.0, 2.0, 3.0], run
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("seed", problems[0])
+        self.assertIn("reps=3", problems[0])
+        self.assertEqual(
+            MANDATE.check_x_axis_label(
+                "fraction", "rep (1..3)", [1.0, 2.0, 3.0], run
+            ),
+            [],
+        )
+        # green: a panel whose categories are not the run's repetitions, or a
+        # run with no repetition count, keeps the declaration's label
+        self.assertEqual(
+            MANDATE.check_x_axis_label("goodput", "seed", [11.0, 21.0, 31.0], run),
+            [],
+        )
+        self.assertEqual(
+            MANDATE.check_x_axis_label("fraction", "seed", [1.0, 2.0], {"reps": 3}),
+            [],
+        )
+
+    def test_the_m3_panels_name_their_own_quantity_and_their_repetitions(self):
+        declaration = {
+            "mandate": "M3",
+            "title": "M3 bulk goodput",
+            "x_label": "seed",
+            "y_label": "MiB/s",
+            "panels": [
+                {
+                    "id": "goodput",
+                    "chart": "bar",
+                    "series": [{"name": "delivered"}, {"name": "shaper_forwarded"}],
+                    "bounds": [{"y": 0.35, "label": "M3 floor 0.35x link rate"}],
+                },
+                {
+                    "id": "fraction",
+                    "chart": "bar",
+                    "series": [{"name": "fraction"}],
+                    "bounds": [{"y": 0.35, "label": "M3 floor 0.35x link rate"}],
+                },
+            ],
+        }
+        rows = [
+            ["panel", "series", "x", "y"],
+            ["goodput", "delivered", 1.0, 0.958],
+            ["goodput", "shaper_forwarded", 1.0, 0.968],
+            ["fraction", "fraction", 1.0, 0.958],
+            ["goodput", "delivered", 2.0, 0.953],
+            ["goodput", "shaper_forwarded", 2.0, 0.961],
+            ["fraction", "fraction", 2.0, 0.953],
+            ["goodput", "delivered", 3.0, 0.948],
+            ["goodput", "shaper_forwarded", 3.0, 0.955],
+            ["fraction", "fraction", 3.0, 0.948],
+        ]
+        code, stderr, out = self.render_mandate(
+            declaration,
+            rows,
+            "M3labels",
+            "--run-values",
+            json.dumps({"reps": 3, "measured_s": 18.0, "floor": 0.35}),
+        )
+        self.assertEqual(code, 0, stderr)
+        fraction = (out / "M3-fraction.svg").read_text(encoding="utf-8")
+        self.assertIn("fraction of link rate", fraction)
+        self.assertNotIn("MiB/s", fraction)
+        self.assertIn("rep (1..3)", fraction)
+        goodput = (out / "M3-goodput.svg").read_text(encoding="utf-8")
+        self.assertIn("MiB/s", goodput)
+        self.assertIn("rep (1..3)", goodput)
+        self.assertNotIn("seed", goodput)
+    def test_a_tick_that_rounds_to_zero_is_not_drawn_negative(self):
+        # M4-imbalance's band view starts a few ten-thousandths below zero, and
+        # the tick there used to read `-0.00` under an all-positive panel.
+        self.assertEqual(MANDATE.tick_label(-0.000344, 2), "0.00")
+        self.assertEqual(MANDATE.tick_label(-1.5, 2), "-1.50")
+        self.assertEqual(MANDATE.tick_label(0.25, 2), "0.25")
+        declaration = {
+            **FRACTION_DECLARATION,
+            "panels": [
+                {
+                    **FRACTION_DECLARATION["panels"][0],
+                    "series": [{"name": "delta"}],
+                    "bounds": [{"y": 0.01, "label": "bound"}],
+                }
+            ],
+        }
+        rows = [
+            ["panel", "series", "x", "y"],
+            ["fraction", "delta", 1.0, -0.000344],
+            ["fraction", "delta", 2.0, 0.000115],
+            ["fraction", "delta", 3.0, 0.000115],
+        ]
+        code, stderr, out = self.render_mandate(declaration, rows, "MXzero")
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M3-fraction.svg").read_text(encoding="utf-8")
+        self.assertIn(">0.00<", document)
+        self.assertNotIn("-0.00", document)
 
 
 if __name__ == "__main__":

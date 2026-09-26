@@ -687,14 +687,24 @@ the reader:
 
 - **the axis**, for a bar panel, is chosen by the tool rather than inherited
   from the data's min/max. A fraction panel (`[0, 1]` quantity) whose *floor
-  sits at the top of that unit*, or whose bound a minority of the bars has
-  crossed, is drawn as a **band view**: the axis spans the bound's own band
-  either side of it (`MIN_UNIT_SPAN` of the unit at least), and its label says
-  it is not zero-based. Every other bar panel keeps the zero baseline. Every
-  bound the panel draws at its own scale must then resolve at least
-  `MIN_BOUND_PIXELS` of the axis height, or the render is refused by name —
-  the delivery panels failed that at `0.5 %`, i.e. half a pixel. A pinned
-  `y_extent` that reintroduces the failure is refused the same way.
+  sits at the top of that unit* and which the bars reach for is drawn as a
+  **band view**: the axis spans the bound's own band either side of it
+  (`MIN_UNIT_SPAN` of the unit at least), and a note inside the plot says it is
+  not zero-based. A floor the run has just breached is still that scale (one
+  bar at `0.994` under a `0.995` floor), so the reaching is tested on a
+  majority, not on every bar. Every other bar panel keeps the zero baseline,
+  with the axis extended to cover **every bound the panel draws and every
+  per-arm guard its own label names** plus `MIN_HEADROOM_PIXELS` above the
+  highest of them. Every bound the panel draws at its own scale must then
+  resolve at least `MIN_BOUND_PIXELS` of the axis height, or the render is
+  refused by name — the delivery panels failed that at `0.5 %`, i.e. half a
+  pixel. A pinned `y_extent` that reintroduces the failure is refused the same
+  way, and so is a pinned `y_extent` that leaves a *named* guard outside the
+  range (the `M2-wire` panel announced `hostile_wire_guard=10` and
+  `lone_wire_guard=14` on an axis topping out at 6.6, so the region it was
+  explaining was off the frame) or leaves no room for a bar over the highest
+  value it names (`M4-shares` was drawn over `0..0.25` — the fair share itself
+  — so a flow over the share could not be drawn at all).
 - **a crossed bound must be attributable.** A bound with at most a third of
   the bars beyond it is read as a departure, and whether that departure is a
   breach or an arm's tolerated tripwire is a property of *the run*: the panel
@@ -707,7 +717,14 @@ the reader:
   M2 wire budget line made a budget breach of a crossing the verdict tolerates.
   A crossing nothing in the run asserts a looser guard against — a per-flow
   delivery floor — stands as the breach it draws, so a failing run still
-  renders its evidence.
+  renders its evidence. A crossing a named guard *does* tolerate is measured
+  against the tolerance (the region between the reference and the point where a
+  departure begins) rather than against its own tenth of a multiple, which is
+  sub-pixel once the axis has to carry the guard as well; the margin rule is
+  unchanged for every bound with no such guard. A bound the values *cluster*
+  around in the middle of a unit (a fair share, a symmetric departure band) has
+  no crossing at all: it is the target they are read at, and calling it one
+  labelled eight flows sitting on 25 % as `1 of 8 bars beyond it`.
 - **a bound label must lie inside the plot.** The label is what says what the
   line governs, and `check_label_fit` reads each drawn label back out of the
   SVG and refuses the render when its box leaves the plot area. Measured on a
@@ -722,6 +739,28 @@ the reader:
   browser resolves for the panel's 11px style), pinned in the tests to widths
   real Chrome measured — so a font wider than that bound is outside what it can
   catch, while the vertical extent needs no width at all.
+- **a label must be drawn once and only once.** `check_label_overlap` refuses a
+  label drawn twice on one anchor (the preserved run drew
+  `fair share 25.0%fair share 25.0%` over itself) or any two labels sharing
+  ink; wrapped lines of one label are exempt, being stacked a line height
+  apart.
+- **bars must be separate.** `check_bar_separation` refuses two bars that touch,
+  because flush bars read as one continuously growing quantity: the old
+  placement clamped each category's group towards the middle so the outer
+  groups overlapped their neighbours by 52 px and one series painted a rising
+  staircase. Bars are laid out in category bands with the domain padded by half
+  a band at each end, so no placement is clamped and every pair keeps
+  `MIN_BAR_GAP_PIXELS`.
+- **drawn text must be readable and honest.** `check_canvas_text_fit` refuses a
+  text that leaves the canvas — including the *rotated* y label, whose length
+  runs along the panel's own height, which is why the band-view note is drawn
+  inside the plot instead of appended to that label — and a text carrying an
+  empty template (`[]`, `()`, `None`), which draws the absence of the evidence
+  its own label claims rather than the measurement.
+- **a legend must name the quantity, not the column.** `check_series_labels`
+  refuses a legend drawing a producer's column name (`wire_x`,
+  `shaper_forwarded`); `series_label` maps the names whose prettified form is
+  still cryptic and prettifies the rest.
 
 ### `tools/perf-loop` — the paired A/B battery (`tools/PERF_LOOP.md`)
 

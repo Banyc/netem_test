@@ -199,9 +199,13 @@ Into `--dir` (the path is printed, and recorded in the report):
   is inspectable after the fact;
 - `plots/<mandate>-<panel>.svg`, and `.png` unless `--no-rasterize` — the
   verified panels, each checked for series geometry, for every declared
-  bound, for an axis that resolves the bounds it draws, and for what each
-  crossed bound is attributed to (a producer that declares no verdict section
-  writes none);
+  bound, for an axis that resolves *every value the panel names* — the bound
+  and the per-arm guards its own label carries — with headroom for a bar over
+  the highest of them, for what each crossed bound is attributed to, for a
+  label that fits its plot and is drawn once, for bars that do not touch, for
+  text that neither leaves the canvas nor draws an empty placeholder, and for
+  a legend that names the quantity rather than the producer's column (a
+  producer that declares no verdict section writes none);
 - `mandate-check.json` — `schema` (`mandate-check/6`), `ok`, `exit_code`,
   `verdict`, `started_at`, `duration_seconds`, `producers_declared` and
   `producers_selected`, a `producers` record per *declared* producer (`id`,
