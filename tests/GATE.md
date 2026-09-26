@@ -317,30 +317,61 @@ live. The costs are **measured** — one release (probes) or one debug
 rounded up — and they are per `cargo test` process, so each includes the
 binary's startup.
 
-The baseline row is the unimpaired link, `lane=loopback layer=netem-link
-load=burst metric=counters scale=64-pkt`. Every other row declares how it
-relates to that baseline (`orthogonal`, `composite(<dimensions>)` or
-`re-measurement(<reason>)`), and the checker derives the dimensions the row's
-cells actually vary — a dimension the row values differently from the
-baseline, or one the baseline does not state at all; a dimension the row does
-not name is inherited from the baseline — and fails an unlabelled row, a row
-whose label disagrees with that derivation, and a row whose cells state one
-dimension twice (so its relation cannot be determined). Declared: **7
-orthogonal** rows and **10 composite** rows, plus the baseline row itself; no
-row is a re-measurement.
+A declaration may carry **several baselines**, because one reference cannot
+serve every measurement family: `baseline = <row>` is the **default** baseline
+a row inherits when its relation names none, and each
+`baseline.<family> = <row>` line declares a named baseline a row opts into with
+a trailing `@<family>` on its relation. A row's relation is then derived
+against *its own family's* reference — the dimensions the row's cells actually
+vary against that reference, a dimension it values differently or one the
+reference does not state at all, with a dimension the row does not name
+inherited — and the checker fails an unlabelled row, a row whose label
+disagrees with that derivation, a row whose cells state one dimension twice
+(so its relation cannot be determined), a row naming a baseline family that
+does not exist, and a declared baseline no row states a relation against (a
+stale reference).
+
+The harness declares four baselines, one per measurement family:
+
+- **default** — `netem_passes_traffic_unimpaired`, the unimpaired conformance
+  link (`lane=loopback layer=netem-link load=burst metric=counters
+  scale=64-pkt`); the seven other `netem_scenarios` rows are stated against it.
+- **`pair`** — `raw_netem_pair::netem_pair_raw_udp_echo_clean_link`, the raw
+  pair's clean cell. The pair's latency row differs from it in exactly one
+  dimension (`impairment`), so it is `orthogonal@pair` — read against the
+  conformance link it looked like a `composite(impairment,layer)`, which was
+  the baseline's problem, not the arm's.
+- **`lane`** —
+  `lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on`,
+  the jittery-short-rtt variance cell. The reordering row differs in exactly
+  `metric`; the thin-link row differs in `lane` **and** `metric` together, and
+  is honestly composite: it is measured in another regime, not as a second
+  axis of the jittery one.
+- **`probe`** — `lib::tests::clean_forwarding_perf_probe`, the harness's
+  wall-clock probe cell (`metric=throughput layer=netem-runner`). The deadline
+  probe differs in `metric` and the std-udp probe in `transport`, so both are
+  orthogonal; the destination-cache probe declares the reference's own cell
+  point, so it is a `re-measurement(second-arm-same-declared-point)` — a
+  deliberate second arm whose declared cell repeats its reference's, which is
+  the redundancy a shortening pass must see rather than a silent duplicate.
+
+Declared: **11 orthogonal** rows, **2 composite** rows and **1
+re-measurement**, plus the four baseline rows.
 
 The composites are not a re-cut of the arms — every window, cadence and tier
 is immutable — they are what the mandate's six-axis space (`impairment × load
-shape × lane × layer × metric × scale`) makes of these cells.
-`netem_reorder_with_rate_jumps_ahead` varies its impairment and its rate
-together; the two `raw_netem_pair` rows vary the layer and the `impairment`
-key the baseline does not state (the clean pair row's `impairment=none` is the
-baseline's own state, stated rather than varied); the three
-`lane_regime_coverage` rows and the four `lib::tests` probes vary their lane,
-layer and metric; and the std-udp probe varies its transport as well. A
-result on those rows is attributed to the combination, not to one dimension;
-the label is what stops it from being read as a single-dimension result, and
-no arm is to be retuned to make a label simpler.
+shape × lane × layer × metric × scale`) makes of these cells once each row is
+read against its own family's reference. `netem_reorder_with_rate_jumps_ahead`
+varies its impairment and its rate together, and the thin-link row varies its
+lane and its metric together. A result on those rows is attributed to the
+combination, not to one dimension; the label is what stops it from being read
+as a single-dimension result, and no arm is to be retuned to make a label
+simpler. The other six composites the single-baseline derivation used to
+report were rows measured against the wrong reference: the pair rows differ
+from the raw pair's own clean cell in one dimension, and the three probes
+differ from the probe cell in one dimension each. The two remaining composites
+are recorded as `attribution@baseline-family=…` gaps below, with the
+single-axis arm that would close each.
 
 The budgets are per tier, and they bound the rows declared in that tier — the
 perf-relevant tests, not the crate's correctness unit tests:
@@ -355,15 +386,15 @@ netem_scenarios::netem_passes_traffic_unimpaired = default | 0.6 | baseline | ba
 netem_scenarios::netem_rate_limit_throttles_burst = default | 0.3 | orthogonal | conformance-rate@impairment=rate-limit
 netem_scenarios::netem_reorder_with_rate_jumps_ahead = default | 0.1 | composite(impairment,rate) | conformance-reorder@impairment=reorder+rate=rate-limit
 netem_scenarios::netem_snapshot_reports_queue_and_stats = default | 0.2 | orthogonal | conformance-queue@impairment=queue-limit
-raw_netem_pair::netem_pair_raw_udp_echo_clean_link = default | 0.1 | composite(impairment,layer) | pair-echo@layer=netem-pair+impairment=none
-raw_netem_pair::netem_pair_raw_udp_latency_is_observable = default | 0.2 | composite(impairment,layer) | pair-latency@layer=netem-pair+impairment=delay25ms
-lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on = default | 0.1 | composite(lane,metric) | regime-jittery@lane=jittery-short-rtt+metric=rttvar
-lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot = default | 6.2 | composite(lane,metric) | regime-jittery@lane=jittery-short-rtt+metric=reordering
-lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot = standard | 14.8 | composite(lane,metric) | regime-thin@lane=high-rtt-low-rate+metric=rto
-lib::tests::clean_forwarding_perf_probe = perf | 0.2 | composite(layer,metric) | probe-forwarding@metric=throughput+layer=netem-runner
-lib::tests::learned_destination_cache_perf_probe = perf | 0.2 | composite(layer,metric) | probe-dest-cache@metric=throughput+layer=netem-runner
-lib::tests::short_deadline_latency_perf_probe = perf | 0.1 | composite(layer,metric) | probe-deadline@metric=latency+layer=netem-runner
-lib::tests::std_udp_connected_peer_perf_probe = perf | 1.2 | composite(layer,metric,transport) | probe-std-udp@metric=throughput+layer=netem-runner+transport=std-udp
+raw_netem_pair::netem_pair_raw_udp_echo_clean_link = default | 0.1 | baseline@pair | pair-echo@layer=netem-pair+impairment=none
+raw_netem_pair::netem_pair_raw_udp_latency_is_observable = default | 0.2 | orthogonal@pair | pair-latency@layer=netem-pair+impairment=delay25ms
+lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on = default | 0.1 | baseline@lane | regime-jittery@lane=jittery-short-rtt+metric=rttvar
+lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot = default | 6.2 | orthogonal@lane | regime-jittery@lane=jittery-short-rtt+metric=reordering
+lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot = standard | 14.8 | composite(lane,metric)@lane | regime-thin@lane=high-rtt-low-rate+metric=rto
+lib::tests::clean_forwarding_perf_probe = perf | 0.2 | baseline@probe | probe-forwarding@metric=throughput+layer=netem-runner
+lib::tests::learned_destination_cache_perf_probe = perf | 0.2 | re-measurement(second-arm-same-declared-point)@probe | probe-dest-cache@metric=throughput+layer=netem-runner
+lib::tests::short_deadline_latency_perf_probe = perf | 0.1 | orthogonal@probe | probe-deadline@metric=latency+layer=netem-runner
+lib::tests::std_udp_connected_peer_perf_probe = perf | 1.2 | orthogonal@probe | probe-std-udp@metric=throughput+layer=netem-runner+transport=std-udp
 ```
 
 The declared sums are `default` 10.5 s of a 60 s budget, `standard` 14.8 s of
@@ -380,13 +411,20 @@ standard = 120
 full = 300
 perf = 60
 baseline = netem_scenarios::netem_passes_traffic_unimpaired
+baseline.pair = raw_netem_pair::netem_pair_raw_udp_echo_clean_link
+baseline.lane = lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
+baseline.probe = lib::tests::clean_forwarding_perf_probe
 drift = 0.5
 drift_floor_s = 2.0
 ```
 
 Each line below is a cell the harness does **not** claim, with the reason it is
 empty. The product mandates' cells are named with their pending owner rather
-than left out, so the gap is a record and not an omission:
+than left out, so the gap is a record and not an omission. The two
+`attribution@baseline-family=…` lines are a second kind: the row is a composite
+and no existing arm is one declared dimension away from it, so no family
+arrangement can attribute it; they name the single-axis arm that would close
+the gap.
 
 ```gate-coverage-gaps
 M1@lane=dual-lane+metric=p99 = owned by rtp_mux's mandate_smoke; the harness supplies the impairment instrument and asserts none of the product's mandate bounds. Declaration pending (tools/PERF_INFRA.md, "Where the migration stands").
@@ -400,4 +438,6 @@ regime-thin@lane=high-rtt-low-rate+metric=goodput = the thin-link lane's goodput
 probe-forwarding@scale=multi-megabyte = the probes measure single-datagram and 200-packet cost; transfer-scale cost is measured by the perf-loop battery, not by a harness test.
 probe-forwarding@metric=cpu-attribution = per-datagram CPU cost is measured by owning-symbol attribution (tools/samply_hotspots.py), not by a wall-clock probe.
 probe-forwarding@load=request-response = the probes drive the runner directly, so no load shape exists at this layer; request/response is a transport-lane shape owned by rtp_mux.
+attribution@baseline-family=default = netem_scenarios::netem_reorder_with_rate_jumps_ahead is two declared dimensions (impairment, rate) from the conformance reference, and no arm varies one of them alone; a conformance arm one axis away from it is what closes this.
+attribution@baseline-family=lane = lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot is two declared dimensions (lane, metric) from the lane family's reference; the thin-link regime is another regime, not a second axis of the jittery one, so a lane_regime_coverage arm one axis away closes this.
 ```
