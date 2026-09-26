@@ -475,7 +475,10 @@ Run from this workspace root, with no arguments:
 tools/mandate-check
 ```
 
-It runs `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`,
+It runs `cargo test --release -p rtp_mux --test mandate_smoke -- -Z
+unstable-options --report-time --nocapture` (the two timing flags are the
+runner's own, so every test's reported duration is libtest's own measurement of
+that test rather than a bracket between two lines' arrivals),
 renders one validated SVG+PNG per panel through `tools/mandate_plot.py`, prints
 a verdict block and writes `mandate-check.json` alongside the eight evidence
 files. Measured cost: **216.3 s** on a warm build (10 panels, 20 SVG+PNG plot
@@ -522,11 +525,13 @@ of them — that is what makes the coverage-preservation comparison available to
 a crate that is not `rtp_mux`. Two producers are declared and covered today:
 
 - **`rtp_mux`** — the tri-mandate smoke set above
-  (`cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`): its
+  (`cargo test --release -p rtp_mux --test mandate_smoke -- -Z unstable-options
+  --report-time --nocapture`): its
   `M1`-`M4` arms, its verdict lines and the eight evidence files.
 - **`netem_test`** — this workspace's four perf-tier probes, in the harness
   `lib` target
-  (`cargo test --release -p netem-test --lib -- --ignored --test-threads=1 --nocapture`):
+  (`cargo test --release -p netem-test --lib -- -Z unstable-options
+  --report-time --ignored --test-threads=1 --nocapture`):
   four report-only arms in the `probe` section. They assert no bound, so they
   print no `MANDATE` line and write no evidence; each arm line carries its own
   section (`section=probe`), which is how a producer with no verdict line
@@ -546,7 +551,14 @@ hole.
 
 **`tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
 a producer printed becomes an `arms` entry in `mandate-check.json` (schema
-`mandate-check/5`, which over `/4` adds the `producers` map — one record per
+`mandate-check/6`, which over `/5` takes each test's `duration_seconds` from
+libtest's own `--report-time` stamp instead of bracketing it against the
+previous completion, marks a test whose stamp is missing with a null duration
+and a null `duration_source` rather than inferring one, and adds
+`timings.targets` — per target libtest's own `finished in` total, the stamped
+and running test counts, the summed and largest stamped seconds and whether
+they fit that total; `/5` over `/4` adds the
+`producers` map — one record per
 declared producer, with its invocation, revision, tree, log, exit status and
 arm count — and a `producer` field on every arm; `/4` over `/3` added the
 `rtp_mux` `tree_id`, the content a run built, since a commit id read from
@@ -652,7 +664,11 @@ regenerate them.
 Because the comparison refuses a baseline whose schema predates the per-arm
 record, this file has to be re-recorded with a current `tools/mandate-check`
 (no `--quick`) whenever the runner or a producer changes shape; the checked-in
-file is schema `mandate-check/5`. A `/4` file is still read, but it carries
+file is schema `mandate-check/5`, so its `timings` block is the per-test
+numbers the pre-`/6` bracketing produced — `m2_interactive_delivery_and_wire`
+at 0.000 s beside `m3_bulk_goodput_fraction` at 61.981 s, in a run libtest
+timed at 147.1 s — and is read by nothing: only `arms` is compared. A `/4`
+file is still read, but it carries
 one producer's arms only, so a run compared against it cannot show the second
 producer's coverage — re-record rather than compare across the addition.
 

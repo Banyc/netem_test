@@ -9,14 +9,30 @@ can verify from a machine, not from prose, that the mandated checks ran and
 what they measured.
 
 It also times the run per test and per mandate, and records what each perf
-*arm* measured. The smoke set is read as a stream (not waited on and then read
-whole), so the arrival of every libtest completion line, every ``MANDATE`` line
-and every ``[mandate-smoke <arm>]`` line is timestamped against the child's
-start. Those arrivals give each test and each mandate a wall-clock duration
-bracketed between two observed lines: the smoke set serialises its own
-measurements, so the completions arrive in run order, and a per-test duration
-includes the gap before the test started (fixture setup, lock wait). The
-report records the method alongside the numbers so a reader knows what was
+*arm* measured. A test's duration is **libtest's own**: the command appends
+``-Z unstable-options --report-time`` to every producer's invocation, so
+libtest prints ``test <name> ... ok <1.234s>`` from an instant it takes around
+that test's own execution, and the command reads that stamp. The stamp stays
+that test's own while the target runs concurrently — which is why the fix does
+not serialise a producer: libtest's default parallelism is kept. ``-Z
+unstable-options`` is the gate libtest puts on the flag, and on this
+workspace's stable-pinned toolchain libtest accepts it when
+``RUSTC_BOOTSTRAP=1`` is in the child's environment, which selects no
+different compiler and changes no codegen, so no nightly toolchain and no
+second build is needed. A test whose result line carries no stamp is
+**marked** (``duration_source`` and ``duration_seconds`` null) rather than
+given a number bracketed from the stream, and a target that ran tests without
+a single stamp is an evidence failure naming the absence.
+
+The child's lines are still read as a stream and timestamped against the
+child's start, which is what orders the tests and what a *mandate's* duration
+is still bracketed from: the ``MANDATE`` line is printed from inside the test
+that measured it, so the harness's stamp is available for the test and not for
+the section, and the bracket is labelled as what it is. Each per-target record
+says how many of its tests carried a stamp and whether the stamped per-test
+times fit the target's own ``finished in`` total, so a number that cannot be
+one test's own time is a named failure rather than a plausible-looking row.
+The report records the method alongside the numbers so a reader knows what was
 measured, and a declared nominal cost that has drifted from this measured
 wall-clock is visible rather than assumed (the owning crate's
 ``gate-perf-design`` block states the declared cost, ``check-gate.py``
@@ -60,13 +76,17 @@ owes it. ``tools/MANDATE_SMOKE.md`` states the same contract as the form a
 crate's author follows; the runners and the failure modes are these.
 
 1. **The target and the invocation.** A producer's target and cargo arguments
-   are its registry entry's, and its declared ``test_args`` are appended after
-   ``--``. The command adds no test filter of its own and no
-   ``--test-threads``; a producer whose measurements are wall-clock must
+   are its registry entry's, its declared ``test_args`` are appended after
+   ``--``, and the command inserts its own per-test timing flags
+   (``-Z unstable-options --report-time``) between ``--`` and them, so the
+   stamps the run is timed from are the ones it asked for and a producer
+   cannot declare the instrument away. It adds no test filter of its own and
+   no ``--test-threads``; a producer whose measurements are wall-clock must
    serialise them, either internally or with ``--test-threads=1`` among its
    declared ``test_args``. The ``rtp_mux`` producer is run exactly as
 
-       cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture
+       cargo test --release -p rtp_mux --test mandate_smoke -- \
+           -Z unstable-options --report-time --nocapture
 
 2. **Where the evidence goes.** The smoke set must write, into the directory
    named by the environment variable ``MANDATE_CHECK_DIR`` (this command
@@ -165,9 +185,18 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   and the panel series counts, plus the run's exact command, the ``rtp_mux``
   source revision (its ``jj`` or ``git`` commit and change ids, and the tree
   that revision points at, each when resolvable), the wall-clock duration,
-  every problem found and the exit code. ``schema`` is ``mandate-check/4``:
-  over ``mandate-check/3`` the ``rtp_mux`` record gains ``tree_id`` and
-  ``tree_id_source`` — the identity of the *content* the run built, which the
+  every problem found and the exit code. ``schema`` is ``mandate-check/6``:
+  over ``mandate-check/5`` (which added the ``producers`` map, one record per
+  declared producer) it takes each test's ``duration_seconds`` from libtest's
+  own ``--report-time`` stamp rather than bracketing it against the previous
+  completion, adds ``duration_source`` to every test and every mandate, and
+  adds ``timings.targets`` — per target the parsed ``finished in`` total, how
+  many of its tests ran and how many carried a stamp, the summed and largest
+  stamped durations, and whether those fit that total. A ``/5`` reader keeps
+  working: ``timings.tests`` keeps its keys, ``duration_seconds`` is still the
+  test's own seconds, and ``duration_source`` says where each came from.
+  ``mandate-check/4`` added ``tree_id`` and ``tree_id_source`` to the
+  ``rtp_mux`` record — the identity of the *content* the run built, which the
   commit id alone does not give, because ``jj`` rewrites ``@`` on every
   operation and the working-copy commit a build reads may be an auto-snapshot
   whose commit id is throwaway. ``mandate-check/3`` adds ``arms`` (one entry per
@@ -177,8 +206,8 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   verbatim, the declared coverage ``cells`` and ``raw_line``), ``arm_notes``
   (the prose-only arm lines, with their mandate when one can be attributed)
   and ``arm_declaration`` (the declaration the cells were read from).
-  ``timings`` and ``mandates`` are unchanged, so a reader of
-  ``mandate-check/2`` or ``mandate-check/3`` keeps working.
+  so a reader of ``mandate-check/2`` or ``mandate-check/3`` keeps working, and
+  the fields those schemas define are unchanged by ``mandate-check/6``.
 
 The eight expected evidence files, the ``plots`` directory, and this
 command's own ``mandate-check.json`` and ``mandate-smoke.log`` are removed from
@@ -195,9 +224,10 @@ be compared as if it were that run's measurement.
   checkout, missing smoke-set source, cargo not found, a compile or test
   failure, a timeout, a missing/malformed/multiple ``MANDATE`` line, a
   missing/empty/mis-shaped declaration or data file, a malformed,
-  unattributable, undeclared or absent arm line, or a panel that could not be
-  rendered or verified. The evidence is not trustworthy, whatever the
-  verdicts said.
+  unattributable, undeclared or absent arm line, a target that ran tests
+  without one libtest per-test stamp to time them from, a per-test time that
+  cannot fit its target's own total, or a panel that could not be rendered or
+  verified. The evidence is not trustworthy, whatever the verdicts said.
 - ``3`` — the evidence is complete and at least one mandate reports ``FAIL``.
 
 Failing loudly is the point: a checker that cannot fail is worse than no
@@ -243,7 +273,7 @@ REPORT_NAME = "mandate-check.json"
 # name is its registry entry's.
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/5"
+REPORT_SCHEMA = "mandate-check/6"
 ARMS_DECLARATION_NAME = "mandate-arms.json"
 ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
 PRODUCERS_DECLARATION_NAME = "mandate-producers.json"
@@ -298,6 +328,38 @@ GIT_TREE_RE = re.compile(r"^(?P<tree>[0-9a-f]{40})$")
 # lines do not match a state and are not completions.
 TEST_RESULT_RE = re.compile(r"^test (?P<name>\S+) \.\.\. ?(?P<tail>.*)$")
 TEST_STATES = ("ok", "FAILED", "ignored")
+# `-Z unstable-options --report-time` makes libtest append its own measurement
+# of the test's execution to the result: `test <name> ... ok <1.234s>`, and
+# `FAILED <0.205s>` for a failure. The instant is taken around that test's own
+# run, so it is that test's own time even while sibling tests run in parallel;
+# a bracketed stream position is not. The flag is gated by libtest, and on a
+# stable-pinned toolchain libtest accepts it when `RUSTC_BOOTSTRAP` is set in
+# the child's environment (the same compiler, the same codegen: only the flag
+# gate moves).
+TIMING_ARGS = ("-Z", "unstable-options", "--report-time")
+TIMING_ENV = "RUSTC_BOOTSTRAP"
+TIMING_ENV_VALUE = "1"
+# The test's own time resolved the way the runner resolves every duration.
+DURATION_SOURCE_HARNESS = "libtest-report-time"
+# A mandate's own time cannot come from libtest (the `MANDATE` line is printed
+# from inside the test, so there is no per-section stamp), so it stays the
+# bracket between two `MANDATE` lines and says so.
+DURATION_SOURCE_STREAM_BRACKET = "stream-bracket-of-mandate-lines"
+# The harness's own per-test stamp, read from a result line's tail or from the
+# bare state line a test that prints splits its completion into.
+TEST_STAMP_RE = re.compile(
+    r"^(?P<state>ok|FAILED)(?:,.*)?\s+<(?P<seconds>[0-9]+(?:\.[0-9]+)?)s>$"
+)
+# libtest's summary line carries the whole target's wall-clock:
+# `test result: ok. 4 passed; 0 failed; 1 ignored; ...; finished in 86.16s`.
+TEST_TOTAL_RE = re.compile(
+    r"^test result: .*finished in (?:(?P<minutes>[0-9]+)m )?(?P<seconds>[0-9]+(?:\.[0-9]+)?)s$"
+)
+# The fit check's slack. libtest prints its total to two decimals and a test's
+# own stamp to three, and a target's first test does not start at the instant
+# the process does, so a stamp that fits the total to within this much is a fit.
+TOTAL_FIT_TOLERANCE = 0.01
+TOTAL_FIT_FLOOR_SECONDS = 0.1
 # A libtest progress note (`test <name> has been running for over 60 seconds`):
 # the test is still running, so the note is not a completion and not a marker
 # whose result is still to come.
@@ -358,11 +420,18 @@ ARM_WINDOW_KEYS = {
 # number is recorded; the unit is not a second quantity to compare.
 ARM_UNIT_SUFFIXES = ("B", "s")
 TIMING_METHOD = (
-    "streamed-line-arrival: a test's completion is the arrival of its libtest "
-    "result line, and its duration is bracketed against the previous "
-    "completion (0 for the first, the child's start); a mandate's duration is "
-    "bracketed the same way against its neighbouring MANDATE lines. A bracket "
-    "includes the gap before the test started"
+    "libtest-per-test-stamp: a test's duration is the time libtest itself "
+    "reports for that test (the child is run with -Z unstable-options "
+    "--report-time, so its result reads 'test <name> ... ok <1.234s>'), which "
+    "libtest takes around that test's own execution and which therefore stays "
+    "that test's own while the target's tests run concurrently. It is not a "
+    "line's position in the stream, which under libtest's default parallelism "
+    "is an artefact of the interleaving. A test whose result carries no stamp "
+    "has a null duration and duration_source, and is never bracketed. A "
+    "mandate's duration is still the bracket between its neighbouring MANDATE "
+    "lines and is marked with that source, because the MANDATE line is printed "
+    "from inside the test that measured the section and no per-section stamp "
+    "exists"
 )
 
 
@@ -1118,8 +1187,19 @@ def prepare_output_dir(out_dir, log_names=(LOG_NAME,)):
 
 
 def producer_command(cargo, producer):
-    """One producer's contract invocation: its declared argv, no filter added."""
-    return [cargo, *producer["cargo_args"], "--", *producer["test_args"]]
+    """One producer's contract invocation: its declared argv, no filter added.
+
+    The command's own per-test timing flags go between ``--`` and the
+    producer's declared args: they are the instrument, so the runner asks for
+    them itself rather than trusting a producer's declaration to carry them.
+    """
+    return [
+        cargo,
+        *producer["cargo_args"],
+        "--",
+        *TIMING_ARGS,
+        *producer["test_args"],
+    ]
 
 
 def run_producer(command, *, crate, out_dir, quick, timeout):
@@ -1134,6 +1214,11 @@ def run_producer(command, *, crate, out_dir, quick, timeout):
     """
     env = dict(os.environ)
     env[OUT_DIR_ENV] = str(out_dir)
+    # libtest's `-Z unstable-options` gate is open on a nightly compiler and,
+    # on the stable-pinned toolchain this workspace uses, when the child sees
+    # `RUSTC_BOOTSTRAP`. It selects no different compiler and changes no
+    # codegen: it is the flag gate, not the build.
+    env[TIMING_ENV] = TIMING_ENV_VALUE
     env.pop(QUICK_ENV, None)
     if quick:
         env[QUICK_ENV] = "1"
@@ -1192,7 +1277,7 @@ def _result_state(tail):
     )
 
 
-def derive_timings(events, target):
+def derive_timings(events, target, serial=False):
     """The run's per-test and per-mandate wall-clock, from the line timeline.
 
     Every libtest result line and every ``MANDATE`` line is an observed
@@ -1200,25 +1285,34 @@ def derive_timings(events, target):
     the previous result's, a mandate's the bracket between its ``MANDATE``
     line and the previous one; the first bracket runs from the child's start.
     A ``FAILED`` or ``ignored`` result is recorded with its state and, for
-    ``ignored``, a null duration (it never ran). Nothing here is inferred: an
-    absent line stays absent.
+    ``ignored``, a null duration (it never ran). Nothing here is inferred: a
+    test whose result carries no libtest stamp keeps a null duration rather
+    than falling back to the bracket, and the absence is reported.
 
     A test that prints while it runs splits its own completion in two: libtest
     writes ``test <name> ... `` and flushes, the test's output follows, and the
     state arrives on a line of its own when the test ends. The completion is
-    then the arrival of that **state** line — which is when the test ended —
-    and the marker line, whose tail is the test's first line of output rather
-    than a state, is held until the state arrives. A producer whose arms are
-    printed from inside its own test (the harness's perf probes) times exactly
-    like one that buffers it (the smoke set).
+    then the arrival of that **state** line, whose tail carries the stamp, and
+    the marker line, whose tail is the test's first line of output rather than
+    a state, is held until the state arrives. A producer whose arms are printed
+    from inside its own test (the harness's perf probes) times exactly like one
+    that buffers it (the smoke set).
+
+    ``serial`` says whether the producer's own arguments serialise its tests
+    (``--test-threads=1``); a serial target's stamped per-test times must sum
+    to no more than the target's own total, which is an impossibility check a
+    concurrent target cannot support because its tests legitimately overlap.
+    Either way no single stamped time may exceed that total.
     """
     tests = []
     mandates = []
+    problems = []
     previous_completion = 0.0
     previous_mandate = 0.0
+    total_seconds = None
     awaiting = None
 
-    def record(name, state, seconds):
+    def record(name, state, seconds, stamp):
         nonlocal previous_completion
         entry = {
             "target": target,
@@ -1227,9 +1321,12 @@ def derive_timings(events, target):
             "started_at_seconds": previous_completion,
             "finished_at_seconds": seconds,
             "duration_seconds": None,
+            "duration_source": None,
         }
         if state != "ignored":
-            entry["duration_seconds"] = round(max(seconds - previous_completion, 0.0), 3)
+            if stamp is not None:
+                entry["duration_seconds"] = round(stamp, 3)
+                entry["duration_source"] = DURATION_SOURCE_HARNESS
             previous_completion = seconds
         tests.append(entry)
 
@@ -1243,9 +1340,18 @@ def derive_timings(events, target):
                     "mandate": mandate.group("mandate"),
                     "finished_at_seconds": seconds,
                     "duration_seconds": round(max(seconds - previous_mandate, 0.0), 3),
+                    "duration_source": DURATION_SOURCE_STREAM_BRACKET,
                 }
             )
             previous_mandate = seconds
+            continue
+        total = TEST_TOTAL_RE.match(line)
+        if total is not None:
+            total_seconds = round(
+                int(total.group("minutes") or 0) * 60.0
+                + float(total.group("seconds")),
+                3,
+            )
             continue
         result = TEST_RESULT_RE.match(line)
         if result is not None:
@@ -1260,19 +1366,132 @@ def derive_timings(events, target):
                 awaiting = result.group("name")
                 continue
             awaiting = None
-            record(result.group("name"), state, seconds)
+            record(result.group("name"), state, seconds, _stamp_seconds(tail))
             continue
         if awaiting is not None:
             state = _result_state(line)
             if state is not None:
-                record(awaiting, state, seconds)
+                record(awaiting, state, seconds, _stamp_seconds(line))
                 awaiting = None
     return {
         "method": TIMING_METHOD,
         "origin": "smoke-child-start",
         "tests": tests,
         "mandates": mandates,
+        "targets": [_target_fit(target, tests, total_seconds, serial, problems)],
+        "problems": problems,
     }
+
+
+def _stamp_seconds(text):
+    """The harness's own time for a result, or ``None`` when it carries none."""
+    match = TEST_STAMP_RE.match(text.strip())
+    if match is None:
+        return None
+    return float(match.group("seconds"))
+
+
+def _target_fit(target, tests, total_seconds, serial, problems):
+    """One target's own-recorded total, and whether its stamps fit it.
+
+    Three things are decided here, in the order of what they can prove. A
+    target that ran tests and produced **no** stamp is a failure: the
+    instrument was not measuring, and every duration is null rather than a
+    bracketed stand-in. A stamped time that exceeds the target's own
+    ``finished in`` total cannot be one test's own time under any schedule, so
+    it is a failure too. When the target ran serially its stamps cannot
+    overlap, so their sum must fit the total as well; a concurrent target's
+    legitimately overlap, so its overlap is recorded as a measurement (the
+    factor says by how much) rather than refused.
+    """
+    ran = [entry for entry in tests if entry["state"] != "ignored"]
+    stamped = [
+        entry for entry in tests if entry["duration_source"] == DURATION_SOURCE_HARNESS
+    ]
+    durations = [entry["duration_seconds"] for entry in stamped]
+    summed = round(sum(durations), 3)
+    largest = max(durations, default=None)
+    record = {
+        "target": target,
+        "total_seconds": total_seconds,
+        "total_source": "libtest-finished-in" if total_seconds is not None else None,
+        "serial": bool(serial),
+        "tests": len(tests),
+        "ran": len(ran),
+        "stamped": len(stamped),
+        "sum_seconds": summed,
+        "max_seconds": largest,
+        "overlap_factor": (
+            round(summed / total_seconds, 3)
+            if stamped and total_seconds is not None and total_seconds > 0
+            else None
+        ),
+        "fits": None,
+        "note": None,
+    }
+    if ran and not stamped:
+        record["note"] = "no-test-carried-a-libtest-stamp"
+        problems.append(
+            f"the {target} target ran {len(ran)} test(s) but not one of its "
+            "results carries libtest's own per-test stamp, so no test's "
+            "duration could be taken. The command ran it with "
+            f"'{' '.join(TIMING_ARGS)}' and {TIMING_ENV}={TIMING_ENV_VALUE}; a "
+            "libtest that refuses those, or a --format that prints no stamp, "
+            "leaves every duration null rather than bracketed from the stream"
+        )
+        return record
+    if total_seconds is None:
+        record["note"] = "no-libtest-total-line" if tests else "no-tests-ran"
+        return record
+    slack = max(TOTAL_FIT_FLOOR_SECONDS, total_seconds * TOTAL_FIT_TOLERANCE)
+    oversized = [
+        entry for entry in stamped if entry["duration_seconds"] > total_seconds + slack
+    ]
+    if oversized:
+        worst = max(oversized, key=lambda entry: entry["duration_seconds"])
+        record["fits"] = False
+        problems.append(
+            f"{worst['name']} reports {worst['duration_seconds']:.3f}s, which "
+            f"cannot fit the {target} target's own total of {total_seconds:.2f}s "
+            "(libtest's 'finished in'), so it is not that test's own time"
+            + (f"; {len(oversized)} stamp(s) exceed it" if len(oversized) > 1 else "")
+        )
+        return record
+    if serial and summed > total_seconds + slack:
+        record["fits"] = False
+        problems.append(
+            f"the {target} target's stamped per-test times sum to {summed:.3f}s "
+            f"but the target ran serially (--test-threads=1) and finished in "
+            f"{total_seconds:.2f}s, so at least one stamp is not its own test's "
+            "time"
+        )
+        return record
+    record["fits"] = True
+    if stamped and len(stamped) < len(ran):
+        record["note"] = (
+            f"{len(ran) - len(stamped)} of {len(ran)} test(s) carried no stamp "
+            "and have a null duration"
+        )
+    return record
+
+
+def _declared_serial(test_args):
+    """Whether a producer's own arguments serialise its tests.
+
+    A serial target's per-test times cannot overlap, which is what lets the
+    fit check compare their sum with the target's total. The declaration is
+    read (`--test-threads=1`, either spelling); a producer that serialises
+    itself internally is not seen here and its sum is simply not refused.
+    """
+    for index, token in enumerate(test_args):
+        if token.startswith("--test-threads="):
+            value = token.partition("=")[2]
+        elif token == "--test-threads":
+            value = test_args[index + 1] if index + 1 < len(test_args) else ""
+        else:
+            continue
+        return value.strip() == "1"
+    return False
 
 
 def apply_mandate_timings(report, timings, producer):
@@ -1292,6 +1511,9 @@ def apply_mandate_timings(report, timings, producer):
     for entry in timings["mandates"]:
         entry["producer"] = producer["id"]
         merged["mandates"].append(entry)
+    for entry in timings.get("targets") or []:
+        entry["producer"] = producer["id"]
+        merged.setdefault("targets", []).append(entry)
     for mandate in producer["verdicts"]:
         record = report["mandates"].get(mandate)
         entry = by_mandate.get(mandate)
@@ -1299,6 +1521,7 @@ def apply_mandate_timings(report, timings, producer):
             continue
         record["finished_at_seconds"] = entry["finished_at_seconds"]
         record["duration_seconds"] = entry["duration_seconds"]
+        record["duration_source"] = entry.get("duration_source")
 
 
 def _kill_process_group(process):
@@ -1443,6 +1666,7 @@ def build_report(args, out_dir, declared, selected, quick, timeout):
             "origin": "smoke-child-start",
             "tests": [],
             "mandates": [],
+            "targets": [],
         },
         "arms": [],
         "arm_notes": [],
@@ -1472,6 +1696,7 @@ def build_report(args, out_dir, declared, selected, quick, timeout):
                 "panels": 0,
                 "finished_at_seconds": None,
                 "duration_seconds": None,
+                "duration_source": None,
             }
     return report
 
@@ -1550,9 +1775,31 @@ def verdict_block(report):
         lines.append(f"{mandate} {verdict}  {measured}".rstrip())
         duration = record.get("duration_seconds")
         if duration is not None:
-            lines.append(f"  duration: {duration:.2f}s (bracketed wall-clock)")
+            lines.append(
+                f"  duration: {duration:.2f}s ({record.get('duration_source') or 'unstated'})"
+            )
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
+    for entry in (report.get("timings") or {}).get("targets") or []:
+        total = entry.get("total_seconds")
+        fits = entry.get("fits")
+        shape = ""
+        if total is not None:
+            if entry.get("serial"):
+                shape = f", {entry['sum_seconds']:.2f}s of {total:.2f}s total (serial)"
+            else:
+                shape = (
+                    f", {entry['sum_seconds']:.2f}s of {total:.2f}s total "
+                    f"({entry['overlap_factor']:.2f}x overlap: {entry['stamped']} "
+                    "concurrent test(s))"
+                )
+        lines.append(
+            f"timings: {entry['producer']}:{entry['target']}  "
+            f"{entry['stamped']}/{entry['ran']} test(s) stamped by libtest"
+            + shape
+            + f"  fit={'yes' if fits else 'NO' if fits is False else 'unchecked'}"
+            + (f"  note: {entry['note']}" if entry.get("note") else "")
+        )
     arms = report.get("arms") or []
     produced = sorted({arm.get("producer") for arm in arms if arm.get("producer")})
     lines.append(
@@ -1604,16 +1851,20 @@ def evaluate_producer(args, producer, out_dir, report, run, declaration):
     }
     # The per-test and per-section wall-clock observed on this child's output
     # stream, so a cost the declaration claims can be compared with what the
-    # run actually took, per test, rather than only in total.
-    apply_mandate_timings(
-        report,
-        derive_timings(run.get("events") or [], producer["target"]),
-        producer,
+    # run actually took, per test, rather than only in total. The per-test
+    # durations are libtest's own stamps; the timing problems they raise (a
+    # target that produced none, a stamp that cannot fit its target's total)
+    # are this producer's evidence failures like any other.
+    timings = derive_timings(
+        run.get("events") or [],
+        producer["target"],
+        serial=_declared_serial(producer["test_args"]),
     )
+    apply_mandate_timings(report, timings, producer)
     # This producer's own problems, so a report of several producers says which
     # one broke and the exit code is decided per producer rather than by the
     # union of everyone's evidence.
-    problems = []
+    problems = list(timings.get("problems") or [])
     # What each arm measured, so a later run's coverage can be diffed against a
     # committed baseline instead of argued about.
     arms = apply_arm_records(

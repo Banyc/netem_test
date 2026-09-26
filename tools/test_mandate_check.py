@@ -4,6 +4,7 @@ import io
 import json
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -71,6 +72,9 @@ def main():
                     "cwd": os.getcwd(),
                     "mandate_check_dir": out,
                     "quick": os.environ.get("MANDATE_SMOKE_QUICK"),
+                    # The runner sets this so the stable-pinned toolchain's
+                    # libtest accepts the `-Z unstable-options` it times with.
+                    "rustc_bootstrap": os.environ.get("RUSTC_BOOTSTRAP"),
                 }
             )
             + NEWLINE
@@ -281,7 +285,7 @@ PASS_LINES = [
     "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
     "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
     "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0",
-    "test m1_interactive_tail_latency ... ok",
+    "test m1_interactive_tail_latency ... ok <86.163s>",
     "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   25.3 "
     "p90=   43.0 p99=   89.0 p999=   97.9 max=   102.5 over250=   0 wire=     42300B "
     "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
@@ -292,7 +296,7 @@ PASS_LINES = [
     "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
     "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
     "MANDATE M2 PASS delivery=1.000 amp=3.61 budget=6.0",
-    "test m2_interactive_delivery_and_wire ... ok",
+    "test m2_interactive_delivery_and_wire ... ok <86.162s>",
     "[mandate-smoke m3/rep1] delivered 0.963 MiB/s over 2.0004s, shaper forwarded "
     "0.972 MiB/s, capacity 1.000 MiB/s, fraction 0.963 (820148 / 992240 bytes)",
     "[mandate-smoke m3/rep2] delivered 0.971 MiB/s over 2.0011s, shaper forwarded "
@@ -300,7 +304,7 @@ PASS_LINES = [
     "[mandate-smoke m3/rep3] delivered 0.958 MiB/s over 2.0008s, shaper forwarded "
     "0.967 MiB/s, capacity 1.000 MiB/s, fraction 0.958 (815872 / 990128 bytes)",
     "MANDATE M3 PASS goodput=0.52 floor=0.35 link_mib_s=8.0",
-    "test m3_bulk_goodput_fraction ... ok",
+    "test m3_bulk_goodput_fraction ... ok <60.589s>",
     "[mandate-smoke m4/clean flow A] sent=  120 recv=  120 delivery=1.000 "
     "share=0.2502 offered=1269600B delivered=1269600B p50=   22.0 p90=   41.0 "
     "p99=  118.4 max=  240.0",
@@ -327,9 +331,23 @@ PASS_LINES = [
     # ceiling, and that measurement is what names the series the latency panel's
     # ceiling bound governs; the plotter refuses a crossed bound without it.
     "hostile_p99_guard=900.0",
-    "test m4_interactive_lane_fairness ... ok",
-    "test result: ok. 4 passed; 0 failed",
+    "test m4_interactive_lane_fairness ... ok <23.037s>",
+    "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; "
+    "finished in 86.16s",
 ]
+
+
+# The same stream from a libtest that did not stamp its results: the runner
+# asked for the stamps and did not get them, so no test has a duration and the
+# run must say so rather than bracket one from the line positions.
+def unstamped(lines):
+    """A libtest stream with the per-test stamps and the target total removed."""
+    stripped = []
+    for line in lines:
+        line = re.sub(r" <[0-9.]+s>$", "", line)
+        line = re.sub(r"; finished in [0-9.]+s$", "", line)
+        stripped.append(line)
+    return stripped
 
 
 def arm_lines(lines):
@@ -350,23 +368,24 @@ PROBE_LINES = [
     "direct=3.157 Mpps filter=513.149 Mpps queued=2.105 Mpps",
     "[mandate-smoke forwarding] section=probe recv=200000 direct_mpps=3.157 "
     "filter_mpps=513.149 queued_mpps=2.105",
-    "ok",
+    "ok <0.010s>",
     "test tests::short_deadline_latency_perf_probe ... short_deadline_latency_perf_probe: "
     "median=125ns",
     "[mandate-smoke deadline] section=probe recv=1000 median_us=0.125 "
     "idle_poll_us=5000.000",
-    "ok",
+    "ok <0.001s>",
     "test tests::std_udp_connected_peer_perf_probe ... [perf] connected UDP peer: "
     "connected=27259 roundtrips/s",
     "[mandate-smoke std-udp] section=probe recv=21 operations=2000 "
     "connected_rps=27259 unconnected_rps=23793 speedup=1.146",
-    "ok",
+    "ok <0.020s>",
     "test tests::learned_destination_cache_perf_probe ... [perf] Learned destination: "
     "cached=12.86 ns/packet",
     "[mandate-smoke dest-cache] section=probe recv=5000000 cached_ns=12.86 "
     "locked_ns=25.80 speedup=2.01",
-    "ok",
-    "test result: ok. 4 passed; 0 failed",
+    "ok <0.015s>",
+    "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; "
+    "finished in 0.05s",
 ]
 
 
@@ -545,6 +564,7 @@ class MandateCheckTest(unittest.TestCase):
                 "--test",
                 "mandate_smoke",
                 "--",
+                *MANDATE_CHECK.TIMING_ARGS,
                 "--nocapture",
             ],
         )
@@ -559,9 +579,15 @@ class MandateCheckTest(unittest.TestCase):
                 "--test",
                 "mandate_smoke",
                 "--",
+                *MANDATE_CHECK.TIMING_ARGS,
                 "--nocapture",
             ],
         )
+        # The stamps the run is timed from are libtest's, so the runner asks
+        # for them itself and opens the gate the stable-pinned toolchain's
+        # libtest puts on the flag.
+        self.assertIn("--report-time", record["argv"])
+        self.assertEqual(record["rustc_bootstrap"], MANDATE_CHECK.TIMING_ENV_VALUE)
         self.assertEqual(Path(record["cwd"]).resolve(), self.crate.resolve())
         self.assertEqual(record["mandate_check_dir"], report["out_dir"])
         self.assertIsNone(record["quick"])
@@ -622,8 +648,9 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         report = self.report()
         timings = report["timings"]
-        self.assertIn("streamed-line-arrival", timings["method"])
-        self.assertIn("gap before the test started", timings["method"])
+        self.assertIn("libtest-per-test-stamp", timings["method"])
+        self.assertIn("never bracketed", timings["method"])
+        self.assertNotIn("streamed-line-arrival", timings["method"])
         self.assertEqual(timings["origin"], "smoke-child-start")
         self.assertEqual(
             [entry["name"] for entry in timings["tests"]],
@@ -634,10 +661,32 @@ class MandateCheckTest(unittest.TestCase):
                 "m4_interactive_lane_fairness",
             ],
         )
+        # Each duration is the fixture's own stamp, not the gap between its
+        # line's arrival and the previous completion's (the line sleeps make
+        # those gaps a fifth of a second, which none of these numbers is).
+        self.assertEqual(
+            [entry["duration_seconds"] for entry in timings["tests"]],
+            [86.163, 86.162, 60.589, 23.037],
+        )
         for entry in timings["tests"]:
             self.assertEqual(entry["target"], "mandate_smoke")
             self.assertEqual(entry["state"], "ok")
-            self.assertGreater(entry["duration_seconds"], 0)
+            self.assertEqual(entry["duration_source"], "libtest-report-time")
+        # The target's own total is recorded, and the stamps fit it: the
+        # fixture's 86.163 s test is the whole 86.16 s target, so the fit
+        # check has to tolerate libtest's own rounding and still refuse a
+        # number that could not be one test's time.
+        (target,) = timings["targets"]
+        self.assertEqual(target["target"], "mandate_smoke")
+        self.assertEqual(target["producer"], "rtp_mux")
+        self.assertEqual(target["total_seconds"], 86.16)
+        self.assertEqual(target["total_source"], "libtest-finished-in")
+        self.assertEqual(target["ran"], 4)
+        self.assertEqual(target["stamped"], 4)
+        self.assertEqual(target["max_seconds"], 86.163)
+        self.assertEqual(target["sum_seconds"], 255.951)
+        self.assertTrue(target["fits"])
+        self.assertFalse(target["serial"])
         measured = {
             mandate: report["mandates"][mandate]["duration_seconds"]
             for mandate in ("M1", "M2", "M3", "M4")
@@ -645,52 +694,176 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(set(measured), {"M1", "M2", "M3", "M4"})
         for duration in measured.values():
             self.assertGreater(duration, 0)
+        for mandate in ("M1", "M2", "M3", "M4"):
+            self.assertEqual(
+                report["mandates"][mandate]["duration_source"],
+                MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET,
+            )
         self.assertIn("duration: ", stdout)
-        self.assertIn("bracketed wall-clock", stdout)
+        self.assertIn(MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET, stdout)
+        self.assertIn("4/4 test(s) stamped by libtest", stdout)
+        self.assertIn("fit=yes", stdout)
 
-    def test_derive_timings_brackets_results_and_mandates(self):
+    def test_derive_timings_takes_each_duration_from_its_own_stamp(self):
+        # The stream order and the stamps disagree on purpose: a bracket would
+        # call `slow` 9.5 s and `fast` 2.5 s, while libtest's own instants say
+        # 9.0 s and 1.0 s. The stamps win, because only they survive a target
+        # whose tests overlap.
         events = [
-            {"seconds": 1.0, "line": "running 3 tests"},
-            {"seconds": 3.0, "line": "MANDATE M1 PASS p99=1.0"},
-            {"seconds": 3.5, "line": "test m1_x ... ok"},
-            {"seconds": 4.0, "line": "test m2_y has been running for over 60 seconds"},
-            {"seconds": 9.5, "line": "test m2_y ... FAILED"},
-            {"seconds": 10.0, "line": "test m3_z ... ignored, perf tier"},
-            {"seconds": 12.0, "line": "MANDATE M2 FAIL delivery=0.0"},
+            {"seconds": 0.5, "line": "running 2 tests"},
+            {"seconds": 2.0, "line": "MANDATE M1 PASS p99=1.0"},
+            {"seconds": 3.0, "line": "test fast ... ok <1.000s>"},
+            {"seconds": 5.5, "line": "test slow has been running for over 60 seconds"},
+            {"seconds": 12.0, "line": "test slow ... FAILED <9.000s>"},
+            {"seconds": 12.5, "line": "test skipped ... ignored, perf tier"},
+            {"seconds": 13.0, "line": "MANDATE M2 FAIL delivery=0.0"},
+            {
+                "seconds": 13.1,
+                "line": "test result: FAILED. 1 passed; 1 failed; 1 ignored; "
+                "0 measured; 0 filtered out; finished in 12.50s",
+            },
         ]
         timings = MANDATE_CHECK.derive_timings(events, "mandate_smoke")
         self.assertEqual(
-            [entry["name"] for entry in timings["tests"]], ["m1_x", "m2_y", "m3_z"]
+            [entry["name"] for entry in timings["tests"]], ["fast", "slow", "skipped"]
         )
-        first, second, third = timings["tests"]
-        self.assertEqual((first["state"], first["duration_seconds"]), ("ok", 3.5))
-        self.assertEqual(first["started_at_seconds"], 0.0)
-        self.assertEqual((second["state"], second["duration_seconds"]), ("FAILED", 6.0))
-        self.assertEqual((third["state"], third["duration_seconds"]), ("ignored", None))
+        fast, slow, skipped = timings["tests"]
+        self.assertEqual((fast["state"], fast["duration_seconds"]), ("ok", 1.0))
+        self.assertEqual(fast["duration_source"], "libtest-report-time")
+        self.assertEqual((slow["state"], slow["duration_seconds"]), ("FAILED", 9.0))
+        self.assertEqual(slow["duration_source"], "libtest-report-time")
+        self.assertNotEqual(slow["duration_seconds"], 9.5)
+        # An `ignored` test never ran, so it has no stamp and no duration.
+        self.assertEqual(slow["finished_at_seconds"], 12.0)
+        self.assertEqual((skipped["state"], skipped["duration_seconds"]), ("ignored", None))
+        self.assertIsNone(skipped["duration_source"])
+        self.assertEqual(timings["problems"], [])
+        (target,) = timings["targets"]
+        self.assertEqual(target["total_seconds"], 12.5)
+        self.assertEqual(target["ran"], 2)
+        self.assertEqual(target["stamped"], 2)
+        self.assertEqual(target["max_seconds"], 9.0)
+        self.assertTrue(target["fits"])
         self.assertEqual(
-            [(entry["mandate"], entry["duration_seconds"]) for entry in timings["mandates"]],
-            [("M1", 3.0), ("M2", 9.0)],
+            [(entry["mandate"], entry["duration_source"]) for entry in timings["mandates"]],
+            [
+                ("M1", MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET),
+                ("M2", MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET),
+            ],
         )
+
+    def test_a_stamp_less_result_is_marked_and_never_bracketed(self):
+        # A libtest that printed no stamp: the old bracketing would have
+        # invented 4.0 s and 2.0 s here, and a report that quietly kept doing
+        # that would look fixed. Every duration is null and every row says so.
+        events = [
+            {"seconds": 0.5, "line": "running 2 tests"},
+            {"seconds": 4.5, "line": "test a ... ok"},
+            {"seconds": 6.5, "line": "test b ... ok"},
+            {"seconds": 6.6, "line": "test result: ok. 2 passed; finished in 4.00s"},
+        ]
+        timings = MANDATE_CHECK.derive_timings(events, "lib")
+        self.assertEqual(
+            [entry["duration_seconds"] for entry in timings["tests"]], [None, None]
+        )
+        self.assertEqual(
+            [entry["duration_source"] for entry in timings["tests"]], [None, None]
+        )
+        self.assertEqual(len(timings["problems"]), 1)
+        self.assertIn("carries libtest's own per-test stamp", timings["problems"][0])
+        self.assertIn("--report-time", timings["problems"][0])
+        (target,) = timings["targets"]
+        self.assertEqual((target["ran"], target["stamped"]), (2, 0))
+        self.assertIsNone(target["fits"])
+        self.assertIsNone(target["overlap_factor"])
+        self.assertEqual(target["note"], "no-test-carried-a-libtest-stamp")
 
     def test_derive_timings_reads_a_completion_split_by_the_tests_own_output(self):
         # The harness's probes print from inside their own test, so libtest's
         # marker and its state arrive on different lines; the completion is the
-        # state line, and the marker's tail is the test's own first line.
+        # state line, and the marker's tail is the test's own first line. The
+        # stamp rides the state line.
         events = [
             {"seconds": 0.5, "line": "running 2 tests"},
             {"seconds": 1.0, "line": "test tests::a ... probe says hello"},
             {"seconds": 1.2, "line": "[mandate-smoke a] section=probe recv=10"},
-            {"seconds": 2.0, "line": "ok"},
+            {"seconds": 2.0, "line": "ok <1.500s>"},
             {"seconds": 3.0, "line": "test tests::b ... ignored, release only"},
+            {"seconds": 3.1, "line": "test result: ok. 1 passed; 1 ignored; finished in 2.50s"},
         ]
         timings = MANDATE_CHECK.derive_timings(events, "lib")
         self.assertEqual(
             [(entry["name"], entry["state"]) for entry in timings["tests"]],
             [("tests::a", "ok"), ("tests::b", "ignored")],
         )
-        self.assertEqual(timings["tests"][0]["duration_seconds"], 2.0)
+        self.assertEqual(timings["tests"][0]["duration_seconds"], 1.5)
+        self.assertEqual(timings["tests"][0]["duration_source"], "libtest-report-time")
         self.assertEqual(timings["tests"][0]["target"], "lib")
         self.assertEqual(timings["tests"][1]["duration_seconds"], None)
+
+    def test_a_serial_targets_stamps_must_sum_to_no_more_than_its_total(self):
+        # --test-threads=1 means the tests cannot overlap, so two stamps whose
+        # sum exceeds the target's own total cannot both be one test's time.
+        events = [
+            {"seconds": 0.5, "line": "running 2 tests"},
+            {"seconds": 4.0, "line": "test a ... ok <3.000s>"},
+            {"seconds": 8.0, "line": "test b ... ok <3.000s>"},
+            {"seconds": 8.1, "line": "test result: ok. 2 passed; finished in 4.00s"},
+        ]
+        timings = MANDATE_CHECK.derive_timings(events, "lib", serial=True)
+        (target,) = timings["targets"]
+        self.assertFalse(target["fits"])
+        self.assertEqual(target["sum_seconds"], 6.0)
+        self.assertEqual(len(timings["problems"]), 1)
+        self.assertIn("sum to 6.000s", timings["problems"][0])
+        self.assertIn("ran serially", timings["problems"][0])
+
+    def test_a_stamp_that_cannot_fit_its_targets_total_is_refused(self):
+        # A per-test time larger than the whole target is an impossibility
+        # under any schedule, so it is refused whether or not the target ran
+        # serially.
+        events = [
+            {"seconds": 0.5, "line": "running 2 tests"},
+            {"seconds": 4.0, "line": "test a ... ok <9.000s>"},
+            {"seconds": 5.0, "line": "test b ... ok <1.000s>"},
+            {"seconds": 5.1, "line": "test result: ok. 2 passed; finished in 4.00s"},
+        ]
+        timings = MANDATE_CHECK.derive_timings(events, "mandate_smoke")
+        (target,) = timings["targets"]
+        self.assertFalse(target["fits"])
+        self.assertEqual(len(timings["problems"]), 1)
+        self.assertIn("cannot fit the mandate_smoke target's own total", timings["problems"][0])
+        self.assertIn("9.000s", timings["problems"][0])
+
+    def test_a_stamp_less_target_makes_the_run_refuse_rather_than_invent(self):
+        # End to end: the instrument is not measuring, so the report must not
+        # carry numbers that look measured.
+        code, stdout, _ = self.run_tool(
+            self.healthy_plan(stdout=unstamped(PASS_LINES))
+        )
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("not one of its results carries libtest's own per-test stamp", stdout)
+        report = self.report()
+        self.assertFalse(report["ok"])
+        for entry in report["timings"]["tests"]:
+            self.assertIsNone(entry["duration_seconds"], entry)
+            self.assertIsNone(entry["duration_source"])
+        self.assertEqual(len(report["problems"]), 1)
+        self.assertIn("rtp_mux: the mandate_smoke target ran 4 test(s)", report["problems"][0])
+
+    def test_a_stamp_over_the_targets_total_makes_the_run_refuse(self):
+        plan = self.healthy_plan(
+            stdout=[
+                line.replace("ok <86.163s>", "ok <999.000s>")
+                for line in PASS_LINES
+            ]
+        )
+        code, stdout, _ = self.run_tool(plan)
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("cannot fit the mandate_smoke target's own total", stdout)
+        report = self.report()
+        (target,) = report["timings"]["targets"]
+        self.assertFalse(target["fits"])
 
     def test_quick_asks_the_smoke_set_for_its_shortest_windows(self):
         code, _, stderr = self.run_tool(self.healthy_plan(), "--quick")
@@ -962,11 +1135,32 @@ class MandateCheckTest(unittest.TestCase):
             )
         self.assertEqual(MANDATE_CHECK.resolve_tree_id(self.crate, None, None), (None, None))
 
-    def test_report_records_each_arm_measurement_schema_five(self):
+    def test_report_records_each_arm_measurement_schema_six(self):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         report = self.report()
-        self.assertEqual(report["schema"], "mandate-check/5")
+        self.assertEqual(report["schema"], "mandate-check/6")
+        # The schema bump is over `/5`: a `/5` reader's keys keep their meaning
+        # (a test's `duration_seconds` is still its own seconds, and the arm
+        # record is untouched), and the new keys say where a duration came
+        # from rather than changing what the old ones name.
+        self.assertEqual(
+            sorted(report["timings"]),
+            ["mandates", "method", "origin", "targets", "tests"],
+        )
+        self.assertEqual(
+            sorted(report["timings"]["tests"][0]),
+            [
+                "duration_seconds",
+                "duration_source",
+                "finished_at_seconds",
+                "name",
+                "producer",
+                "started_at_seconds",
+                "state",
+                "target",
+            ],
+        )
         self.assertEqual(
             [arm["producer"] for arm in report["arms"]],
             ["rtp_mux"] * len(report["arms"]),
@@ -1499,10 +1693,14 @@ class MandateCheckTest(unittest.TestCase):
                 "netem-test",
                 "--lib",
                 "--",
+                *MANDATE_CHECK.TIMING_ARGS,
                 "--ignored",
                 "--test-threads=1",
                 "--nocapture",
             ],
+        )
+        self.assertEqual(
+            records[1]["rustc_bootstrap"], MANDATE_CHECK.TIMING_ENV_VALUE
         )
         self.assertEqual(
             [entry["producer"] for entry in report["timings"]["tests"]],
@@ -1530,7 +1728,21 @@ class MandateCheckTest(unittest.TestCase):
         )
         for entry in probe_timings:
             self.assertEqual(entry["state"], "ok")
-            self.assertGreater(entry["duration_seconds"], 0)
+            self.assertEqual(entry["duration_source"], "libtest-report-time")
+        # The probe producer declares --test-threads=1, so its tests cannot
+        # overlap and its stamped times must fit its own total; the fit check
+        # is enforced there and the record says so.
+        self.assertEqual(
+            [entry["target"] for entry in report["timings"]["targets"]],
+            ["mandate_smoke", "lib"],
+        )
+        probe_target = report["timings"]["targets"][1]
+        self.assertTrue(probe_target["serial"])
+        self.assertTrue(probe_target["fits"])
+        self.assertEqual(
+            [entry["duration_seconds"] for entry in probe_timings],
+            [0.01, 0.001, 0.02, 0.015],
+        )
 
     def test_the_second_producers_arms_keep_their_own_sample_counts(self):
         code, _, stderr = self.run_two_producers(self.two_producer_plan())

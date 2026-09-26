@@ -40,7 +40,9 @@ A producer is one entry of `tools/mandate-producers.json` (schema
   producer's checkout, so a missing smoke set fails with a named file rather
   than as a cargo error);
 - `cargo_args`, `test_args` — the exact invocation, `test_args` placed after
-  `--`;
+  `--`, behind the runner's own per-test timing flags (`-Z unstable-options
+  --report-time`, so the duration of every test in the report is libtest's own
+  measurement of that test rather than a bracket between two lines' arrivals);
 - `sections`, `verdicts` — every section an arm may be attributed to, and
   which of those print a `MANDATE` line and write plots (`verdicts ⊆`
   `sections`); a producer with a verdict section owes that section's evidence,
@@ -54,8 +56,8 @@ Two producers are declared today, and a default run records both:
 
 | id | what it is | invocation | records |
 | --- | --- | --- | --- |
-| `rtp_mux` | the tri-mandate smoke set, `rtp_mux/tests/mandate_smoke.rs` | `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture` | its `M1`-`M4` arms, with verdict lines and the eight evidence files |
-| `netem_test` | this workspace's four perf-tier probes, in the harness `lib` target | `cargo test --release -p netem-test --lib -- --ignored --test-threads=1 --nocapture` | 4 arms in the `probe` section, report-only: no verdict line, no evidence file, no plot |
+| `rtp_mux` | the tri-mandate smoke set, `rtp_mux/tests/mandate_smoke.rs` | `cargo test --release -p rtp_mux --test mandate_smoke -- -Z unstable-options --report-time --nocapture` | its `M1`-`M4` arms, with verdict lines and the eight evidence files |
+| `netem_test` | this workspace's four perf-tier probes, in the harness `lib` target | `cargo test --release -p netem-test --lib -- -Z unstable-options --report-time --ignored --test-threads=1 --nocapture` | 4 arms in the `probe` section, report-only: no verdict line, no evidence file, no plot |
 
 A third producer is a registry entry plus a source change in the crate that
 owns the target; nothing in the runner changes. A section is an arm-id
@@ -95,8 +97,10 @@ plots. The `netem_test` producer declares none, so it owes rules 1, 5 and 6
 only.
 
 1. **Target and invocation** — the target is the registry entry's, run exactly
-   as its `cargo_args` and `test_args` say. The command adds no test filter of
-   its own and no `--test-threads`; a producer whose measurements are
+   as its `cargo_args` and `test_args` say, with the runner's per-test timing
+   flags inserted between `--` and the declared `test_args`. The command adds
+   no test filter of its own and no `--test-threads`; a producer whose
+   measurements are
    wall-clock must serialise them, either internally (the smoke set's
    assertions are wall-clock, so it holds a lock) or by declaring
    `--test-threads=1` among its `test_args`, as the probe producer does. The
@@ -198,7 +202,7 @@ Into `--dir` (the path is printed, and recorded in the report):
   bound, for an axis that resolves the bounds it draws, and for what each
   crossed bound is attributed to (a producer that declares no verdict section
   writes none);
-- `mandate-check.json` — `schema` (`mandate-check/5`), `ok`, `exit_code`,
+- `mandate-check.json` — `schema` (`mandate-check/6`), `ok`, `exit_code`,
   `verdict`, `started_at`, `duration_seconds`, `producers_declared` and
   `producers_selected`, a `producers` record per *declared* producer (`id`,
   `package`, `target`, `source`, `selected`, the resolved `path`, `sections`,
@@ -213,10 +217,20 @@ Into `--dir` (the path is printed, and recorded in the report):
   `mandate_order`/`section_order` the declared producers define, a `mandates`
   record per verdict section (`producer`, `declared`, `verdict`, the parsed
   `values`, the verbatim `raw_line`, `finished_at_seconds`,
-  `duration_seconds`, the `plots` paths, `series_counts`, `panels`), an `arms`
+  `duration_seconds`, `duration_source`, the `plots` paths, `series_counts`,
+  `panels`), a `timings` record whose `tests[]` carry each test's own
+  `duration_seconds` with the `duration_source` it came from (`libtest-report-time`
+  for a stamp, `null` for a test that printed none — never a bracketed
+  stand-in), whose `mandates[]` carry the stream bracket and say so, and whose
+  `targets[]` record, per target, libtest's own `finished in` total, how many
+  tests ran and how many carried a stamp, the summed and largest stamped
+  seconds, the observed overlap factor, and whether those seconds fit that
+  total, an `arms`
   record per arm (below), the prose `arm_notes` and the `arm_declaration` the
   cells came from, and every `problem` found, each prefixed with the producer
-  it came from.
+  it came from. A target that ran tests without a single stamp, and a stamped
+  time that cannot fit its target's own total, are `problem`s and fail the run
+  as absent or impossible evidence rather than being written as a number.
 
 The `rtp_mux` and `smoke` keys a `mandate-check/4` reader reads are kept as
 that producer's identity record and run record, and are `null` when it was not
