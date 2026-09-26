@@ -341,6 +341,18 @@ def _latency_rows(points):
     ]
 
 
+def _reading_markup(sentences):
+    """A line panel's reading band, wrapped and drawn, as `svg_line_chart` does."""
+    rows = []
+    for sentence in sentences:
+        rows.extend(MANDATE.REPORT.wrap_label(sentence, MANDATE.REPORT.READING_PLOT_WIDTH))
+    body = "".join(
+        f'<text class="arm-reading" x="76" y="{24 + index * 13}">{row}</text>'
+        for index, row in enumerate(rows)
+    )
+    return f'<svg><g class="arm-readings">{body}</g></svg>'
+
+
 class MandatePlotTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/tmp"))
@@ -1913,6 +1925,131 @@ class MandatePlotTest(unittest.TestCase):
         )
         self.assertNotEqual(code, 0, stderr)
         self.assertIn("about no series any line panel", stderr)
+
+    def test_a_caption_whose_numbers_come_from_another_source_is_refused(self):
+        # The defect this replaces: `check_readings_stated` reads the drawn
+        # sentence back and requires it to be the one the formatter produced,
+        # which is green on a caption whose *magnitude* was taken from
+        # somewhere else -- the producer's own `[m1-censoring] max=` token is
+        # the candidate this loop checked first -- because the formatter is the
+        # only thing either side of that comparison ever consulted. The caption
+        # is what the reader trusts instead of the pixels, so a caption that is
+        # authoritative and wrong is worse than no caption.
+        series = [("lone_tail", list(REAL_LONE_TAIL_TAIL))]
+        detector = {"verdict": "Clear", "rungs_at_edge": -2.43, "room": 105000.0}
+        drawn = MANDATE.arm_reading(
+            "lone_tail", MANDATE.REPORT.decimate(series[0][1]), detector
+        )
+        markup = _reading_markup([drawn])
+        self.assertEqual(
+            MANDATE.check_readings_stated(
+                "latency", series, [("lone_tail", drawn)], markup
+            ),
+            [],
+        )
+        self.assertEqual(MANDATE.check_reading_numbers("latency", series, markup), [])
+        # The red half: the same sentence with the magnitude the instrument's
+        # own row states (the detector's `max=`, which on the recorded run was
+        # a *different* series' maximum). `check_readings_stated` is still
+        # green on it -- that is the vacuity the new check closes -- and the
+        # numbers check refuses by name, arm and both values.
+        wrong = drawn.replace("peak 2652 ms", "peak 1074.1 ms")
+        self.assertNotEqual(wrong, drawn)
+        broken = _reading_markup([wrong])
+        self.assertEqual(
+            MANDATE.check_readings_stated(
+                "latency", series, [("lone_tail", wrong)], broken
+            ),
+            [],
+        )
+        problems = MANDATE.check_reading_numbers("latency", series, broken)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'lone_tail'", problems[0])
+        self.assertIn("1074.1", problems[0])
+        self.assertIn("2651.69", problems[0])
+        self.assertIn("worse than no caption", problems[0])
+        # The other numbers are pinned too: a peak time, a last sample and a
+        # hole count from a different series are each caught, and a caption
+        # that states no maximum at all cannot be read back and is refused
+        # rather than skipped.
+        for broken_text, fragment in (
+            (drawn.replace("at 15.76 s", "at 9.56 s"), "where its maximum is"),
+            (drawn.replace("last 59.8 ms", "last 424.3 ms"), "its last sample"),
+            (drawn.replace("1 sample gap(s)", "2 sample gap(s)"), "sample gap(s)"),
+            (drawn.replace("peak 2652 ms at 15.76 s", "the series is quiet"), "states no maximum"),
+        ):
+            with self.subTest(caption=broken_text):
+                rows = MANDATE.check_reading_numbers(
+                    "latency", series, _reading_markup([broken_text])
+                )
+                self.assertTrue(rows, broken_text)
+                self.assertIn(fragment, "\n".join(rows))
+
+    def test_a_caption_taken_from_another_arm_is_refused(self):
+        # The other shape the finding named: the arm may be selected
+        # differently in the two paths, so one arm's sentence can be drawn
+        # beside another arm's series. The band is split per arm by the arm's
+        # own `<arm>: ` marker rather than by position, so a reading is matched
+        # to the series it names -- and a sentence that names the wrong arm is
+        # measured against the wrong points and refused.
+        series = [
+            ("first", [(float(index), 10.0 * index) for index in range(1, 8)]),
+            ("second", [(float(index), 100.0 * index) for index in range(1, 8)]),
+        ]
+        first = MANDATE.arm_reading("first", series[0][1])
+        second = MANDATE.arm_reading("second", series[1][1])
+        # The run read one arm and not the other: both sentence shapes --
+        # `<arm>: <verdict> - ...` and `<arm> - ...` -- are in the band, and
+        # the split is by the arm's own marker rather than by draw position.
+        verdicts = {"first": {"verdict": "Censored", "room": 40.0}}
+        read = [
+            ("first", MANDATE.arm_reading("first", series[0][1], verdicts["first"])),
+            ("second", second),
+        ]
+        for sentences in ([first, second], [second, first], [text for _, text in read]):
+            with self.subTest(band=[text.split(" ")[0] for text in sentences]):
+                self.assertEqual(
+                    MANDATE.check_reading_numbers(
+                        "latency", series, _reading_markup(sentences)
+                    ),
+                    [],
+                )
+        mislabelled = _reading_markup([second.replace("second - ", "first - ", 1)])
+        problems = MANDATE.check_reading_numbers("latency", series, mislabelled)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'first'", problems[0])
+        self.assertIn("states its maximum as 700", problems[0])
+        self.assertIn("is 70", problems[0])
+
+    def test_a_render_whose_caption_states_another_series_maximum_is_refused(self):
+        # End to end: a formatter that takes its magnitude from the detector's
+        # own `max=` token instead of from the drawn points is refused by the
+        # render, not merely by the predicate -- the artifact never reaches
+        # disk carrying a number its own series contradicts.
+        detector = {"verdict": "Clear", "rungs_at_edge": -2.43, "room": 105000.0}
+        rows = _latency_rows(REAL_LONE_TAIL_TAIL)
+        censoring = json.dumps({"lone_tail": {**detector, "max": 1074.1}})
+        code, stderr, _ = self.render_mandate(
+            LONE_TAIL_DECLARATION, rows, "M1lie", "--run-censoring", censoring
+        )
+        self.assertEqual(code, 0, stderr)
+        honest = MANDATE.arm_reading
+
+        def lying_formatter(arm, points, reading=None):
+            text = honest(arm, points, reading)
+            return MANDATE.re.sub(
+                r"peak [-+0-9.eE]+ ms",
+                f"peak {(reading or detector)['max']:.1f} ms",
+                text,
+            )
+
+        with mock.patch.object(MANDATE, "arm_reading", lying_formatter):
+            code, stderr, _ = self.render_mandate(
+                LONE_TAIL_DECLARATION, rows, "M1lie", "--run-censoring", censoring
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("states its maximum as 1074.1", stderr)
+        self.assertIn("does not measure", stderr)
 
     def test_a_reading_band_that_eats_the_plot_is_refused(self):
         # The band and the shape it explains share one canvas, so the band may

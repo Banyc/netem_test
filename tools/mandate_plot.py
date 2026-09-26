@@ -146,6 +146,17 @@ silenced by softening a declaration:
   outright when a reading names an arm no line panel draws, and
   `check_reading_band` refuses a band that would leave the plot too short to
   show the shape it explains.
+- **the stated-number test** — `check_reading_numbers` reads the numbers back
+  out of that drawn band and measures them against the drawn points. A band is
+  the part of a latency panel a reader trusts *instead of* the pixels, so a
+  band whose numbers came from anywhere else (the producer's own
+  `[m1-censoring] max=` token, another arm's series, a differently filtered
+  one) is authoritative and wrong. `check_readings_stated` cannot see that: it
+  compares the drawn sentence with the sentence the formatter produced, so the
+  formatter is the only source either side of it consults. Each stated number
+  is therefore compared at the precision it is *written* to -- where the
+  maximum is, what follows it, where the holes are -- and a clause the check
+  cannot read back at all is refused rather than skipped.
 
 Two reading choices the input contract leaves open, decided here and made
 loud instead of silent:
@@ -343,6 +354,39 @@ AXIS_TICK_RE = re.compile(
 The tick text is how a reader reads a bar's magnitude, so it is read back out
 of the artifact rather than from the loop that printed it.
 """
+
+STATED_PEAK_RE = re.compile(
+    r"(?:peak|max(?:imum)?) ([-+0-9.eE]+) ms at ([-+0-9.eE]+) s"
+)
+"""The magnitude a drawn reading states, and where it says it happened.
+
+The clause's own word is matched loosely on purpose: a caption that spells the
+maximum `max` rather than `peak` is still a caption claiming a magnitude, and a
+check that skipped it would be blind to exactly the change it exists to catch.
+"""
+
+STATED_AFTER_RE = re.compile(
+    r"(-?\d+) sample\(s\) after it \(next ([-+0-9.eE]+) ms at "
+    r"([-+0-9.eE]+) s, last ([-+0-9.eE]+) ms at ([-+0-9.eE]+) s\)"
+)
+"""What the drawn reading says follows its maximum, when something does."""
+
+STATED_END_RE = re.compile(
+    r"nothing after it, so the series ends on its own maximum"
+)
+"""The drawn reading's other form: the maximum is the last sample."""
+
+STATED_HOLES_RE = re.compile(
+    r"(\d+) sample gap\(s\) over ([-+0-9.eE]+) s, largest ([-+0-9.eE]+) s "
+    r"\(([-+0-9.eE]+)-([-+0-9.eE]+) s\), drawn as breaks, not climbs"
+)
+"""What the drawn reading says about the holes in its own sampling."""
+
+STATED_GAP_WALL_RE = re.compile(r"no sample gap over ([-+0-9.eE]+) s")
+"""The drawn reading's form for a series with a cadence and no hole in it."""
+
+STATED_NO_GAP_RE = re.compile(r"no sample gap(?![ \w])")
+"""The drawn reading's form for a series too short to have a cadence."""
 
 ARM_READING_MIN_PLOT_PIXELS = 100.0
 """The least plot a line panel keeps once its reading band is reserved.
@@ -1049,6 +1093,203 @@ def check_readings_stated(panel_id, series, readings, markup):
                 f"shape, so the reader cannot draw the opposite conclusion from "
                 f"the pixels. Missing: {text!r}"
             )
+    return problems
+
+
+def stated_spans(text, arms):
+    """The slice of a joined reading band each arm's own sentence occupies.
+
+    The band is read back out of the artifact as its wrapped lines and rejoined
+    with single spaces (`drawn_readings`), which is how `check_readings_stated`
+    already reconstructs a sentence. Each reading opens with its own arm name --
+    `<arm>: <verdict> - ...` when the run read one, `<arm> - ...` when it did
+    not -- so the split is by that marker rather than by position, and a clause
+    cannot be attributed to a series merely because it was drawn next to it.
+    """
+    found = {}
+    for arm in arms:
+        for marker in (f"{arm}: ", f"{arm} - "):
+            index = text.find(marker)
+            if index >= 0:
+                found[arm] = index
+                break
+    ordered = sorted(found.items(), key=lambda pair: pair[1])
+    spans = {}
+    for position, (arm, start) in enumerate(ordered):
+        end = ordered[position + 1][1] if position + 1 < len(ordered) else len(text)
+        spans[arm] = text[start:end]
+    return spans
+
+
+def stated_tolerance(text):
+    """Half a unit in the last place a written number carries, plus rounding slack.
+
+    A stated number is compared at the precision it is *written* to rather than
+    against a tolerance chosen to make a run pass: `853.9` allows half of
+    `0.1`, and nothing else. That is what makes the check catch a caption whose
+    magnitude came from a different source whatever that source's own
+    formatting was -- a `1074.1` against a series that measures `853.89` fails
+    by 2200 last places rather than by a hair. The `1.001` (and the epsilon)
+    absorbs the last-digit rounding of a binary value printed to that place,
+    which can sit exactly half a unit from the decimal it prints.
+    """
+    match = re.fullmatch(
+        r"([-+]?)(\d+)(?:\.(\d+))?(?:[eE]([-+]?\d+))?", text.strip()
+    )
+    if match is None:
+        return None
+    decimals = len(match.group(3) or "")
+    exponent = int(match.group(4) or 0)
+    return 10.0 ** (exponent - decimals) * 0.5 * 1.001 + 1e-9
+
+
+def stated_problem(panel_id, arm, what, written, measured):
+    """A problem when a written number is not the value the series measures."""
+    tolerance = stated_tolerance(written)
+    if tolerance is None:
+        return (
+            f"panel {panel_id!r}: the reading drawn for arm {arm!r} states {what} "
+            f"as {written!r}, which is not a number; the band exists so the "
+            "reader does not have to interpret the pixels, so a value the "
+            "reader cannot read is not a reading"
+        )
+    value = float(written)
+    if abs(value - measured) <= tolerance:
+        return None
+    return (
+        f"panel {panel_id!r}: the reading drawn for arm {arm!r} states {what} "
+        f"{written}, which the series it is drawn from does not measure: that "
+        f"point is {measured:.6g}. A caption whose numbers come from anywhere "
+        "but its own series is worse than no caption, because the band is what "
+        "the reader trusts instead of the pixels"
+    )
+
+
+def stated_reading_problems(panel_id, arm, points, text):
+    """Every number a drawn reading states, measured against the drawn series.
+
+    The facts are recomputed here from the same points the panel plots -- where
+    the maximum is, how many samples follow it, where the holes are -- so this
+    is a check on the *reader's* copy of the series and not a second call to the
+    formatter that wrote it. A clause the sentence does not carry at all is not
+    this check's business (`check_readings_stated` owns what is stated); what it
+    owns is that what *is* stated is what was measured.
+    """
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    peak = max(ys)
+    peak_index = len(ys) - 1 - ys[::-1].index(peak)
+    after = len(points) - 1 - peak_index
+    wall = REPORT.gap_wall_seconds(points)
+    holes = REPORT.series_walls(points)
+    problems = []
+
+    def note(what, written, measured):
+        problem = stated_problem(panel_id, arm, what, written, measured)
+        if problem is not None:
+            problems.append(problem)
+
+    match = STATED_PEAK_RE.search(text)
+    if match is None:
+        problems.append(
+            f"panel {panel_id!r}: the reading drawn for arm {arm!r} states no "
+            "maximum, so the band's own claim cannot be read back against the "
+            "series it is drawn from; a caption whose numbers cannot be checked "
+            "is the same defect as no caption at all"
+        )
+    else:
+        note("its maximum as", match.group(1), peak)
+        note("where its maximum is as", match.group(2), xs[peak_index])
+    match = STATED_AFTER_RE.search(text)
+    if match is None:
+        if STATED_END_RE.search(text) is None:
+            problems.append(
+                f"panel {panel_id!r}: the reading drawn for arm {arm!r} states "
+                "neither what follows its maximum nor that nothing does, so the "
+                "one clause that tells a peak which returned from a climb the "
+                "window cut off cannot be read back against the series"
+            )
+        elif after:
+            problems.append(
+                f"panel {panel_id!r}: the reading drawn for arm {arm!r} states that "
+                "nothing follows its maximum, and the series it is drawn from has "
+                f"{after} sample(s) after it; the whole point of the clause is to "
+                "tell a peak that returned from a climb the window cut off"
+            )
+    else:
+        if int(match.group(1)) != after:
+            problems.append(
+                f"panel {panel_id!r}: the reading drawn for arm {arm!r} states "
+                f"{match.group(1)} sample(s) after its maximum, and the series it "
+                f"is drawn from has {after}: a reader told how long a peak "
+                "lasted is told a number about a different series"
+            )
+        if after:
+            note("the sample after its maximum as", match.group(2), ys[peak_index + 1])
+            note("that sample's time as", match.group(3), xs[peak_index + 1])
+        note("its last sample as", match.group(4), ys[-1])
+        note("its last sample's time as", match.group(5), xs[-1])
+    match = STATED_HOLES_RE.search(text)
+    if match is None and (
+        STATED_GAP_WALL_RE.search(text) is None
+        and STATED_NO_GAP_RE.search(text) is None
+    ):
+        problems.append(
+            f"panel {panel_id!r}: the reading drawn for arm {arm!r} states nothing "
+            "about the holes in its own sampling, so whether the line is drawn "
+            "across a period nobody observed cannot be checked from the caption; "
+            "the holes are the one thing about the shape the pixels cannot carry"
+        )
+    if match is not None:
+        if int(match.group(1)) != len(holes):
+            problems.append(
+                f"panel {panel_id!r}: the reading drawn for arm {arm!r} states "
+                f"{match.group(1)} sample gap(s), and the series it is drawn from "
+                f"has {len(holes)}: a hole the reader is not told about is a hole "
+                "read as the end of the line"
+            )
+        if wall is not None:
+            note("the least step it would call a gap as", match.group(2), wall)
+        if holes:
+            largest = max(holes, key=lambda hole: hole[3])
+            note("its largest gap as", match.group(3), largest[3])
+            note("where that gap starts as", match.group(4), largest[1])
+            note("where that gap ends as", match.group(5), largest[2])
+    else:
+        match = STATED_GAP_WALL_RE.search(text)
+        if match is not None and wall is not None:
+            note("the least step it would call a gap as", match.group(1), wall)
+    return problems
+
+
+def check_reading_numbers(panel_id, series, markup):
+    """Problems that let a drawn caption state numbers its own series did not measure.
+
+    `check_readings_stated` reads the drawn sentence back out and requires it to
+    equal the one the formatter produced, which proves the sentence reached the
+    panel and proves nothing at all about the sentence being *true* of the
+    series: the formatter is the only thing that was ever consulted, so a
+    magnitude taken from somewhere else -- the producer's own `[m1-censoring]
+    max=` token, another arm's series, a differently filtered one -- is green
+    there and authoritative-and-wrong to the reader. This is the same reading
+    taken one step further: the numbers are parsed out of the drawn text and
+    measured against the drawn points, so the caption and the drawing cannot
+    disagree without the render being refused.
+    """
+    joined = " ".join(drawn_readings(markup))
+    if not joined:
+        return []
+    arms = [name for name, _ in series]
+    spans = stated_spans(joined, arms)
+    problems = []
+    for name, points in series:
+        text = spans.get(name)
+        if text is None:
+            continue
+        drawn = REPORT.decimate(points)
+        if not drawn:
+            continue
+        problems += stated_reading_problems(panel_id, name, drawn, text)
     return problems
 
 
@@ -2178,6 +2419,7 @@ def panel_markup(title, x_label, y_label, panel, points, run_values=None, run_ce
         + (
             check_gap_honesty(panel["id"], series, markup)
             + check_readings_stated(panel["id"], series, readings, markup)
+            + check_reading_numbers(panel["id"], series, markup)
             if chart == "line"
             else []
         )
