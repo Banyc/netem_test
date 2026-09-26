@@ -1473,6 +1473,29 @@ class CheckGateEnvTierScriptlessTest(EnvTierFixture):
             output,
         )
 
+    def test_a_surface_no_script_runs_is_declared_with_the_marker(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+            "| per-dial loss rate under a sized load | fixture-liveness@shape=churn\n"
+            "fixture-wake = FIXTURE_WAKE_BOUND | - | the handover wake bound the "
+            "sources read in-process | fixture-wake@shape=handover"
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("gate-env-tier: 2 env-scaled surface(s), 3 variable(s)", output)
+        self.assertIn("fixture-wake (no script runner) FIXTURE_WAKE_BOUND", output)
+
+    def test_a_marked_surface_whose_variables_a_script_sets_fails(self):
+        self.declare(
+            "fixture-wake = FIXTURE_ITERATIONS,FIXTURE_WAKE_BOUND | - "
+            "| the handover wake bound the sources read in-process "
+            "| fixture-wake@shape=handover"
+        )
+        self.rejects(
+            "'-' states that no script runs it, but local/run_env.py sets "
+            "FIXTURE_ITERATIONS"
+        )
+
 
 class CheckGateScenarioDirectoryTest(CheckGatePerfFixture):
     """`--crate`'s scenario directory is reconciled with the package's targets.

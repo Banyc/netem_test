@@ -80,6 +80,9 @@ alongside the existing ones:
     gate-coverage-gaps     <cell> = <non-empty reason>
     gate-env-tier          <name> = <vars> | <runner> | <measures> | <cells>
 
+`<runner>` is a script path relative to the crate root, or `-` for a surface
+no script runs.
+
 `<coverage>` is a comma-separated list of cells, each
 `<mandate-or-property>@<dimension>=<value>[+<dimension>=<value>…]` — for
 example `M1@loss=ge5+jitter=100ms+shape=request-response` — stated relative to
@@ -134,6 +137,15 @@ stale). A surface with **no** block is a note rather than a failure, for the sam
 reason an unmigrated perf declaration is: a `GATE.md` written before the block
 existed cannot be failed for a line the grammar did not have, and the point is
 that the surface is named rather than invisible.
+
+The runner field states how the surface is run: a script path relative to the
+crate root, or `-` for a surface nothing but the invocation runs. A scriptless
+surface is one whose variables the sources read in-process and no script sets,
+so it has no runner to name; the marker is refused if a script of the crate does
+set one of its variables, because that script is its runner and naming it is
+what the surface owes. This is what makes the scriptless half expressible as a
+surface of its own rather than as extra names on a row whose runner sets none
+of them.
 
 **A zero-row declaration is a form, not an absence.** A crate whose work has no
 perf arm at all — nothing measures a bound, no impairment instrument is

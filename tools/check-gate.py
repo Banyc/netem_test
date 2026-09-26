@@ -2766,6 +2766,13 @@ def check_perf_membership(
     return summary
 
 
+# `<runner>` states how a surface is run: a script path relative to the crate
+# root, or this marker when nothing but the invocation runs it -- an in-process
+# knob is read by whoever invokes the tests and set by no script, so it has no
+# runner to name.
+ENV_TIER_NO_RUNNER = "-"
+
+
 def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
     """Check the ```gate-env-tier block, and detect a surface no block declares.
 
@@ -2774,6 +2781,11 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
     in the default tier, and what scales them is an environment variable the
     crate's own runner sets. The grammar had no line for one, so such a surface
     appeared in no block at all.
+
+    The runner field is a script path or the no-runner marker: a surface the
+    sources read in-process is run by whoever invokes the tests and set by no
+    script, so it has no script to name, and a surface marked no-runner whose
+    variables a script does set is refused — that script is its runner.
 
     Detection is two-sided, which is what makes it an artifact rather than a
     guess: a name counts when a script in the crate *names* it and the crate's
@@ -2796,8 +2808,11 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
     root = layout().root
     rust_sources = _rust_env_read_names(root)
     detected: dict[str, set[str]] = {}
+    script_names: dict[Path, set[str]] = {}
     for script in _crate_scripts(root):
-        for name in _script_env_names(script):
+        names = _script_env_names(script)
+        script_names[script] = names
+        for name in names:
             if name in rust_sources:
                 detected.setdefault(name, set()).add(str(script.relative_to(root)))
     # The scriptless half: a name the sources read that no script of this
@@ -2854,15 +2869,24 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
             )
     available = set(rust_sources)
     for surface in surfaces:
-        runner = root / surface.runner
-        if not runner.is_file():
+        runnerless = surface.runner == ENV_TIER_NO_RUNNER
+        if runnerless:
+            # Nothing but the invocation runs a scriptless surface, so naming a
+            # script that sets one of its variables would record a runner the
+            # surface does not have -- and would hide it from the checks the
+            # runner form owes.
+            setters = {
+                str(path.relative_to(root)): sorted(names & set(surface.variables))
+                for path, names in script_names.items()
+                if names & set(surface.variables)
+            }
+        elif not (root / surface.runner).is_file():
             problems.append(
                 f"gate-env-tier surface {surface.name}: runner "
                 f"{surface.runner!r} is not a file under {root}; a surface is "
                 "run by something, and that something is part of the record"
             )
             continue
-        runner_sets = _script_env_names(runner)
         unread = sorted(set(surface.variables) - available)
         if unread:
             problems.append(
@@ -2870,6 +2894,22 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
                 "passed to no env-reading function of this crate; a declared "
                 "variable the crate never reads is a stale declaration"
             )
+        if runnerless:
+            if setters:
+                detail = "; ".join(
+                    f"{script} sets {', '.join(names)}"
+                    for script, names in sorted(setters.items())
+                )
+                problems.append(
+                    f"gate-env-tier surface {surface.name}: "
+                    f"{ENV_TIER_NO_RUNNER!r} states that no script runs it, but "
+                    f"{detail}; a surface whose variables a script sets has "
+                    "that script as its runner, so name it"
+                )
+            continue
+        runner_sets = script_names.get(root / surface.runner) or _script_env_names(
+            root / surface.runner
+        )
         unset = sorted(set(surface.variables) - runner_sets)
         if len(unset) == len(surface.variables):
             problems.append(
@@ -2894,8 +2934,13 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
         f"{len(variables)} variable(s), {cells} coverage cell(s)"
     ]
     for surface in surfaces:
+        runner = (
+            "no script runner"
+            if surface.runner == ENV_TIER_NO_RUNNER
+            else surface.runner
+        )
         summary.append(
-            f"  gate-env-tier-surface: {surface.name} ({surface.runner}) "
+            f"  gate-env-tier-surface: {surface.name} ({runner}) "
             f"{', '.join(surface.variables)} - {surface.measures}"
         )
     return summary, notes
@@ -2905,8 +2950,9 @@ def parse_env_tier(text: str, problems: list[str]) -> list[EnvTier]:
     """Parse `gate-env-tier` rows: `<name> = <vars> | <runner> | <measures> | <cells>`.
 
     `<vars>` is a comma-separated list of environment variable names, `<runner>`
-    a script path relative to the crate root, `<measures>` prose, and `<cells>`
-    a comma-separated list in the same grammar the coverage cells use.
+    a script path relative to the crate root or `-` for a surface no script
+    runs, `<measures>` prose, and `<cells>` a comma-separated list in the same
+    grammar the coverage cells use.
     """
     surfaces: list[EnvTier] = []
     seen: set[str] = set()
@@ -2960,8 +3006,10 @@ def parse_env_tier(text: str, problems: list[str]) -> list[EnvTier]:
             problem = True
         if not runner:
             problems.append(
-                f"gate-env-tier surface {name}: no runner named; an env-scaled "
-                "surface is run by a script, and the runner is part of the record"
+                f"gate-env-tier surface {name}: no runner field; state the script "
+                f"that runs the surface, or {ENV_TIER_NO_RUNNER!r} for a surface "
+                "no script runs, because how a surface is run is part of the "
+                "record"
             )
             problem = True
         if not measures:
