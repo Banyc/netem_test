@@ -129,6 +129,19 @@ than a failure, for the same reason an unmigrated perf declaration is: a
 grammar did not have, and the point is that the surface is named rather than
 invisible.
 
+**A zero-row declaration is a form, not an absence.** A crate whose work has no
+perf arm at all — nothing measures a bound, no impairment instrument is
+reachable — owes the same kind of statement a coverage gap owes: what is *not*
+covered, and why. The three blocks may therefore be declared with **zero rows**:
+an empty `gate-perf-design`, an empty `gate-budgets` (no `baseline`, no tier
+budget: with no row there is no reference and no tier to pay for), and a
+`gate-coverage-gaps` block carrying at least one `<cell> = <reason>` line. The
+checker refuses the two ways of getting this wrong: zero rows with no gap at all
+declares nothing and is an error that says so, and a `baseline = <row>` line
+beside zero rows references nothing and is the ordinary dangling-reference error
+with the zero-row reason named. A crate that *does* declare rows still owes a
+baseline, exactly as before.
+
 **One reference cannot serve every family, so a declaration may carry several
 baselines.** `baseline = <row>` is the **default** reference a row inherits
 when its relation names none; each `baseline.<family> = <row>` line declares a

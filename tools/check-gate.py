@@ -2129,11 +2129,6 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
             problems.append(f"gate-budgets: tier {key} budget {budget} is negative")
             continue
         tiers[key] = budget
-    if baseline is None:
-        problems.append(
-            "gate-budgets declares no 'baseline = <row>' line; every design row's "
-            "coverage must be stated relative to a named baseline row"
-        )
     return PerfBudgets(tiers, baseline, drift, floor, named, members)
 
 
@@ -3175,6 +3170,31 @@ def check_perf_gate(
     rows = parse_perf_design(design_block, problems)
     budgets = parse_perf_budgets(budgets_block or "", problems)
     gaps = parse_perf_gaps(gaps_block or "", problems)
+    if rows and budgets.baseline is None:
+        problems.append(
+            "gate-budgets declares no 'baseline = <row>' line; every design row's "
+            "coverage must be stated relative to a named baseline row"
+        )
+    if not rows:
+        # A crate with no perf arm owes an honest negative rather than a
+        # fabricated row: the blocks may declare zero rows, and then they must
+        # say what is *not* covered and reference nothing. A zero-row block set
+        # that records no gap declares nothing at all, and a baseline with no
+        # row to be the reference of is the ordinary dangling-reference error.
+        if not gaps:
+            problems.append(
+                "gate-perf-design declares no row and gate-coverage-gaps "
+                "records no gap: a zero-row declaration must still say what is "
+                "not covered; state at least one `<cell> = <reason>` line, or "
+                "declare a row"
+            )
+        if budgets.baseline is not None:
+            problems.append(
+                f"gate-budgets declares baseline {budgets.baseline!r} while "
+                "gate-perf-design declares no row; with zero rows the "
+                "declaration is the gap-only form and states against nothing, "
+                "so remove the baseline line (or declare the row it names)"
+            )
     relation_summary = check_perf_relations(rows, budgets, problems)
     membership_summary = check_perf_membership(rows, budgets, problems)
 
@@ -3214,7 +3234,7 @@ def check_perf_gate(
                 f"its {budget:.2f}s budget ({names}); retier a test, lower a "
                 "cost, or raise the budget as a declared change"
             )
-    if budgets.baseline is not None and budgets.baseline not in {row.name for row in rows}:
+    if rows and budgets.baseline is not None and budgets.baseline not in {row.name for row in rows}:
         problems.append(
             f"gate-budgets: baseline {budgets.baseline!r} is not a gate-perf-design "
             "row, so the rows' coverage is stated against nothing"

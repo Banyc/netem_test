@@ -299,6 +299,33 @@ class CheckGatePerfTest(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn("default-required: 2 asserting scenario(s) present", output)
 
+    # -- the zero-row (gap-only) declaration ---------------------------------
+
+    def test_a_zero_row_gap_only_declaration_passes(self):
+        """A crate with no perf arm states the negative instead of a fake row."""
+        self.write_gate(design="", budgets="", gaps=BASE_GAPS)
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("gate-perf-design: 0 perf test row(s)", output)
+        self.assertIn("baseline unset", output)
+
+    def test_a_zero_row_declaration_with_no_gap_fails(self):
+        """Zero rows with zero gaps declares nothing, and says so."""
+        self.write_gate(design="", budgets="", gaps="")
+        self.rejects("declares no row and gate-coverage-gaps records no gap")
+
+    def test_a_zero_row_declaration_with_a_baseline_fails(self):
+        """The gap-only form references nothing, so a baseline is a mistake."""
+        self.write_gate(design="", budgets="baseline = beta::t_beta", gaps=BASE_GAPS)
+        self.rejects(
+            "declares baseline 'beta::t_beta' while gate-perf-design declares no row"
+        )
+
+    def test_a_zero_row_declaration_still_refuses_a_reason_less_gap(self):
+        """The gap grammar keeps its teeth in the zero-row form."""
+        self.write_gate(design="", budgets="", gaps="M1@lane=dual-lane = ")
+        self.rejects("records no reason")
+
     def test_a_lib_entry_that_is_not_an_ignored_test_is_still_stale(self):
         """The new resolution does not turn `gate-manifest` into a free-form list."""
         self.write_gate(
