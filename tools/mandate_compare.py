@@ -67,6 +67,18 @@ arm against its declared coverage cell in `tools/mandate-arms.json`, not this
 comparison. Nor does it see a shortening that leaves the window in place, keeps
 at least half the samples and drops no cell.
 
+It can also report a regression there is not, and the counts are where. A
+counter has no absolute floor, so one small enough that half of it is a handful
+of datagrams crosses the 50 % tolerance on an **unchanged** tree. Measured: on
+the `M1/lone_tail` arm of two real full runs of the unchanged tree,
+`bulk_wire_bytes` read 1920 in one and 785 in the next (-59 %), red-flagging
+two arms — and that counter is not one the arm claims (the arm declares no bulk
+lane, so the few kilobytes are not the workload it covers). So a count
+regression on a counter the arm's own cell does not name is a candidate false
+positive, to be read against the arm before it is acted on; a floor for such a
+key would remove it, and adding one is a change to this comparison's noise band
+and not to its detection.
+
 ## What it refuses
 
 A comparison between runs that are not comparable is refused (exit ``2``)

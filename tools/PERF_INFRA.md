@@ -591,30 +591,47 @@ It cannot see an arm that keeps its sample count and counters while its
 **impairment was quietly weakened** — a 2 % loss arm retuned to 1 % measures the
 same shape under a milder regime. That is a change to a frozen perf-test
 setting, and the guard against it is the setting's immutability plus reading the
-arm against its declared cell, not this comparison.
+arm against its declared cell, not this comparison. Nor is every count
+regression one: the counts have no absolute floor, so a counter small enough
+that half of it is a handful of datagrams can cross the tolerance on an
+*unchanged* tree — measured on the `M1/lone_tail` arm of two real full runs,
+where `bulk_wire_bytes` read 1920 and then 785, a counter that arm does not
+claim (it declares no bulk lane). `tools/mandate_compare.py`'s docstring states
+that false-positive mode and the floor that would remove it.
 
 ### The checked-in baseline
 
 `tools/mandate-baseline.json` is the `mandate-check.json` of one real
 `tools/mandate-check` run, checked in so that `tools/mandate-compare` has a
 reference: it records the per-arm measurements a later run's coverage is
-compared against. It was taken with `tools/mandate-check` (no arguments, so no
-`--quick`) on 2026-09-26, with the runner at commit `e3644df7` (change
-`yprpylpz`) and the sibling `rtp_mux` at commit `e4b5ee4f` (change
-`wmrkurmovoouxvsyuwpozsuovvkwmrrx`) — an empty working-copy snapshot, so the
-recorded `tree_id` `a0648702` is what actually names the content it built —
-which pins `rtp v0.0.94`; the run took **216.3 s**, passed all four mandates,
-and recorded **19 arms** — 3 M1, 3 M2, 3 M3 reps, 8 M4 flows and 2 M4
-aggregates. The checked-in copy is the run's JSON with machine-local absolute
-paths replaced by tokens (`<baseline run
- dir>`, `<rtp_mux checkout>`, `<netem_test checkout>`, `<cargo>`); every
-measured value, the command, the revisions, the tree and the duration are
+compared against. It was taken with `tools/mandate-check --no-rasterize` (no
+`--quick`, and no other argument that reaches a producer — `--no-rasterize`
+only skips the PNG step, so the arms are those of a default run) on
+2026-09-26, with the runner at commit `9c4fcabe` (change
+`nnozsvltxvvnuqzkmvkoknvsrquuwttr`; the working-copy snapshot read at that
+moment was empty, so the recorded runner `tree_id`
+`d72f0d5824461f0eded3b0af4d8b5a7024b114cd` is what actually names the content
+it built) and the sibling `rtp_mux` at commit `4632257a` (change
+`xwwmprmsltkkkuwpuvkvwkoukusvuooo`), whose tree `937a25b0` pins `rtp v0.0.95`
+and `mux v0.0.31`. The run took **147.1 s**, passed all four mandates with 10
+verified SVG panels, and recorded **23 arms from both producers**: 19 for
+`rtp_mux` (3 M1, 3 M2, 3 M3 reps and 10 M4 arms) and the 4 probes
+(`probe/forwarding` over 200 000 iterations, `probe/deadline` over 1 000,
+`probe/std-udp` over 21 paired medians, `probe/dest-cache` over 5 000 000).
+Its `timings` cover both producers, so `tools/check-gate.py
+--mandate-check-json` drift-checks the four `lib::tests::*` rows as well as
+`rtp_mux`'s. The checked-in copy is the run's JSON with machine-local absolute
+paths replaced by tokens (`<baseline run dir>`, `<rtp_mux checkout>`,
+`<netem_test checkout>`, `<cargo>`); every
+measured value, the command, the revisions, the trees and the duration are
 verbatim. The plots themselves are not committed; re-run the command to
 regenerate them.
 Because the comparison refuses a baseline whose schema predates the per-arm
 record, this file has to be re-recorded with a current `tools/mandate-check`
-(no `--quick`) whenever the runner or the smoke set changes shape; the
-checked-in file is schema `mandate-check/4`.
+(no `--quick`) whenever the runner or a producer changes shape; the checked-in
+file is schema `mandate-check/5`. A `/4` file is still read, but it carries
+one producer's arms only, so a run compared against it cannot show the second
+producer's coverage — re-record rather than compare across the addition.
 
 ### `tools/mandate_plot.py` — the validated panel renderer
 
