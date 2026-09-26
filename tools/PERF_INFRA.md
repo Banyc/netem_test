@@ -730,6 +730,15 @@ the reader:
   around in the middle of a unit (a fair share, a symmetric departure band) has
   no crossing at all: it is the target they are read at, and calling it one
   labelled eight flows sitting on 25 % as `1 of 8 bars beyond it`.
+- **a bound drawn over arms whose own bounds differ must be attributable per
+  arm.** A bound the run *restates* for some arms (`delivery_floor=0.995` under
+  a declared `1.000`) is drawn as each arm's own segment, naming the arms it
+  governs (`check_bound_arm_governance`). A **line** panel cannot split its one
+  line per arm, so it owes the same division in words: the bound names the arm
+  it governs and, for every other arm it crosses, the run's own key and value
+  for it — the shape whose absence let a `lone_tail` peak of 1567.1 ms cross
+  `M1-latency`'s 250 ms ceiling with nothing on the panel saying that arm is
+  asserted at its own 3200 ms p99 guard.
 - **a bound label must lie inside the plot.** The label is what says what the
   line governs, and `check_label_fit` reads each drawn label back out of the
   SVG and refuses the render when its box leaves the plot area. Measured on a

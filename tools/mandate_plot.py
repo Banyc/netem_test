@@ -146,8 +146,9 @@ silenced by softening a declaration:
   outright when a reading names an arm no line panel draws, and
   `check_reading_band` refuses a band that would leave the plot too short to
   show the shape it explains.
-- **the per-arm bound test** — `check_bound_arm_governance` refuses a bar panel
-  that draws one bound across arms whose own bounds differ. A bound the run
+- **the per-arm bound test** — `check_bound_arm_governance` refuses a panel
+  that draws one bound across arms whose own bounds differ, which is
+  `AGENTS.md`'s second panel test. A **bar** panel whose bound the run
   *restates* for some of the arms (`delivery_floor=0.995` under a declared
   `1.000`) is not one floor drawn across one group of arms: a bar between the
   two values crosses the declaration's line while sitting inside its own arm's
@@ -158,6 +159,13 @@ silenced by softening a declaration:
   the rest, each segment naming the arms it governs. A run that restates
   nothing, a panel whose arms the run does not enumerate, and a quantity whose
   bound the run never restates are all left with their single declared line.
+  A **line** panel cannot split its one line per arm — its arms share the time
+  axis — so it owes the same division in words: the bound names the arm it
+  governs and, for every other arm it crosses, the run's own key and value for
+  it. Measured on `M1-latency`, the `lone_tail` series peaked at 1567.1 ms
+  against a panel whose only mark was the 250 ms mandate ceiling, which is not
+  what that arm is asserted against (its own p99 guard is 3200 ms): the reader
+  saw a 6.3×-over-ceiling peak and no way to learn it was a pass.
 - **the departure-view test** — `check_departure_view_stated` refuses a panel
   whose own frame cannot carry the failure its mandate is read for. Two
   shapes, one rule. A bar panel whose bound is a value its own bars *straddle*
@@ -915,6 +923,111 @@ def run_guards(run_values, series=None, text=""):
     return guards
 
 
+# -- a bound drawn across arms whose guards differ -------------------------
+#
+# `M1-latency` draws one 250 ms ceiling across three arms, and the run asserts a
+# different bound for each of them: the ceiling itself on the clean arm, and
+# `hostile_p99_guard` / `lone_p99_guard` / `lone_over250_guard` on the impaired
+# ones. The reader who sees the `lone_tail` series peak at 1567.1 ms (a real
+# run's number) crossing that ceiling has, as drawn, no way to learn that 1567.1
+# ms is a *pass* for that arm -- the panel's own reading band gives the arm's
+# peak and its detector verdict and never what the arm is asserted against.
+#
+# The bar-panel case of the same rule is `check_bound_arm_governance`'s:
+# `M2-delivery` draws each arm's own floor and names the arms it governs. A line
+# panel cannot split the line per arm -- its arms share the time axis -- so it
+# names, on the bound, what each arm it draws is read against.
+def guard_statistic_unit(statistic):
+    """The unit a guard key's own statistic name declares, or ``""``.
+
+    `over250` is a *share of samples*, and on a panel whose axis is in
+    milliseconds the key's own name is the only thing that says so: read bare,
+    `lone_over250_guard=8` would be read as 8 ms. Every other statistic here
+    (a percentile, a maximum) is stated in the panel's own unit, which its y
+    label already carries, so nothing is appended and no unit is guessed.
+    """
+    return "%" if statistic.startswith("over") else ""
+
+
+def arm_guard_tokens(series, run_values):
+    """The run's own guards, attributed to the drawn arm each one bounds.
+
+    A `MANDATE` line names each arm's guard as `<arm>_<statistic>_guard`
+    (`hostile_p99_guard`, `lone_over250_guard`), and a *line* panel's series are
+    the arms themselves -- which is why the quantity-keyed clause
+    `run_guards` builds cannot name them: there the statistic token has to
+    appear in a series name (`hostile_wire_guard` on the wire panel, whose
+    series is `wire_x`), while here it is the arm that has to.
+
+    The arm a key belongs to is the longest underscore-delimited prefix of the
+    key's own name that a drawn series' name starts with (`lone` ->
+    `lone_tail`), so the attribution is read off the run's own keys and the
+    panel's own legend rather than from a name the renderer would have to
+    invent. A key no drawn series claims is left out: a guard named against an
+    arm this panel does not draw would look like evidence for it.
+    """
+    if not isinstance(run_values, dict):
+        return []
+    names = [name for name, _ in series]
+    found = {name: [] for name in names}
+    # The run's own key order is the order its `MANDATE` line prints them in, and
+    # reading the guards back in it keeps the label's sentence in the order the
+    # producer asserted them rather than an alphabetisation of its own keys.
+    for key in run_values:
+        value = run_values[key]
+        if not isinstance(key, str) or not key.endswith(GUARD_KEY_SUFFIX):
+            continue
+        if not numeric(value):
+            continue
+        parts = key[: -len(GUARD_KEY_SUFFIX)].split("_")
+        for take in range(len(parts) - 1, 0, -1):
+            candidate = "_".join(parts[:take])
+            arm = next(
+                (
+                    name
+                    for name in names
+                    if candidate == name or name.startswith(candidate + "_")
+                ),
+                None,
+            )
+            if arm is None:
+                continue
+            statistic = "_".join(parts[take:]) or candidate
+            found[arm].append((key, statistic, float(value)))
+            break
+    return [(name, found[name]) for name in names if found[name]]
+
+
+def arm_guard_clause(series, run_values):
+    """The clause a bound drawn across arms with different guards owes.
+
+    "Does each drawn bound apply to every series it crosses?" is `AGENTS.md`'s
+    second panel test, and on a line panel it has to be answered in words: the
+    one line cannot be drawn per arm, so it names the arms it governs and
+    states, for every other arm it crosses, the key and value the run asserts
+    for it. Returns the empty string when the run states no guard for any of
+    the panel's arms, which is the case where the declaration's own bound is
+    the only bound there is.
+    """
+    tokens = arm_guard_tokens(series, run_values)
+    if not tokens:
+        return ""
+    guarded = {name for name, _ in tokens}
+    reference = [name for name, _ in series if name not in guarded]
+    parts = []
+    if reference:
+        parts.append("governs " + " ".join(reference))
+    for name, guards in tokens:
+        parts.append(
+            f"{name} guards "
+            + ", ".join(
+                f"{key}={value:g}{guard_statistic_unit(statistic)}"
+                for key, statistic, value in guards
+            )
+        )
+    return "; ".join(parts)
+
+
 # -- the readings a line panel states, and the honesty of its geometry -----
 #
 # Two things a latency panel must be able to say about itself, both of them the
@@ -1581,12 +1694,36 @@ def check_bound_arm_governance(panel_id, panel, series, bounds, run_values, mark
     floor of whichever arm crossed it, which is a breach for one arm and a pass
     for its neighbour. So every segment the run's own bounds imply has to be on
     the panel, each naming the arms it governs.
+
+    A **line** panel is the same rule with one line it cannot split: its arms
+    share the time axis, so the run's per-arm guards cannot be drawn as
+    segments. There the bound names, per arm, the key and value the run asserts
+    for it (`arm_guard_clause`), and this refuses a panel whose drawn label
+    does not carry that clause -- which is the shape that let a `lone_tail`
+    peak of 1567.1 ms cross the 250 ms ceiling on a panel saying nothing about
+    the arm's own 3200 ms p99 guard.
     """
     planned = effective_bounds(panel, series, bounds, run_values)
-    if len(planned) <= len(bounds):
-        return []
     drawn = [declared for declared, _, _ in label_boxes(markup)]
     problems = []
+    if panel["chart"] != "bar":
+        clause = arm_guard_clause(series, run_values)
+        if not clause:
+            return []
+        for bound in bounds:
+            label = governed_label(bound, series, run_values, crossing=False)
+            if label in drawn:
+                continue
+            problems.append(
+                f"panel {panel_id!r}: the run states the guards {clause!r} for "
+                f"the arms this bound crosses, so one line across every series "
+                "would be the bound of none of them; the panel has to name which "
+                f"arm it governs and what the other arms are read against. "
+                f"Missing: {label!r} (drawn: {drawn!r})"
+            )
+        return problems
+    if len(planned) <= len(bounds):
+        return []
     for bound in planned:
         label = governed_label(bound, series, run_values)
         if label in drawn:
@@ -1602,15 +1739,23 @@ def check_bound_arm_governance(panel_id, panel, series, bounds, run_values, mark
 
 
 def named_guard_values(series, bounds, run_values, *, crossing):
-    """The run's own guards the panel's drawn labels will name.
+    """The run's own guards the panel's drawn labels will name on its own axis.
 
-    Only what a label actually says counts as named. A bar panel's bound carries
-    the guards for the quantity it governs, so the axis has to carry them too —
-    whether or not a bar has crossed yet, because the range is the reason the
-    crossing is drawable at all when it comes. A line panel's label carries no
-    such clause, so the M1 latency panel does not silently inherit
-    `lone_p999_guard=8000` and blow its axis up to eight thousand milliseconds.
-    `governed_label` builds both labels the same way.
+    Only what a label actually says counts as named. A *bar* panel's bound
+    carries the guards for the quantity its bars plot, so the axis has to carry
+    them too — whether or not a bar has crossed yet, because the range is the
+    reason the crossing is drawable at all when it comes.
+
+    A *line* panel's bound names the run's per-arm guards instead
+    (`arm_guard_clause`), and those are not values on the axis the panel plots:
+    `lone_p99_guard=3200` is a bound on one *statistic* of that series and
+    `lone_over250_guard=8%` is not in the y unit at all. Pulling them onto the
+    axis would put the 250 ms ceiling at 3 % of its height and delete the
+    crossing the panel exists to show — the defect this docstring used to
+    describe as `lone_p999_guard=8000` blowing the axis up to eight thousand
+    milliseconds. What the reader compares a guard against is the arm's own
+    stated peak, which the reading band carries; the legend and the clause name
+    the statistic, so the value is read against the right quantity.
     """
     if not crossing or not isinstance(run_values, dict):
         return []
@@ -2473,15 +2618,18 @@ def governed_label(bound, series, run_values, crossing=True):
 
     The crossing clause is for bar panels, where one line is drawn across many
     bars and the bars' own guards are the only thing that distinguishes a
-    breach from a tolerated tripwire. A line panel's series carry their own
-    legend entries, so its bounds are labelled with their declared governance
-    and left at that.
+    breach from a tolerated tripwire. A line panel cannot split its line, so it
+    gets the other half of the same rule instead: the arm-guard clause, naming
+    the arm the declared bound governs and the arms the run asserts its own
+    guards for.
 
-    The guard clause is *not* conditional on a crossing: the guards are the
+    A bar's guard clause is *not* conditional on a crossing: the guards are the
     arms' own bounds, and the axis has to carry them whether or not one of them
     has been reached yet (a run whose worst arm sits 0.09 under the budget is
     the same panel as one whose worst arm sits 0.05 over it). Naming them is
-    also what makes the range honest — a panel may draw what it names.
+    also what makes the range honest — a panel may draw what it names. A line
+    panel's clause names values on statistics of its series rather than on the
+    axis it plots, which is why `named_guard_values` leaves the line axis alone.
     """
     clauses = []
     if bound.get("arms"):
@@ -2508,6 +2656,13 @@ def governed_label(bound, series, run_values, crossing=True):
             )
         if crossing_clauses:
             clauses.append("; ".join(crossing_clauses))
+    else:
+        # A line panel's series are the arms themselves, so its bound names
+        # which arm it governs and what the other arms are read against -- the
+        # division a bar panel draws instead (`check_bound_arm_governance`).
+        clause = arm_guard_clause(series, run_values)
+        if clause:
+            clauses.append(clause)
     if not clauses:
         return bound["label"]
     return f"{bound['label']} [{'; '.join(clauses)}]"
@@ -3000,6 +3155,9 @@ def panel_markup(
             if chart == "bar"
             else check_departure_view_stated(
                 panel["id"], panel, panels or [panel], points, markup
+            )
+            + check_bound_arm_governance(
+                panel["id"], panel, series, bounds, run_values, markup
             )
         )
         + (

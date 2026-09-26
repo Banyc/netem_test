@@ -417,6 +417,85 @@ def _latency_rows(points):
     ]
 
 
+# A real run's M1 readings, and the shape the panel below is about: one 250 ms
+# ceiling drawn across three arms whose own guards differ by more than the
+# ceiling itself (`lone_tail`'s p99 guard is 3200 ms). These are the
+# `MANDATE M1` line's own numbers and the run's own drawn `M1.csv` points.
+M1_RUN_VALUES = {
+    "clean_p50": 24.4,
+    "clean_p90": 30.0,
+    "clean_p99": 93.1,
+    "clean_p999": 103.4,
+    "clean_max": 107.7,
+    "clean_over250": 0,
+    "hostile_p50": 45.8,
+    "hostile_p90": 141.0,
+    "hostile_p99": 231.8,
+    "hostile_p999": 267.7,
+    "hostile_max": 277.1,
+    "hostile_over250": 12,
+    "lone_p50": 0.2,
+    "lone_p90": 59.4,
+    "lone_p99": 166.4,
+    "lone_p999": 1465.8,
+    "lone_max": 1567.1,
+    "lone_over250": 2,
+    "ceiling": 250.0,
+    "hostile_p99_guard": 900.0,
+    "hostile_over250_guard": 8.0,
+    "lone_p99_guard": 3200.0,
+    "lone_p999_guard": 8000.0,
+    "lone_over250_guard": 8.0,
+}
+
+M1_ARMS_DECLARATION = {
+    "mandate": "M1",
+    "title": "M1 interactive tail latency",
+    "x_label": "elapsed time (s)",
+    "y_label": "latency (ms)",
+    "panels": [
+        {
+            "id": "latency",
+            "chart": "line",
+            "series": [{"name": "clean"}, {"name": "hostile"}, {"name": "lone_tail"}],
+            "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+        },
+        {
+            "id": "cdf",
+            "chart": "cdf",
+            "x_label": "latency (ms)",
+            "y_label": "percentile (%)",
+            "series": [{"name": "clean"}, {"name": "hostile"}, {"name": "lone_tail"}],
+            "bounds": [],
+        },
+    ],
+}
+
+M1_ARMS_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["latency", "clean", 1.53, 20.137],
+    ["latency", "clean", 2.06, 107.674],
+    ["latency", "clean", 13.52, 20.8],
+    ["latency", "hostile", 1.5, 0.05],
+    ["latency", "hostile", 2.44, 277.114],
+    ["latency", "hostile", 13.55, 69.55],
+    ["latency", "lone_tail", 1.5, 0.092417],
+    ["latency", "lone_tail", 10.87, 1567.111],
+    ["latency", "lone_tail", 17.23, 1466.0],
+    ["cdf", "clean", 20.137, 0.0],
+    ["cdf", "clean", 85.316, 98.0],
+    ["cdf", "clean", 93.088, 99.0],
+    ["cdf", "clean", 107.674, 100.0],
+    ["cdf", "hostile", 0.05, 0.0],
+    ["cdf", "hostile", 213.408, 98.0],
+    ["cdf", "hostile", 231.837, 99.0],
+    ["cdf", "hostile", 277.114, 100.0],
+    ["cdf", "lone_tail", 0.092417, 0.0],
+    ["cdf", "lone_tail", 122.818459, 98.0],
+    ["cdf", "lone_tail", 172.260084, 99.0],
+    ["cdf", "lone_tail", 1567.110834, 100.0],
+]
+
 def _points(rows):
     """CSV rows from a fixture, in the shape `mandate_plot.parse_points` takes."""
     return MANDATE.parse_points(
@@ -2401,6 +2480,138 @@ class MandatePlotTest(unittest.TestCase):
             MANDATE.effective_bounds(wire, wire_series, wire_bounds, M2_RUN_VALUES),
             [{"y": 6.0, "label": "M2 wire budget 6x"}],
         )
+
+    def test_a_line_bound_names_the_guard_of_every_arm_it_crosses(self):
+        # `M1-latency` draws one 250 ms ceiling across three arms and the run
+        # asserts a different bound for each of them, so the line has to say
+        # which arm it governs and what the others are read against. As drawn
+        # before this, the `lone_tail` series crosses the ceiling at 1567.1 ms
+        # and the panel states nothing that says 1567.1 ms is inside that arm's
+        # own 3200 ms p99 guard: the reader's only mark is the mandate's, and
+        # the mandate's bound is not what that arm is asserted against.
+        panels = M1_ARMS_DECLARATION["panels"]
+        points = _points(M1_ARMS_ROWS)
+        series = MANDATE.panel_series(panels[0], points)
+        self.assertEqual(
+            MANDATE.arm_guard_tokens(series, M1_RUN_VALUES),
+            [
+                (
+                    "hostile",
+                    [
+                        ("hostile_p99_guard", "p99", 900.0),
+                        ("hostile_over250_guard", "over250", 8.0),
+                    ],
+                ),
+                (
+                    "lone_tail",
+                    [
+                        ("lone_p99_guard", "p99", 3200.0),
+                        ("lone_p999_guard", "p999", 8000.0),
+                        ("lone_over250_guard", "over250", 8.0),
+                    ],
+                ),
+            ],
+        )
+        # The arm is read off the run's own key and the panel's own legend
+        # (`lone` -> `lone_tail`), and a guard for an arm this panel does not
+        # draw is left out rather than named against the wrong series.
+        self.assertEqual(
+            MANDATE.arm_guard_tokens([("clean", [])], M1_RUN_VALUES), []
+        )
+        code, stderr, out = self.render_mandate(
+            M1_ARMS_DECLARATION,
+            M1_ARMS_ROWS,
+            "M1arms",
+            "--run-values",
+            json.dumps(M1_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        # The label is long enough to wrap; `label_boxes` reports one box per
+        # drawn line, with the undivided sentence in the first line's
+        # `<title>`. The drawn ink has to spell that sentence out, not clip it.
+        boxes = MANDATE.label_boxes(document)
+        self.assertEqual(
+            boxes[0][0],
+            "M1 ceiling 250 ms [governs clean; hostile guards "
+            "hostile_p99_guard=900, hostile_over250_guard=8%; lone_tail "
+            "guards lone_p99_guard=3200, lone_p999_guard=8000, "
+            "lone_over250_guard=8%]",
+        )
+        self.assertGreater(len(boxes), 1, "the long label is wrapped, not clipped")
+        self.assertEqual(" ".join(line for _, line, _ in boxes), boxes[0][0])
+        self.assertEqual(
+            MANDATE.check_bound_arm_governance(
+                "latency",
+                panels[0],
+                series,
+                MANDATE._bound_specs(panels[0]),
+                M1_RUN_VALUES,
+                document,
+            ),
+            [],
+        )
+
+    def test_a_line_bound_that_names_no_arm_is_refused(self):
+        # The vacuity of the arm-governance clause: the pre-change drawing --
+        # one line at the declared ceiling, its label naming no arm and no
+        # guard -- has to go red, both as a predicate and end to end.
+        panels = M1_ARMS_DECLARATION["panels"]
+        points = _points(M1_ARMS_ROWS)
+        series = MANDATE.panel_series(panels[0], points)
+        bounds = MANDATE._bound_specs(panels[0])
+        one_line = MANDATE.REPORT.svg_line_chart(
+            "M1 [latency]",
+            "elapsed time (s)",
+            "latency (ms)",
+            series,
+            MANDATE.REPORT.extent_including_bounds(
+                MANDATE.REPORT.finite_extent(series), [(250.0, "")]
+            ),
+            [(250.0, "M1 ceiling 250 ms")],
+            walls=True,
+            markers=True,
+        )
+        problems = MANDATE.check_bound_arm_governance(
+            "latency", panels[0], series, bounds, M1_RUN_VALUES, one_line
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("would be the bound of none of them", problems[0])
+        self.assertIn("governs clean", problems[0])
+        self.assertIn("lone_p99_guard=3200", problems[0])
+        # End to end: a drawing that keeps the bare declared label does not
+        # write the panel at all. The clause is stripped from the artifact the
+        # chart is handed rather than from `governed_label`, because the check's
+        # own plan is built by that formatter: patching it would weaken both
+        # sides at once and prove nothing about the drawing.
+        drawn_line = MANDATE.REPORT.svg_line_chart
+
+        def line_without_the_arm_guards(
+            title, x_label, y_label, chart_series, extent, line_bounds, **keywords
+        ):
+            return drawn_line(
+                title,
+                x_label,
+                y_label,
+                chart_series,
+                extent,
+                [
+                    (y, label.split(" [")[0] if label else label)
+                    for y, label in line_bounds or []
+                ],
+                **keywords,
+            )
+
+        with mock.patch.object(MANDATE.REPORT, "svg_line_chart", line_without_the_arm_guards):
+            code, stderr, _ = self.render_mandate(
+                M1_ARMS_DECLARATION,
+                M1_ARMS_ROWS,
+                "M1arms2",
+                "--run-values",
+                json.dumps(M1_RUN_VALUES),
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("the bound of none of them", stderr)
 
     def test_a_panel_with_no_bound_says_where_the_bound_is_drawn(self):
         # `M1-cdf` draws the latency distribution and no line at all: the
