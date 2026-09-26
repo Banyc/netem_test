@@ -333,24 +333,35 @@ def arm_lines(lines):
     return [line for line in lines if line.startswith("[mandate-smoke ")]
 
 
-# A second producer's stdout: this crate's own perf-tier probes, in the arm-line
-# shape `tools/mandate-check` records (label, `section=`, and the sample count
-# the probe ran). No `MANDATE` line and no evidence file, because a report-only
-# probe asserts no bound to declare — which is what `section=` is for.
+# A second producer's stdout: this crate's own perf-tier probes. The shape is
+# the real one — libtest flushes `test <name> ... ` before the test runs, the
+# probe's own prose and arm line follow, and the state arrives on a line of its
+# own — so this fixture also proves the runner times a producer that prints
+# during its own test. There is no `MANDATE` line and no evidence file, because
+# a report-only probe asserts no bound to declare — which is what `section=` is
+# for.
 PROBE_LINES = [
     "running 4 tests",
+    "test tests::clean_forwarding_perf_probe ... clean_forwarding_perf_probe: "
+    "direct=3.157 Mpps filter=513.149 Mpps queued=2.105 Mpps",
     "[mandate-smoke forwarding] section=probe recv=200000 direct_mpps=3.157 "
     "filter_mpps=513.149 queued_mpps=2.105",
-    "test tests::clean_forwarding_perf_probe ... ok",
+    "ok",
+    "test tests::short_deadline_latency_perf_probe ... short_deadline_latency_perf_probe: "
+    "median=125ns",
     "[mandate-smoke deadline] section=probe recv=1000 median_us=0.125 "
     "idle_poll_us=5000.000",
-    "test tests::short_deadline_latency_perf_probe ... ok",
+    "ok",
+    "test tests::std_udp_connected_peer_perf_probe ... [perf] connected UDP peer: "
+    "connected=27259 roundtrips/s",
     "[mandate-smoke std-udp] section=probe recv=21 operations=2000 "
     "connected_rps=27259 unconnected_rps=23793 speedup=1.146",
-    "test tests::std_udp_connected_peer_perf_probe ... ok",
+    "ok",
+    "test tests::learned_destination_cache_perf_probe ... [perf] Learned destination: "
+    "cached=12.86 ns/packet",
     "[mandate-smoke dest-cache] section=probe recv=5000000 cached_ns=12.86 "
     "locked_ns=25.80 speedup=2.01",
-    "test tests::learned_destination_cache_perf_probe ... ok",
+    "ok",
     "test result: ok. 4 passed; 0 failed",
 ]
 
@@ -413,10 +424,16 @@ class MandateCheckTest(unittest.TestCase):
         plan = self.healthy_plan()
         probes = PROBE_LINES if probes is None else probes
         # Keyed by the cargo package name the runner invokes, which is the
-        # package's own name and not the producer's registry id.
+        # package's own name and not the producer's registry id. Each sub-plan
+        # sleeps between lines so the per-test brackets are real durations.
         plan["by_package"] = {
-            "rtp_mux": self.healthy_plan(),
-            "netem-test": {"exit": 0, "stdout": list(probes), "stderr": []},
+            "rtp_mux": {**self.healthy_plan(), "line_sleep": 0.01},
+            "netem-test": {
+                "exit": 0,
+                "stdout": list(probes),
+                "stderr": [],
+                "line_sleep": 0.01,
+            },
         }
         plan.update(overrides)
         return plan
@@ -650,6 +667,26 @@ class MandateCheckTest(unittest.TestCase):
             [(entry["mandate"], entry["duration_seconds"]) for entry in timings["mandates"]],
             [("M1", 3.0), ("M2", 9.0)],
         )
+
+    def test_derive_timings_reads_a_completion_split_by_the_tests_own_output(self):
+        # The harness's probes print from inside their own test, so libtest's
+        # marker and its state arrive on different lines; the completion is the
+        # state line, and the marker's tail is the test's own first line.
+        events = [
+            {"seconds": 0.5, "line": "running 2 tests"},
+            {"seconds": 1.0, "line": "test tests::a ... probe says hello"},
+            {"seconds": 1.2, "line": "[mandate-smoke a] section=probe recv=10"},
+            {"seconds": 2.0, "line": "ok"},
+            {"seconds": 3.0, "line": "test tests::b ... ignored, release only"},
+        ]
+        timings = MANDATE_CHECK.derive_timings(events, "lib")
+        self.assertEqual(
+            [(entry["name"], entry["state"]) for entry in timings["tests"]],
+            [("tests::a", "ok"), ("tests::b", "ignored")],
+        )
+        self.assertEqual(timings["tests"][0]["duration_seconds"], 2.0)
+        self.assertEqual(timings["tests"][0]["target"], "lib")
+        self.assertEqual(timings["tests"][1]["duration_seconds"], None)
 
     def test_quick_asks_the_smoke_set_for_its_shortest_windows(self):
         code, _, stderr = self.run_tool(self.healthy_plan(), "--quick")
@@ -1467,6 +1504,25 @@ class MandateCheckTest(unittest.TestCase):
             [entry["target"] for entry in report["timings"]["tests"]],
             ["mandate_smoke"] * 4 + ["lib"] * 4,
         )
+        # The probes print from inside their own tests, so their completions are
+        # split by their own arm lines; both producers are still timed.
+        probe_timings = [
+            entry
+            for entry in report["timings"]["tests"]
+            if entry["producer"] == "netem_test"
+        ]
+        self.assertEqual(
+            [entry["name"] for entry in probe_timings],
+            [
+                "tests::clean_forwarding_perf_probe",
+                "tests::short_deadline_latency_perf_probe",
+                "tests::std_udp_connected_peer_perf_probe",
+                "tests::learned_destination_cache_perf_probe",
+            ],
+        )
+        for entry in probe_timings:
+            self.assertEqual(entry["state"], "ok")
+            self.assertGreater(entry["duration_seconds"], 0)
 
     def test_the_second_producers_arms_keep_their_own_sample_counts(self):
         code, _, stderr = self.run_two_producers(self.two_producer_plan())

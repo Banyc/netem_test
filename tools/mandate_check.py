@@ -299,6 +299,10 @@ GIT_TREE_RE = re.compile(r"^(?P<tree>[0-9a-f]{40})$")
 # lines do not match a state and are not completions.
 TEST_RESULT_RE = re.compile(r"^test (?P<name>\S+) \.\.\. ?(?P<tail>.*)$")
 TEST_STATES = ("ok", "FAILED", "ignored")
+# A libtest progress note (`test <name> has been running for over 60 seconds`):
+# the test is still running, so the note is not a completion and not a marker
+# whose result is still to come.
+TEST_PROGRESS_RE = re.compile(r"^has been running for over ")
 MANDATE_TIMING_RE = re.compile(r"^MANDATE (?P<mandate>M[0-9]+) ")
 # An arm line: `[mandate-smoke <label>] <body>`. The label is the producer's
 # own arm name and may carry alignment padding, so it is stripped.
@@ -1177,6 +1181,20 @@ def run_producer(command, *, crate, out_dir, quick, timeout):
     }
 
 
+def _result_state(tail):
+    """The libtest state a result line's tail names, or ``None``."""
+    return next(
+        (
+            candidate
+            for candidate in TEST_STATES
+            if tail == candidate
+            or tail.startswith(candidate + " ")
+            or tail.startswith(candidate + ",")
+        ),
+        None,
+    )
+
+
 def derive_timings(events, target):
     """The run's per-test and per-mandate wall-clock, from the line timeline.
 
@@ -1187,11 +1205,37 @@ def derive_timings(events, target):
     A ``FAILED`` or ``ignored`` result is recorded with its state and, for
     ``ignored``, a null duration (it never ran). Nothing here is inferred: an
     absent line stays absent.
+
+    A test that prints while it runs splits its own completion in two: libtest
+    writes ``test <name> ... `` and flushes, the test's output follows, and the
+    state arrives on a line of its own when the test ends. The completion is
+    then the arrival of that **state** line — which is when the test ended —
+    and the marker line, whose tail is the test's first line of output rather
+    than a state, is held until the state arrives. A producer whose arms are
+    printed from inside its own test (the harness's perf probes) times exactly
+    like one that buffers it (the smoke set).
     """
     tests = []
     mandates = []
     previous_completion = 0.0
     previous_mandate = 0.0
+    awaiting = None
+
+    def record(name, state, seconds):
+        nonlocal previous_completion
+        entry = {
+            "target": target,
+            "name": name,
+            "state": state,
+            "started_at_seconds": previous_completion,
+            "finished_at_seconds": seconds,
+            "duration_seconds": None,
+        }
+        if state != "ignored":
+            entry["duration_seconds"] = round(max(seconds - previous_completion, 0.0), 3)
+            previous_completion = seconds
+        tests.append(entry)
+
     for event in events:
         line = event["line"].strip()
         seconds = event["seconds"]
@@ -1207,36 +1251,25 @@ def derive_timings(events, target):
             previous_mandate = seconds
             continue
         result = TEST_RESULT_RE.match(line)
-        if result is None:
+        if result is not None:
+            tail = result.group("tail").strip()
+            state = _result_state(tail)
+            if state is None:
+                # Either the marker's result is still to come because the test
+                # printed (tail is its own first line), or this is a progress
+                # note and the test is still running.
+                if TEST_PROGRESS_RE.match(tail):
+                    continue
+                awaiting = result.group("name")
+                continue
+            awaiting = None
+            record(result.group("name"), state, seconds)
             continue
-        tail = result.group("tail").strip()
-        state = next(
-            (
-                candidate
-                for candidate in TEST_STATES
-                if tail == candidate or tail.startswith(candidate + " ")
-                or tail.startswith(candidate + ",")
-            ),
-            None,
-        )
-        if state is None:
-            # A libtest progress note (`has been running for over 60
-            # seconds`) is not a completion.
-            continue
-        entry = {
-            "target": target,
-            "name": result.group("name"),
-            "state": state,
-            "started_at_seconds": previous_completion,
-            "finished_at_seconds": seconds,
-            "duration_seconds": None,
-        }
-        if state != "ignored":
-            entry["duration_seconds"] = round(
-                max(seconds - previous_completion, 0.0), 3
-            )
-            previous_completion = seconds
-        tests.append(entry)
+        if awaiting is not None:
+            state = _result_state(line)
+            if state is not None:
+                record(awaiting, state, seconds)
+                awaiting = None
     return {
         "method": TIMING_METHOD,
         "origin": "smoke-child-start",
