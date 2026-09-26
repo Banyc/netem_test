@@ -1232,6 +1232,20 @@ if __name__ == "__main__":
     raise SystemExit(main())
 '''
 
+# A knob the sources read and no script sets: the shape an in-process test knob
+# has, which is the half of a surface the scripts cannot show.
+WAKE_KNOB_RS = """fn env_parse(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+pub fn wake_bound_ms() -> u64 {
+    env_parse("FIXTURE_WAKE_BOUND", 50)
+}
+"""
+
 
 def append_block(path: Path, name: str, body: str) -> None:
     path.write_text(
@@ -1240,19 +1254,13 @@ def append_block(path: Path, name: str, body: str) -> None:
     )
 
 
-class CheckGateEnvTierTest(unittest.TestCase):
-    """The env-scaled opt-in surface: detection, and the enforcement it gets.
-
-    Every other block keys on `#[ignore]`, so a tier that is scaled by an
-    environment variable and run by a script appears in none of them. These
-    cases pin both halves: the surface a crate has but has not declared is named
-    (not silently absent), and a declared surface is enforced in both directions
-    (a variable the runner sets and the sources read must be named, a declared
-    variable the crate never reads is stale).
+class EnvTierFixture(unittest.TestCase):
+    """The crate root an env-scaled-surface case is checked against.
 
     The fixture is its own crate root rather than a subclass of the perf
     fixture: the env check reads sources and scripts, not compiled test lists,
-    so it needs no `gate-perf-design`/`gate-budgets` blocks at all.
+    so it needs no `gate-perf-design`/`gate-budgets` blocks at all. A case that
+    needs another source reads it in through `EXTRA_SOURCES`.
     """
 
     GATE = (
@@ -1262,6 +1270,8 @@ class CheckGateEnvTierTest(unittest.TestCase):
         "```gate-perf-guard-helpers\n```\n"
     )
 
+    EXTRA_SOURCES: dict[str, str] = {}
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/tmp"))
         self.root = Path(self._tmp.name) / "fixture"
@@ -1269,6 +1279,10 @@ class CheckGateEnvTierTest(unittest.TestCase):
         (self.root / "tests" / "tests" / "alpha.rs").write_text(ALPHA_RS, encoding="utf-8")
         (self.root / "src").mkdir(parents=True)
         (self.root / "src" / "env_knob.rs").write_text(ENV_KNOB_RS, encoding="utf-8")
+        for name, text in self.EXTRA_SOURCES.items():
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
         (self.root / "local").mkdir()
         (self.root / "local" / "run_env.py").write_text(ENV_RUNNER_PY, encoding="utf-8")
         (self.root / "tests" / "GATE.md").write_text(self.GATE, encoding="utf-8")
@@ -1315,6 +1329,18 @@ class CheckGateEnvTierTest(unittest.TestCase):
         self.assertNotEqual(code, 0, f"expected a non-zero exit; output={output}")
         self.assertIn(fragment, output)
         return output
+
+
+class CheckGateEnvTierTest(EnvTierFixture):
+    """The env-scaled opt-in surface: detection, and the enforcement it gets.
+
+    Every other block keys on `#[ignore]`, so a tier that is scaled by an
+    environment variable and run by a script appears in none of them. These
+    cases pin both halves: the surface a crate has but has not declared is named
+    (not silently absent), and a declared surface is enforced in both directions
+    (a variable the runner sets and the sources read must be named, a declared
+    variable the crate never reads is stale).
+    """
 
     def test_an_undeclared_surface_is_named_rather_than_invisible(self):
         code, output = self.check()
@@ -1397,6 +1423,55 @@ class CheckGateEnvTierTest(unittest.TestCase):
             "| | fixture-liveness@shape=churn"
         )
         self.rejects("says nothing about what it measures")
+
+
+class CheckGateEnvTierScriptlessTest(EnvTierFixture):
+    """The half of a surface no script can show.
+
+    A knob the sources read in-process is named by no script and belongs to no
+    `#[ignore]` set, so the declaration is the only artifact that records it and
+    an omission is otherwise silent. These cases pin that enforcement — the red
+    side is the same declaration a script-named variable would have needed — and
+    the advisory that names such a surface when there is no block at all.
+    """
+
+    EXTRA_SOURCES = {"src/wake_knob.rs": WAKE_KNOB_RS}
+
+    def test_a_variable_only_the_sources_read_must_be_declared(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+            "| per-dial loss rate under a sized load | fixture-liveness@shape=churn"
+        )
+        self.rejects(
+            "FIXTURE_WAKE_BOUND is read by src/wake_knob.rs and set by no script"
+        )
+
+    def test_a_declared_scriptless_variable_passes(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS,FIXTURE_WAKE_BOUND "
+            "| local/run_env.py | per-dial loss rate and the handover wake bound "
+            "| fixture-liveness@shape=churn, fixture-wake@shape=handover"
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("gate-env-tier: 1 env-scaled surface(s), 3 variable(s)", output)
+        self.assertIn("FIXTURE_WAKE_BOUND", output)
+
+    def test_the_note_names_a_surface_no_script_sets(self):
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("FIXTURE_WAKE_BOUND", output)
+        self.assertIn("read by src/env_knob.rs, src/wake_knob.rs", output)
+
+    def test_the_note_names_a_surface_no_script_sets_at_all(self):
+        (self.root / "local" / "run_env.py").unlink()
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn(
+            "FIXTURE_ITERATIONS, FIXTURE_ROUNDS, FIXTURE_WAKE_BOUND "
+            "(named by no script and read by src/env_knob.rs, src/wake_knob.rs)",
+            output,
+        )
 
 
 class CheckGateScenarioDirectoryTest(CheckGatePerfFixture):

@@ -2775,17 +2775,20 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
     crate's own runner sets. The grammar had no line for one, so such a surface
     appeared in no block at all.
 
-    Detection is two-sided and needs both sides to fire, which is what makes it
-    an artifact rather than a guess: a name counts when a script in the crate
-    *names* it and the crate's Rust sources pass it to a function that reads the
-    process environment. The declaration is then enforced in both directions —
-    every variable the runner sets and the sources read must be declared, and
-    every declared variable must be read — and a detected surface the declaration
-    omits is an error. An undeclared surface with no block at all is a **note**,
-    not a failure, for the same reason an unmigrated perf declaration is: a
-    `GATE.md` written before the block existed cannot be failed for a line the
-    grammar did not have, and the point is that the surface is named rather than
-    invisible.
+    Detection is two-sided, which is what makes it an artifact rather than a
+    guess: a name counts when a script in the crate *names* it and the crate's
+    Rust sources pass it to a function that reads the process environment. The
+    declaration is then enforced in both directions — every variable the
+    sources read must be declared, and every declared variable must be read —
+    and a surface the declaration omits is an error. The two halves are not
+    symmetric: a script-named variable is visible in the scripts as well, but a
+    variable only the sources read is visible in no script at all, so the
+    declaration is the one place it can be recorded and it is enforced against
+    the sources' own set rather than against the intersection. An undeclared
+    surface with no block at all is a **note**, not a failure, for the same
+    reason an unmigrated perf declaration is: a `GATE.md` written before the
+    block existed cannot be failed for a line the grammar did not have, and the
+    point is that the surface is named rather than invisible.
 
     Returns ``(summary_lines, notes)``.
     """
@@ -2797,17 +2800,28 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
         for name in _script_env_names(script):
             if name in rust_sources:
                 detected.setdefault(name, set()).add(str(script.relative_to(root)))
+    # The scriptless half: a name the sources read that no script of this
+    # crate sets. It is read in-process by whoever invokes the tests, so no
+    # `#[ignore]` set and no runner names it — which is exactly why dropping it
+    # from the declaration is otherwise silent.
+    scriptless = sorted(set(rust_sources) - set(detected))
     block = manifest_block("gate-env-tier")
     if block is None:
-        if detected:
+        undeclared = sorted(set(detected) | set(rust_sources))
+        if undeclared:
             scripts = sorted({s for names in detected.values() for s in names})
             readers = sorted(
-                {source for name in detected for source in rust_sources.get(name, ())}
+                {source for name in undeclared for source in rust_sources.get(name, ())}
+            )
+            named = (
+                f"named by {', '.join(scripts)} and "
+                if scripts
+                else "named by no script and "
             )
             notes.append(
                 "note: env-scaled opt-in surface undeclared: "
-                f"{', '.join(sorted(detected))} (named by {', '.join(scripts)} "
-                f"and read by {', '.join(readers)}); a ```gate-env-tier block "
+                f"{', '.join(undeclared)} ({named}"
+                f"read by {', '.join(readers)}); a ```gate-env-tier block "
                 "names the variables, the runner and what it measures "
                 "(advisory, because a GATE.md written before the block existed "
                 "cannot be failed for a line the grammar did not have)"
@@ -2827,6 +2841,16 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
                 "but no declared surface names it; add it to the surface's "
                 "variable list (a surface the declaration omits is exactly the "
                 "one nothing else can see)"
+            )
+    for variable in scriptless:
+        if variable not in declared:
+            problems.append(
+                f"gate-env-tier: {variable} is read by "
+                f"{', '.join(sorted(rust_sources[variable]))} and set by no "
+                "script of this crate, so it scales an opt-in tier in-process, "
+                "but no declared surface names it; add it to a surface's "
+                "variable list (a name no script sets is the half the scripts "
+                "cannot show, so the declaration is the only record of it)"
             )
     available = set(rust_sources)
     for surface in surfaces:

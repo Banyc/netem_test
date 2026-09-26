@@ -113,21 +113,27 @@ using the same grammar the coverage cells use:
 
     gate-env-tier   soak-accept-churn = SOAK_DIALERS,SOAK_ITERATIONS | local/soak.py | per-dial liveness rate | liveness@shape=dial-churn
 
-The checker detects such a surface from two artifacts rather than from a
-convention: a name counts when a script in the crate names it **and** this
-crate's Rust sources pass it to a function that reads the process environment
-(the reader is the transitive closure over crate-local calls, because a name is
-normally handed to a wrapper — `env_parse("SOAK_DIALERS", 16)` — that forwards
-it to `env::var`, so a one-hop scan reports no surface at all and would be
-vacuously silent). Detection is what makes the block enforceable in both
-directions: with the block present, every detected variable it omits is an
-error, every variable the runner sets and the sources read must be declared,
-and every declared variable must be read by some source of the crate (a
-fabricated one is stale). A detected surface with **no** block is a note rather
-than a failure, for the same reason an unmigrated perf declaration is: a
-`GATE.md` written before the block existed cannot be failed for a line the
-grammar did not have, and the point is that the surface is named rather than
-invisible.
+The checker reads the surface from two artifacts rather than from a
+convention: a name counts when this crate's Rust sources pass it to a function
+that reads the process environment (the reader is the transitive closure over
+crate-local calls, because a name is normally handed to a wrapper —
+`env_parse("SOAK_DIALERS", 16)` — that forwards it to `env::var`, so a one-hop
+scan reports no surface at all and would be vacuously silent) **and** a script
+in the crate names it.
+
+The two halves are not symmetric, and the asymmetry is why the enforcement is
+stated against the sources' own set rather than against the intersection. A
+script-named variable is visible in the scripts as well as in the sources; a
+variable only the sources read — the knob an in-process test is sized by, which
+no script sets — is visible in no script at all, so the declaration is its only
+record. With the block present, every variable the sources read must therefore
+be declared (a script-named omission and a scriptless one are both errors),
+every variable the runner sets and the sources read must be declared, and every
+declared variable must be read by some source of the crate (a fabricated one is
+stale). A surface with **no** block is a note rather than a failure, for the same
+reason an unmigrated perf declaration is: a `GATE.md` written before the block
+existed cannot be failed for a line the grammar did not have, and the point is
+that the surface is named rather than invisible.
 
 **A zero-row declaration is a form, not an absence.** A crate whose work has no
 perf arm at all — nothing measures a bound, no impairment instrument is
