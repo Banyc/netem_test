@@ -10,6 +10,15 @@ a fallen sample count, a shrunk window, a fallen delivery or wire counter, a
 statistic that stopped being measured, a coverage cell no arm covers any more —
 and the well-formed case must pass with its value moves reported rather than
 failed.
+
+Whether a counted quantity is load-bearing is then a question about the arm's
+declared cells, so each of the three answers has a case: a cell that claims the
+counter's lane keeps the tooth **with no floor** (below the measured floor as
+well as above it), a cell that declares the lane idle is reported and never
+compared, and a cell that says neither is recorded as a gap and keeps the
+measured floor. The vacuity pair is stated rather than implied: a *claiming*
+arm whose counter vanishes fails, and a *non-claiming* one whose counter
+vanishes stays green — the latter is the intended behaviour, not an accident.
 """
 
 import importlib.util
@@ -31,6 +40,55 @@ SPEC.loader.exec_module(MANDATE_COMPARE)
 M1_CELL = "M1@impairment=clean+lane=dual+metric=p99"
 M4_CELL = "M4@lane=dual+flows=4+metric=per-flow-share"
 PROBE_CELL = "probe-forwarding@metric=throughput+layer=netem-runner"
+# The recorded arms whose bulk-lane counters the floor was derived from: the
+# `M1/lone_tail` cell drives no bulk load (its residue read 1920 B and then
+# 785 B between two runs of the unchanged tree), and the `M1/clean` cell drives
+# 2 MiB / 3 s of it. Both say `lane=dual`, which is why the declaration cannot
+# tell them apart and the floor survives for that pair.
+LONE_TAIL_CELL = (
+    "M1@impairment=gilbert-elliott-5-8+jitter=100ms+lane=dual"
+    "+shape=request-response+depth=1+flows=1+scale=256B+metric=p99"
+)
+CLEAN_CELL = (
+    "M1@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual"
+    "+shape=cadence+flows=1+scale=256B+metric=p99"
+)
+# A hypothetical future arm whose cell *does* claim the bulk lane, by each of
+# the forms the grammar is used to express one.
+CLAIMING_CELLS = {
+    "lane=bulk": "M3@lane=bulk+rate=8MiBps+burst=2MiB+period=3s+reps=3+metric=capacity-fraction",
+    "load=bulk": "M1@lane=dual+load=bulk+metric=p99",
+    "bulk=shared": "hol@rate=400kbps+loss=iid1+bulk=shared+metric=p99",
+}
+# Cells that declare the bulk lane idle, the two forms the producers use.
+IDLE_CELLS = {
+    "load=none": "M4@impairment=clean+lane=dual+flows=4+shape=cadence+load=none+metric=per-flow-share",
+    "bulk=none": "hol@rate=400kbps+loss=iid1+bulk=none+metric=p99",
+}
+IDLE_CELL = IDLE_CELLS["load=none"]
+
+
+def arm_with(
+    arm_id,
+    cells,
+    counters,
+    sample_count=2400,
+):
+    """One arm carrying exactly the counters a case is about.
+
+    `sent`/`received`/`wire_bytes` are always present, so `counters` names the
+    quantities under test and a key left out of it is the *absence* of that key
+    rather than the absence of the whole record.
+    """
+    record = arm(arm_id, cells=cells)
+    record["counters"] = {
+        "sent": sample_count,
+        "received": sample_count,
+        "wire_bytes": 126000,
+        **counters,
+    }
+    record["sample_count"] = sample_count
+    return record
 
 
 def arm(
@@ -339,84 +397,349 @@ class MandateCompareTest(unittest.TestCase):
         self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stderr)
         self.assertIn("wire_bytes 126000 -> 50000 (-60.3%)", stdout)
 
-    # -- the measured noise band: below it a count is reported, not failed -
+    # -- the claim rule: a counter the cells claim is a tooth, with no floor -
 
-    def test_a_residue_bulk_counter_fall_is_reported_and_stays_green(self):
-        # The real false positive: a bulk-lane counter the arm's cell does not
-        # claim (the request-response arms declare no bulk workload) sat at
-        # 1920 B and read 785 B on the next run of the unchanged tree. Both
-        # values are inside the band, so the 59 % fall is visible and green.
-        base = baseline_report()
-        base["arms"][0]["counters"]["bulk_wire_bytes"] = 1920
-        base_path = self.write_baseline(base)
-        candidate = baseline_report()
-        candidate["arms"][0]["counters"]["bulk_wire_bytes"] = 785
+    def one_arm(self, arm_id, cells, counters, name):
+        """A baseline of one lone arm, written to disk, and its path."""
+        return self.write_baseline(report([arm_with(arm_id, cells, counters)]), name=name)
+
+    def test_a_claiming_cell_below_the_floor_is_compared_and_fails(self):
+        # The future-arm case that motivated the rule: the cell claims the bulk
+        # lane, so a 40 000-byte workload is a tooth exactly like 8 MiB — a
+        # magnitude floor would have swallowed this fall.
+        for form, cell in sorted(CLAIMING_CELLS.items()):
+            with self.subTest(claim=form):
+                base_path = self.one_arm(
+                    "M1/clean",
+                    [cell],
+                    {"bulk_wire_bytes": 40000},
+                    f"claim-{form.replace('=', '-')}.json",
+                )
+                candidate = report(
+                    [arm_with("M1/clean", [cell], {"bulk_wire_bytes": 20000})]
+                )
+                code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+                self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stdout + stderr)
+                self.assertIn("bulk_wire_bytes 40000 -> 20000 (-50.0%)", stdout)
+                self.assertIn("no floor applies", stdout)
+                self.assertNotIn("reported, not a regression", stdout)
+
+    def test_a_claiming_cell_whose_counter_vanishes_fails(self):
+        # The tooth the magnitude band removed, restored for a claiming arm.
+        cell = CLAIMING_CELLS["lane=bulk"]
+        base_path = self.one_arm(
+            "M1/clean", [cell], {"bulk_sink_bytes": 40000}, "claim-absent.json"
+        )
+        candidate = report([arm_with("M1/clean", [cell], {})])
+        code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stdout + stderr)
+        self.assertIn("bulk_sink_bytes 40000 -> not measured", stdout)
+
+    def test_the_vacuity_pair_a_non_claiming_cell_whose_counter_vanishes_is_ok(self):
+        # Stated as intended behaviour rather than left as an accident: the
+        # cell declares the lane idle, so the counter is not the coverage the
+        # arm measures and its disappearance is reported, never compared.
+        for form, cell in sorted(IDLE_CELLS.items()):
+            with self.subTest(idle=form):
+                base_path = self.one_arm(
+                    "M4/m4/clean",
+                    [cell],
+                    {"bulk_sink_bytes": 40000},
+                    f"idle-absent-{form.replace('=', '-')}.json",
+                )
+                candidate = report([arm_with("M4/m4/clean", [cell], {})])
+                code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+                self.assertEqual(code, 0, stdout + stderr)
+                self.assertIn("bulk_sink_bytes 40000 -> not measured", stdout)
+                self.assertIn("declare the lane idle", stdout)
+                self.assertIn("reported, never compared", stdout)
+                self.assertIn("coverage regression(s)=0", stdout)
+
+    def test_an_idle_cell_whose_counter_fell_is_reported_not_failed(self):
+        base_path = self.one_arm(
+            "M4/m4/clean", [IDLE_CELL], {"bulk_wire_bytes": 40000}, "idle-fell.json"
+        )
+        candidate = report(
+            [arm_with("M4/m4/clean", [IDLE_CELL], {"bulk_wire_bytes": 20000})]
+        )
+        code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("bulk_wire_bytes 40000 -> 20000 (-50.0%)", stdout)
+        self.assertIn("reported, never compared", stdout)
+
+    def test_the_recorded_residue_pair_stays_reported_not_failed(self):
+        # The false positive this rule had to preserve the fix for, on the same
+        # recorded pair: the request-response arm's cell names `lane=dual` and
+        # no bulk load, so the declaration is silent, the pair is a gap, and the
+        # 59 % wobble in the residue is visible and green.
+        base_path = self.one_arm(
+            "M1/lone_tail", [LONE_TAIL_CELL], {"bulk_wire_bytes": 1920}, "residue.json"
+        )
+        candidate = report(
+            [arm_with("M1/lone_tail", [LONE_TAIL_CELL], {"bulk_wire_bytes": 785})]
+        )
         code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
         self.assertEqual(code, 0, stdout + stderr)
         self.assertIn("bulk_wire_bytes 1920 -> 785 (-59.1%)", stdout)
         self.assertIn("reported, not a regression", stdout)
+        self.assertIn("leave the lane unstated", stdout)
         self.assertIn("coverage regression(s)=0", stdout)
         self.assertIn("verdict: OK  exit=0", stdout)
+        self.assertIn("M1/lone_tail bulk_wire_bytes = 1920", stdout)
 
-    def test_an_absent_residue_bulk_counter_is_reported_and_stays_green(self):
-        base = baseline_report()
-        base["arms"][0]["counters"]["bulk_sink_bytes"] = 0
-        base_path = self.write_baseline(base)
-        candidate = baseline_report()
-        candidate["arms"][0]["counters"].pop("bulk_sink_bytes", None)
+    def test_the_same_recorded_pair_on_a_claiming_cell_would_fail(self):
+        # The pair *is* a tooth once a cell claims the lane, which is what makes
+        # the residue's silence the thing that rescues it.
+        base_path = self.one_arm(
+            "M1/lone_tail", [CLAIMING_CELLS["load=bulk"]], {"bulk_wire_bytes": 1920}, "residue-claimed.json"
+        )
+        candidate = report(
+            [
+                arm_with(
+                    "M1/lone_tail",
+                    [CLAIMING_CELLS["load=bulk"]],
+                    {"bulk_wire_bytes": 785},
+                )
+            ]
+        )
         code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
-        self.assertEqual(code, 0, stdout + stderr)
-        self.assertIn("bulk_sink_bytes 0 -> not measured", stdout)
-        self.assertIn("absent, not a regression", stdout)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stdout + stderr)
+        self.assertIn("bulk_wire_bytes 1920 -> 785 (-59.1%)", stdout)
+        self.assertNotIn("reported, not a regression", stdout)
 
-    def test_a_load_bearing_bulk_counter_fall_is_still_a_coverage_regression(self):
-        # The same key on an arm that does drive the bulk lane stays a tooth:
-        # 8 MiB is far above the band, so halving it is coverage loss.
-        base = baseline_report()
-        base["arms"][0]["counters"]["bulk_wire_bytes"] = 8482399
-        base_path = self.write_baseline(base)
-        candidate = baseline_report()
-        candidate["arms"][0]["counters"]["bulk_wire_bytes"] = 4241199
+    def test_a_silent_cell_above_its_floor_is_still_a_coverage_regression(self):
+        # The other arm the same token blocks: `M1/clean`'s cell is silent too,
+        # and its 8 MiB counter has to stay a tooth.
+        base_path = self.one_arm(
+            "M1/clean", [CLEAN_CELL], {"bulk_wire_bytes": 8482399}, "silent-above.json"
+        )
+        candidate = report(
+            [arm_with("M1/clean", [CLEAN_CELL], {"bulk_wire_bytes": 4241199})]
+        )
         code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
-        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stderr)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stdout + stderr)
         self.assertIn("bulk_wire_bytes 8482399 -> 4241199 (-50.0%)", stdout)
         self.assertNotIn("reported, not a regression", stdout)
-
-    def test_a_load_bearing_bulk_counter_absent_is_still_a_coverage_regression(self):
-        base = baseline_report()
-        base["arms"][0]["counters"]["bulk_wire_bytes"] = 8482399
-        base_path = self.write_baseline(base)
-        candidate = baseline_report()
-        candidate["arms"][0]["counters"].pop("bulk_wire_bytes", None)
+        # ... and its absence is still one, because the baseline is above the
+        # floor the declaration left as the only thing that could decide.
+        candidate = report([arm_with("M1/clean", [CLEAN_CELL], {})])
         code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
-        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stderr)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stdout + stderr)
         self.assertIn("bulk_wire_bytes 8482399 -> not measured", stdout)
-        self.assertNotIn("reported, not a regression", stdout)
 
-    def test_the_noise_bands_are_printed_and_written_to_the_diff(self):
-        out = self.root / "bands.json"
-        code, stdout, stderr = self.run_tool(baseline_report(), "--json-out", str(out))
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("bands: bulk_sink_bytes 65536, bulk_wire_bytes 65536", stdout)
+    def test_a_claiming_cell_at_and_below_the_floor_is_compared(self):
+        # A floor is not consulted for a claimed counter: at exactly the floor
+        # and one byte under it both keys are teeth, because the cell, not the
+        # magnitude, decided.
+        cell = CLAIMING_CELLS["load=bulk"]
+        base_path = self.one_arm(
+            "M1/clean",
+            [cell],
+            {"bulk_wire_bytes": 65536, "bulk_sink_bytes": 65535},
+            "floor-edge.json",
+        )
+        candidate = report(
+            [
+                arm_with(
+                    "M1/clean",
+                    [cell],
+                    {"bulk_wire_bytes": 32768, "bulk_sink_bytes": 32767},
+                )
+            ]
+        )
+        code, stdout, stderr = self.run_tool(candidate, baseline=base_path)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION, stdout + stderr)
+        self.assertIn("bulk_wire_bytes 65536 -> 32768 (-50.0%)", stdout)
+        self.assertIn("bulk_sink_bytes 65535 -> 32767 (-50.0%)", stdout)
+
+    def test_the_claim_rule_is_derived_from_the_cells_and_ignores_shape(self):
+        # `shape` names the interactive lane's load shape and `rate`/`burst` name
+        # a rate regime, so neither is read as a bulk claim: the same
+        # `shape=cadence` is claimed-or-idle by the load dimension alone.
+        for form, cell in sorted(CLAIMING_CELLS.items()):
+            self.assertEqual(
+                MANDATE_COMPARE.cell_claim(cell, "bulk_wire_bytes")[0],
+                MANDATE_COMPARE.CLAIMED,
+                form,
+            )
+        for form, cell in sorted(IDLE_CELLS.items()):
+            self.assertEqual(
+                MANDATE_COMPARE.cell_claim(cell, "bulk_sink_bytes")[0],
+                MANDATE_COMPARE.IDLE,
+                form,
+            )
+        self.assertEqual(
+            MANDATE_COMPARE.cell_claim(LONE_TAIL_CELL, "bulk_wire_bytes")[0],
+            MANDATE_COMPARE.UNSTATED,
+        )
+        self.assertEqual(
+            MANDATE_COMPARE.cell_claim(CLEAN_CELL, "bulk_wire_bytes")[0],
+            MANDATE_COMPARE.UNSTATED,
+        )
+        # A rate regime is not a lane: the conformance and reorder rows carry
+        # `rate=` with no bulk lane, and reading it as one would claim the lane.
+        for cell in (
+            "conformance-reorder@impairment=reorder+rate=rate-limit",
+            "reorder-rate@impairment=reorder+rate=curve+metric=p99",
+        ):
+            self.assertEqual(
+                MANDATE_COMPARE.cell_claim(cell, "bulk_wire_bytes")[0],
+                MANDATE_COMPARE.UNSTATED,
+                cell,
+            )
+        # `load`/`bulk` are about the bulk lane, so they never disclaim the
+        # arm's own lane — and a cell that names no lane at all leaves that lane
+        # unstated rather than claimed (the `hol` cells carry `rate`/`loss`).
+        for key in ("sent", "received", "wire_bytes", "offered_bytes", "delivered_bytes"):
+            for form, cell in CLAIMING_CELLS.items():
+                expected = (
+                    MANDATE_COMPARE.UNSTATED
+                    if MANDATE_COMPARE.LANE_DIMENSION not in cell.split("@", 1)[1]
+                    else MANDATE_COMPARE.CLAIMED
+                )
+                self.assertEqual(
+                    MANDATE_COMPARE.cell_claim(cell, key)[0], expected, f"{form}/{key}"
+                )
+            for form, cell in IDLE_CELLS.items():
+                expected = (
+                    MANDATE_COMPARE.UNSTATED
+                    if MANDATE_COMPARE.LANE_DIMENSION not in cell.split("@", 1)[1]
+                    else MANDATE_COMPARE.CLAIMED
+                )
+                self.assertEqual(
+                    MANDATE_COMPARE.cell_claim(cell, key)[0], expected, f"{form}/{key}"
+                )
+            self.assertEqual(MANDATE_COMPARE.COUNTER_LANES.get(key), None, key)
+
+    def test_a_claiming_cell_outranks_a_silent_or_idle_one_on_the_same_arm(self):
+        # An arm's cells combine by the declared precedence, so a claim any
+        # declared cell makes keeps the tooth.
+        arm_record = {"cells": [IDLE_CELL, LONE_TAIL_CELL, CLAIMING_CELLS["load=bulk"]]}
+        claim, why, gap = MANDATE_COMPARE.arm_claim(arm_record, "bulk_wire_bytes")
+        self.assertEqual(claim, MANDATE_COMPARE.CLAIMED)
+        self.assertIn("load=bulk", why)
+        self.assertFalse(gap)
+        arm_record = {"cells": [IDLE_CELL, LONE_TAIL_CELL]}
+        claim, _why, gap = MANDATE_COMPARE.arm_claim(arm_record, "bulk_wire_bytes")
+        self.assertEqual(claim, MANDATE_COMPARE.UNSTATED, "silence outranks an idle cell")
+        self.assertTrue(gap)
+        arm_record = {"cells": [IDLE_CELL]}
+        self.assertEqual(
+            MANDATE_COMPARE.arm_claim(arm_record, "bulk_wire_bytes")[0], MANDATE_COMPARE.IDLE
+        )
+
+    def test_a_cell_stating_one_dimension_twice_is_unstated(self):
+        self.assertEqual(
+            MANDATE_COMPARE.cell_claim("M1@lane=dual+load=bulk+load=none", "bulk_wire_bytes")[0],
+            MANDATE_COMPARE.UNSTATED,
+        )
+
+    def test_a_claim_on_one_load_dimension_wins_over_an_idle_on_the_other(self):
+        # Two dimensions can speak, and the claim wins: a tooth is not dropped
+        # by a second dimension saying the idle thing.
+        self.assertEqual(
+            MANDATE_COMPARE.cell_claim("hol@lane=dual+load=none+bulk=shared", "bulk_wire_bytes")[0],
+            MANDATE_COMPARE.CLAIMED,
+        )
+        self.assertEqual(
+            MANDATE_COMPARE.cell_claim("hol@lane=dual+load=bulk+bulk=none", "bulk_wire_bytes")[0],
+            MANDATE_COMPARE.CLAIMED,
+        )
+        self.assertEqual(
+            MANDATE_COMPARE.cell_claim("hol@lane=dual+load=none+bulk=none", "bulk_wire_bytes")[0],
+            MANDATE_COMPARE.IDLE,
+        )
+
+    def test_the_claim_gaps_are_printed_and_written_to_the_diff(self):
+        base_path = self.one_arm(
+            "M1/lone_tail", [LONE_TAIL_CELL], {"bulk_wire_bytes": 1920}, "gap-write.json"
+        )
+        candidate = report(
+            [arm_with("M1/lone_tail", [LONE_TAIL_CELL], {"bulk_wire_bytes": 785})]
+        )
+        out = self.root / "gaps.json"
+        code, stdout, stderr = self.run_tool(
+            candidate, "--json-out", str(out), baseline=base_path
+        )
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("gaps: 1 unstated arm x counter pair(s)", stdout)
+        diff = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual([gap["key"] for gap in diff["claim_gaps"]], ["bulk_wire_bytes"])
+        self.assertEqual(diff["claim_gaps"][0]["arm"], "M1/lone_tail")
+        self.assertEqual(diff["claim_gaps"][0]["baseline"], 1920)
+        self.assertEqual(diff["claim_gaps"][0]["decided_by"], "floor")
+        self.assertEqual(diff["claim_rule"]["counter_lanes"]["bulk_wire_bytes"], "bulk")
+
+    def test_a_gap_above_its_floor_is_recorded_as_magnitude_decided(self):
+        # The gap is recorded whatever the magnitude: the *declaration* decided
+        # nothing here either, it is the count that stands above the floor.
+        base_path = self.one_arm(
+            "M1/clean", [CLEAN_CELL], {"bulk_wire_bytes": 8482399}, "gap-above.json"
+        )
+        out = self.root / "gap-above-diff.json"
+        code, stdout, stderr = self.run_tool(
+            report([arm_with("M1/clean", [CLEAN_CELL], {"bulk_wire_bytes": 8482399})]),
+            "--json-out",
+            str(out),
+            baseline=base_path,
+        )
+        self.assertEqual(code, 0, stdout + stderr)
+        diff = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(diff["claim_gaps"][0]["decided_by"], "tolerance")
+        self.assertIn("above its floor: compared by magnitude, not by the declaration", stdout)
+
+    def test_a_gap_on_a_key_with_no_floor_is_recorded_as_compared_anyway(self):
+        # A cell that names no lane at all leaves its own-lane counters
+        # unstated too. Nothing hangs on it — the key has no floor, so the pair
+        # is compared exactly as a claimed one — and the gap says so instead of
+        # implying a weakness that is not there.
+        base_path = self.one_arm("probe/forwarding", [PROBE_CELL], {}, "gap-no-floor.json")
+        candidate = report([arm_with("probe/forwarding", [PROBE_CELL], {})])
+        out = self.root / "gap-no-floor-diff.json"
+        code, stdout, stderr = self.run_tool(
+            candidate, "--json-out", str(out), baseline=base_path
+        )
+        self.assertEqual(code, 0, stdout + stderr)
         diff = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(
-            diff["count_noise_bands"],
+            [gap["key"] for gap in diff["claim_gaps"]],
+            ["sent", "received", "wire_bytes"],
+        )
+        self.assertEqual(
+            {gap["decided_by"] for gap in diff["claim_gaps"]}, {"no-floor"}
+        )
+        self.assertIn("the cell names no lane dimension", stdout)
+        self.assertIn("compared exactly as a claimed counter", stdout)
+
+    def test_the_floors_are_printed_and_written_to_the_diff(self):
+        out = self.root / "floors.json"
+        code, stdout, stderr = self.run_tool(baseline_report(), "--json-out", str(out))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("floors: bulk_sink_bytes 65536, bulk_wire_bytes 65536", stdout)
+        self.assertIn("applied only where the arm's cells leave the lane unstated", stdout)
+        diff = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(
+            diff["count_floors"],
             {"bulk_wire_bytes": 65536, "bulk_sink_bytes": 65536},
         )
 
-    def test_a_counter_without_a_band_is_compared_at_the_count_tolerance(self):
-        # Only the two bulk-lane byte counters carry a band; every other
+    def test_a_counter_without_a_floor_is_compared_at_the_count_tolerance(self):
+        # Only the two bulk-lane byte counters carry a floor; every other
         # counter keeps the plain 50 % criterion however small it is.
-        self.assertEqual(MANDATE_COMPARE.noise_band_bytes("received"), 0)
-        self.assertEqual(MANDATE_COMPARE.noise_band_bytes("wire_bytes"), 0)
-        self.assertGreater(MANDATE_COMPARE.noise_band_bytes("bulk_wire_bytes"), 0)
+        self.assertEqual(MANDATE_COMPARE.floor_bytes("received"), 0)
+        self.assertEqual(MANDATE_COMPARE.floor_bytes("wire_bytes"), 0)
+        self.assertGreater(MANDATE_COMPARE.floor_bytes("bulk_wire_bytes"), 0)
 
-    def test_every_banded_key_is_a_byte_counter(self):
-        # The band is a byte floor and the diagnostic says so, so a key whose
-        # unit is not bytes may not be listed.
-        for key in MANDATE_COMPARE.COUNT_NOISE_BANDS_BYTES:
+    def test_every_floored_key_is_a_bulk_lane_byte_counter(self):
+        # A floor is a byte quantity, and it is only ever consulted for a lane
+        # the cells can claim or disclaim: the bulk lane.
+        for key in MANDATE_COMPARE.COUNT_FLOORS_BYTES:
             self.assertTrue(key.endswith("_bytes"), key)
             self.assertIn(key, MANDATE_COMPARE.COVERAGE_COUNTER_KEYS)
+            self.assertEqual(MANDATE_COMPARE.COUNTER_LANES.get(key), "bulk", key)
+        for key, lane in MANDATE_COMPARE.COUNTER_LANES.items():
+            self.assertIn(key, MANDATE_COMPARE.COVERAGE_COUNTER_KEYS, key)
+            self.assertNotEqual(lane, None, key)
 
     def test_a_counter_that_stopped_being_measured_is_a_coverage_regression(self):
         candidate = baseline_report()

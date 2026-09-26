@@ -54,16 +54,42 @@ to 4 s is a regression whoever reports the sample counts. Everything the
 comparison reads comes from the two reports; nothing is re-measured here.
 
 That relative tolerance is only meaningful where the baseline value is
-load-bearing, and a counter has no absolute floor: below the magnitude at which
-the counter's own run-to-run noise lives, half of it is a handful of datagrams
-and a fall past 50 % says nothing about coverage. The comparison therefore
-carries a **measured noise band per counted quantity**
-(`COUNT_NOISE_BANDS_BYTES`, printed with the tolerances): a counter whose
-baseline sits inside its band is
-not a workload the arm's cell claims, so a movement in it — including a
-disappearance — is *reported* and never a coverage regression. The band is
-derived from the spread real runs of the unchanged tree recorded for that key,
-not chosen to make the comparison pass; the derivation is stated with the band.
+load-bearing, and whether a counted quantity is *load-bearing for an arm* is a
+question about the arm's own **declaration**, not about magnitude: the arms'
+coverage cells state the property, the dimensions and the values each arm
+exercises, and a cell that names the lane a counter measures is that arm's
+claim to be compared on it. So the comparison derives the answer
+(`cell_claim`, `arm_claim`, `COUNTER_LANES`) and prints the rule with its
+verdict; a claiming cell is compared **with no floor at all**, so a small
+counter is a tooth exactly like a large one.
+
+The three ways a cell can speak about a counter, and what each does:
+
+- **claimed** — the cell names the counter's lane as the arm's own (`lane=bulk`)
+  or offers a workload on it (`load=` or `bulk=`, any value but `none`). Compared,
+  with no floor: a fall past the tolerance **or** a disappearance is a coverage
+  regression.
+- **idle** — the cell declares the lane carries no workload (`load=none` or
+  `bulk=none`, the way the M4 arms declare the bulk lane connected but never
+  opened). *Reported and never compared*, and that is the intended behaviour
+  rather than an accident of magnitude: the arm's own declaration says the
+  counter is not the coverage the arm measures.
+- **unstated** — the cell names neither. The declaration does not decide and
+  the comparison does not guess: the pair is recorded in the diff's
+  `claim_gaps` (with what therefore did decide it: the key's measured floor, or
+  the plain count tolerance where the key has no floor), and only here the
+  **measured floor** (`COUNT_FLOORS_BYTES`) is what keeps a residue among them
+  from failing. The floor's value and derivation are unchanged; what narrowed is
+  the population it applies to, from every arm to the arm x counter pairs no
+  cell claims or disclaims.
+
+What the declaration can and cannot express is stated with `COUNTER_LANES` and
+the blocker recorded there: the grammar admits two positive forms (`lane=<the
+counter's lane>`, and `load=`/`bulk=` with a value that is not `none`) and both
+are read, while `shape=` (the *interactive* lane's load shape) and `rate=`/`burst=`
+(a rate regime, not a lane) are not, and `lane=dual` is silent about the bulk
+lane — the two arms whose cells say it need opposite outcomes, which is the
+specific evidence that keeps the floor at all.
 
 **The detection limit**, stated so a green diff is not read as more than it is:
 this comparison sees an arm that disappeared, a load-bearing sample count or
@@ -78,24 +104,32 @@ same shape under a milder regime. That is a change to a frozen perf-test
 setting, and the guard against it is the setting's immutability and reading the
 arm against its declared coverage cell in `tools/mandate-arms.json`, not this
 comparison. Nor does it see a shortening that leaves the window in place, keeps
-at least half the samples and drops no cell.
+at least half the samples and drops no cell. And an arm whose cell *declares a
+lane idle* has that lane's counters reported and never compared, deliberately,
+so a real workload on a lane the declaration calls idle is not caught here: the
+accuracy of the declaration is trusted, exactly as it is for the impairment it
+names. That is the price of deciding relevance from the declaration; the
+*unstated* pairs that used to be decided by magnitude are the ones this rule
+takes away from it, and they are the ones it names.
 
-A regression it reported there is not, and how the counts are bounded now. The
+A false positive it used to report, and what the declaration does about it. The
 counts once had no absolute floor, so one small enough that half of it is a
 handful of datagrams crossed the 50 % tolerance on an **unchanged** tree: on
 the `M1/lone_tail`/`M2/lone_tail` arms of two real full runs of the unchanged
 tree, `bulk_wire_bytes` read 1920 in one and 785 in the next (-59 %),
-red-flagging two arms whose cells declare no bulk workload — the few kilobytes
-are the fixture's incidental bulk-lane traffic, not the coverage the arm
-exists to measure. That is what `COUNT_NOISE_BANDS_BYTES` removes: a counter
-whose baseline is inside its measured band is not load-bearing for the arm, so
-its movement stays *visible* in the arm's line (with the band named) while the
-verdict stays green. The band's cost is stated with it: a counter below its
-band is not compared for coverage at all, so a fall in a genuinely tiny
-counter is reported and not failed. No such counter exists among the recorded
-arms — every load-bearing counter is orders of magnitude above its band, and
-the keys that have no band (all but the two bulk-lane byte counters) are
-compared exactly as before.
+red-flagging two arms that drive no bulk workload — the few kilobytes are the
+fixture's incidental bulk-lane traffic, not the coverage the arm exists to
+measure. A magnitude floor removed the false positive but could not tell a
+residue from a small real workload, which is a *relevance* question: it is the
+arm's declared cells that answer it, and they are what this comparison reads
+now (`cell_claim`, `arm_claim`). On those two arms the cell's `lane=dual`
+leaves the bulk lane unstated, so they keep the floor and the wobble stays
+*visible* in the arm's line while the verdict stays green — and the pair is
+printed and written in `claim_gaps`, so the hole is named rather than implied.
+A cell that *claims* the lane (`lane=bulk`, or a `load` on it) is compared with
+no floor at all, so the residue arm's silence is doing real work: the same
+1920 -> 785 pair fails on a claiming cell, and every claim the declarations
+make is printed with the verdict.
 
 ## What it refuses
 
@@ -138,9 +172,10 @@ DEFAULT_WINDOW_TOLERANCE = 0.01
 DEFAULT_DELIVERY_TOLERANCE = 0.005
 DEFAULT_VALUE_TOLERANCE = 0.5
 MINIMUM_SCHEMA = 3
-# How many arms and moves the printed block lists before it summarises the
+# How many arms and claim gaps the printed block lists before it summarises the
 # rest, so a large run cannot bury its verdict in a wall of lines.
 MAX_ARM_LINES = 200
+MAX_GAP_LINES = 24
 
 EXIT_OK = 0
 EXIT_UNCOMPARABLE = 2
@@ -187,24 +222,89 @@ VALUE_STAT_KEYS = (
 # p99 is. It is compared absolutely, with the slope the M2/M4 floors allow.
 DELIVERY_KEY = "delivery"
 
-# The measured run-to-run noise band of a counted quantity, in **bytes**, below
-# which a count is not a workload its arm's cell claims: its value is the
-# fixture's incidental traffic, so a movement in it — including a
-# disappearance — is reported and never a coverage regression. The band is an
-# absolute floor because the noise is quantisation noise (a few datagrams): it
-# dominates a small counter and is invisible in a large one. Only byte counters
-# may be listed here; every other key is compared with no floor at all.
+# ─────────────────────── which counters are load-bearing ─────────────────────
 #
-# Derived, not chosen. Over every full-run report recorded on disk, the two
-# bulk-lane counters read 0..3525 B on an arm whose cell declares no bulk lane
-# (the `M1/lone_tail`/`M2/lone_tail` request-response arms — 56 observations
-# across 15 runs, 6 of them of one unchanged tree, tree
-# 937a25b06400b83124c7b99d114379999a800a65), and 2097152..8484001 B on every
-# arm whose cell drives the bulk lane (112 observations) — a 595x gap. The
-# band is the largest power of two inside that gap (geometric midpoint 85978
-# B), leaving an 18.6x margin below the observed residue ceiling and a 32x
-# margin above the smallest observed real bulk workload.
-COUNT_NOISE_BANDS_BYTES = {
+# A counter's *fall* is coverage loss only when the arm's declaration claims the
+# lane it measures. What a cell can say, and what each answer does to the
+# comparison, is stated in the module docstring: a claim keeps the tooth with no
+# floor, an idle declaration is reported and never compared, and an unstated
+# lane keeps the measured floor and is named in `claim_gaps`.
+
+# The lane a compared counter measures, where it is not the arm's own lane.
+# Only keys that measure a *second* lane may appear: a key that measures the
+# arm's own lane cannot be disclaimed by a dimension about another lane, so
+# nothing of the sort is listed here. Every key absent from this map measures
+# the arm's own lane — the lane its cells name and its samples are taken on.
+COUNTER_LANES = {
+    "bulk_wire_bytes": "bulk",
+    "bulk_sink_bytes": "bulk",
+}
+
+# The cell dimensions that speak about a lane, and the one value that declares it
+# idle. `lane` names the lane the arm measures on; `load` and `bulk` declare the
+# workload offered on the *second* (bulk) lane, and both are read, because the
+# grammar's own cells express the bulk workload either way: `rtp_mux`'s gate rows
+# write `load=bulk`/`load=bulk-burst`/`load=bulk-matched` and `load=none`, and its
+# `hol_probe` rows write `bulk=none`/`bulk=shared`/`bulk=split-and-shared`. Two
+# forms are deliberately *not* read: `shape=` names the **interactive** lane's
+# load shape (the arm table these cells restate carries a separate `bulk` column),
+# so reading `shape=cadence` as a bulk claim would make M4's
+# `shape=cadence+load=none` a claim of a lane it never opens; and `rate=`/`burst=`
+# name a rate regime that is not a lane at all — `conformance-reorder@
+# impairment=reorder+rate=rate-limit` and `reorder-rate@impairment=reorder+
+# rate=curve` carry them with no bulk lane in sight.
+LANE_DIMENSION = "lane"
+LOAD_DIMENSIONS = ("load", "bulk")
+IDLE_LOAD_VALUES = frozenset({"none"})
+
+CLAIMED = "claimed"
+IDLE = "idle"
+UNSTATED = "unstated"
+
+# How one arm's cells combine into its claim: a claim wins wherever any declared
+# cell makes it (a tooth is never dropped because a second cell was silent), a
+# silent cell is preferred to one that declares the lane idle, and only an arm
+# whose every cell says the lane is idle is left uncompared.
+CLAIM_PRECEDENCE = (CLAIMED, UNSTATED, IDLE)
+
+# `<dimension>=<value>`, the per-dimension shape `tools/check-gate.py`'s
+# `CELL_DIMENSION_RE` admits. That checker is the grammar's authority and has
+# already rejected a malformed cell before a claim is read; this repeats the
+# shape rather than importing the checker into every claim call.
+CELL_DIMENSION_PART_RE = re.compile(
+    r"^(?P<name>[A-Za-z][A-Za-z0-9_-]*)=(?P<value>[^=,+\s]+)$"
+)
+
+# The **measured floor** of a counted quantity, in bytes, applied to a pair the
+# cells leave unstated — and only there: a claiming cell is compared with no
+# floor, and an idle cell is not compared at all. The floor is an absolute
+# quantity because the noise is quantisation noise (a few datagrams): it
+# dominates a small counter and is invisible in a large one. Only byte counters
+# may be listed here.
+#
+# Derived, not chosen, and unchanged by the narrowing above. Over every full-run
+# report recorded on disk, the two bulk-lane counters read 0..3525 B on the
+# `M1/lone_tail`/`M2/lone_tail` request-response arms — whose cells, under this
+# rule, leave the lane unstated — (56 observations across 15 runs, 6 of them of
+# one unchanged tree, tree 937a25b06400b83124c7b99d114379999a800a65), and
+# 2097152..8484001 B on every arm that drives the bulk lane (112 observations) —
+# a 595x gap. The floor is the largest power of two inside that gap (geometric
+# midpoint 85978 B), leaving an 18.6x margin below the observed residue ceiling
+# and a 32x margin above the smallest observed real bulk workload. Re-deriving a
+# tighter value would need a new measurement of that spread; narrowing which
+# pairs it applies to needs none, and that is what this rule does.
+#
+# It is kept, rather than replaced outright, because of one token the
+# declarations cannot distinguish: `lane=dual`. The `M1/clean` cell
+# (`M1@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence
+# +flows=1+scale=256B+metric=p99`) drives 2 MiB / 3 s on the bulk lane and
+# records `bulk_wire_bytes` 8482399, so reading its cell as a non-claim would
+# drop that counter out of the comparison and let the arm lose its concurrent
+# bulk load with a green verdict. The `M1/lone_tail` cell
+# (`...lane=dual+shape=request-response+depth=1...`) runs with the bulk lane idle
+# and records `bulk_wire_bytes` 1920 and then 785 between two runs of the
+# unchanged tree, so reading *its* cell as a claim restores that false positive.
+COUNT_FLOORS_BYTES = {
     "bulk_wire_bytes": 65536,
     "bulk_sink_bytes": 65536,
 }
@@ -291,36 +391,152 @@ def relative_change(baseline, candidate):
     return (candidate - baseline) / baseline
 
 
-def noise_band_bytes(key):
-    """The measured byte noise band of one counted quantity, 0 when none."""
-    return COUNT_NOISE_BANDS_BYTES.get(key, 0)
+def floor_bytes(key):
+    """The declared measured floor of one counted quantity, 0 when none.
+
+    A floor is consulted only where the arm's cells leave the counter's lane
+    unstated (`UNSTATED`); a claiming cell is compared with none, and an idle
+    cell is not compared at all.
+    """
+    return COUNT_FLOORS_BYTES.get(key, 0)
 
 
-def compare_counter(key, baseline, candidate, tolerance, band=0):
+def cell_dimensions(cell):
+    """``dimension -> value`` for one coverage cell, or ``None`` when ambiguous.
+
+    A cell stating one dimension twice says two things about it and the reader
+    cannot tell which a claim should read, so it yields nothing rather than one
+    of the two values (the arm's claim is then unstated, which is recorded).
+    """
+    _, _, dimensions = cell.partition("@")
+    named = {}
+    for part in dimensions.split("+"):
+        match = CELL_DIMENSION_PART_RE.match(part)
+        if match is None:
+            return None
+        name = match.group("name")
+        if name in named:
+            return None
+        named[name] = match.group("value")
+    return named
+
+
+def cell_claim(cell, key):
+    """How one cell speaks about the lane ``key`` measures, ``(claim, why)``.
+
+    ``claimed`` when the cell says the arm measures on that lane (it names the
+    lane as the arm's own) or offers a workload on it (a `load`/`bulk` dimension
+    whose value is not `none`); ``idle`` when it declares that lane carries no
+    workload; ``unstated`` when it names neither, which is not a claim and not a
+    disclaimer. The `why` is the cell's own words, so a verdict that rests on
+    the answer names it.
+    """
+    lane = COUNTER_LANES.get(key)
+    dimensions = cell_dimensions(cell)
+    if dimensions is None:
+        return UNSTATED, "the cell states no readable dimension (or states one twice)"
+    named = dimensions.get(LANE_DIMENSION)
+    if lane is None:
+        # The key measures the arm's own lane — the lane its cells name and its
+        # samples are taken on. `load`/`bulk` are about the *other* lane and
+        # cannot disclaim it.
+        if named is None:
+            return UNSTATED, "the cell names no lane dimension"
+        return CLAIMED, f"the cell names the arm's own lane ({LANE_DIMENSION}={named})"
+    if named == lane:
+        return CLAIMED, (
+            f"the cell names the counter's lane as the arm's own ({LANE_DIMENSION}={lane})"
+        )
+    declared = [
+        (name, dimensions[name]) for name in LOAD_DIMENSIONS if name in dimensions
+    ]
+    for name, value in declared:
+        if value not in IDLE_LOAD_VALUES:
+            return CLAIMED, (
+                f"the cell offers a workload on the {lane} lane ({name}={value})"
+            )
+    if declared:
+        name, value = declared[0]
+        return IDLE, f"the cell declares the {lane} lane idle ({name}={value})"
+    if named is None:
+        return UNSTATED, f"the cell names neither the {lane} lane nor a load on it"
+    return UNSTATED, (
+        f"the cell names {LANE_DIMENSION}={named} and no load on the {lane} lane"
+    )
+
+
+def arm_claim(arm, key):
+    """``(claim, why, gap)``: what one arm's declared cells say about ``key``.
+
+    The arm's cells combine by `CLAIM_PRECEDENCE`, so a claim any declared cell
+    makes keeps the tooth. ``why`` is the decided cell's own reason, without the
+    cell text (the cells are in the arm's record and in every gap this files).
+    ``gap`` is true when the arm's cells leave the lane unstated: the declaration
+    decides nothing for that pair, and the pair is filed so that what *did*
+    decide it (a floor, or the plain count tolerance where the key has no floor)
+    is visible rather than implicit.
+    """
+    cells = [cell for cell in (arm.get("cells") or []) if isinstance(cell, str)]
+    if not cells:
+        return UNSTATED, "the arm declares no coverage cell", True
+    claims = [cell_claim(cell, key) for cell in cells]
+    for wanted in CLAIM_PRECEDENCE:
+        for claim, why in claims:
+            if claim == wanted:
+                return claim, why, wanted == UNSTATED
+    raise AssertionError(f"no claim outcome for {key!r}: {claims!r}")
+
+
+def compare_counter(key, baseline, candidate, tolerance, claim=CLAIMED, floor=0, why=None):
     """One counted quantity as ``("regression"|"move"|None, text)``.
 
     The fall is compared with ``<=`` so that a shortening which takes exactly
     half an arm's samples — the case the instrument exists for — is a
-    regression, and the tolerance is the run-to-run band the comparison is not
+    regression, and the tolerance is the run-to-run spread the comparison is not
     allowed to read as coverage loss.
 
-    ``band`` is the counter's measured noise band in bytes. When the baseline
-    sits inside it the counter is not a workload the arm claims, so a fall or a
-    disappearance is a *move* to report, never a coverage regression, and the
-    text says why and names the band.
+    ``claim`` is what the arm's declared cells say about the lane ``key``
+    measures (`arm_claim`), and it alone decides whether a movement may fail:
+
+    - ``CLAIMED`` — compared, with no floor at all, however small the baseline;
+    - ``IDLE`` — reported and never compared, because the arm's own declaration
+      says the lane carries no workload;
+    - ``UNSTATED`` — reported, and `floor` (the key's measured floor in bytes,
+      0 for a key that has none) is what keeps a residue from failing; `why`
+      names the cell's own words for the silence.
     """
+    if claim == IDLE:
+        if candidate is None:
+            return (
+                "move",
+                f"{key} {baseline} -> not measured [the arm's cells declare the "
+                f"lane idle ({why}): reported, never compared]",
+            )
+        if candidate == baseline:
+            return None, None
+        change = relative_change(baseline, candidate)
+        text = f"{key} {baseline} -> {candidate}" + (
+            f" ({change:+.1%})" if change is not None else ""
+        )
+        return (
+            "move",
+            f"{text} [the arm's cells declare the lane idle ({why}): reported, "
+            "never compared]",
+        )
     inside = (
-        band
+        claim == UNSTATED
+        and floor
         and isinstance(baseline, (int, float))
         and not isinstance(baseline, bool)
-        and baseline < band
+        and baseline < floor
     )
     if candidate is None:
         if inside:
             return (
                 "move",
-                f"{key} {baseline} -> not measured [inside the measured "
-                f"{band}-byte noise band: absent, not a regression]",
+                f"{key} {baseline} -> not measured [the arm's cells leave the lane "
+                f"unstated ({why}), and the baseline sits inside the measured "
+                f"{floor}-byte floor: absent, not a regression]",
             )
         return "regression", f"{key} {baseline} -> not measured"
     change = relative_change(baseline, candidate)
@@ -331,12 +547,19 @@ def compare_counter(key, baseline, candidate, tolerance, band=0):
             return (
                 "move",
                 f"{key} {baseline} -> {candidate} ({change:+.1%}), past the "
-                f"{tolerance:.0%} tolerance but inside the measured {band}-byte "
-                "noise band: reported, not a regression",
+                f"{tolerance:.0%} tolerance but inside the measured {floor}-byte "
+                f"floor, which applies because the arm's cells leave the lane "
+                f"unstated ({why}): reported, not a regression",
             )
+        claimed_note = (
+            f" [the arm's cells claim the lane ({why}), so no floor applies]"
+            if claim == CLAIMED and floor_bytes(key) > 0
+            else ""
+        )
         return (
             "regression",
-            f"{key} {baseline} -> {candidate} ({change:+.1%}), past the {tolerance:.0%} tolerance",
+            f"{key} {baseline} -> {candidate} ({change:+.1%}), past the "
+            f"{tolerance:.0%} tolerance{claimed_note}",
         )
     if candidate != baseline:
         return "move", f"{key} {baseline} -> {candidate} ({change:+.1%})"
@@ -375,11 +598,32 @@ def compare_delivery(baseline, candidate, tolerance):
     return "move", text
 
 
+def decided_by(key, baseline):
+    """What an *unstated* pair's verdict rests on, the declaration deciding nothing.
+
+    The key's measured floor when it has one and the baseline sits inside it; the
+    50 % count tolerance otherwise; and for a key with no floor at all, that same
+    tolerance — which is where a claimed pair would be too, so the gap weakens
+    nothing.
+    """
+    floor = floor_bytes(key)
+    if not floor:
+        return "no-floor"
+    return "floor" if baseline < floor else "tolerance"
+
+
 def compare_arm(baseline_arm, candidate_arm, tolerances):
-    """One arm's changes, split into coverage regressions and value moves."""
+    """One arm's changes, split into coverage regressions and value moves.
+
+    The claim read for every counter is the *baseline* arm's — the declaration
+    under test — and a candidate that drops the cell making a claim is caught by
+    the cell-coverage comparison, which fails when a declared cell is exercised
+    by no arm any more.
+    """
     regressions = []
     moves = []
     drifts = []
+    gaps = []
     baseline_samples = baseline_arm.get("sample_count")
     candidate_samples = candidate_arm.get("sample_count") if candidate_arm else None
     if baseline_samples is not None:
@@ -393,12 +637,27 @@ def compare_arm(baseline_arm, candidate_arm, tolerances):
     for key in COVERAGE_COUNTER_KEYS:
         if key not in baseline_counters:
             continue
+        claim, why, gap = arm_claim(baseline_arm, key)
+        if gap:
+            gaps.append(
+                {
+                    "arm": baseline_arm.get("id"),
+                    "key": key,
+                    "baseline": baseline_counters[key],
+                    "cells": [cell for cell in (baseline_arm.get("cells") or [])],
+                    "why": why,
+                    "floor_bytes": floor_bytes(key),
+                    "decided_by": decided_by(key, baseline_counters[key]),
+                }
+            )
         outcome, text = compare_counter(
             key,
             baseline_counters[key],
             candidate_counters.get(key),
             tolerances["count"],
-            band=noise_band_bytes(key),
+            claim=claim,
+            floor=floor_bytes(key) if claim == UNSTATED else 0,
+            why=why,
         )
         if outcome is not None:
             (regressions if outcome == "regression" else moves).append(text)
@@ -451,7 +710,7 @@ def compare_arm(baseline_arm, candidate_arm, tolerances):
             regressions.append(text)
         elif text is not None:
             moves.append(text)
-    return {"regressions": regressions, "drifts": drifts, "moves": moves}
+    return {"regressions": regressions, "drifts": drifts, "moves": moves, "gaps": gaps}
 
 
 def compare_cells(baseline, candidate, gate_checker, problems):
@@ -540,6 +799,7 @@ def compare(args):
             entry["regressions"] = [f"the arm is in the baseline and absent from the candidate"]
             entry["drifts"] = []
             entry["moves"] = []
+            entry["gaps"] = []
         else:
             entry.update(compare_arm(baseline["arms"][arm_id], candidate_arm, tolerances))
         arms.append(entry)
@@ -571,11 +831,35 @@ def compare(args):
     drifts = [
         {"arm": arm["id"], "changes": arm["drifts"]} for arm in arms if arm["drifts"]
     ]
+    gaps = [gap for arm in arms for gap in arm.get("gaps") or []]
     return {
         "baseline": str(baseline["path"]),
         "candidate": str(candidate["path"]),
         "tolerances": tolerances,
-        "count_noise_bands": dict(COUNT_NOISE_BANDS_BYTES),
+        # The floors and what determines a counter's load-bearing status: a
+        # claim, an idle declaration or an unstated lane. Both are printed and
+        # written so a verdict can be read against the rule it applied.
+        "count_floors": dict(COUNT_FLOORS_BYTES),
+        "claim_rule": {
+            "counter_lanes": dict(COUNTER_LANES),
+            "claimed": (
+                f"{LANE_DIMENSION}=<the counter's lane> (the lane is the arm's own) or "
+                + " or ".join(LOAD_DIMENSIONS)
+                + f"=<value other than {', '.join(sorted(IDLE_LOAD_VALUES))}> "
+                "(the arm offers a workload on that lane)"
+            ),
+            "idle": (
+                " or ".join(LOAD_DIMENSIONS)
+                + f"=<{', '.join(sorted(IDLE_LOAD_VALUES))}> (the cell declares "
+                "that lane carries no workload)"
+            ),
+            "unstated": (
+                "neither; the pair is reported in claim_gaps and its counter is "
+                "compared under the key's measured floor"
+            ),
+            "combine": " > ".join(CLAIM_PRECEDENCE) + " over an arm's cells",
+        },
+        "claim_gaps": gaps,
         "baseline_summary": summary_of(baseline),
         "candidate_summary": summary_of(candidate),
         "arms": arms,
@@ -655,14 +939,47 @@ def verdict_lines(diff):
         f"{tolerances['window']:.1%}, delivery {tolerances['delivery']:.3f}, "
         f"value {tolerances['value']:.0%}"
     )
-    bands = diff["count_noise_bands"]
-    if bands:
+    floors = diff["count_floors"]
+    rule = diff["claim_rule"]
+    lanes = ", ".join(sorted(rule["counter_lanes"]))
+    lines.append(
+        "   claims: a counter is load-bearing for an arm when the arm's declared cells "
+        "claim the lane it measures"
+    )
+    lines.append(
+        f"           claimed by {rule['claimed']}; idle (reported, never compared) by "
+        f"{rule['idle']}; unstated otherwise. Iterated over an arm's cells: {rule['combine']}"
+    )
+    lines.append(
+        f"           the bulk-lane keys are {lanes}; every other compared counter "
+        "measures the arm's own lane"
+    )
+    if floors:
         lines.append(
-            "    bands: "
-            + ", ".join(f"{key} {value}" for key, value in sorted(bands.items()))
-            + " (a count at or above its band is compared for coverage; below it "
-            "is reported, not failed)"
+            "    floors: "
+            + ", ".join(f"{key} {value}" for key, value in sorted(floors.items()))
+            + " (bytes) — applied only where the arm's cells leave the lane unstated; a "
+            "claiming cell is compared with no floor, an idle one not at all"
         )
+    gaps = diff["claim_gaps"]
+    on_floor = sum(1 for gap in gaps if gap["decided_by"] == "floor")
+    lines.append(
+        f"      gaps: {len(gaps)} unstated arm x counter pair(s) — the declaration decides "
+        f"nothing for these; {on_floor} of them sit inside their floor, where that (not "
+        "the declaration) keeps a residue from failing"
+    )
+    gap_note = {
+        "floor": lambda gap: f"inside the {gap['floor_bytes']}-byte floor: reported, not failed",
+        "tolerance": lambda gap: "above its floor: compared by magnitude, not by the declaration",
+        "no-floor": lambda gap: "no floor on this key: compared exactly as a claimed counter",
+    }
+    for gap in gaps[:MAX_GAP_LINES]:
+        lines.append(
+            f"            {gap['arm']} {gap['key']} = {gap['baseline']} "
+            f"[{gap_note[gap['decided_by']](gap)}; {gap['why']}]"
+        )
+    if len(gaps) > MAX_GAP_LINES:
+        lines.append(f"            ... {len(gaps) - MAX_GAP_LINES} more gap(s)")
     lines.append("arms:")
     for entry in diff["arms"][:MAX_ARM_LINES]:
         status = "LOSS" if entry["regressions"] else "ok  "

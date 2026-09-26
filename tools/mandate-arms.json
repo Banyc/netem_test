@@ -1,6 +1,6 @@
 {
   "schema": "mandate-arms/1",
-  "source": "tools/PERF_INFRA.md, 'The smoke set' (the arm table: each arm's impairment, load shape and lanes), and the M3/M4 arm descriptions in rtp_mux/tests/mandate_smoke.rs; the cells restate what those documents already state and are not a second authority for any bound. The `probe/` keys name this crate's own perf-tier probes, whose cells are the `probe-*` rows of tests/GATE.md (family `probe`, reference lib::tests::clean_forwarding_perf_probe).",
+  "source": "tools/PERF_INFRA.md, 'The smoke set' (the arm table: each arm's impairment, load shape and lanes), and the M3/M4 arm descriptions in rtp_mux/tests/mandate_smoke.rs; the cells restate what those documents already state and are not a second authority for any bound. The `probe/` keys name this crate's own perf-tier probes, whose cells are the `probe-*` rows of tests/GATE.md (family `probe`, reference lib::tests::clean_forwarding_perf_probe). tools/mandate-compare also reads each arm's cells to decide whether a counter it recorded is load-bearing for that arm — the rule, and what the declared cells can and cannot express, is in that tool's docstring.",
   "cells": {
     "M1/clean": [
       "M1@impairment=loss2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+scale=256B+metric=p99"

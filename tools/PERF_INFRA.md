@@ -597,13 +597,30 @@ It cannot see an arm that keeps its sample count and counters while its
 **impairment was quietly weakened** — a 2 % loss arm retuned to 1 % measures the
 same shape under a milder regime. That is a change to a frozen perf-test
 setting, and the guard against it is the setting's immutability plus reading the
-arm against its declared cell, not this comparison. Nor is every count
-regression one: the counts have no absolute floor, so a counter small enough
-that half of it is a handful of datagrams can cross the tolerance on an
-*unchanged* tree — measured on the `M1/lone_tail` arm of two real full runs,
-where `bulk_wire_bytes` read 1920 and then 785, a counter that arm does not
-claim (it declares no bulk lane). `tools/mandate_compare.py`'s docstring states
-that false-positive mode and the floor that would remove it.
+arm against its declared cell, not this comparison.
+
+Whether a counter is load-bearing is a question about the arm's declaration,
+and the comparison answers it from the cells rather than from magnitude. A cell
+that names the counter's lane as the arm's own (`lane=bulk`) or offers a
+workload on it (`load=` or `bulk=`, any value but `none`) **claims** the counter,
+so it is
+compared with no floor at all; a cell that declares the lane idle (`load=none`,
+`bulk=none`)
+has it *reported and never compared*; a cell that names neither leaves the pair
+**unstated**, which the comparison records as a gap and where the key's measured
+floor (`COUNT_FLOORS_BYTES`, the two bulk-lane byte counters at 64 KiB) keeps a
+residue from failing. That floor is the survivor of the false-positive fix
+measured on the `M1/lone_tail` arm of two real full runs, where
+`bulk_wire_bytes` read 1920 and then 785: the cell says `lane=dual`, which names
+the dual-lane *topology* without saying whether the bulk lane is driven, and the
+cells as declared cannot tell that arm from the `M1/clean` arm that records
+`bulk_wire_bytes` 8482399 while saying the same thing. A rule that read
+`lane=dual` as a claim red-flags the residue; a rule that read it as a non-claim
+stops comparing the 8 MiB. So the floor stays for exactly those unstated pairs,
+the pairs are named in every verdict, and a *claiming* cell consults no floor at
+all. `tools/mandate_compare.py`'s docstring and
+`tools/mandate-arms.json`'s cell declarations are the authorities for the rule
+and the cells it reads.
 
 ### The checked-in baseline
 

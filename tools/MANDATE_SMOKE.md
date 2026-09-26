@@ -338,18 +338,31 @@ covers what the baseline covered — the arm is gone, its sample count fell by
 half or more, a load-bearing delivery or wire counter fell that far or stopped
 being measured, a measured window shrank by more than 1 %, a statistic the
 assertions read stopped being measured, the delivery ratio fell, or a declared
-coverage cell is covered by no arm any more. A counter is **load-bearing** when
-its baseline sits at or above the measured noise band the comparison prints for
-its key (`COUNT_NOISE_BANDS_BYTES`, currently the two bulk-lane byte counters at
-64 KiB); below that the value is the fixture's incidental traffic rather than
-the workload the arm claims, so a fall in it — even one past the 50 % tolerance —
-is reported in the arm's line, with the band named, and the verdict stays green.
-The band is derived from the spread real runs of the unchanged tree recorded for
-that key, not chosen to make a comparison pass; every key without a band is
-compared exactly as before. A **value change** is a statistics move —
-a latency percentile, a goodput rate, a share — which on a shared host is
-run-to-run noise: it is reported always, and is a failure (exit `5`) only under
-`--fail-on-value-drift` past `--value-tolerance`.
+coverage cell is covered by no arm any more.
+
+A counter is **load-bearing for an arm** when the arm's own declared cells claim
+the lane it measures — the relevance is the declaration's to state, not
+magnitude's to suggest. The comparison prints the rule it applied and reads each
+cell (`cell_claim`): a cell that names the counter's lane as the arm's own
+(`lane=bulk`) or offers a workload on it (`load=` or `bulk=`, any value but
+`none`) **claims**
+it, so it is compared with **no floor at all** and a small counter is a tooth
+exactly like a large one; a cell that declares the lane idle (`load=none` or
+`bulk=none`) has its counter *reported and never compared*, which is intended
+behaviour rather than an
+accident of size; and a cell that names neither leaves the pair **unstated**, so
+the comparison does not guess — the pair is listed under `gaps:` and in the
+diff's `claim_gaps`, and the key's measured floor
+(`COUNT_FLOORS_BYTES`, the two bulk-lane byte counters at 64 KiB — a value
+derived from the spread real runs of the unchanged tree recorded for that key,
+never chosen to make a comparison pass) is what keeps a residue among those pairs
+from failing. Only that last case consults a floor, and no other compared counter
+has one.
+
+A **value change** is a statistics move — a latency percentile, a goodput rate,
+a share — which on a shared host is run-to-run noise: it is reported always, and
+is a failure (exit `5`) only under `--fail-on-value-drift` past
+`--value-tolerance`.
 
 An incomparable pair is refused (exit `2`) rather than reported as agreement: a
 report whose `schema` predates `mandate-check/3` (the per-arm record; `/3`,

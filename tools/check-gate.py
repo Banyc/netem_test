@@ -1042,11 +1042,11 @@ DOC_COUNTS: tuple[DocCount, ...] = (
         authority="the producers[] array of tools/mandate-producers.json",
     ),
     DocCount(
-        label="counted noise-band counters",
+        label="counted floors applied to an unstated lane",
         docs=("tools/MANDATE_SMOKE.md",),
         pattern=rf"the ({_NUMERAL}) bulk-lane byte counters",
-        keys=("noise_band_counters",),
-        authority="len(COUNT_NOISE_BANDS_BYTES) in tools/mandate_compare.py",
+        keys=("count_floor_counters",),
+        authority="len(COUNT_FLOORS_BYTES) in tools/mandate_compare.py",
     ),
     DocCount(
         label="reference families of the rtp_mux draft",
@@ -1417,14 +1417,14 @@ def _draft_gate_counts(root: Path, problems: list[str]) -> dict[str, float]:
     )
 
 
-def _noise_band_counters(root: Path, problems: list[str]) -> dict[str, float]:
-    """`len(COUNT_NOISE_BANDS_BYTES)` from `tools/mandate_compare.py`."""
+def _count_floor_counters(root: Path, problems: list[str]) -> dict[str, float]:
+    """`len(COUNT_FLOORS_BYTES)` from `tools/mandate_compare.py`."""
     path = root / "tools" / "mandate_compare.py"
     spec = importlib.util.spec_from_file_location("mandate_compare_doc_counts", path)
     if spec is None or spec.loader is None:
         problems.append(
             f"DOC COUNT: cannot derive: {path} cannot be loaded for "
-            "COUNT_NOISE_BANDS_BYTES"
+            "COUNT_FLOORS_BYTES"
         )
         return {}
     module = importlib.util.module_from_spec(spec)
@@ -1433,16 +1433,16 @@ def _noise_band_counters(root: Path, problems: list[str]) -> dict[str, float]:
     except Exception as error:  # noqa: BLE001 - any import failure is the point
         problems.append(
             f"DOC COUNT: cannot derive: {path} failed to import ({error!r}) for "
-            "COUNT_NOISE_BANDS_BYTES"
+            "COUNT_FLOORS_BYTES"
         )
         return {}
-    bands = getattr(module, "COUNT_NOISE_BANDS_BYTES", None)
-    if not isinstance(bands, dict):
+    floors = getattr(module, "COUNT_FLOORS_BYTES", None)
+    if not isinstance(floors, dict):
         problems.append(
-            f"DOC COUNT: cannot derive: {path} defines no COUNT_NOISE_BANDS_BYTES dict"
+            f"DOC COUNT: cannot derive: {path} defines no COUNT_FLOORS_BYTES dict"
         )
         return {}
-    return {"noise_band_counters": float(len(bands))}
+    return {"count_floor_counters": float(len(floors))}
 
 
 def doc_count_values(root: Path, problems: list[str]) -> dict[str, float]:
@@ -1507,7 +1507,7 @@ def doc_count_values(root: Path, problems: list[str]) -> dict[str, float]:
         values["references_total"] = (
             draft["draft_families"] + values["harness_families"]
         )
-    values.update(_noise_band_counters(root, problems))
+    values.update(_count_floor_counters(root, problems))
     return values
 
 
