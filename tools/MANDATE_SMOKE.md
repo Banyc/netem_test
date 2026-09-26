@@ -223,6 +223,35 @@ has drifted past the tolerance the crate declares, and when a measured test
 exceeds its tier budget. It only compares a row whose `<target>::<test>` the
 report measured, and it says how many rows it compared.
 
+## Comparing a run with the committed baseline
+
+`arms` is what makes a shortening checkable, and `tools/mandate-compare` is
+what checks it: it diffs a fresh report against the committed
+`tools/mandate-baseline.json` and reports, per arm, exactly which quantities
+moved.
+
+```sh
+./tools/mandate-compare <run>/mandate-check.json
+```
+
+A **coverage regression** (exit `4`) is a movement that means the arm no longer
+covers what the baseline covered — the arm is gone, its sample count fell by
+half or more, a delivery or wire counter fell that far or stopped being
+measured, a measured window shrank by more than 1 %, a statistic the assertions
+read stopped being measured, the delivery ratio fell, or a declared coverage
+cell is covered by no arm any more. A **value change** is a statistics move —
+a latency percentile, a goodput rate, a share — which on a shared host is
+run-to-run noise: it is reported always, and is a failure (exit `5`) only under
+`--fail-on-value-drift` past `--value-tolerance`.
+
+An incomparable pair is refused (exit `2`) rather than reported as agreement: a
+report whose `schema` predates `mandate-check/3`, a report carrying no arms, a
+candidate recorded with a different window set from the baseline's, and a
+coverage cell the gate checker's grammar rejects. The committed baseline must
+therefore be re-recorded with a current `tools/mandate-check` before it can
+certify anything — a baseline from before the per-arm record is refused, not
+read as agreement.
+
 ## Exit codes
 
 | code | meaning |

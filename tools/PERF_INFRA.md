@@ -371,6 +371,61 @@ the three tests in `gate-default-required`, so a plain `cargo test -p rtp_mux`
 runs them too; `tools/mandate-check` is the release, evidence-producing
 invocation.
 
+### The per-arm record and the coverage comparison
+
+The dual mandate's coverage half needs an instrument, not an argument. A
+`MANDATE` line is a verdict: it says a bound was crossed, never what the arm
+measured, so a shortening that halves an arm's samples can pass every assertion
+while quietly weakening the p99 that assertion reads. Two tools close that
+hole.
+
+**`tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
+the smoke set already printed becomes an `arms` entry in `mandate-check.json`
+(schema `mandate-check/3`; the record's fields are in `tools/MANDATE_SMOKE.md`):
+the arm id and mandate, its **sample count** (the producer's own `recv`), the
+**statistics** the assertions read (`p50`/`p90`/`p99`/`p999`/`max`/`over250`, the
+bulk rates), the **delivery and wire counters** (`sent`, `received`,
+`wire_bytes`, `bulk_wire_bytes`, `bulk_sink_bytes`, and the
+offered/delivered/forwarded bytes where the arm has them), the **measured
+windows**, every parsed token verbatim, and the **declared coverage cells** the
+arm exercises, read from `tools/mandate-arms.json` (a declaration naming what
+each smoke arm covers, matched by the longest arm-id prefix). The record is
+required, not decorative: a run that measured no arm, a mandate whose arm lines
+are gone, an arm line that cannot be attributed, and an arm that claims no
+declared cell each fail the run.
+
+**`tools/mandate-compare` turns a difference into a verdict.** It compares a
+fresh report with the committed `tools/mandate-baseline.json`:
+
+```sh
+./tools/mandate-compare <run>/mandate-check.json
+```
+
+A **coverage regression** (exit `4`) is a movement that means the arm no longer
+covers what the baseline covered: the arm is gone, its sample count fell by
+half or more, a delivery or wire counter fell that far or stopped being
+measured, a measured window shrank by more than 1 %, a statistic the assertions
+read stopped being measured, the delivery ratio fell past its tolerance, a
+declared cell is covered by no arm any more, or a mandate vanished. A **value
+change** is a statistics move — a latency percentile, a goodput rate, a share —
+which on a shared host is run-to-run noise: it is reported always and is a
+failure (exit `5`) only under `--fail-on-value-drift`.
+
+The count tolerance is 50 % rather than tight because that is the run-to-run
+band two recorded full runs of the unchanged tree showed on the
+request/response arm (819 -> 421 samples and 514 -> 882) — a tolerance tight
+enough to catch a 20 % shortening would red-flag a healthy run on a contended
+host. The **measured window** is what carries the sharp shortening signal and
+is compared at 1 %. That split is the comparison's **detection limit**, stated
+rather than left implicit: it sees a dropped arm, a halved sample count, a
+shortened window, a delivery or wire counter that fell or stopped being
+measured, a statistic that disappeared, and a coverage cell no longer covered.
+It cannot see an arm that keeps its sample count and counters while its
+**impairment was quietly weakened** — a 2 % loss arm retuned to 1 % measures the
+same shape under a milder regime. That is a change to a frozen perf-test
+setting, and the guard against it is the setting's immutability plus reading the
+arm against its declared cell, not this comparison.
+
 ### The checked-in baseline
 
 `tools/mandate-baseline.json` is the `mandate-check.json` of one real
