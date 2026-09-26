@@ -540,6 +540,28 @@ class CheckGatePerfTest(unittest.TestCase):
         )
         self.rejects("found 5 field(s)")
 
+    def test_a_row_covering_two_cells_of_one_dimension_is_orthogonal(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "orthogonal | conformance-alpha@impairment=delay20ms",
+                "orthogonal | conformance-alpha@impairment=delay20ms,conformance-alpha@impairment=delay25ms",
+            )
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("1 orthogonal", output)
+
+    def test_a_row_whose_cells_vary_different_dimensions_is_composite(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "orthogonal | conformance-alpha@impairment=delay20ms",
+                "composite(impairment,scale) | conformance-alpha@impairment=delay20ms,conformance-alpha@scale=128-pkt",
+            )
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("alpha::t_ok varies impairment, scale", output)
+
     # -- the rest of the declaration ---------------------------------------
 
     def test_budgets_without_a_design_block_fails(self):
