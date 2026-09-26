@@ -11,6 +11,17 @@ reports, per arm, exactly which quantities moved.
 
     ./tools/mandate-compare <run>/mandate-check.json
 
+## What it compares, and from whom
+
+Every arm of every producer a report covers is compared, because every arm's
+``id`` is unique across the producers of a run (a section is an arm-id
+namespace, so two producers cannot share one) and every arm carries the
+``producer`` field that printed it. The verdict block names both runs'
+producers, so a verdict can be read as covering them — and a producer whose
+arms the candidate did not record at all is not a green verdict but a coverage
+regression, one absent arm at a time. A producer added since the baseline is
+reported as new arms, not as a regression: coverage grew.
+
 ## The two kinds of movement
 
 They are not the same kind of claim and must not be read as one.
@@ -503,7 +514,29 @@ def summary_of(report):
         "arms": len(report["arms"]),
         "samples": samples,
         "revision": (payload.get("rtp_mux") or {}).get("revision"),
+        "producers": producers_of(payload, report["arms"]),
     }
+
+
+def producers_of(payload, arms):
+    """The producer ids a report covers, in its own order.
+
+    A ``mandate-check/5`` report names the producers it declared and selected,
+    so the comparison can say which producers its verdict covers. A ``/3`` or
+    ``/4`` report has no producer record at all (it predates the second
+    producer), so the ids are read from the arms' own ``producer`` field — and
+    when even that is absent the list is empty, which the verdict block prints
+    as ``unnamed`` rather than as a producer this comparison invented.
+    """
+    declared = payload.get("producers")
+    if isinstance(declared, dict):
+        selected = payload.get("producers_selected")
+        if isinstance(selected, list) and selected:
+            return [str(entry) for entry in selected]
+        return sorted(str(entry) for entry in declared)
+    return sorted(
+        {str(arm["producer"]) for arm in arms.values() if arm.get("producer")}
+    )
 
 
 def _quantities(entry):
@@ -524,6 +557,11 @@ def verdict_lines(diff):
             f"  {role.split('_')[0]:>9}: schema={summary['schema']} "
             f"quick={'yes' if summary['quick'] else 'no'} arms={summary['arms']} "
             f"samples={summary['samples']} revision={summary['revision'] or 'unresolved'}"
+        )
+        lines.append(
+            f"  {'':>9}  producers: "
+            f"{', '.join(summary['producers']) if summary['producers'] else 'unnamed'} "
+            f"({len(summary['producers'])} covered)"
         )
     tolerances = diff["tolerances"]
     lines.append(

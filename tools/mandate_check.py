@@ -32,21 +32,41 @@ later run's arms can be diffed against a committed baseline and a sample count
 that fell can be called a coverage regression rather than noise. ``arms`` is a
 record of what the producer printed; it invents nothing.
 
-    ./tools/mandate-check [--rtp-mux <path>] [--dir <out>] [--quick]
+    ./tools/mandate-check [--producer <id> ...] [--dir <out>] [--quick]
+
+## The producers
+
+A run records the arms of every **producer** it selects. A producer is one
+entry of ``tools/mandate-producers.json``, the declaration that says what a
+producer is: its cargo invocation, its source, the *sections* its arms are
+attributed to, which of those sections print a ``MANDATE`` line and write
+plots, and where its log goes. Two producers are declared. ``rtp_mux`` is the
+tri-mandate smoke set this command was built for; ``netem_test`` is this
+workspace's own perf-tier probes. ``--producer <id>`` selects one or more, and
+with none named **every** declared producer runs, so one run produces per-arm
+records for both. ``--producer-path <id>=<path>`` points one producer at
+another checkout, and ``--rtp-mux <path>`` is the documented shorthand for the
+``rtp_mux`` one.
+
+The report records each producer's own invocation, revision, tree, log, exit
+status and arm count under ``producers``, and each arm carries the ``producer``
+that printed it. The ``rtp_mux``/``smoke`` keys a ``mandate-check/4`` reader
+reads are kept as that producer's record (``null`` when it was not selected).
 
 ## The contract
 
-The command depends on the following contract, which the ``mandate_smoke``
-target owes it:
+The command depends on the following contract, which every declared producer
+owes it. ``tools/MANDATE_SMOKE.md`` states the same contract as the form a
+crate's author follows; the runners and the failure modes are these.
 
-1. **The target and the invocation.** The set is the test target
-   ``mandate_smoke`` of the ``rtp_mux`` crate, run exactly as
+1. **The target and the invocation.** A producer's target and cargo arguments
+   are its registry entry's, and its declared ``test_args`` are appended after
+   ``--``. The command adds no test filter of its own and no
+   ``--test-threads``; a producer whose measurements are wall-clock must
+   serialise them, either internally or with ``--test-threads=1`` among its
+   declared ``test_args``. The ``rtp_mux`` producer is run exactly as
 
        cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture
-
-   The command adds no test filter and no ``--test-threads``; the smoke set
-   must therefore serialise its own measurements (its assertions are
-   wall-clock).
 
 2. **Where the evidence goes.** The smoke set must write, into the directory
    named by the environment variable ``MANDATE_CHECK_DIR`` (this command
@@ -70,8 +90,8 @@ target owes it:
    with
 
    - ``MANDATE`` at column 1, one ASCII space between fields;
-   - ``<ID>`` one of ``M1``, ``M2``, ``M3``, ``M4`` — no other id is
-     accepted;
+   - ``<ID>`` one of the verdict sections the producing crate declares — for
+     ``rtp_mux``, ``M1``, ``M2``, ``M3``, ``M4`` and no other id;
    - ``<PASS|FAIL>`` exactly, in upper case;
    - at least one ``<key>=<value>`` measurement token, whitespace separated,
      ``<key>`` matching ``[A-Za-z_][A-Za-z0-9_]*`` and ``<value>`` a
@@ -112,9 +132,14 @@ target owes it:
      <f> MiB/s, capacity <f> MiB/s, fraction <f> (<n> / <n> bytes)``.
 
    ``<arm>`` is the producer's own label (``clean``, ``hostile``,
-   ``lone_tail``, ``m3/rep1``, ``m4/clean flow A``, ...). An arm line belongs
-   to the mandate whose ``MANDATE`` line next follows it. For a key/value arm
-   the sample count is its ``recv`` — the producer's own sample count.
+   ``lone_tail``, ``m3/rep1``, ``m4/clean flow A``, ...). An arm line whose
+   body carries ``section=<id>`` is **self-attributing**: ``<id>`` must be one
+   of the producer's declared sections and the arm's id is ``<id>/<arm>``,
+   which is how a producer with no ``MANDATE`` line to print (a report-only
+   perf probe, which asserts no bound) still records attributable arms. Any
+   other arm line belongs to the section whose ``MANDATE`` line next follows
+   it. For a key/value arm the sample count is its ``recv`` — the producer's
+   own sample count.
 
    This is a record of the arms a run measured, so it is required, not
    optional: a key/value arm line that no ``MANDATE`` line follows cannot be
@@ -200,20 +225,42 @@ from pathlib import Path
 MODULE_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = MODULE_DIR.parent
 
+# The ids the ``rtp_mux`` producer's verdict lines use. They are the unit
+# tests' fallback: every producer declares its own sections, and a verdict id
+# is only accepted when the producer that printed it declares it.
 MANDATE_IDS = ("M1", "M2", "M3", "M4")
-SMOKE_PACKAGE = "rtp_mux"
-SMOKE_TARGET = "mandate_smoke"
-SMOKE_SOURCE = Path("tests") / f"{SMOKE_TARGET}.rs"
+# The producer ``--rtp-mux`` and ``default_crate_path`` name, and the one whose
+# record the report keeps under the ``rtp_mux``/``smoke`` keys a
+# ``mandate-check/4`` reader reads.
+PRIMARY_PRODUCER = "rtp_mux"
 OUT_DIR_ENV = "MANDATE_CHECK_DIR"
 QUICK_ENV = "MANDATE_SMOKE_QUICK"
 DEFAULT_TIMEOUT_SECONDS = 900.0
 DEFAULT_CARGO = "cargo"
 REPORT_NAME = "mandate-check.json"
+# The log name of the ``rtp_mux`` producer. Kept as a module constant because
+# it is also the run directory's ownership sentinel; every producer's own log
+# name is its registry entry's.
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/4"
+REPORT_SCHEMA = "mandate-check/5"
 ARMS_DECLARATION_NAME = "mandate-arms.json"
 ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
+PRODUCERS_DECLARATION_NAME = "mandate-producers.json"
+PRODUCERS_DECLARATION_SCHEMA = "mandate-producers/1"
+PRODUCER_KEYS = (
+    "id",
+    "package",
+    "target",
+    "source",
+    "default_path",
+    "cargo_args",
+    "test_args",
+    "sections",
+    "verdicts",
+    "log",
+    "evidence",
+)
 REVISION_TIMEOUT_SECONDS = 30.0
 LOG_TAIL_LINES = 20
 # How long the line reader may take to drain after the child exits or is
@@ -224,11 +271,12 @@ EXIT_OK = 0
 EXIT_EVIDENCE_FAILURE = 2
 EXIT_MANDATE_FAILURE = 3
 
-# ``MANDATE <ID> <PASS|FAIL> <key>=<value> ...``. The id is intentionally
-# matched loosely (``M[0-9]+``) and then checked against ``MANDATE_IDS``, so an
-# unknown mandate is a named failure instead of an ignored line.
+# ``MANDATE <ID> <PASS|FAIL> <key>=<value> ...``. The id is matched loosely
+# (``[A-Za-z][A-Za-z0-9_]*``) and then checked against the verdict sections the
+# producing crate declares, so an unknown mandate is a named failure instead of
+# an ignored line.
 MANDATE_LINE_RE = re.compile(
-    r"^MANDATE (?P<mandate>M[0-9]+) (?P<verdict>PASS|FAIL)"
+    r"^MANDATE (?P<mandate>[A-Za-z][A-Za-z0-9_]*) (?P<verdict>PASS|FAIL)"
     r"(?:[ \t]+(?P<values>.*?))?[ \t]*$"
 )
 VALUE_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)$")
@@ -348,12 +396,14 @@ def _coerce_value(text):
     return number if math.isfinite(number) else text
 
 
-def parse_mandate_lines(text):
+def parse_mandate_lines(text, ids=MANDATE_IDS):
     """Parse the ``MANDATE`` lines into ``({id: record}, [problems])``.
 
     Every line whose first token is ``MANDATE`` must match the contract
     grammar exactly; anything else that starts with ``MANDATE`` is reported
-    as a problem rather than skipped.
+    as a problem rather than skipped. ``ids`` are the verdict sections the
+    producing crate declares, so a line naming a section the producer does not
+    declare is a named failure rather than an accepted verdict.
     """
     records = {}
     problems = []
@@ -369,14 +419,19 @@ def parse_mandate_lines(text):
             problems.append(
                 f"line {line_number}: {line!r} starts with MANDATE but does not "
                 "match the contract grammar "
-                "'MANDATE <M1|M2|M3|M4> <PASS|FAIL> <key>=<value> ...'"
+                "'MANDATE <ID> <PASS|FAIL> <key>=<value> ...'"
             )
             continue
         mandate = match.group("mandate")
-        if mandate not in MANDATE_IDS:
+        if mandate not in ids:
+            because = (
+                f"is not one of {', '.join(ids)}"
+                if ids
+                else "names a section, but the producer that printed it declares "
+                "no verdict section"
+            )
             problems.append(
-                f"line {line_number}: mandate {mandate!r} is not one of "
-                f"{', '.join(MANDATE_IDS)}"
+                f"line {line_number}: mandate {mandate!r} {because}"
             )
             continue
         if mandate in records:
@@ -533,15 +588,21 @@ def _arm_record(label, body, dialect, values):
 
 
 def parse_arm_lines(events, problems):
-    """The run's arms, attributed to the mandate each one precedes.
+    """The run's arms, attributed to the section each one belongs to.
 
-    Every ``[mandate-smoke ...]`` line is a candidate; the mandate is the id
-    of the ``MANDATE`` line that next arrives, which is the order the smoke set
-    emits (one mandate's arm lines, then its ``MANDATE`` line). Returns
+    Every ``[mandate-smoke ...]`` line is a candidate. An arm line whose body
+    carries ``section=<id>`` is attributed by that token, and its id is
+    ``<id>/<label>``; any other arm line belongs to the section named by the
+    ``MANDATE`` line that next arrives, which is the order the smoke set emits
+    (one section's arm lines, then its ``MANDATE`` line). The two paths exist
+    because a producer that asserts no bound (a report-only perf probe) prints
+    no ``MANDATE`` line for its arms to follow. Whether ``<id>`` is a section
+    the producer declares is checked by the caller against the registry, and
+    whether a section has arms at all by :func:`check_arm_coverage`. Returns
     ``(arms, notes)`` with ``arms`` sorted by id.
 
     The guards are vacuity guards: an arm line that can never be attributed, a
-    mandate with no arm line, an arm with no declared coverage cell, and a run
+    section with no arm line, an arm with no declared coverage cell, and a run
     with no arm measurement at all are all problems, so an arm set that
     quietly empties is a failure rather than a report with an empty ``arms``.
     """
@@ -549,15 +610,18 @@ def parse_arm_lines(events, problems):
     notes = []
     pending = []
 
-    def flush(mandate):
+    def emit(entry, section):
+        entry.pop("note", None)
+        entry["mandate"] = section
+        entry["id"] = f"{section}/{entry['label']}"
+        arms.append(entry)
+
+    def flush(section):
         for entry in pending:
             if entry.get("note"):
-                notes.append(_public_arm_note(entry, mandate))
+                notes.append(_public_arm_note(entry, section))
                 continue
-            entry.pop("note", None)
-            entry["mandate"] = mandate
-            entry["id"] = f"{mandate}/{entry['label']}"
-            arms.append(entry)
+            emit(entry, section)
         pending.clear()
 
     for event in events:
@@ -565,20 +629,25 @@ def parse_arm_lines(events, problems):
         if line != "MANDATE" and line.startswith("MANDATE "):
             matched = MANDATE_LINE_RE.match(line)
             mandate = matched.group("mandate") if matched is not None else None
-            if mandate in MANDATE_IDS:
+            if mandate is not None:
                 flush(mandate)
             continue
         parsed = parse_arm_line(line)
         if parsed is not None:
-            pending.append(parsed)
+            section = parsed.get("values", {}).get("section")
+            if not parsed.get("note") and isinstance(section, str):
+                emit(parsed, section)
+            else:
+                pending.append(parsed)
     for entry in pending:
         if entry.get("note"):
             notes.append(_public_arm_note(entry, None))
             continue
         problems.append(
             f"the arm line {entry['raw_line']!r} follows the last 'MANDATE' line "
-            "and cannot be attributed to a mandate; the smoke set must print an "
-            "arm's line before that arm's mandate's MANDATE line"
+            "and carries no 'section=' token, so it cannot be attributed to a "
+            "mandate or a section; print the arm's line before its section's "
+            "MANDATE line, or name the section in the line itself"
         )
     pending.clear()
     arms.sort(key=lambda arm: arm["id"])
@@ -680,20 +749,22 @@ def stamp_arm_coverage(arms, declaration, problems):
             )
 
 
-def check_arm_coverage(arms, notes, problems):
-    """Require every mandate's arms to have been measured, or say which not.
+def check_arm_coverage(arms, notes, problems, sections=MANDATE_IDS):
+    """Require every section's arms to have been measured, or say which not.
 
-    A mandate whose arm lines are absent has had its coverage silently deleted,
+    A section whose arm lines are absent has had its coverage silently deleted,
     so it is a problem; a run with no arm measurement at all is the same
-    failure stated once.
+    failure stated once. ``sections`` is the union of the sections the selected
+    producers declare, which is why it defaults to the ``rtp_mux`` producer's
+    four mandate ids: the guard belongs to the producer's declaration, not to
+    this function.
     """
     measured = {arm["mandate"] for arm in arms}
-    seen = {note["mandate"] for note in notes if note["mandate"] is not None}
-    for mandate in MANDATE_IDS:
-        if mandate not in measured:
+    for section in sections:
+        if section not in measured:
             problems.append(
-                f"{mandate}: no '[mandate-smoke <arm>]' measurement line was "
-                "attributed to it, so the mandate's arms were never measured"
+                f"{section}: no '[mandate-smoke <arm>]' measurement line was "
+                "attributed to it, so its arms were never measured"
             )
     if not arms:
         problems.append(
@@ -703,50 +774,204 @@ def check_arm_coverage(arms, notes, problems):
         )
 
 
-def _arm_summary(arms, notes):
-    """One line per mandate: how many arms it measured and how many samples."""
+def check_arm_sections(arms, producer, problems):
+    """Every arm's section must be one the producing crate declares.
+
+    An arm attributed to a section outside its producer's declaration is an arm
+    whose id no declaration can vouch for, so it is a problem and names both.
+    """
+    declared = set(producer["sections"])
+    for arm in arms:
+        if arm["mandate"] not in declared:
+            problems.append(
+                f"the arm {arm['id']!r} is attributed to the section "
+                f"{arm['mandate']!r}, which the {producer['id']} producer does "
+                f"not declare (its sections are "
+                f"{', '.join(producer['sections']) or 'none'}); declare the "
+                f"section in {PRODUCERS_DECLARATION_NAME} or attribute the arm "
+                "to one of the declared ones"
+            )
+
+
+def _arm_summary(arms, notes, report):
+    """One line per producer and section: its arms and their sample count."""
     lines = []
-    for mandate in MANDATE_IDS:
-        of_mandate = [arm for arm in arms if arm["mandate"] == mandate]
-        if not of_mandate:
-            lines.append(f"  {mandate} arms: none measured")
-            continue
-        counts = [arm["sample_count"] for arm in of_mandate]
-        known = [count for count in counts if count is not None]
-        samples = f"{sum(known)} sample(s)" if known else "no per-sample count"
-        labels = ", ".join(arm["label"] for arm in of_mandate)
-        lines.append(
-            f"  {mandate} arms: {len(of_mandate)} ({labels}), {samples}"
-        )
+    produced = sorted({arm.get("producer") for arm in arms if arm.get("producer")})
+    for producer in produced:
+        record = report["producers"].get(producer) or {}
+        prefix = f"{producer} " if len(produced) > 1 else ""
+        for section in record.get("sections") or []:
+            of_section = [
+                arm
+                for arm in arms
+                if arm.get("producer") == producer and arm["mandate"] == section
+            ]
+            if not of_section:
+                lines.append(f"  {prefix}{section} arms: none measured")
+                continue
+            counts = [arm["sample_count"] for arm in of_section]
+            known = [count for count in counts if count is not None]
+            samples = f"{sum(known)} sample(s)" if known else "no per-sample count"
+            labels = ", ".join(arm["label"] for arm in of_section)
+            lines.append(
+                f"  {prefix}{section} arms: {len(of_section)} ({labels}), {samples}"
+            )
     if notes:
         lines.append(f"  arm notes (prose, not compared): {len(notes)}")
     return lines
 
 
+def producer_checkout(producer):
+    """A producer's declared default checkout, resolved against the workspace."""
+    declared = Path(producer["default_path"]).expanduser()
+    if declared.is_absolute():
+        return declared.resolve()
+    return (WORKSPACE_ROOT / declared).resolve()
+
+
 def default_crate_path():
-    """The sibling ``../rtp_mux`` of this workspace, where the smoke set lives."""
-    return (WORKSPACE_ROOT.parent / SMOKE_PACKAGE).resolve()
+    """The primary producer's default checkout: the sibling ``../rtp_mux``.
+
+    The registry's ``rtp_mux`` entry declares the same ``../rtp_mux``
+    ``default_path``; ``test_mandate_check`` pins the two to each other so this
+    helper cannot drift into a second authority.
+    """
+    return (WORKSPACE_ROOT.parent / PRIMARY_PRODUCER).resolve()
 
 
-def resolve_crate(requested):
-    """The ``rtp_mux`` checkout, or a failure naming what is missing."""
-    if requested is None:
-        crate = default_crate_path()
+def load_producer_declaration(path, problems):
+    """The producer registry, or a named failure.
+
+    It is this command's own file — it declares which test targets are producers
+    and what each owes the runner — so a missing or malformed one is a failure:
+    without it there is no producer to run, and a run that silently recorded
+    nothing would report success on absent evidence.
+    """
+    if not path.is_file():
+        problems.append(
+            f"the producer declaration {path} does not exist, so no producer's "
+            "arms can be recorded; it travels with this command"
+        )
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        problems.append(f"the producer declaration {path} cannot be read: {error}")
+        return None
+    if not isinstance(payload, dict):
+        problems.append(f"the producer declaration {path} is not a JSON object")
+        return None
+    if payload.get("schema") != PRODUCERS_DECLARATION_SCHEMA:
+        problems.append(
+            f"the producer declaration {path} declares schema "
+            f"{payload.get('schema')!r}, not {PRODUCERS_DECLARATION_SCHEMA!r}"
+        )
+        return None
+    entries = payload.get("producers")
+    if not isinstance(entries, list) or not entries:
+        problems.append(
+            f"the producer declaration {path} declares no producers, so there is "
+            "nothing to run"
+        )
+        return None
+    seen = set()
+    for entry in entries:
+        problem = _producer_problem(entry, seen)
+        if problem is not None:
+            problems.append(f"the producer declaration {path}: {problem}")
+            return None
+    # A section is an arm-id namespace, so two producers may not share one:
+    # the same id from two producers would record two different measurements
+    # under one name and no comparison could tell them apart.
+    owners = {}
+    for entry in entries:
+        for section in entry["sections"]:
+            if section in owners:
+                problems.append(
+                    f"the producer declaration {path}: the section {section!r} is "
+                    f"declared by both {owners[section]!r} and {entry['id']!r}; a "
+                    "section is an arm-id namespace, so it must have one owner"
+                )
+                return None
+            owners[section] = entry["id"]
+    if PRIMARY_PRODUCER not in seen:
+        problems.append(
+            f"the producer declaration {path} does not declare the "
+            f"{PRIMARY_PRODUCER!r} producer, whose record the report keeps under "
+            "the keys a mandate-check/4 reader reads"
+        )
+        return None
+    return payload
+
+
+def _producer_problem(entry, seen):
+    """One registry entry's first problem, or ``None`` when it is well formed."""
+    if not isinstance(entry, dict):
+        return "an entry is not a JSON object"
+    missing = [key for key in PRODUCER_KEYS if key not in entry]
+    if missing:
+        return f"the entry {entry.get('id')!r} is missing {', '.join(missing)}"
+    unknown = [key for key in entry if key not in PRODUCER_KEYS]
+    if unknown:
+        return f"the entry {entry['id']!r} carries unknown key(s) {', '.join(unknown)}"
+    if not isinstance(entry["id"], str) or not entry["id"]:
+        return "an entry's id is not a non-empty string"
+    if entry["id"] in seen:
+        return f"the producer {entry['id']!r} is declared twice"
+    for key in ("package", "target", "source", "default_path", "log"):
+        if not isinstance(entry[key], str) or not entry[key]:
+            return f"the producer {entry['id']!r} gives {key!r} no string"
+    for key in ("cargo_args", "test_args"):
+        if not isinstance(entry[key], list) or not all(
+            isinstance(token, str) and token for token in entry[key]
+        ):
+            return f"the producer {entry['id']!r} gives {key!r} no list of tokens"
+    for key in ("sections", "verdicts"):
+        if not isinstance(entry[key], list) or not all(
+            isinstance(token, str) and token for token in entry[key]
+        ):
+            return f"the producer {entry['id']!r} gives {key!r} no list of sections"
+    if not entry["sections"]:
+        return f"the producer {entry['id']!r} declares no section, so no arm it prints can be attributed"
+    if len(set(entry["sections"])) != len(entry["sections"]):
+        return f"the producer {entry['id']!r} declares a section twice"
+    outside = [section for section in entry["verdicts"] if section not in entry["sections"]]
+    if outside:
+        return (
+            f"the producer {entry['id']!r} declares the verdict section(s) "
+            f"{', '.join(outside)} it does not list among its sections"
+        )
+    if not isinstance(entry["evidence"], bool):
+        return f"the producer {entry['id']!r} gives evidence neither true nor false"
+    seen.add(entry["id"])
+    return None
+
+
+def resolve_producer(producer, override):
+    """``(checkout, None)``, or ``(None, problem)`` naming what is missing.
+
+    ``override`` is the CLI path for this producer (resolved against the
+    current directory, as a CLI path is), otherwise its declared
+    ``default_path`` (resolved against this workspace).
+    """
+    if override is None:
+        crate = producer_checkout(producer)
     else:
-        crate = Path(requested).expanduser().resolve()
+        crate = Path(override).expanduser().resolve()
     if not (crate / "Cargo.toml").is_file():
-        raise MandateCheckError(
-            f"the {SMOKE_PACKAGE} checkout {crate} has no Cargo.toml, so the "
-            f"{SMOKE_TARGET!r} smoke set cannot be built from it"
+        return None, (
+            f"the {producer['id']} checkout {crate} has no Cargo.toml, so its "
+            f"{producer['target']!r} target cannot be built from it"
         )
-    source = crate / SMOKE_SOURCE
+    source = crate / producer["source"]
     if not source.is_file():
-        raise MandateCheckError(
-            f"the smoke set source {source} does not exist: the "
-            f"{SMOKE_TARGET!r} target must live in "
-            f"{crate / 'tests'}, or --rtp-mux names the wrong checkout"
+        return None, (
+            f"the {producer['id']} producer's source {source} does not exist: the "
+            f"{producer['target']!r} target must live in "
+            f"{source.parent}, or --producer-path {producer['id']}=<path> names "
+            "the wrong checkout"
         )
-    return crate
+    return crate, None
 
 
 def resolve_revision(crate):
@@ -844,16 +1069,16 @@ def _capture(command, *, cwd):
     return {"exit_code": completed.returncode, "stdout": completed.stdout}
 
 
-def prepare_output_dir(out_dir):
+def prepare_output_dir(out_dir, log_names=(LOG_NAME,)):
     """Create the run directory and clear what an earlier run left in it.
 
     Every file this command's run writes is removed: the eight evidence files
-    the smoke set produces, the ``plots`` directory, this command's report and
-    the smoke set's log. The report is removed for the same reason the
+    the producers produce, the ``plots`` directory, this command's report and
+    every producer's log. The report is removed for the same reason the
     evidence is — a reader (``tools/mandate-compare``) reads
     ``<dir>/mandate-check.json``, so one surviving a run that wrote none would
-    be read as that run's measurement. Removal happens before the smoke set is
-    built and before the checkout is validated, so no exit path can leave a
+    be read as that run's measurement. Removal happens before a producer is
+    built and before its checkout is validated, so no exit path can leave a
     previous run's report standing.
 
     Only the files this command owns are removed, and only from a directory
@@ -878,7 +1103,7 @@ def prepare_output_dir(out_dir):
             f"command ({REPORT_NAME} or {LOG_NAME}), so it is not this "
             "command's directory to clear; pass an empty --dir"
         )
-    for name in (REPORT_NAME, LOG_NAME):
+    for name in (REPORT_NAME, LOG_NAME, *log_names):
         stale = out_dir / name
         if stale.is_file():
             stale.unlink()
@@ -891,23 +1116,13 @@ def prepare_output_dir(out_dir):
         shutil.rmtree(plots)
 
 
-def smoke_command(cargo):
-    """The contract invocation, with no filter and no extra harness flag."""
-    return [
-        cargo,
-        "test",
-        "--release",
-        "-p",
-        SMOKE_PACKAGE,
-        "--test",
-        SMOKE_TARGET,
-        "--",
-        "--nocapture",
-    ]
+def producer_command(cargo, producer):
+    """One producer's contract invocation: its declared argv, no filter added."""
+    return [cargo, *producer["cargo_args"], "--", *producer["test_args"]]
 
 
-def run_smoke(command, *, crate, out_dir, quick, timeout):
-    """Run the smoke set, returning its output, how it ended and its timeline.
+def run_producer(command, *, crate, out_dir, quick, timeout):
+    """Run one producer, returning its output, how it ended and its timeline.
 
     The child gets its own process group so a timeout kills the test binary
     and not just the cargo that spawned it. Its combined output is read as a
@@ -1030,16 +1245,30 @@ def derive_timings(events, target):
     }
 
 
-def apply_mandate_timings(report, timings):
-    """Attach each mandate's measured wall-clock to its record in the report."""
+def apply_mandate_timings(report, timings, producer):
+    """Attach one producer's measured wall-clock to its mandates and the report.
+
+    ``timings`` is one producer's own timeline, measured from its own child's
+    start, so its per-test and per-mandate entries are appended to the report's
+    merged lists with their ``producer`` stamped. Each of the producer's
+    verdict sections takes its duration from its own ``MANDATE`` lines and not
+    from another producer's.
+    """
     by_mandate = {entry["mandate"]: entry for entry in timings["mandates"]}
-    for mandate, record in report["mandates"].items():
+    merged = report["timings"]
+    for entry in timings["tests"]:
+        entry["producer"] = producer["id"]
+        merged["tests"].append(entry)
+    for entry in timings["mandates"]:
+        entry["producer"] = producer["id"]
+        merged["mandates"].append(entry)
+    for mandate in producer["verdicts"]:
+        record = report["mandates"].get(mandate)
         entry = by_mandate.get(mandate)
-        if entry is None:
+        if record is None or entry is None:
             continue
         record["finished_at_seconds"] = entry["finished_at_seconds"]
         record["duration_seconds"] = entry["duration_seconds"]
-    report["timings"] = timings
 
 
 def _kill_process_group(process):
@@ -1103,9 +1332,45 @@ def _log_tail(text, lines=LOG_TAIL_LINES):
     return stripped[-lines:]
 
 
-def build_report(args, crate, out_dir, command, revision, tree, quick, timeout):
-    report_path = out_dir / REPORT_NAME
+def producer_record(producer, out_dir):
+    """One producer's record: what it is, where it lives, what it printed."""
     return {
+        "id": producer["id"],
+        "package": producer["package"],
+        "target": producer["target"],
+        "source": producer["source"],
+        "default_path": producer["default_path"],
+        "selected": False,
+        "path": None,
+        "sections": list(producer["sections"]),
+        "verdicts": list(producer["verdicts"]),
+        "evidence": producer["evidence"],
+        "log": str(out_dir / producer["log"]),
+        "command": None,
+        "revision": None,
+        "change_id": None,
+        "revision_source": None,
+        "tree_id": None,
+        "tree_id_source": None,
+        "run": {
+            "exit_code": None,
+            "timed_out": False,
+            "log": str(out_dir / producer["log"]),
+        },
+        "arms": 0,
+    }
+
+
+def build_report(args, out_dir, declared, selected, quick, timeout):
+    """The empty report: every declared producer, and every selected one's grid.
+
+    Every declared producer gets a record so that a reader can see which
+    producers exist and which this run selected, rather than reading a
+    one-producer report as the whole inventory. A verdict section declared by
+    two producers is refused before this point, so the ``mandates`` map and
+    ``mandate_order`` list have one owner per section.
+    """
+    report = {
         "schema": REPORT_SCHEMA,
         "ok": False,
         "exit_code": None,
@@ -1114,34 +1379,33 @@ def build_report(args, crate, out_dir, command, revision, tree, quick, timeout):
         "duration_seconds": None,
         "timeout_seconds": timeout,
         "quick": quick,
-        "command": command,
-        "cwd": str(crate),
+        "producers_declared": [entry["id"] for entry in declared],
+        "producers_selected": list(selected),
+        "producers": {
+            entry["id"]: producer_record(entry, out_dir) for entry in declared
+        },
+        "command": None,
+        "cwd": None,
         "out_dir": str(out_dir),
-        "report": str(report_path),
-        "rtp_mux": {
-            "path": str(crate),
-            "revision": revision[0],
-            "change_id": revision[1],
-            "revision_source": revision[2],
-            "tree_id": tree[0],
-            "tree_id_source": tree[1],
+        "report": str(out_dir / REPORT_NAME),
+        # Kept for a `mandate-check/4` reader: the primary producer's identity
+        # and run, or null when it was not selected this run.
+        "rtp_mux": None,
+        "smoke": {
+            "exit_code": None,
+            "timed_out": False,
+            "log": str(out_dir / LOG_NAME),
+            "producer": None,
         },
-        "smoke": {"exit_code": None, "timed_out": False, "log": str(out_dir / LOG_NAME)},
-        "mandates": {
-            mandate: {
-                "declared": False,
-                "verdict": None,
-                "values": {},
-                "raw_line": None,
-                "plots": [],
-                "series_counts": [],
-                "panels": 0,
-                "finished_at_seconds": None,
-                "duration_seconds": None,
-            }
-            for mandate in MANDATE_IDS
+        "mandates": {},
+        "mandate_order": [],
+        "section_order": [],
+        "timings": {
+            "method": TIMING_METHOD,
+            "origin": "smoke-child-start",
+            "tests": [],
+            "mandates": [],
         },
-        "timings": {"method": TIMING_METHOD, "origin": "smoke-child-start", "tests": [], "mandates": []},
         "arms": [],
         "arm_notes": [],
         "arm_declaration": {
@@ -1152,6 +1416,26 @@ def build_report(args, crate, out_dir, command, revision, tree, quick, timeout):
         },
         "problems": [],
     }
+    for entry in declared:
+        for section in entry["sections"]:
+            report["section_order"].append(section)
+        if entry["id"] not in selected:
+            continue
+        for mandate in entry["verdicts"]:
+            report["mandate_order"].append(mandate)
+            report["mandates"][mandate] = {
+                "producer": entry["id"],
+                "declared": False,
+                "verdict": None,
+                "values": {},
+                "raw_line": None,
+                "plots": [],
+                "series_counts": [],
+                "panels": 0,
+                "finished_at_seconds": None,
+                "duration_seconds": None,
+            }
+    return report
 
 
 def write_report(out_dir, report):
@@ -1160,41 +1444,68 @@ def write_report(out_dir, report):
     return path
 
 
-def apply_arm_records(report, events, declaration):
-    """Record the run's per-arm measurements, or name why they are missing.
+def apply_arm_records(report, events, declaration, producer, problems):
+    """Record one producer's per-arm measurements, or name why they are missing.
 
     Every guard here is a vacuity guard: the record must be non-empty, every
-    arm must be attributable to a mandate, and every arm must claim a declared
-    coverage cell. An empty or partial record is a failure, not an empty list.
+    arm must be attributable to a section its own producer declares, and every
+    arm must claim a declared coverage cell. An empty or partial record is a
+    failure, not an empty list. The problems are appended to the caller's list
+    so that one producer's failure is decided on its own evidence.
     """
-    problems = report["problems"]
-    if declaration is not None:
+    if report["arm_declaration"]["source"] is None and declaration is not None:
         report["arm_declaration"]["source"] = declaration.get("source")
         report["arm_declaration"]["declared_cells"] = sum(
             1 for cells in declaration["cells"].values() for cell in cells
         )
     arms, notes = parse_arm_lines(events, problems)
+    for arm in arms:
+        arm["producer"] = producer["id"]
     stamp_arm_coverage(arms, declaration, problems)
-    check_arm_coverage(arms, notes, problems)
-    report["arms"] = arms
-    report["arm_notes"] = notes
+    check_arm_sections(arms, producer, problems)
+    check_arm_coverage(arms, notes, problems, tuple(producer["sections"]))
+    report["arms"].extend(arms)
+    report["arm_notes"].extend(notes)
     return arms
 
 
 def verdict_block(report):
     """The human- and machine-readable block printed on every exit path."""
     lines = [
-        f"mandate-check: {SMOKE_TARGET} in {report['rtp_mux']['path']}",
-        f"  revision: {report['rtp_mux']['revision'] or 'unresolved'}"
-        f" ({report['rtp_mux']['revision_source'] or 'no jj or git'})",
-        f"  tree:     {report['rtp_mux']['tree_id'] or 'unresolved'}"
-        f" ({report['rtp_mux']['tree_id_source'] or 'no jj or git'})",
-        f"  command:  {' '.join(report['command'])}",
-        f"  output:   {report['out_dir']}",
-        f"  quick:    {'yes' if report['quick'] else 'no'}"
-        f"   timeout: {report['timeout_seconds']:.0f}s",
+        f"mandate-check: {len(report['producers_selected'])} producer(s) run"
+        f" of {len(report['producers_declared'])} declared",
     ]
-    for mandate in MANDATE_IDS:
+    for producer in report["producers_selected"]:
+        record = report["producers"][producer]
+        lines.append(f"producer: {producer}  {record['package']}:{record['target']}")
+        lines.append(f"  checkout: {record['path'] or 'unresolved'}")
+        lines.append(
+            f"  revision: {record['revision'] or 'unresolved'}"
+            f" ({record['revision_source'] or 'no jj or git'})"
+        )
+        lines.append(
+            f"  tree:     {record['tree_id'] or 'unresolved'}"
+            f" ({record['tree_id_source'] or 'no jj or git'})"
+        )
+        lines.append(f"  command:  {' '.join(record['command'] or [])}")
+        lines.append(f"  log:      {record['log']}")
+        lines.append(
+            f"  exit:     {record['run']['exit_code']}"
+            f"{' (timed out)' if record['run']['timed_out'] else ''}"
+            f"   arms: {record['arms']}"
+        )
+    unselected = [
+        entry for entry in report["producers_declared"]
+        if entry not in report["producers_selected"]
+    ]
+    if unselected:
+        lines.append(f"  not selected: {', '.join(unselected)}")
+    lines.append(f"  output:   {report['out_dir']}")
+    lines.append(
+        f"  quick:    {'yes' if report['quick'] else 'no'}"
+        f"   timeout: {report['timeout_seconds']:.0f}s"
+    )
+    for mandate in report["mandate_order"]:
         record = report["mandates"][mandate]
         verdict = record["verdict"] or "MISSING"
         measured = " ".join(f"{key}={value}" for key, value in record["values"].items())
@@ -1204,8 +1515,15 @@ def verdict_block(report):
             lines.append(f"  duration: {duration:.2f}s (bracketed wall-clock)")
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
-    lines.append(f"arms: {len(report.get('arms') or [])} measured")
-    lines.extend(_arm_summary(report.get("arms") or [], report.get("arm_notes") or []))
+    arms = report.get("arms") or []
+    produced = sorted({arm.get("producer") for arm in arms if arm.get("producer")})
+    lines.append(
+        f"arms: {len(arms)} measured"
+        + (f" ({', '.join(produced)})" if len(produced) > 1 else "")
+    )
+    lines.extend(
+        _arm_summary(arms, report.get("arm_notes") or [], report)
+    )
     declaration = report.get("arm_declaration") or {}
     if declaration.get("source") is not None:
         lines.append(
@@ -1213,17 +1531,18 @@ def verdict_block(report):
             f"{Path(declaration.get('path') or '').name}"
         )
     duration = report["duration_seconds"]
+    order = report["mandate_order"]
     passed = sum(
-        1 for mandate in MANDATE_IDS if report["mandates"][mandate]["verdict"] == "PASS"
+        1 for mandate in order if report["mandates"][mandate]["verdict"] == "PASS"
     )
-    panels = sum(len(report["mandates"][mandate]["plots"]) for mandate in MANDATE_IDS)
+    panels = sum(len(report["mandates"][mandate]["plots"]) for mandate in order)
     if report["exit_code"] == EXIT_EVIDENCE_FAILURE:
         summary = (
-            f"evidence incomplete ({passed}/{len(MANDATE_IDS)} mandate line(s) said "
+            f"evidence incomplete ({passed}/{len(order)} mandate line(s) said "
             f"PASS, {panels} plot(s))"
         )
     else:
-        summary = f"{passed}/{len(MANDATE_IDS)} mandate(s) passed, {panels} plot(s)"
+        summary = f"{passed}/{len(order)} mandate(s) passed, {panels} plot(s)"
     lines.append(
         f"verdict: {'PASS' if report['ok'] else 'FAIL'}  exit={report['exit_code']}  "
         + summary
@@ -1235,51 +1554,64 @@ def verdict_block(report):
     return lines
 
 
-def evaluate(args, out_dir, report, run, declaration):
-    """Parse and verify the run, filling ``report`` and returning the exit code."""
-    log_path = out_dir / LOG_NAME
+def evaluate_producer(args, producer, out_dir, report, run, declaration):
+    """Parse and verify one producer's run, filling the report. Exit code back."""
+    record = report["producers"][producer["id"]]
+    log_path = out_dir / producer["log"]
     log_path.write_text(run["output"], encoding="utf-8")
-    report["smoke"] = {
+    record["run"] = {
         "exit_code": run["exit_code"],
         "timed_out": run["timed_out"],
         "log": str(log_path),
     }
-    # The per-test and per-mandate wall-clock observed on the child's output
+    # The per-test and per-section wall-clock observed on this child's output
     # stream, so a cost the declaration claims can be compared with what the
     # run actually took, per test, rather than only in total.
-    apply_mandate_timings(report, derive_timings(run.get("events") or [], SMOKE_TARGET))
+    apply_mandate_timings(
+        report,
+        derive_timings(run.get("events") or [], producer["target"]),
+        producer,
+    )
+    # This producer's own problems, so a report of several producers says which
+    # one broke and the exit code is decided per producer rather than by the
+    # union of everyone's evidence.
+    problems = []
     # What each arm measured, so a later run's coverage can be diffed against a
     # committed baseline instead of argued about.
-    apply_arm_records(report, run.get("events") or [], declaration)
-    problems = report["problems"]
+    arms = apply_arm_records(
+        report, run.get("events") or [], declaration, producer, problems
+    )
+    record["arms"] = len(arms)
     if run["timed_out"]:
         problems.append(
-            f"the smoke set did not finish within {args.timeout:.0f}s and was "
+            f"the test target did not finish within {args.timeout:.0f}s and was "
             f"killed; its partial output is {log_path}"
         )
     elif run["exit_code"] != 0:
         problems.append(
-            f"the smoke set exited {run['exit_code']} (compile or test failure); "
-            f"its output is {log_path}"
+            f"the test target exited {run['exit_code']} (compile or test "
+            f"failure); its output is {log_path}"
         )
 
-    records, parse_problems = parse_mandate_lines(run["output"])
+    records, parse_problems = parse_mandate_lines(
+        run["output"], tuple(producer["verdicts"])
+    )
     problems.extend(parse_problems)
-    for mandate in MANDATE_IDS:
+    for mandate in producer["verdicts"]:
         if mandate not in records:
             problems.append(
                 f"{mandate}: the smoke set printed no 'MANDATE {mandate} "
                 "<PASS|FAIL> ...' line, so this mandate was never measured"
             )
 
-    for mandate in MANDATE_IDS:
-        record = report["mandates"][mandate]
+    for mandate in producer["verdicts"]:
+        section = report["mandates"][mandate]
         parsed = records.get(mandate)
         if parsed is not None:
-            record["declared"] = True
-            record["verdict"] = parsed["verdict"]
-            record["values"] = parsed["values"]
-            record["raw_line"] = parsed["raw_line"]
+            section["declared"] = True
+            section["verdict"] = parsed["verdict"]
+            section["values"] = parsed["values"]
+            section["raw_line"] = parsed["raw_line"]
         summary, render_problems = render_mandate(
             mandate,
             out_dir,
@@ -1287,25 +1619,21 @@ def evaluate(args, out_dir, report, run, declaration):
             browser=args.browser,
         )
         if summary is not None:
-            record["plots"] = list(summary.get("svg") or []) + list(summary.get("png") or [])
-            record["series_counts"] = list(summary.get("series_counts") or [])
-            record["panels"] = summary.get("panels", 0)
+            section["plots"] = list(summary.get("svg") or []) + list(
+                summary.get("png") or []
+            )
+            section["series_counts"] = list(summary.get("series_counts") or [])
+            section["panels"] = summary.get("panels", 0)
             problems.extend(_verify_plots(mandate, summary))
         problems.extend(render_problems)
 
+    report["problems"].extend(
+        f"{producer['id']}: {problem}" for problem in problems
+    )
     if problems:
-        report["exit_code"] = EXIT_EVIDENCE_FAILURE
-        report["ok"] = False
-        report["verdict"] = "FAIL"
         return EXIT_EVIDENCE_FAILURE
-
-    failed = [m for m in MANDATE_IDS if report["mandates"][m]["verdict"] == "FAIL"]
-    report["ok"] = not failed
-    report["verdict"] = "PASS" if not failed else "FAIL"
-    if failed:
-        report["exit_code"] = EXIT_MANDATE_FAILURE
+    if any(report["mandates"][mandate]["verdict"] == "FAIL" for mandate in producer["verdicts"]):
         return EXIT_MANDATE_FAILURE
-    report["exit_code"] = EXIT_OK
     return EXIT_OK
 
 
@@ -1324,9 +1652,32 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="mandate-check",
         description=(
-            "Run the tri-mandate perf smoke set (rtp_mux's mandate_smoke target), "
-            "render each mandate's panels, print a verdict block, and write "
-            "mandate-check.json as machine-checkable evidence."
+            "Run the perf producers declared in tools/mandate-producers.json "
+            "(rtp_mux's mandate_smoke smoke set and netem_test's perf-tier "
+            "probes by default), render each mandate's panels, print a verdict "
+            "block, and write mandate-check.json as machine-checkable evidence "
+            "for every producer's arms."
+        ),
+    )
+    parser.add_argument(
+        "--producer",
+        action="append",
+        default=None,
+        metavar="ID",
+        help=(
+            "run only this producer, repeatably; with none named every "
+            "declared producer runs, so one run records every producer's arms"
+        ),
+    )
+    parser.add_argument(
+        "--producer-path",
+        action="append",
+        default=None,
+        metavar="ID=PATH",
+        help=(
+            "point one producer at another checkout (repeatable), resolved "
+            "against the current directory; the default is the "
+            "producer's declared default_path, resolved against this workspace"
         ),
     )
     parser.add_argument(
@@ -1334,8 +1685,9 @@ def parse_args(argv):
         type=Path,
         default=None,
         help=(
-            "the rtp_mux checkout holding the smoke set "
-            f"(default: the sibling ../{SMOKE_PACKAGE} of this workspace)"
+            "the rtp_mux checkout holding the smoke set; the documented "
+            "shorthand for --producer-path rtp_mux=<path> "
+            f"(default: the sibling ../{PRIMARY_PRODUCER} of this workspace)"
         ),
     )
     parser.add_argument(
@@ -1351,20 +1703,24 @@ def parse_args(argv):
         "--quick",
         action="store_true",
         help=(
-            f"set {QUICK_ENV}=1 so the smoke set takes its shortest windows; "
-            "the assertions and the evidence files must still be complete"
+            f"set {QUICK_ENV}=1 so a producer that honours it takes its "
+            "shortest windows; the assertions and the evidence files must "
+            "still be complete"
         ),
     )
     parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
-        help=f"seconds before the smoke set is killed (default: {DEFAULT_TIMEOUT_SECONDS:.0f})",
+        help=(
+            "seconds before a producer is killed (default: "
+            f"{DEFAULT_TIMEOUT_SECONDS:.0f}, applied per producer)"
+        ),
     )
     parser.add_argument(
         "--cargo",
         default=DEFAULT_CARGO,
-        help=f"cargo executable to build and run the smoke set (default: {DEFAULT_CARGO})",
+        help=f"cargo executable to build and run the producers (default: {DEFAULT_CARGO})",
     )
     parser.add_argument(
         "--browser",
@@ -1384,9 +1740,52 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
+def producer_overrides(args):
+    """``(overrides, problems)``: the per-producer checkout paths the CLI names.
+
+    ``--producer-path <id>=<path>`` is the general form and ``--rtp-mux
+    <path>`` the documented shorthand for the primary producer; an explicit
+    ``--producer-path`` for that producer wins over the shorthand.
+    """
+    overrides = {}
+    problems = []
+    for token in args.producer_path or []:
+        producer, separator, path = token.partition("=")
+        if not separator or not producer or not path:
+            problems.append(f"--producer-path {token!r} is not <id>=<path>")
+            continue
+        overrides[producer] = Path(path)
+    if args.rtp_mux is not None:
+        overrides.setdefault(PRIMARY_PRODUCER, args.rtp_mux)
+    return overrides, problems
+
+
+def select_producers(declared, requested, problems):
+    """The producers to run: those named, or every declared producer.
+
+    With none named the run records **every** declared producer, so a single
+    invocation produces per-arm records for all of them rather than only the
+    one this command was first built for.
+    """
+    by_id = {entry["id"]: entry for entry in declared}
+    if not requested:
+        return list(declared)
+    selected = []
+    for name in requested:
+        if name not in by_id:
+            problems.append(
+                f"--producer {name!r} is not one of {', '.join(by_id)}"
+            )
+            continue
+        if by_id[name] not in selected:
+            selected.append(by_id[name])
+    return selected
+
+
 def main(argv=None):
     args = parse_args(argv)
     started = time.monotonic()
+    declaration_problems = []
     try:
         if args.timeout <= 0:
             raise MandateCheckError("--timeout must be positive")
@@ -1394,56 +1793,138 @@ def main(argv=None):
             out_dir = args.dir.expanduser().resolve()
         else:
             out_dir = default_out_dir()
-        # The run directory is cleared before anything is validated, so that
-        # no later failure can leave an earlier run's report standing where a
+        # The producer registry is only read (never written) before the run
+        # directory is cleared, so every producer's log is cleared with it; the
+        # clearing itself happens before any producer is built or validated, so
+        # no exit path can leave an earlier run's report standing where a
         # comparison would read it as this run's.
-        prepare_output_dir(out_dir)
-        crate = resolve_crate(args.rtp_mux)
+        producers_declaration = load_producer_declaration(
+            MODULE_DIR / PRODUCERS_DECLARATION_NAME, declaration_problems
+        )
+        logs = [
+            entry["log"]
+            for entry in (producers_declaration or {}).get("producers") or []
+        ] or [LOG_NAME]
+        prepare_output_dir(out_dir, logs)
+        if declaration_problems:
+            raise MandateCheckError("; ".join(declaration_problems))
+        overrides, override_problems = producer_overrides(args)
+        if override_problems:
+            raise MandateCheckError("; ".join(override_problems))
+        selection_problems = []
+        selected = select_producers(
+            producers_declaration["producers"], args.producer, selection_problems
+        )
+        if selection_problems or not selected:
+            raise MandateCheckError("; ".join(selection_problems) or "no producer selected")
+        resolved = {}
+        for entry in selected:
+            crate, problem = resolve_producer(entry, overrides.get(entry["id"]))
+            if problem is not None:
+                raise MandateCheckError(problem)
+            resolved[entry["id"]] = crate
         cargo = shutil.which(args.cargo)
         if cargo is None:
             raise MandateCheckError(
-                f"the cargo executable {args.cargo!r} was not found on PATH, so the "
-                "smoke set cannot be built"
+                f"the cargo executable {args.cargo!r} was not found on PATH, so no "
+                "producer can be built"
             )
     except MandateCheckError as error:
         print(f"mandate-check: error: {error}", file=sys.stderr)
         return EXIT_EVIDENCE_FAILURE
 
-    declaration_problems = []
+    arm_problems = []
     declaration = load_arm_declaration(
-        MODULE_DIR / ARMS_DECLARATION_NAME, declaration_problems
+        MODULE_DIR / ARMS_DECLARATION_NAME, arm_problems
     )
-    if declaration_problems:
-        for problem in declaration_problems:
+    if arm_problems:
+        for problem in arm_problems:
             print(f"mandate-check: error: {problem}", file=sys.stderr)
         return EXIT_EVIDENCE_FAILURE
 
-    revision = resolve_revision(crate)
-    tree = resolve_tree_id(crate, revision[0], revision[2])
-    command = smoke_command(cargo)
-    report = build_report(args, crate, out_dir, command, revision, tree, args.quick, args.timeout)
-    try:
-        run = run_smoke(
-            command,
-            crate=crate,
-            out_dir=out_dir,
-            quick=args.quick,
-            timeout=args.timeout,
-        )
-        exit_code = evaluate(args, out_dir, report, run, declaration)
-        report["duration_seconds"] = round(time.monotonic() - started, 3)
-        write_report(out_dir, report)
-    except OSError as error:
-        print(f"mandate-check: error: {error}", file=sys.stderr)
-        return EXIT_EVIDENCE_FAILURE
+    report = build_report(
+        args,
+        out_dir,
+        producers_declaration["producers"],
+        [entry["id"] for entry in selected],
+        args.quick,
+        args.timeout,
+    )
+    codes = []
+    runs = {}
+    for entry in selected:
+        crate = resolved[entry["id"]]
+        revision = resolve_revision(crate)
+        tree = resolve_tree_id(crate, revision[0], revision[2])
+        command = producer_command(cargo, entry)
+        record = report["producers"][entry["id"]]
+        record["selected"] = True
+        record["path"] = str(crate)
+        record["command"] = command
+        record["revision"], record["change_id"], record["revision_source"] = revision
+        record["tree_id"], record["tree_id_source"] = tree
+        try:
+            run = run_producer(
+                command,
+                crate=crate,
+                out_dir=out_dir,
+                quick=args.quick,
+                timeout=args.timeout,
+            )
+        except OSError as error:
+            print(f"mandate-check: error: {entry['id']}: {error}", file=sys.stderr)
+            return EXIT_EVIDENCE_FAILURE
+        runs[entry["id"]] = run
+        codes.append(evaluate_producer(args, entry, out_dir, report, run, declaration))
+
+    # The records a `mandate-check/4` reader reads: the primary producer's
+    # identity, command and run, or null when it was not selected this run.
+    primary = report["producers"].get(PRIMARY_PRODUCER) or {}
+    if primary.get("selected"):
+        report["rtp_mux"] = {
+            key: primary[key]
+            for key in (
+                "path",
+                "revision",
+                "change_id",
+                "revision_source",
+                "tree_id",
+                "tree_id_source",
+            )
+        }
+        report["smoke"] = {
+            "producer": PRIMARY_PRODUCER,
+            "exit_code": primary["run"]["exit_code"],
+            "timed_out": primary["run"]["timed_out"],
+            "log": primary["run"]["log"],
+        }
+    first = report["producers"].get(report["producers_selected"][0]) or {}
+    report["command"] = first.get("command")
+    report["cwd"] = first.get("path")
+    if EXIT_EVIDENCE_FAILURE in codes:
+        exit_code = EXIT_EVIDENCE_FAILURE
+    elif EXIT_MANDATE_FAILURE in codes:
+        exit_code = EXIT_MANDATE_FAILURE
+    else:
+        exit_code = EXIT_OK
+    report["exit_code"] = exit_code
+    report["ok"] = exit_code == EXIT_OK
+    report["verdict"] = "PASS" if report["ok"] else "FAIL"
+    report["duration_seconds"] = round(time.monotonic() - started, 3)
+    write_report(out_dir, report)
     for line in verdict_block(report):
         print(line)
-    if exit_code != EXIT_OK and (run["timed_out"] or run["exit_code"] != 0):
+    for entry in selected:
+        run = runs[entry["id"]]
+        if not (run["timed_out"] or run["exit_code"] != 0):
+            continue
         tail = _log_tail(run["output"])
-        if tail:
-            print(f"--- last {len(tail)} line(s) of {out_dir / LOG_NAME} ---", file=sys.stderr)
-            for line in tail:
-                print(line, file=sys.stderr)
+        if not tail:
+            continue
+        log = report["producers"][entry["id"]]["log"]
+        print(f"--- last {len(tail)} line(s) of {log} ---", file=sys.stderr)
+        for line in tail:
+            print(line, file=sys.stderr)
     return exit_code
 
 

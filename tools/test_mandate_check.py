@@ -37,27 +37,44 @@ import time
 NEWLINE = chr(10)
 
 
+def package_of(argv):
+    for index, token in enumerate(argv):
+        if token in ("-p", "--package") and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
 def main():
     plan_path = os.environ.get("FAKE_CARGO_PLAN")
     if not plan_path:
         print("fake cargo: FAKE_CARGO_PLAN is not set", file=sys.stderr)
         return 97
     plan = json.loads(pathlib.Path(plan_path).read_text(encoding="utf-8"))
+    argv = sys.argv[1:]
+    package = package_of(argv)
+    # A plan may carry one sub-plan per package so a two-producer run can be
+    # exercised end to end; without one the whole plan is the response, which
+    # is what every one-producer test uses.
+    plan = (plan.get("by_package") or {}).get(package) or plan
     out = os.environ.get("MANDATE_CHECK_DIR")
     if out is None:
         print("fake cargo: MANDATE_CHECK_DIR is not set", file=sys.stderr)
         return 98
-    pathlib.Path(os.environ["FAKE_CARGO_RECORD"]).write_text(
-        json.dumps(
-            {
-                "argv": sys.argv[1:],
-                "cwd": os.getcwd(),
-                "mandate_check_dir": out,
-                "quick": os.environ.get("MANDATE_SMOKE_QUICK"),
-            }
-        ),
-        encoding="utf-8",
-    )
+    # One JSON line per invocation: a two-producer run invokes this twice, and
+    # a reader that wants the first may have it.
+    with open(os.environ["FAKE_CARGO_RECORD"], "a", encoding="utf-8") as record:
+        record.write(
+            json.dumps(
+                {
+                    "argv": argv,
+                    "package": package,
+                    "cwd": os.getcwd(),
+                    "mandate_check_dir": out,
+                    "quick": os.environ.get("MANDATE_SMOKE_QUICK"),
+                }
+            )
+            + NEWLINE
+        )
     if plan.get("sleep"):
         time.sleep(plan["sleep"])
     for line in plan.get("stdout") or []:
@@ -316,6 +333,28 @@ def arm_lines(lines):
     return [line for line in lines if line.startswith("[mandate-smoke ")]
 
 
+# A second producer's stdout: this crate's own perf-tier probes, in the arm-line
+# shape `tools/mandate-check` records (label, `section=`, and the sample count
+# the probe ran). No `MANDATE` line and no evidence file, because a report-only
+# probe asserts no bound to declare — which is what `section=` is for.
+PROBE_LINES = [
+    "running 4 tests",
+    "[mandate-smoke forwarding] section=probe recv=200000 direct_mpps=3.157 "
+    "filter_mpps=513.149 queued_mpps=2.105",
+    "test tests::clean_forwarding_perf_probe ... ok",
+    "[mandate-smoke deadline] section=probe recv=1000 median_us=0.125 "
+    "idle_poll_us=5000.000",
+    "test tests::short_deadline_latency_perf_probe ... ok",
+    "[mandate-smoke std-udp] section=probe recv=21 operations=2000 "
+    "connected_rps=27259 unconnected_rps=23793 speedup=1.146",
+    "test tests::std_udp_connected_peer_perf_probe ... ok",
+    "[mandate-smoke dest-cache] section=probe recv=5000000 cached_ns=12.86 "
+    "locked_ns=25.80 speedup=2.01",
+    "test tests::learned_destination_cache_perf_probe ... ok",
+    "test result: ok. 4 passed; 0 failed",
+]
+
+
 class MandateCheckTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/tmp"))
@@ -331,6 +370,16 @@ class MandateCheckTest(unittest.TestCase):
         self.cargo = self.root / "fake-cargo"
         self.cargo.write_text(FAKE_CARGO, encoding="utf-8")
         self.cargo.chmod(0o755)
+        # A stand-in second producer's checkout: enough for the runner's source
+        # check, and pointed at by --producer-path in the two-producer tests.
+        self.probe_crate = self.root / "netem_test"
+        (self.probe_crate / "src").mkdir(parents=True)
+        (self.probe_crate / "Cargo.toml").write_text(
+            '[package]\nname = "netem_test"\nversion = "0.1.0"\n', encoding="utf-8"
+        )
+        (self.probe_crate / "src" / "lib.rs").write_text(
+            "// the perf-tier probes\n", encoding="utf-8"
+        )
         self.out = self.root / "run"
         self.record = self.root / "cargo-record.json"
         self.plan_path = self.root / "plan.json"
@@ -355,8 +404,46 @@ class MandateCheckTest(unittest.TestCase):
         plan.update(overrides)
         return plan
 
-    def run_tool(self, plan, *extra, no_rasterize=True, browser=None, extra_env=None):
+    def two_producer_plan(self, probes=None, **overrides):
+        """One plan carrying a sub-plan per package, for a two-producer run.
+
+        The `rtp_mux` sub-plan is the healthy smoke set; the `netem_test`
+        sub-plan is the probes' arm lines and no evidence.
+        """
+        plan = self.healthy_plan()
+        probes = PROBE_LINES if probes is None else probes
+        # Keyed by the cargo package name the runner invokes, which is the
+        # package's own name and not the producer's registry id.
+        plan["by_package"] = {
+            "rtp_mux": self.healthy_plan(),
+            "netem-test": {"exit": 0, "stdout": list(probes), "stderr": []},
+        }
+        plan.update(overrides)
+        return plan
+
+    def run_two_producers(self, plan, *extra, **kwargs):
+        """Run both producers against a fake cargo, with the probe checkout."""
+        return self.run_tool(
+            plan,
+            "--producer-path",
+            f"netem_test={self.probe_crate}",
+            producers=("rtp_mux", "netem_test"),
+            *extra,
+            **kwargs,
+        )
+
+    def run_tool(
+        self,
+        plan,
+        *extra,
+        no_rasterize=True,
+        browser=None,
+        extra_env=None,
+        producers=("rtp_mux",),
+    ):
         self.plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        if self.record.exists():
+            self.record.unlink()
         env = {
             "FAKE_CARGO_PLAN": str(self.plan_path),
             "FAKE_CARGO_RECORD": str(self.record),
@@ -370,6 +457,10 @@ class MandateCheckTest(unittest.TestCase):
             "--dir",
             str(self.out),
         ]
+        # The default producer set is every declared producer, so a test that
+        # wants one producer names it; `producers=()` runs the default set.
+        for name in producers:
+            arguments += ["--producer", name]
         if no_rasterize:
             arguments.append("--no-rasterize")
         if browser is not None:
@@ -386,7 +477,15 @@ class MandateCheckTest(unittest.TestCase):
         return json.loads((self.out / MANDATE_CHECK.REPORT_NAME).read_text(encoding="utf-8"))
 
     def cargo_record(self):
-        return json.loads(self.record.read_text(encoding="utf-8"))
+        return self.cargo_records()[0]
+
+    def cargo_records(self):
+        lines = [
+            line
+            for line in self.record.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return [json.loads(line) for line in lines]
 
     def reject(self, plan, fragment, *extra, **kwargs):
         """Assert one run is refused non-zero, naming the problem."""
@@ -822,11 +921,15 @@ class MandateCheckTest(unittest.TestCase):
             )
         self.assertEqual(MANDATE_CHECK.resolve_tree_id(self.crate, None, None), (None, None))
 
-    def test_report_records_each_arm_measurement_schema_four(self):
+    def test_report_records_each_arm_measurement_schema_five(self):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         report = self.report()
-        self.assertEqual(report["schema"], "mandate-check/4")
+        self.assertEqual(report["schema"], "mandate-check/5")
+        self.assertEqual(
+            [arm["producer"] for arm in report["arms"]],
+            ["rtp_mux"] * len(report["arms"]),
+        )
         arms = {arm["id"]: arm for arm in report["arms"]}
         self.assertEqual(
             sorted(arms),
@@ -1198,7 +1301,7 @@ class MandateCheckTest(unittest.TestCase):
             stderr=["error[E0425]: cannot find value `nope` in this scope"],
             mandates={},
         )
-        code, stdout, stderr = self.reject(plan, "the smoke set exited 101")
+        code, stdout, stderr = self.reject(plan, "the test target exited 101")
         self.assertEqual(code, 2)
         self.assertIn("cannot find value `nope`", stderr)
         self.assertIn("mandate-smoke.log", stdout)
@@ -1295,6 +1398,209 @@ class MandateCheckTest(unittest.TestCase):
         self.assertIn("'p99' is repeated", problems[0])
         self.assertIn("is not a <key>=<value> token", problems[1])
         self.assertIn("without a single key=value measurement", problems[2])
+
+    # -- the second producer, end to end -----------------------------------
+
+    def test_a_run_records_every_declared_producers_arms(self):
+        code, stdout, stderr = self.run_tool(
+            self.two_producer_plan(),
+            "--producer-path",
+            f"netem_test={self.probe_crate}",
+            producers=(),
+        )
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["producers_declared"], ["rtp_mux", "netem_test"])
+        self.assertEqual(report["producers_selected"], ["rtp_mux", "netem_test"])
+        by_producer = {}
+        for arm in report["arms"]:
+            by_producer.setdefault(arm["producer"], []).append(arm["id"])
+        self.assertEqual(sorted(by_producer), ["netem_test", "rtp_mux"])
+        self.assertEqual(len(by_producer["rtp_mux"]), 16)
+        self.assertEqual(
+            sorted(by_producer["netem_test"]),
+            [
+                "probe/deadline",
+                "probe/dest-cache",
+                "probe/forwarding",
+                "probe/std-udp",
+            ],
+        )
+        self.assertEqual(report["producers"]["netem_test"]["arms"], 4)
+        self.assertEqual(report["producers"]["netem_test"]["target"], "lib")
+        self.assertFalse(report["producers"]["netem_test"]["verdicts"])
+        # The record a `mandate-check/4` reader reads stays the primary
+        # producer's, not the second one's.
+        self.assertEqual(report["smoke"]["producer"], "rtp_mux")
+        self.assertEqual(
+            report["command"], report["producers"]["rtp_mux"]["command"]
+        )
+        self.assertEqual(report["rtp_mux"]["path"], str(self.crate.resolve()))
+        self.assertIn("arms: 20 measured (netem_test, rtp_mux)", stdout)
+        self.assertIn("producer: netem_test  netem_test:lib", stdout)
+        self.assertIn(
+            "probe arms: 4 (deadline, dest-cache, forwarding, std-udp)", stdout
+        )
+        records = self.cargo_records()
+        self.assertEqual(
+            [record["package"] for record in records], ["rtp_mux", "netem-test"]
+        )
+        self.assertEqual(
+            records[1]["argv"],
+            [
+                "test",
+                "--release",
+                "-p",
+                "netem-test",
+                "--lib",
+                "--",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ],
+        )
+        self.assertEqual(
+            [entry["producer"] for entry in report["timings"]["tests"]],
+            ["rtp_mux"] * 4 + ["netem_test"] * 4,
+        )
+        self.assertEqual(
+            [entry["target"] for entry in report["timings"]["tests"]],
+            ["mandate_smoke"] * 4 + ["lib"] * 4,
+        )
+
+    def test_the_second_producers_arms_keep_their_own_sample_counts(self):
+        code, _, stderr = self.run_two_producers(self.two_producer_plan())
+        self.assertEqual(code, 0, stderr)
+        arms = {arm["id"]: arm for arm in self.report()["arms"]}
+        forwarding = arms["probe/forwarding"]
+        self.assertEqual(forwarding["mandate"], "probe")
+        self.assertEqual(forwarding["label"], "forwarding")
+        self.assertEqual(forwarding["dialect"], "kv")
+        self.assertEqual(forwarding["sample_count"], 200000)
+        self.assertEqual(forwarding["values"]["section"], "probe")
+        self.assertEqual(forwarding["values"]["direct_mpps"], 3.157)
+        self.assertEqual(
+            forwarding["cells"],
+            ["probe-forwarding@metric=throughput+layer=netem-runner"],
+        )
+        # A probe measures no window, so its record invents none: the measured
+        # geometry the comparison reads is the sample count it actually ran.
+        self.assertEqual(forwarding["windows"], {})
+        self.assertEqual(arms["probe/std-udp"]["sample_count"], 21)
+        self.assertEqual(arms["probe/dest-cache"]["sample_count"], 5000000)
+        self.assertEqual(arms["probe/deadline"]["sample_count"], 1000)
+
+    def test_a_producer_whose_arm_lines_are_gone_is_refused(self):
+        plan = self.two_producer_plan(
+            probes=["running 4 tests", "test result: ok. 4 passed; 0 failed"]
+        )
+        code, stdout, _ = self.run_two_producers(plan)
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("netem_test: probe: no '[mandate-smoke", stdout)
+        # The other producer's arms are still recorded: one producer's failure
+        # does not delete the other's evidence.
+        self.assertEqual(
+            len(
+                [
+                    arm
+                    for arm in self.report()["arms"]
+                    if arm["producer"] == "rtp_mux"
+                ]
+            ),
+            16,
+        )
+
+    def test_an_arm_whose_section_the_producer_does_not_declare_is_refused(self):
+        plan = self.two_producer_plan(
+            probes=[
+                line.replace("section=probe", "section=mandate") for line in PROBE_LINES
+            ]
+        )
+        code, stdout, _ = self.run_two_producers(plan)
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("'mandate/forwarding'", stdout)
+        self.assertIn("does not declare", stdout)
+
+    def test_an_arm_with_no_section_token_before_any_mandate_line_is_refused(self):
+        plan = self.two_producer_plan(
+            probes=[line.replace(" section=probe", "") for line in PROBE_LINES]
+        )
+        code, stdout, _ = self.run_two_producers(plan)
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("cannot be attributed to a mandate", stdout)
+
+    def test_a_missing_producer_source_is_refused(self):
+        (self.probe_crate / "src" / "lib.rs").unlink()
+        code, _, stderr = self.run_two_producers(self.two_producer_plan())
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("netem_test", stderr)
+        self.assertIn("does not exist", stderr)
+
+    def test_unknown_producer_selection_is_refused(self):
+        code, _, stderr = self.run_tool(self.healthy_plan(), "--producer", "nope")
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("--producer 'nope' is not one of rtp_mux, netem_test", stderr)
+
+    def test_a_malformed_producer_path_is_refused(self):
+        code, _, stderr = self.run_tool(
+            self.healthy_plan(), "--producer-path", "netem_test"
+        )
+        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertIn("is not <id>=<path>", stderr)
+
+    def test_the_registry_declares_the_primary_producers_default_checkout(self):
+        problems = []
+        declaration = MANDATE_CHECK.load_producer_declaration(
+            WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME, problems
+        )
+        self.assertEqual(problems, [])
+        primary = [
+            entry
+            for entry in declaration["producers"]
+            if entry["id"] == MANDATE_CHECK.PRIMARY_PRODUCER
+        ]
+        self.assertEqual(len(primary), 1)
+        self.assertEqual(
+            MANDATE_CHECK.producer_checkout(primary[0]),
+            MANDATE_CHECK.default_crate_path(),
+        )
+
+    def test_the_shipped_registry_and_arm_declaration_cover_the_second_producer(self):
+        problems = []
+        declaration = MANDATE_CHECK.load_producer_declaration(
+            WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME, problems
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            [entry["id"] for entry in declaration["producers"]],
+            ["rtp_mux", "netem_test"],
+        )
+        arm_problems = []
+        arm_declaration = MANDATE_CHECK.load_arm_declaration(
+            WORKSPACE / "tools" / MANDATE_CHECK.ARMS_DECLARATION_NAME, arm_problems
+        )
+        self.assertEqual(arm_problems, [])
+        cells = arm_declaration["cells"]
+        for entry in declaration["producers"]:
+            for section in entry["sections"]:
+                self.assertTrue(
+                    any(key.startswith(f"{section}/") for key in cells),
+                    f"no declared cell for the section {section}",
+                )
+
+    def test_a_section_declared_by_two_producers_is_refused(self):
+        path = self.root / "producers.json"
+        declaration = json.loads(
+            (
+                WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME
+            ).read_text(encoding="utf-8")
+        )
+        declaration["producers"][1]["sections"] = ["M1", "probe"]
+        declaration["producers"][1]["verdicts"] = []
+        path.write_text(json.dumps(declaration), encoding="utf-8")
+        problems = []
+        self.assertIsNone(MANDATE_CHECK.load_producer_declaration(path, problems))
+        self.assertIn("is declared by both", " ".join(problems))
 
     def test_default_rtp_mux_is_the_sibling_checkout(self):
         self.assertEqual(

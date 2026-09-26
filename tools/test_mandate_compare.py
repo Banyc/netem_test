@@ -30,6 +30,7 @@ SPEC.loader.exec_module(MANDATE_COMPARE)
 
 M1_CELL = "M1@impairment=clean+lane=dual+metric=p99"
 M4_CELL = "M4@lane=dual+flows=4+metric=per-flow-share"
+PROBE_CELL = "probe-forwarding@metric=throughput+layer=netem-runner"
 
 
 def arm(
@@ -82,7 +83,7 @@ def arm(
 
 def report(arms, quick=False, schema="mandate-check/3", mandates=("M1", "M2", "M3", "M4")):
     """One `mandate-check.json` fixture."""
-    return {
+    payload = {
         "schema": schema,
         "ok": True,
         "exit_code": 0,
@@ -94,6 +95,16 @@ def report(arms, quick=False, schema="mandate-check/3", mandates=("M1", "M2", "M
         },
         "arms": arms,
     }
+    named = sorted({entry.get("producer") for entry in arms if entry.get("producer")})
+    if named:
+        # A `mandate-check/5` report records the producers it covers; the arms'
+        # own `producer` field is what the comparison reads when it is absent.
+        payload["producers"] = {
+            entry: {"id": entry, "selected": True} for entry in named
+        }
+        payload["producers_declared"] = named
+        payload["producers_selected"] = named
+    return payload
 
 
 def baseline_report():
@@ -132,6 +143,74 @@ class MandateCompareTest(unittest.TestCase):
         self.assertEqual(code, MANDATE_COMPARE.EXIT_UNCOMPARABLE, stdout + stderr)
         self.assertIn(fragment, stdout + stderr)
         return code, stdout, stderr
+
+    # -- two producers in one comparison ------------------------------------
+
+    def two_producer_report(self, probes=True):
+        """A report covering `rtp_mux`'s three arms and one probe arm."""
+        arms = baseline_report()["arms"]
+        for entry in arms:
+            entry["producer"] = "rtp_mux"
+        if probes:
+            probe = arm(
+                "probe/forwarding",
+                sample_count=200000,
+                wire=0,
+                cells=(PROBE_CELL,),
+            )
+            probe["producer"] = "netem_test"
+            # A probe measures no window, so its record carries none.
+            probe["windows"] = {}
+            arms = arms + [probe]
+        return report(arms)
+
+    def write_baseline(self, payload, name="two-producer.json"):
+        path = self.root / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_two_producers_are_compared_and_both_are_named(self):
+        base = self.write_baseline(self.two_producer_report())
+        code, stdout, stderr = self.run_tool(self.two_producer_report(), baseline=base)
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("producers: netem_test, rtp_mux (2 covered)", stdout)
+        self.assertIn("ok   probe/forwarding", stdout)
+
+    def test_a_producer_the_candidate_dropped_is_a_coverage_regression(self):
+        base = self.write_baseline(self.two_producer_report())
+        code, stdout, _ = self.run_tool(
+            self.two_producer_report(probes=False), baseline=base
+        )
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION)
+        self.assertIn("probe/forwarding", stdout)
+        self.assertIn("absent: coverage regression", stdout)
+        self.assertIn("producers: rtp_mux (1 covered)", stdout)
+
+    def test_a_second_producers_halved_sample_count_is_a_coverage_regression(self):
+        base = self.write_baseline(self.two_producer_report())
+        candidate = self.two_producer_report()
+        for entry in candidate["arms"]:
+            if entry["id"] == "probe/forwarding":
+                entry["sample_count"] = 100000
+                entry["counters"]["received"] = 100000
+                entry["counters"]["sent"] = 100000
+        code, stdout, _ = self.run_tool(candidate, baseline=base)
+        self.assertEqual(code, MANDATE_COMPARE.EXIT_COVERAGE_REGRESSION)
+        self.assertIn("sample_count 200000 -> 100000", stdout)
+
+    def test_a_report_without_producer_records_names_the_arms_producers(self):
+        base = self.write_baseline(self.two_producer_report())
+        candidate = self.two_producer_report()
+        for key in ("producers", "producers_declared", "producers_selected"):
+            candidate.pop(key)
+        code, stdout, _ = self.run_tool(candidate, baseline=base)
+        self.assertEqual(code, 0)
+        self.assertIn("producers: netem_test, rtp_mux (2 covered)", stdout)
+
+    def test_a_report_with_no_producer_information_is_named_unnamed(self):
+        code, stdout, _ = self.run_tool(baseline_report())
+        self.assertEqual(code, 0)
+        self.assertIn("producers: unnamed (0 covered)", stdout)
 
     # -- the honest cases ---------------------------------------------------
 
