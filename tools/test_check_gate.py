@@ -584,6 +584,174 @@ class CheckGatePerfTest(unittest.TestCase):
         self.write_gate(budgets=BASE_BUDGETS + "\nnonsense = fast")
         self.rejects("is neither a tier nor one of baseline/drift/drift_floor_s")
 
+    # -- several named baselines (one per measurement family) --------------
+
+    def test_a_row_naming_an_undeclared_baseline_family_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ok = default | 0.1 | orthogonal",
+                "alpha::t_ok = default | 0.1 | orthogonal@nope",
+            )
+        )
+        output = self.rejects(
+            "alpha::t_ok: it names the baseline family 'nope', which gate-budgets "
+            "does not declare"
+        )
+        self.assertIn("declare `baseline.nope = <row>`", output)
+
+    def test_a_named_baseline_naming_no_row_fails(self):
+        self.write_gate(
+            budgets=BASE_BUDGETS + "\nbaseline.ghost = alpha::t_missing"
+        )
+        self.rejects(
+            "baseline.ghost names 'alpha::t_missing', which is not a "
+            "gate-perf-design row"
+        )
+
+    def test_a_declared_baseline_no_row_uses_fails(self):
+        self.write_gate(
+            design="\n".join(
+                [
+                    "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                    "alpha::t_ok = default | 0.1 | orthogonal | conformance-alpha@impairment=delay20ms",
+                    "alpha::t_ig = perf | 0.2 | baseline@widow | probe-alpha@metric=throughput+scale=200-pkt",
+                    "lib::tests::probe = perf | 0.3 | re-measurement(second-tier-repeat) | probe-runner@impairment=none",
+                ]
+            ),
+            budgets=BASE_BUDGETS + "\nbaseline.widow = alpha::t_ig",
+        )
+        self.rejects(
+            "baseline.widow = alpha::t_ig is declared but no row states a "
+            "relation against it"
+        )
+
+    def test_a_row_labelled_the_wrong_familys_baseline_fails(self):
+        self.write_gate(
+            design="\n".join(
+                [
+                    "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                    "alpha::t_ok = default | 0.1 | baseline@fam-a | conformance-alpha@impairment=delay20ms",
+                    "alpha::t_ig = perf | 0.2 | baseline@fam-b | probe-alpha@metric=throughput+scale=200-pkt",
+                    "lib::tests::probe = perf | 0.3 | orthogonal@fam-a | probe-runner@metric=throughput",
+                ]
+            ),
+            budgets=BASE_BUDGETS
+            + "\nbaseline.fam-a = alpha::t_ig\nbaseline.fam-b = alpha::t_ok",
+        )
+        output = self.rejects(
+            "alpha::t_ok: it is labelled `baseline@fam-a`, but baseline.fam-a "
+            "is alpha::t_ig"
+        )
+        self.assertIn("a baseline label names only the family", output)
+
+    def test_a_named_familys_reference_must_carry_its_family_label(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ok = default | 0.1 | orthogonal | conformance-alpha@impairment=delay20ms",
+                "alpha::t_ok = default | 0.1 | baseline | conformance-alpha@impairment=delay20ms",
+            ),
+            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+        )
+        output = self.rejects(
+            "alpha::t_ok: it is the reference row of baseline.delay "
+            "(alpha::t_ok)"
+        )
+        self.assertIn("write `baseline@delay`", output)
+
+    def test_a_row_that_is_two_families_reference_row_fails(self):
+        self.write_gate(
+            design=BASE_DESIGN.replace(
+                "alpha::t_ok = default | 0.1 | orthogonal",
+                "alpha::t_ok = default | 0.1 | baseline@fam-a",
+            ),
+            budgets=BASE_BUDGETS
+            + "\nbaseline.fam-a = alpha::t_ok\nbaseline.fam-b = alpha::t_ok",
+        )
+        self.rejects("alpha::t_ok' is the reference row of baseline.fam-a, baseline.fam-b")
+
+    def test_a_named_family_is_derived_against_its_own_baseline(self):
+        """The member is orthogonal to its family's reference, not the default.
+
+        Against the default (``impairment=none``) the member would vary two
+        dimensions (``metric``, ``scale``); against its own family's reference
+        (``impairment=delay20ms``) it varies exactly one.
+        """
+        self.write_gate(
+            design="\n".join(
+                [
+                    "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                    "alpha::t_ok = default | 0.1 | baseline@delay | conformance-alpha@impairment=delay20ms",
+                    "alpha::t_ig = perf | 0.2 | composite(metric,scale) | probe-alpha@metric=throughput+scale=200-pkt",
+                    "lib::tests::probe = perf | 0.3 | orthogonal@delay | probe-runner@impairment=none",
+                ]
+            ),
+            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+        )
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn(
+            "gate-perf-relations: 1 orthogonal, 1 composite, 0 re-measurement, "
+            "2 baseline of 4 row(s) across 2 baseline(s)",
+            output,
+        )
+        self.assertIn(
+            "gate-perf-family: delay(alpha::t_ok) 1 orthogonal, 0 composite, "
+            "0 re-measurement, 1 baseline",
+            output,
+        )
+        self.assertIn(
+            "gate-perf-composite: alpha::t_ig varies metric, scale against "
+            "beta::t_beta",
+            output,
+        )
+
+    def test_a_member_of_a_named_family_is_refused_the_wrong_label(self):
+        self.write_gate(
+            design="\n".join(
+                [
+                    "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                    "alpha::t_ok = default | 0.1 | baseline@delay | conformance-alpha@impairment=delay20ms",
+                    "alpha::t_ig = perf | 0.2 | composite(metric,scale) | probe-alpha@metric=throughput+scale=200-pkt",
+                    "lib::tests::probe = perf | 0.3 | oriented@delay | probe-runner@impairment=none",
+                ]
+            ),
+            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+        )
+        self.rejects("lib::tests::probe: relation 'oriented@delay' is not a relation")
+
+    def test_a_composite_label_mismatching_its_own_family_baseline_fails(self):
+        self.write_gate(
+            design="\n".join(
+                [
+                    "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                    "alpha::t_ok = default | 0.1 | baseline@delay | conformance-alpha@impairment=delay20ms",
+                    "alpha::t_ig = perf | 0.2 | composite(metric,scale) | probe-alpha@metric=throughput+scale=200-pkt",
+                    "lib::tests::probe = perf | 0.3 | composite(metric,lane)@delay | probe-runner@impairment=other+transport=std-udp",
+                ]
+            ),
+            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+        )
+        output = self.rejects("lib::tests::probe: it is labelled composite(metric,lane)@delay")
+        self.assertIn("its cells vary impairment, transport", output)
+
+    def test_a_one_dimension_member_of_a_named_family_must_be_orthogonal(self):
+        self.write_gate(
+            design="\n".join(
+                [
+                    "beta::t_beta = default | 0.4 | baseline | conformance-beta@impairment=none",
+                    "alpha::t_ok = default | 0.1 | baseline@delay | conformance-alpha@impairment=delay20ms",
+                    "alpha::t_ig = perf | 0.2 | composite(metric,scale) | probe-alpha@metric=throughput+scale=200-pkt",
+                    "lib::tests::probe = perf | 0.3 | composite(metric,lane)@delay | probe-runner@impairment=none",
+                ]
+            ),
+            budgets=BASE_BUDGETS + "\nbaseline.delay = alpha::t_ok",
+        )
+        output = self.rejects(
+            "lib::tests::probe: it varies exactly one dimension from baseline "
+            "'delay' (impairment)"
+        )
+        self.assertIn("so write `orthogonal@delay`, not `composite`", output)
+
 
 if __name__ == "__main__":
     unittest.main()

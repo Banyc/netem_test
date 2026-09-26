@@ -49,19 +49,31 @@ target name `lib`), the sum of the declared nominal costs per tier must fit
 that tier's declared budget, and every covered cell and gap reason must be
 non-empty and well-formed.
 
-Each row must also declare how it relates to the row named by
-`gate-budgets: baseline = <row>`: `baseline` for the reference row itself,
-`orthogonal` when the row's cells vary exactly one dimension from the
-baseline, `composite(<dimension>[,<dimension>...])` when they vary several,
-and `re-measurement(<reason>)` when they vary none. The dimensions a row
-varies are derived from its own cells (a key the baseline states differently,
-or does not state at all; a key the row does not name is inherited from the
-baseline), and the declared relation must agree with that derivation. An
-unlabelled row, a label that disagrees with the cells, and a row whose cells
-state one dimension twice (so its relation cannot be determined) are all
-errors that name the row and what to write instead. That check is what makes a
-composite arm visible: without it, a row varying four dimensions at once
-passes exactly like a row varying one. When a fresh `mandate-check.json` is supplied
+Each row must also declare how it relates to a named baseline row:
+`baseline` for the reference row itself, `orthogonal` when the row's cells
+vary exactly one dimension from that baseline, `composite(<dimension>[,<dimension>...])`
+when they vary several, and `re-measurement(<reason>)` when they vary none.
+The dimensions a row varies are derived from its own cells (a key the baseline
+states differently, or does not state at all; a key the row does not name is
+inherited from the baseline), and the declared relation must agree with that
+derivation. An unlabelled row, a label that disagrees with the cells, and a row
+whose cells state one dimension twice (so its relation cannot be determined)
+are all errors that name the row and what to write instead. That check is what
+makes a composite arm visible: without it, a row varying four dimensions at
+once passes exactly like a row varying one.
+
+A declaration may carry several baselines, because one reference cannot serve
+every measurement family: `baseline = <row>` is the **default** baseline a row
+inherits when its relation names none, and each `baseline.<family> = <row>`
+line declares a named baseline a row opts into with a trailing `@<family>` on
+its relation (`orthogonal@m3`, `composite(a,b)@m3`, `baseline@m3`,
+`re-measurement(reason)@m3`). A row's relation is then derived against *its own
+family's* reference, so an M3 arm is not reported confounded merely because the
+M1-clean baseline states four dimensions it does not. A relation that names an
+undeclared family, a row whose `baseline`-label does not name the family it is
+the reference of, and a declared baseline no row states a relation against are
+all errors; the last one is how a stale reference is caught before it rots.
+When a fresh `mandate-check.json` is supplied
 (`--mandate-check-json`, or `mandate-check.json` in the crate root), each
 declared row that the report measured per-test is compared with the report's
 streamed wall-clock and a drift past the declared tolerance is an error. A
@@ -98,7 +110,7 @@ import math
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 TIERS = {"standard", "full", "perf"}
@@ -807,16 +819,19 @@ def check_lane_roles() -> tuple[dict[str, str], list[str]]:
 
 @dataclass(frozen=True)
 class Relation:
-    """A row's declared relation to the `gate-budgets` baseline row.
+    """A row's declared relation to a `gate-budgets` baseline row.
 
     ``kind`` is one of `RELATION_KINDS`; ``keys`` is the dimensions a
     ``composite`` row names it varies; ``reason`` is why a ``re-measurement``
-    row deliberately repeats the baseline's cell.
+    row deliberately repeats the baseline's cell; ``family`` is the named
+    baseline the relation is stated against, or None for the default
+    `baseline = <row>`.
     """
 
     kind: str
     keys: tuple[str, ...] = ()
     reason: str = ""
+    family: str | None = None
 
 
 @dataclass(frozen=True)
@@ -832,12 +847,18 @@ class PerfRow:
 
 @dataclass(frozen=True)
 class PerfBudgets:
-    """The `gate-budgets` block: one budget per tier, plus the baseline row."""
+    """The `gate-budgets` block: one budget per tier, plus the baselines.
+
+    ``baseline`` is the default reference every row inherits when its relation
+    names no family; ``named`` maps each `baseline.<family>` line's family to
+    the row it references.
+    """
 
     tiers: dict[str, float]
     baseline: str | None
     drift: float
     drift_floor_seconds: float
+    named: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -870,19 +891,58 @@ def cell_problem(cell: str) -> str | None:
     return None
 
 
+# `<kind>[(<args>)][@<family>]`. `<family>` is the name of a
+# `gate-budgets: baseline.<family>` line the relation is stated against; no
+# suffix means the default `baseline = <row>`. The arguments may not contain
+# `@`, so the family suffix is never ambiguous with a composite dimension or a
+# re-measurement reason.
+RELATION_RE = re.compile(
+    r"^(?P<kind>[A-Za-z][A-Za-z0-9_-]*)"
+    r"(?:\((?P<argument>[^()@]*)\))?"
+    r"(?:@(?P<family>[A-Za-z][A-Za-z0-9_-]*))?$"
+)
+
+
+def relation_display(kind: str, family: str | None) -> str:
+    """The relation text a diagnostic tells the author to write."""
+    return f"{kind}@{family}" if family else kind
+
+
 def parse_relation(text: str) -> tuple[Relation | None, str | None]:
-    """Parse a row's relation field, or say exactly what to write instead."""
-    kind, opened, argument = text.partition("(")
-    kind = kind.strip()
+    """Parse a row's relation field, or say exactly what to write instead.
+
+    A relation is `<kind>[@<family>]` or `<kind>(<argument>)@<family>`, where
+    `<family>` names a `baseline.<family>` row in `gate-budgets`; without the
+    suffix the row is stated against the default `baseline = <row>`.
+    """
+    text = text.strip()
+    match = RELATION_RE.match(text)
+    if match is None:
+        kind, opened, _rest = text.partition("(")
+        if opened and not text.endswith(")"):
+            return None, (
+                f"relation {text!r} is missing its closing ')'; write "
+                f"{kind.strip()}(...)"
+            )
+        return None, (
+            f"relation {text!r} is not a relation this grammar knows; write "
+            "`baseline`, `orthogonal`, `composite(<dimension>[,<dimension>...])` "
+            "or `re-measurement(<reason>)`, each optionally followed by "
+            "`@<baseline-family>` to state it against a named baseline"
+        )
+    kind = match.group("kind")
+    argument = match.group("argument")
+    family = match.group("family")
     if kind not in RELATION_KINDS:
         return None, (
             f"relation {text!r} is not a relation this grammar knows; write "
             "`baseline`, `orthogonal`, `composite(<dimension>[,<dimension>...])` "
-            "or `re-measurement(<reason>)`"
+            "or `re-measurement(<reason>)`, each optionally followed by "
+            "`@<baseline-family>` to state it against a named baseline"
         )
-    if not opened:
+    if argument is None:
         if kind in ("baseline", "orthogonal"):
-            return Relation(kind), None
+            return Relation(kind, family=family), None
         return None, (
             f"relation {text!r} gives no argument; write "
             + (
@@ -893,11 +953,9 @@ def parse_relation(text: str) -> tuple[Relation | None, str | None]:
                 "baseline's cell"
             )
         )
-    if not argument.endswith(")"):
-        return None, f"relation {text!r} is missing its closing ')'; write {kind}(...)"
-    inner = argument[:-1].strip()
+    inner = argument.strip()
     if kind in ("baseline", "orthogonal"):
-        return None, f"relation {text!r} takes no argument; write `{kind}`"
+        return None, f"relation {text!r} takes no argument; write `{relation_display(kind, family)}`"
     if kind == "re-measurement":
         if not inner:
             return None, (
@@ -905,12 +963,13 @@ def parse_relation(text: str) -> tuple[Relation | None, str | None]:
                 "deliberately repeats the baseline's cell (a second tier, a "
                 "stability re-run, a seed sweep)"
             )
-        if any(character in inner for character in ",()"):
+        if any(character in inner for character in ",()@"):
             return None, (
-                f"re-measurement reason {inner!r} contains ',' or parentheses; "
-                "write one reason token (e.g. `re-measurement(full-tier-rerun)`)"
+                f"re-measurement reason {inner!r} contains ',', a parenthesis or "
+                "'@'; write one reason token (e.g. "
+                "`re-measurement(full-tier-rerun)@<family>`)"
             )
-        return Relation(kind, (), inner), None
+        return Relation(kind, (), inner, family), None
     keys: list[str] = []
     for part in inner.split(","):
         key = part.strip()
@@ -926,7 +985,7 @@ def parse_relation(text: str) -> tuple[Relation | None, str | None]:
             "`composite(...)` must name at least two dimensions; a row that "
             "varies exactly one dimension from the baseline is `orthogonal`"
         )
-    return Relation(kind, tuple(keys)), None
+    return Relation(kind, tuple(keys), "", family), None
 
 
 def parse_perf_design(text: str, problems: list[str]) -> list[PerfRow]:
@@ -1002,9 +1061,15 @@ def parse_perf_design(text: str, problems: list[str]) -> list[PerfRow]:
 
 
 def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
-    """Parse the `gate-budgets` block: `<tier> = <budget_s>` plus the baseline."""
+    """Parse `gate-budgets`: `<tier> = <budget_s>` plus the baseline families.
+
+    `baseline = <row>` is the default reference a row inherits when its
+    relation names no family; each `baseline.<family> = <row>` line declares a
+    named reference a row opts into with `@<family>`.
+    """
     tiers: dict[str, float] = {}
     baseline: str | None = None
+    named: dict[str, str] = {}
     drift = DEFAULT_DRIFT_TOLERANCE
     floor = DEFAULT_DRIFT_FLOOR_SECONDS
     for number, line in _perf_lines(text):
@@ -1020,6 +1085,23 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
                 problems.append("gate-budgets: the baseline line names no row")
                 continue
             baseline = value
+            continue
+        if key.startswith("baseline."):
+            family = key[len("baseline.") :].strip()
+            if not CELL_KEY_RE.match(family):
+                problems.append(
+                    f"gate-budgets line {number}: {key!r} does not name a baseline "
+                    "family; write `baseline.<family> = <row>` with a family name "
+                    "([A-Za-z][A-Za-z0-9_-]*)"
+                )
+                continue
+            if not value:
+                problems.append(f"gate-budgets: baseline.{family} names no row")
+                continue
+            if family in named:
+                problems.append(f"gate-budgets: duplicate baseline family {family!r}")
+                continue
+            named[family] = value
             continue
         if key in ("drift", "drift_floor_s"):
             try:
@@ -1038,7 +1120,7 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
         if key not in PERF_TIERS:
             problems.append(
                 f"gate-budgets line {number}: {key!r} is neither a tier nor one "
-                "of baseline/drift/drift_floor_s"
+                "of baseline/drift/drift_floor_s (nor a `baseline.<family>` line)"
             )
             continue
         if key in tiers:
@@ -1058,7 +1140,7 @@ def parse_perf_budgets(text: str, problems: list[str]) -> PerfBudgets:
             "gate-budgets declares no 'baseline = <row>' line; every design row's "
             "coverage must be stated relative to a named baseline row"
         )
-    return PerfBudgets(tiers, baseline, drift, floor)
+    return PerfBudgets(tiers, baseline, drift, floor, named)
 
 
 def parse_perf_gaps(text: str, problems: list[str]) -> list[PerfGap]:
@@ -1102,18 +1184,22 @@ def check_perf_relations(
 ) -> list[str]:
     """Verify each row's declared relation against the dimensions its cells vary.
 
-    The dimensions a row varies are derived from its own cells: a dimension
-    whose value differs from the baseline's, or that the baseline does not
-    state at all, is varied; a dimension the row does not name is inherited
-    from the baseline. A row labelled `composite` must name exactly those
-    dimensions. Returns the summary lines for the passing case; every failure
-    is appended to ``problems`` with the row and what to write instead.
+    Each row is stated against the baseline of its own family: a relation with
+    a trailing ``@<family>`` is derived against the ``baseline.<family>`` row,
+    and a relation that names none against the default
+    ``baseline = <row>``. The dimensions a row varies are derived from its own
+    cells: a dimension whose value differs from its own family baseline's, or
+    that the baseline does not state at all, is varied; a dimension the row
+    does not name is inherited from that baseline. A row labelled `composite`
+    must name exactly those dimensions. Returns the summary lines for the
+    passing case; every failure is appended to ``problems`` with the row and
+    what to write instead.
     """
     summary: list[str] = []
     if budgets.baseline is None:
         return summary
-    baseline = next((row for row in rows if row.name == budgets.baseline), None)
-    if baseline is None:
+    by_name = {row.name: row for row in rows}
+    if budgets.baseline not in by_name:
         # The baseline is not a row; that is already a failure of its own.
         return summary
 
@@ -1135,79 +1221,170 @@ def check_perf_relations(
             state[key] = value
         return state
 
-    base_state: dict[str, str] = {}
-    base_conflicts: list[str] = []
-    for cell in baseline.cells:
-        for key, value in cell_state(cell, base_conflicts).items():
-            base_state[key] = value
-    if base_conflicts:
-        problems.append(
-            f"gate-perf-design baseline row {baseline.name}: its cells are not one "
-            f"point, so no row's relation to it can be determined "
-            f"({'; '.join(base_conflicts)}); state the baseline once per "
-            "dimension, with one value each"
-        )
-        return summary
+    # family -> reference row name. None is the default, unnamed family; every
+    # other key is a `baseline.<family>` line.
+    families: dict[str | None, str] = {None: budgets.baseline}
+    families.update(budgets.named)
+    reference_of: dict[str, set[str | None]] = {}
+    base_state: dict[str | None, dict[str, str]] = {}
+    for family, name in families.items():
+        row = by_name.get(name)
+        if row is None:
+            if family is not None:
+                problems.append(
+                    f"gate-budgets: baseline.{family} names {name!r}, which is not "
+                    "a gate-perf-design row, so the rows stated against it are "
+                    "stated against nothing"
+                )
+            continue
+        reference_of.setdefault(name, set()).add(family)
+        conflicts: list[str] = []
+        state: dict[str, str] = {}
+        for cell in row.cells:
+            for key, value in cell_state(cell, conflicts).items():
+                state[key] = value
+        if conflicts:
+            problems.append(
+                f"gate-perf-design baseline row {name}: its cells are not one "
+                f"point, so no row's relation to it can be determined "
+                f"({'; '.join(conflicts)}); state the baseline once per "
+                "dimension, with one value each"
+            )
+            continue
+        base_state[family] = state
+    for name, references in sorted(reference_of.items()):
+        if len(references) > 1:
+            labels = ", ".join(
+                "the default baseline" if family is None else f"baseline.{family}"
+                for family in sorted(references, key=lambda f: (f is not None, f or ""))
+            )
+            problems.append(
+                f"gate-budgets: {name!r} is the reference row of {labels}; a row "
+                "carries one relation, so give each family its own reference row"
+            )
+
+    def against_phrase(family: str | None) -> str:
+        """How a diagnostic names the family baseline, without the row."""
+        return "the baseline" if family is None else f"baseline {family!r}"
 
     varied_by_row: dict[str, tuple[str, ...]] = {}
     counts = {kind: 0 for kind in sorted(RELATION_KINDS)}
+    family_counts: dict[str | None, dict[str, int]] = {}
     for row in rows:
+        relation = row.relation
+        family = relation.family if relation is not None else None
+        if family is not None and family not in budgets.named:
+            problems.append(
+                f"gate-perf-design row {row.name}: it names the baseline family "
+                f"{family!r}, which gate-budgets does not declare; declare "
+                f"`baseline.{family} = <row>` or state the row against the "
+                f"default baseline ({budgets.baseline})"
+            )
+            continue
+        if family not in base_state:
+            # This family's reference row is missing or ambiguous; already named.
+            continue
+        against = against_phrase(family)
+        referenced = families[family]
         conflicted: list[str] = []
         varied: set[str] = set()
         for cell in row.cells:
             state = cell_state(cell, conflicted)
             for key, value in state.items():
-                if key not in base_state or base_state[key] != value:
+                if key not in base_state[family] or base_state[family][key] != value:
                     varied.add(key)
         derived = tuple(sorted(varied))
         varied_by_row[row.name] = derived
         if conflicted:
             problems.append(
-                f"gate-perf-design row {row.name}: its relation to the baseline "
+                f"gate-perf-design row {row.name}: its relation to {against} "
                 f"cannot be determined ({'; '.join(conflicted)}), so the "
                 "dimensions it varies are ambiguous; state each dimension once, "
                 "with one value (split the row if it covers two points)"
             )
             continue
-        relation = row.relation
-        wanted = (
-            "baseline"
-            if row.name == budgets.baseline
-            else "orthogonal"
+        wanted = relation_display(
+            "orthogonal"
             if len(derived) == 1
             else "composite(" + ",".join(derived) + ")"
             if derived
-            else "re-measurement(<reason>)"
+            else "re-measurement(<reason>)",
+            family,
         )
-        if row.name == budgets.baseline:
-            if relation is None or relation.kind != "baseline":
-                problems.append(
-                    f"gate-perf-design row {row.name}: it is the gate-budgets "
-                    "baseline, so its relation is the reference every other row "
-                    f"is stated against; write `{wanted}`"
-                )
+
+        def bump(kind: str) -> None:
+            counts[kind] = counts.get(kind, 0) + 1
+            tally = family_counts.setdefault(family, {})
+            tally[kind] = tally.get(kind, 0) + 1
+
+        if family in reference_of.get(row.name, ()):
+            # This row is the reference of the family it is stated against, so
+            # its relation is the `baseline` label for that family.
+            if relation is not None and relation.kind == "baseline":
+                bump("baseline")
                 continue
-            counts["baseline"] += 1
+            if len(reference_of[row.name]) == 1:
+                label = relation_display("baseline", family)
+                if family is None:
+                    problems.append(
+                        f"gate-perf-design row {row.name}: it is the gate-budgets "
+                        "baseline, so its relation is the reference every other "
+                        f"row is stated against; write `{label}`"
+                    )
+                else:
+                    problems.append(
+                        f"gate-perf-design row {row.name}: it is the reference "
+                        f"row of baseline.{family} ({referenced}), so its "
+                        "relation is what every other row in that family is "
+                        f"stated against; write `{label}`"
+                    )
             continue
         if relation is None:
             problems.append(
-                f"gate-perf-design row {row.name}: it declares no relation to the "
-                f"baseline {budgets.baseline}; its cells vary "
+                f"gate-perf-design row {row.name}: it declares no relation to "
+                f"{against} {referenced}; its cells vary "
                 f"{len(derived)} dimension(s), so write `{wanted}`"
             )
             continue
         if relation.kind == "baseline":
-            problems.append(
-                f"gate-perf-design row {row.name}: it is labelled `baseline`, but "
-                f"the baseline is {budgets.baseline}; a row's cells vary "
-                f"{len(derived)} dimension(s) from it, so write `{wanted}`"
-            )
+            if family is None and reference_of.get(row.name):
+                # Reached only for a row that is a *named* family's reference
+                # but carries the plain `baseline` label, which names the
+                # default family instead.
+                only = next(iter(reference_of[row.name]))
+                named = (
+                    "the default baseline"
+                    if only is None
+                    else f"baseline.{only} ({families[only]})"
+                )
+                problems.append(
+                    f"gate-perf-design row {row.name}: it is the reference row of "
+                    f"{named}, so its relation is what every other row in that "
+                    f"family is stated against; write "
+                    f"`{relation_display('baseline', only)}`"
+                )
+                continue
+            if family is None:
+                problems.append(
+                    f"gate-perf-design row {row.name}: it is labelled `baseline`, "
+                    f"but the baseline is {budgets.baseline}; a row's cells vary "
+                    f"{len(derived)} dimension(s) from it, so write `{wanted}`"
+                )
+            else:
+                problems.append(
+                    f"gate-perf-design row {row.name}: it is labelled "
+                    f"`baseline@{family}`, but baseline.{family} is "
+                    f"{budgets.named[family]}, so a baseline label names only "
+                    "the family whose reference row the row is; its cells vary "
+                    f"{len(derived)} dimension(s) from {against} {referenced}, "
+                    f"so write `{wanted}`"
+                )
             continue
         problem = None
         if not derived and relation.kind != "re-measurement":
             problem = (
                 f"gate-perf-design row {row.name}: its cells name no dimension "
-                f"that differs from the baseline {budgets.baseline} "
+                f"that differs from {against} {referenced} "
                 "(every dimension it names repeats the baseline's value), so "
                 "it is a deliberate repeat and must say why; write "
                 "`re-measurement(<reason>)` (e.g. a second tier or a "
@@ -1216,44 +1393,89 @@ def check_perf_relations(
         elif derived and len(derived) == 1 and relation.kind != "orthogonal":
             problem = (
                 f"gate-perf-design row {row.name}: it varies exactly one "
-                f"dimension from the baseline ({derived[0]}), so write "
-                f"`orthogonal`, not `{relation.kind}`"
+                f"dimension from {against} ({derived[0]}), so write "
+                f"`{relation_display('orthogonal', family)}`, not `{relation.kind}`"
             )
         elif derived and len(derived) > 1 and relation.kind == "re-measurement":
             problem = (
                 f"gate-perf-design row {row.name}: it is labelled a "
                 f"re-measurement, but its cells vary {len(derived)} dimension(s) "
-                f"from the baseline ({', '.join(derived)}), so write `{wanted}`"
+                f"from {against} ({', '.join(derived)}), so write `{wanted}`"
             )
         elif derived and len(derived) > 1 and relation.kind != "composite":
             problem = (
                 f"gate-perf-design row {row.name}: its cells vary {len(derived)} "
-                f"dimension(s) from the baseline ({', '.join(derived)}), so write "
+                f"dimension(s) from {against} ({', '.join(derived)}), so write "
                 f"`{wanted}`"
             )
         elif relation.kind == "composite" and set(relation.keys) != set(derived):
             problem = (
                 f"gate-perf-design row {row.name}: it is labelled "
-                f"composite({','.join(relation.keys)}), but its cells vary "
+                f"composite({','.join(relation.keys)}){relation_display('', family)}, "
+                f"but its cells vary "
                 f"{', '.join(derived) or 'nothing'}; name exactly the dimensions "
                 "the cells vary, or fix the cells"
             )
         if problem is not None:
             problems.append(problem)
             continue
-        counts[relation.kind] = counts.get(relation.kind, 0) + 1
+        bump(relation.kind)
+
+    # A baseline no row states a relation against is a stale reference: either
+    # the family was emptied by a shortening or the `@<family>` suffixes were
+    # dropped, and either way the declaration has rotted past what it enforces.
+    for family, name in sorted(families.items(), key=lambda item: (item[0] is not None, item[0] or "")):
+        if family not in base_state:
+            continue
+        used = sum(
+            1
+            for row in rows
+            if row.name != name
+            and row.relation is not None
+            and row.relation.family == family
+        )
+        if used:
+            continue
+        label = f"baseline = {name}" if family is None else f"baseline.{family} = {name}"
+        problems.append(
+            f"gate-budgets: {label} is declared but no row states a relation "
+            "against it; a baseline no row uses is a stale reference - remove "
+            "the line, or state the row that belongs to the family"
+        )
+        continue
 
     order = ("orthogonal", "composite", "re-measurement", "baseline")
-    summary.append(
-        "  gate-perf-relations: "
-        + ", ".join(f"{counts[kind]} {kind}" for kind in order)
-        + f" of {len(rows)} row(s), stated against {budgets.baseline}"
-    )
+    totals = ", ".join(f"{counts[kind]} {kind}" for kind in order)
+    if not budgets.named:
+        summary.append(
+            f"  gate-perf-relations: {totals} of {len(rows)} row(s), stated "
+            f"against {budgets.baseline}"
+        )
+    else:
+        summary.append(
+            f"  gate-perf-relations: {totals} of {len(rows)} row(s) across "
+            f"{len(families)} baseline(s)"
+        )
+        for family in sorted(families, key=lambda f: (f is not None, f or "")):
+            if family not in base_state:
+                continue
+            tally = family_counts.get(family, {})
+            name = families[family]
+            label = f"default({name})" if family is None else f"{family}({name})"
+            summary.append(
+                f"  gate-perf-family: {label} {tally.get('orthogonal', 0)} "
+                f"orthogonal, {tally.get('composite', 0)} composite, "
+                f"{tally.get('re-measurement', 0)} re-measurement, "
+                f"{tally.get('baseline', 0)} baseline"
+            )
     for row in rows:
         if row.relation is not None and row.relation.kind == "composite":
+            family = row.relation.family
+            reference = budgets.baseline if family is None else budgets.named.get(family)
             summary.append(
                 f"  gate-perf-composite: {row.name} varies "
-                f"{', '.join(varied_by_row[row.name])}"
+                f"{', '.join(varied_by_row.get(row.name, ()))}"
+                f" against {reference}"
             )
     return summary
 
@@ -1486,10 +1708,15 @@ def check_perf_gate(
                     )
 
     cells = sum(len(row.cells) for row in rows)
+    named = (
+        f" (+{len(budgets.named)} named: {', '.join(sorted(budgets.named))})"
+        if budgets.named
+        else ""
+    )
     summary = [
         f"  gate-perf-design: {len(rows)} perf test row(s), {cells} coverage "
         f"cell(s), {len(gaps)} gap(s), baseline "
-        f"{budgets.baseline or 'unset'}"
+        f"{budgets.baseline or 'unset'}{named}"
     ]
     summary.extend(relation_summary)
     for tier in sorted(by_tier):

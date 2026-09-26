@@ -76,27 +76,45 @@ The declarative form is three fenced blocks in that crate's `GATE.md`,
 alongside the existing ones:
 
     gate-perf-design       <target>::<test> = <tier> | <nominal_cost_s> | <relation> | <coverage>
-    gate-budgets           <tier> = <budget_s>, plus baseline/drift/drift_floor_s
+    gate-budgets           <tier> = <budget_s>, plus baseline/baseline.<family>/drift/drift_floor_s
     gate-coverage-gaps     <cell> = <non-empty reason>
 
 `<coverage>` is a comma-separated list of cells, each
 `<mandate-or-property>@<dimension>=<value>[+<dimension>=<value>…]` — for
 example `M1@loss=ge5+jitter=100ms+shape=request-response` — stated relative to
-the baseline row named in `gate-budgets`. A row's tier is the tier the
+the baseline of the row's family. A row's tier is the tier the
 compiled test set puts the test in (`default` means not `#[ignore]`d; the other
 tiers are the `gate-manifest` tiers), and the reserved target name `lib` names
 the package's `--lib` target, which is where the harness's own wall-clock
 probes live.
 
+**One reference cannot serve every family, so a declaration may carry several
+baselines.** `baseline = <row>` is the **default** reference a row inherits
+when its relation names none; each `baseline.<family> = <row>` line declares a
+named reference a row opts into with a trailing `@<family>` on its relation.
+A row's relation is therefore derived against *its own family's* reference: an
+M3 row measured against an M1-clean default moved four dimensions because it
+is an M3 row, not because anyone built a confounded arm, and only stating it
+against the M3 arm can say so.
+
 `<relation>` is how the row stands to that baseline, and it is the coverage
 half's attribution rule made checkable:
 
-    baseline                      the reference row itself
-    orthogonal                    its cells vary exactly one dimension from it
-    composite(<dim>[,<dim>…])     they vary several; the row names which
-    re-measurement(<reason>)      they vary none; the row says why it repeats it
+    baseline[( @<family> )]          the reference row itself
+    orthogonal[( @<family> )]        its cells vary exactly one dimension from it
+    composite(<dim>[,<dim>…])[@<family>]   they vary several; the row names which
+    re-measurement(<reason>)[@<family>]    they vary none; the row says why it repeats it
 
-The checker derives the dimensions the row varies from the row's own cells. A
+The `@<family>` suffix names a `baseline.<family>` line; without it the row is
+stated against the default, and the default's row name is printed in the run's
+summary. A row that is a family's reference row carries `baseline@<family>`
+(plain `baseline` for the default), and a `baseline` label that does not name
+the family whose reference the row is, a relation naming a family the block
+does not declare, and a declared baseline no row states a relation against are
+all errors.
+
+The checker derives the dimensions the row varies from the row's own cells
+against that family's reference. A
 dimension whose value differs from the baseline's — **including one the
 baseline does not state at all** — is varied; a dimension the row does not
 name is inherited from the baseline. A row that varies more than one dimension
@@ -107,8 +125,9 @@ repeated cell is a deliberate act — a second tier, a stability re-run — and
 not a silent duplicate; a row whose cells state one dimension twice has no
 determinable relation and fails as ambiguous. Every one of those failures
 names the row and what to write instead, and the passing run prints the
-per-relation counts and one line per composite row naming the dimensions it
-varies, so the attribution a crate actually has is a visible number rather
+per-relation counts, one line per baseline family, and one line per composite
+row naming the dimensions it varies and the reference it was derived against,
+so the attribution a crate actually has is a visible number rather
 than a claim in prose.
 
 The exact grammar, the derivation rule, the checker's failure modes and the
@@ -124,21 +143,41 @@ and `tools/mandate-compare`'s per-arm record are for. Its dimensions are the
 cell's own keys, so a row that spells one physical axis under two names (a
 `loss=none` beside an `impairment=…`, or an `impairment` that already carries
 the loss) is derived as varying two dimensions: the confound is reported, the
-redundancy is not. A relation is defined to the one `baseline` row, so a
-re-measurement *of another row* — a stability re-run or a second tier of an arm
-that is itself a composite — has no label of its own and is filed under that
-arm's composite relation. And the derivation assumes a dimension the row does
-not name is inherited from the baseline: a row whose cell silently omits an
-axis it actually moved is invisible here, while a row that names an axis the
-baseline never states is counted as varying it even when the value is the
-baseline's own state (the two `raw_netem_pair` rows' `impairment=none`).
+redundancy is not. The derivation assumes a dimension the row does not name is
+inherited from its family's reference: a row whose cell silently omits an axis
+it actually moved is invisible here, while a row that names an axis the
+reference never states is counted as varying it even when the value is the
+reference's own state.
+
+The family labels are themselves a declaration, and this is the limit the
+several-baselines form **adds**. The checker can see that a family is declared,
+that its reference row exists, that its reference row is labelled as such, that
+a relation names a family that exists, and that some row other than the
+reference states against it. It cannot see whether a row is in the *right*
+family: a row whose cells happen to vary one dimension from another family's
+reference may be stated against it and pass, and the label is only as honest
+as its author. What is **partition-invariant**, and therefore the number to
+read for shortening, is how many rows have *some* other row one dimension
+away at all: a row with a one-dimension relative is attributable to that
+dimension whichever family it is filed under, and a row with none — every
+other arm two or more declared dimensions away — cannot be attributed however
+the families are cut. The declared composites are the rows that landed on the
+second side of that line; the rows that landed on the first but serve as their
+family's reference are the baseline rows. A family whose only sibling is two
+or more dimensions away has **no usable baseline**, and the only honest
+outcomes are a new single-axis arm beside it or a composite label naming what
+it does vary.
 
 `tools/check-gate.py` enforces the declaration for any crate whose `GATE.md`
 carries the blocks: an unknown target, an unknown test, a test declared in the
 wrong tier, a tier sum over its budget, an empty or malformed coverage cell, a
-gap without a reason, a missing `baseline`, an unlabelled row, a relation that
-disagrees with the row's cells, and an ambiguous row are all failures that
-name the problem. It runs the same way as the other gate checks:
+gap without a reason, a missing `baseline`, a named baseline whose row does not
+exist, a baseline no row states a relation against, a relation naming an
+undeclared family, a `baseline` label on a row that is not that family's
+reference, a row that is the reference of more than one family, an unlabelled
+row, a relation that disagrees with the row's cells, and an ambiguous row are
+all failures that name the problem. It runs the same way as the other gate
+checks:
 
 ```sh
 python3 tools/check-gate.py
