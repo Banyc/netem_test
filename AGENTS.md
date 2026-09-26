@@ -55,7 +55,9 @@ trace manifests, and the paired `manifest.csv`).
 For the interactive path's tri-mandate constitution, `./tools/mandate-check`
 runs `rtp_mux`'s smoke set, renders its panels and writes
 `mandate-check.json`; run it and read the plots for any change to `rtp`,
-`mux` or `rtp_mux` (see `tools/MANDATE_SMOKE.md`).
+`mux` or `rtp_mux` (see `tools/MANDATE_SMOKE.md`). The intention behind the
+constitution, and the inventory of the tools and gates that measure it, are in
+`tools/PERF_INFRA.md`.
 
 Every output, temporary, trace, log, and Cargo target must resolve beneath
 `$TMPDIR`. The paired runner always enables diagnostic mode so the

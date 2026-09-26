@@ -60,7 +60,10 @@ verify from a machine that the mandated checks ran and what they measured:
 Any change to `rtp`, `mux` or `rtp_mux` must run it, and its plots must be
 read: the assertion is a tripwire, the panel is the evidence. The contract the
 command depends on, what it writes, and its exit codes are in
-`tools/MANDATE_SMOKE.md`; the bounds are in `rtp_mux/GATE.md`.
+`tools/MANDATE_SMOKE.md`; the bounds are in `rtp_mux/GATE.md`. The
+intention behind the constitution — why M1/M2/M3 exist, why the hostile and
+lone-tail arms exist, and the inventory of the tools and gates that measure
+them — is in `tools/PERF_INFRA.md`.
 
 ## Default hostile command
 

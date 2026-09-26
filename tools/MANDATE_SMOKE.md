@@ -2,8 +2,10 @@
 
 `tools/mandate-check` is the one command that runs the tri-mandate
 performance smoke set, renders each mandate's panels, prints a verdict per
-mandate, and leaves evidence a machine can check. Run it from this workspace
-root with no arguments:
+mandate, and leaves evidence a machine can check. What the mandates are for,
+what built them, and the wider tool and gate inventory are in
+`tools/PERF_INFRA.md`; this file is the command's contract. Run it from this
+workspace root with no arguments:
 
 ```sh
 ./tools/mandate-check
