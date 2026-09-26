@@ -89,7 +89,7 @@ reference row carries its `baseline@<family>` label, that every declared
 family is used by some row, and that the row's cells lie in the family's own
 **cell-name namespace** (`members.<family>`, see "Family membership" below).
 
-The set splits into **29 families** plus the default: the four mandates, the
+The set splits into **29 reference families** (**28 named plus the default**): the four mandates, the
 constitution gate, the per-target probe groups (the rtp and mux echo ceilings,
 the two instrument-sanity arms, the hostile-preset probes), the `hol_probe`
 regimes, `hol_verify4`, the decomposed frame-reorder and FEC arms, the
@@ -146,7 +146,13 @@ its windows, cadences or tiers retuned to fix that: an attributable arm for a
 family is a **new** arm stated one axis away from a reference, and that is a
 change to the tests, not to these labels. Nothing the draft cannot determine
 was guessed: the labels are the checker's derivation, and the `TBD` costs stay
-`TBD`.
+`TBD`. Three counts in this section — how many rows have a one-dimension
+relative (61 of 94), how many families have several max-orthogonality
+references (16 of 29), and the per-family tallies under the tied references
+(`probe` 2/0/1 against 2/1/0; this draft's `fairness` 1/2/1 against 1/3/0 and
+`interactive` 1/1/1 against 1/2/0) — are this draft's own reading against its
+own arms, and no command in `tools/` prints them, so they stay prose and are
+not machine-checked; the claims stated in either block's numbers above are.
 
 ## Family membership
 

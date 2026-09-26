@@ -349,7 +349,7 @@ namespaces:
 
 - **default** — `netem_passes_traffic_unimpaired`, the unimpaired conformance
   link (`lane=loopback layer=netem-link load=burst metric=counters
-  scale=64-pkt`); the seven other `netem_scenarios` rows are stated against it.
+  scale=64-pkt`); the eight other `netem_scenarios` rows are stated against it.
   Its cells are named `baseline`, `blackout` and `conformance-*`, so the
   namespace it owns is the residual, and `members` declares no prefix for it.
 - **`pair`** — `raw_netem_pair::netem_pair_raw_udp_echo_clean_link`, the raw

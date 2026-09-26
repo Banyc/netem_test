@@ -293,11 +293,15 @@ def layout() -> CrateLayout:
     return LAYOUT
 
 
-def manifest_block(name: str) -> str | None:
-    """Return the body of the ```<name> fenced block, or None."""
-    text = layout().manifest.read_text(encoding="utf-8")
+def fenced_block(text: str, name: str) -> str | None:
+    """Return the body of the ```<name> fenced block in ``text``, or None."""
     block = re.search(rf"```{re.escape(name)}\n(.*?)```", text, re.S)
     return block.group(1) if block else None
+
+
+def manifest_block(name: str) -> str | None:
+    """Return the body of the ```<name> fenced block, or None."""
+    return fenced_block(layout().manifest.read_text(encoding="utf-8"), name)
 
 
 def manifest_entries() -> dict[str, str]:
@@ -831,6 +835,773 @@ def check_lane_roles() -> tuple[dict[str, str], list[str]]:
     if not any(role == "verdict" for role in documented.values()):
         errors.append("no verdict lane is declared")
     return documented, errors
+
+
+# ---------------------------------------------------------------------------
+# The documented counts.
+#
+# A number written into prose that a command already determines is a defect
+# waiting to happen: the code moves, the sentence does not, and a reader acts
+# on the stale number. `tools/PERF_INFRA.md` carried one twice - a probe was
+# added in a sibling crate and the transcription of that crate's opt-in
+# inventory went wrong with no signal. Every rottable count is therefore in
+# exactly one of two honest forms:
+#
+# - **verified** (`DOC_COUNTS`): the sentence keeps the number and this check
+#   fails when it disagrees with the source that determines it, naming the
+#   written value and the derived one. A count that leaves the prose without
+#   its entry being removed fails too, so the check cannot quietly lose its
+#   subject.
+# - **derived** (`DOC_DERIVED`): the number leaves the prose and the sentence
+#   names the command that prints it. The pointer must still be there - a
+#   derived count whose command is no longer named is unreadable - and the
+#   transcribed tally must not come back, so the decision is enforced rather
+#   than merely made once.
+#
+# Prefer `verified` where a command in this repository determines the value
+# before the check runs (`tools/mandate-producers.json`, `tools/mandate-arms.json`,
+# `tools/mandate-baseline.json`, the harness's own `gate-*` blocks, and the
+# `mandate_compare.py` constants the documents quote). Prefer `derived` where
+# the value belongs to a crate this gate cannot run - a sibling's ignored-test
+# inventory - because the checker that owns it there is the only authority, and
+# transcribing its output is exactly how the number rots.
+
+DOC_COUNT_TOLERANCE = 0.05
+
+# A prose count is written either as digits or as a numeral word. The class is
+# only ever the capture group's alphabet, so "report-only arms" cannot be
+# mistaken for "only arms".
+_NUMERAL = (
+    r"(?:[0-9]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+)
+_NUMERAL_WORDS = {
+    word: value
+    for value, word in enumerate(
+        ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+         "nine", "ten", "eleven", "twelve")
+    )
+}
+# The ordinals the producer-count sentence uses ("the third producer is ...").
+_NUMERAL_WORDS.update({"third": 3, "fourth": 4, "fifth": 5})
+
+
+@dataclass(frozen=True)
+class DocCount:
+    """One number in prose that a command already determines.
+
+    ``docs`` are repository-relative paths (all of which must state the count);
+    ``pattern`` is a regex over the whole document with one ``_NUMERAL`` group
+    per entry of ``keys``; ``authority`` names, for the diagnostic, the
+    command or source that determines each value.
+    """
+
+    label: str
+    docs: tuple[str, ...]
+    pattern: str
+    keys: tuple[str, ...]
+    authority: str
+
+
+@dataclass(frozen=True)
+class DocDerived:
+    """One inventory claim whose tally was replaced by the command.
+
+    ``marker`` locates the sentence (the region runs from the marker to the
+    first ``until`` match after it); ``pointer`` is the command the sentence
+    must name; ``forbidden`` pairs a regex with why it may not appear in the
+    region - the transcribed tally the derivation replaced.
+    """
+
+    label: str
+    doc: str
+    marker: str
+    until: str
+    pointer: str
+    forbidden: tuple[tuple[str, str], ...]
+
+
+DOC_COUNTS: tuple[DocCount, ...] = (
+    DocCount(
+        label="producers declared",
+        docs=("tools/PERF_INFRA.md", "tools/MANDATE_SMOKE.md"),
+        pattern=rf"\b({_NUMERAL}) producers are declared",
+        keys=("producers",),
+        authority="the producers[] array of tools/mandate-producers.json",
+    ),
+    DocCount(
+        label="the ordinal after the declared producers",
+        docs=("tools/MANDATE_SMOKE.md",),
+        pattern=rf"\bA (third|fourth|fifth) producer is a registry entry",
+        keys=("next_producer",),
+        authority="one past the producers[] array of tools/mandate-producers.json",
+    ),
+    DocCount(
+        label="evidence files per run",
+        docs=("tools/PERF_INFRA.md", "tools/MANDATE_SMOKE.md"),
+        pattern=rf"(?:the|all|its) ({_NUMERAL}) (?:expected )?evidence\s+files",
+        keys=("evidence_files",),
+        authority=(
+            "two files (<id>.json, <id>.csv) per verdict section of the rtp_mux "
+            "producer in tools/mandate-producers.json"
+        ),
+    ),
+    DocCount(
+        label="MANDATE lines per run",
+        docs=("tools/MANDATE_SMOKE.md",),
+        pattern=rf"all ({_NUMERAL}) `MANDATE` lines",
+        keys=("verdicts",),
+        authority="the verdicts of the rtp_mux producer in tools/mandate-producers.json",
+    ),
+    DocCount(
+        label="panels and plot files of a mandate-check run",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=rf"\(({_NUMERAL}) panels, ({_NUMERAL}) SVG\+PNG plot\s+files\)",
+        keys=("baseline_panels", "baseline_plot_files"),
+        authority=(
+            "the summed mandates[*].panels of tools/mandate-baseline.json, and two "
+            "files per panel (SVG + PNG)"
+        ),
+    ),
+    DocCount(
+        label="mandates and verified panels of the baseline run",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=rf"passed all ({_NUMERAL}) mandates with ({_NUMERAL})\s+verified SVG panels",
+        keys=("verdicts", "baseline_panels"),
+        authority=(
+            "the verdicts of the rtp_mux producer in tools/mandate-producers.json, "
+            "and the summed mandates[*].panels of tools/mandate-baseline.json"
+        ),
+    ),
+    DocCount(
+        label="arms recorded in the baseline run",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=rf"recorded \*\*({_NUMERAL}) arms from both producers\*\*",
+        keys=("arms_total",),
+        authority="len(arms) of tools/mandate-baseline.json",
+    ),
+    DocCount(
+        label="rtp_mux arms in the baseline run",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=rf"\*\*: ({_NUMERAL}) for\s+`rtp_mux`",
+        keys=("arms_rtp_mux",),
+        authority="the arms of tools/mandate-baseline.json whose producer is rtp_mux",
+    ),
+    DocCount(
+        label="per-mandate arm counts in the baseline run",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=(
+            rf"\(({_NUMERAL}) M1, ({_NUMERAL}) M2, ({_NUMERAL}) M3 reps and "
+            rf"({_NUMERAL}) M4 arms\)"
+        ),
+        keys=("arms_M1", "arms_M2", "arms_M3", "arms_M4"),
+        authority="the arms of tools/mandate-baseline.json grouped by mandate",
+    ),
+    DocCount(
+        label="probes recorded in the baseline run",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=rf"and the ({_NUMERAL}) probes\b",
+        keys=("baseline_probes",),
+        authority="the arms of tools/mandate-baseline.json whose producer is netem_test",
+    ),
+    DocCount(
+        label="probe arms in the probe section",
+        docs=("tools/PERF_INFRA.md", "tools/MANDATE_SMOKE.md"),
+        pattern=rf"\b({_NUMERAL})(?:\s+[A-Za-z-]+){{0,3}}\s+arms in the `probe` section",
+        keys=("arms_probe",),
+        authority="the probe/<arm> keys of tools/mandate-arms.json",
+    ),
+    DocCount(
+        label="perf-tier probes of the harness",
+        docs=("tools/PERF_INFRA.md", "tools/MANDATE_SMOKE.md"),
+        pattern=rf"\b({_NUMERAL}) perf-tier probes",
+        keys=("arms_probe",),
+        authority="the probe/<arm> keys of tools/mandate-arms.json",
+    ),
+    DocCount(
+        label="probe-* rows of the harness declaration",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=rf"their ({_NUMERAL}) `probe-\*` rows",
+        keys=("harness_probe_rows",),
+        authority=(
+            "the gate-perf-design rows of tests/GATE.md whose cells are in the "
+            "probe-* namespace"
+        ),
+    ),
+    DocCount(
+        label="duration of the baseline run",
+        docs=("tools/PERF_INFRA.md",),
+        pattern=r"The run took \*\*([0-9.]+) s\*\*",
+        keys=("baseline_duration",),
+        authority="duration_seconds of tools/mandate-baseline.json",
+    ),
+    DocCount(
+        label="producers a two-producer case runs",
+        docs=("tools/MANDATE_SMOKE.md",),
+        pattern=rf"Its ({_NUMERAL})-producer cases",
+        keys=("producers",),
+        authority="the producers[] array of tools/mandate-producers.json",
+    ),
+    DocCount(
+        label="counted noise-band counters",
+        docs=("tools/MANDATE_SMOKE.md",),
+        pattern=rf"the ({_NUMERAL}) bulk-lane byte counters",
+        keys=("noise_band_counters",),
+        authority="len(COUNT_NOISE_BANDS_BYTES) in tools/mandate_compare.py",
+    ),
+    DocCount(
+        label="reference families of the rtp_mux draft",
+        docs=("tools/PERF_PENDING_rtp_mux.md",),
+        pattern=(
+            rf"splits into \*\*({_NUMERAL}) reference families\*\* "
+            rf"\(\*\*({_NUMERAL}) named plus the default\*\*\)"
+        ),
+        keys=("draft_families", "draft_named_families"),
+        authority=(
+            "the baseline/baseline.<family> lines of the gate-budgets block of "
+            "tools/PERF_PENDING_rtp_mux.md (one family per reference row, plus the "
+            "default)"
+        ),
+    ),
+    DocCount(
+        label="relation counts of the rtp_mux draft",
+        docs=("tools/PERF_PENDING_rtp_mux.md",),
+        pattern=(
+            rf"the ({_NUMERAL}) rows are \*\*({_NUMERAL}) orthogonal\*\*, "
+            rf"\*\*({_NUMERAL}) composite\*\*, \*\*({_NUMERAL})\s+re-measurement\*\* "
+            rf"and \*\*({_NUMERAL}) baseline\*\*"
+        ),
+        keys=(
+            "draft_rows",
+            "draft_orthogonal",
+            "draft_composite",
+            "draft_re_measurement",
+            "draft_baseline_rows",
+        ),
+        authority=(
+            "the gate-perf-relations summary the checker derives from the draft's "
+            "own blocks, with its deliberately-unmeasured `TBD` costs substituted "
+            "(a relation is derived from the cells, never from the cost)"
+        ),
+    ),
+    DocCount(
+        label="cost sums of the rtp_mux draft",
+        docs=("tools/PERF_PENDING_rtp_mux.md",),
+        pattern=(
+            rf"declare ({_NUMERAL}) s in `default` \(the four `mandate_smoke` rows "
+            rf"and the constitution\s+gate\) and ({_NUMERAL}) s in `perf` "
+            rf"\(({_NUMERAL}) rows, ({_NUMERAL}) of them still `TBD`\)"
+        ),
+        keys=(
+            "draft_cost_default_rounded",
+            "draft_cost_perf_rounded",
+            "draft_rows_perf",
+            "draft_unmeasured_perf",
+        ),
+        authority=(
+            "the summed nominal costs, row count and `TBD` count of the draft's "
+            "gate-perf-design rows per tier (the default figure to the whole "
+            "second, as the sentence states it)"
+        ),
+    ),
+    DocCount(
+        label="measurement targets of the rtp_mux draft",
+        docs=("tools/PERF_PENDING_rtp_mux.md",),
+        pattern=rf"cover\s+the ({_NUMERAL}) measurement targets",
+        keys=("draft_targets",),
+        authority=(
+            "the distinct targets of the draft's gate-perf-design rows, with its "
+            "deliberately-unmeasured `TBD` costs substituted so every row parses"
+        ),
+    ),
+    DocCount(
+        label="every declared reference, harness plus draft",
+        docs=("tools/PERF_PENDING_rtp_mux.md",),
+        pattern=rf"Every\s+declared reference \(all ({_NUMERAL})\)",
+        keys=("references_total",),
+        authority=(
+            "the reference rows of tests/GATE.md plus those of "
+            "tools/PERF_PENDING_rtp_mux.md"
+        ),
+    ),
+    DocCount(
+        label="baselines and namespaces of the harness declaration",
+        docs=("tests/GATE.md",),
+        pattern=(
+            rf"The harness declares ({_NUMERAL}) baselines, one per measurement "
+            rf"family, and ({_NUMERAL})\s+namespaces"
+        ),
+        keys=("harness_families", "harness_namespaces"),
+        authority=(
+            "the baseline/baseline.<family> lines and the members.<family> lines of "
+            "the gate-budgets block of tests/GATE.md"
+        ),
+    ),
+    DocCount(
+        label="netem_scenarios rows beside the default baseline",
+        docs=("tests/GATE.md",),
+        pattern=rf"the ({_NUMERAL}) other `netem_scenarios` rows are stated against it",
+        keys=("harness_netem_rows",),
+        authority=(
+            "the netem_scenarios:: rows of the gate-perf-design block of "
+            "tests/GATE.md, less their baseline"
+        ),
+    ),
+    DocCount(
+        label="declared relation counts of the harness declaration",
+        docs=("tests/GATE.md",),
+        pattern=(
+            rf"Declared: \*\*({_NUMERAL}) orthogonal\*\* rows, \*\*({_NUMERAL}) "
+            rf"composite\*\* rows and \*\*({_NUMERAL})\s+re-measurement\*\*, "
+            rf"plus the ({_NUMERAL}) baseline rows"
+        ),
+        keys=(
+            "harness_orthogonal",
+            "harness_composite",
+            "harness_re_measurement",
+            "harness_baseline_rows",
+        ),
+        authority=(
+            "the gate-perf-relations summary the checker derives from the "
+            "gate-perf-design and gate-budgets blocks of tests/GATE.md"
+        ),
+    ),
+    DocCount(
+        label="probe rows other than the probe family's reference",
+        docs=("tests/GATE.md",),
+        pattern=rf"and the ({_NUMERAL}) probes\s+differ from the probe cell",
+        keys=("harness_other_probe_rows",),
+        authority=(
+            "the probe-* rows of tests/GATE.md, less the probe family's reference row"
+        ),
+    ),
+)
+
+DOC_DERIVED: tuple[DocDerived, ...] = (
+    DocDerived(
+        label="the rtp opt-in inventory",
+        doc="tools/PERF_INFRA.md",
+        marker=r"^- \*\*`rtp`\*\*",
+        until=r"\n\*\*`proxy`\*\*",
+        pointer="crates/rtp/tools/check-ignored.py",
+        forbidden=(
+            (
+                r"[0-9]+\s+`#\[ignore\]`d\s+tests",
+                "a transcribed total of #[ignore]d tests",
+            ),
+            (
+                r"`(?:perf-lane|probe|standard|full|perf)`\s+[0-9]+",
+                "a transcribed per-tier tally",
+            ),
+            (
+                r"[0-9]+\s+in-crate opt-ins",
+                "a transcribed in-crate opt-in count",
+            ),
+            (
+                r"[0-9]+\s+of\s+[0-9]+\s+probes?\s+record(?:ed)?",
+                "a transcribed probe-selfcheck count",
+            ),
+        ),
+    ),
+    DocDerived(
+        label="the mux perf-test tier tally",
+        doc="tools/PERF_INFRA.md",
+        marker=r"^- \*\*`mux`\*\*",
+        until=r"\n\nThe checker's treatment",
+        pointer="--crate ../mux",
+        forbidden=(
+            (
+                r"\b(?:one|two|[0-9]+)\s+`standard`-tier scenario",
+                "a transcribed tier tally",
+            ),
+            (
+                r"\bno\s+`perf`-tier scenario",
+                "a transcribed tier tally",
+            ),
+        ),
+    ),
+    DocDerived(
+        label="the rtp probe-selfcheck tally",
+        doc="tools/PERF_INFRA.md",
+        marker=r"^\*\*Read report-only output",
+        until=r"\n\n",
+        pointer="crates/rtp/tools/check-ignored.py",
+        forbidden=(
+            (
+                r"[0-9]+\s+of\s+[0-9]+\s+probes?\s+record(?:ed)?",
+                "a transcribed probe-selfcheck count",
+            ),
+            (
+                r"`(?:perf-lane|probe|standard|full|perf)`\s+[0-9]+",
+                "a transcribed per-tier tally",
+            ),
+        ),
+    ),
+)
+
+
+def _doc_number(text: str) -> float | None:
+    """The value of a prose count, written as digits or as a numeral word."""
+    word = text.strip().lower()
+    if word in _NUMERAL_WORDS:
+        return float(_NUMERAL_WORDS[word])
+    try:
+        return float(word)
+    except ValueError:
+        return None
+
+
+def _doc_json(root: Path, relpath: str, problems: list[str]) -> dict | None:
+    """Load a declaration the documented counts are derived from.
+
+    A missing or malformed source is a problem, never a silent skip: a count
+    whose source has gone cannot be verified, and a check that passes because
+    it could not look is the defect this whole section exists to remove.
+    """
+    try:
+        return json.loads((root / relpath).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        problems.append(f"DOC COUNT: cannot derive: {relpath} does not exist")
+    except json.JSONDecodeError as error:
+        problems.append(f"DOC COUNT: cannot derive: {relpath} is not JSON ({error})")
+    return None
+
+
+def _gate_block_counts(
+    text: str,
+    source: str,
+    prefix: str,
+    problems: list[str],
+    *,
+    null_cost: tuple[str, str] | None = None,
+) -> dict[str, float]:
+    """Rows, families, the relation tally and the cost sums of one block set.
+
+    The relation counts are read from the checker's own derivation summary
+    rather than recounted here, so the number a document states and the number
+    the gate prints are the same number by construction.
+
+    ``null_cost`` is ``(placeholder, value)`` and replaces a placeholder cost
+    before parsing, which the draft declaration needs: its rows carry a ``TBD``
+    cost by design (the measurement is still owed), and a relation is derived
+    from the cells, never from the cost, so the substitution cannot change a
+    relation count. The placeholder and how many rows carry it are counted
+    separately, because a document states them too.
+    """
+    values: dict[str, float] = {}
+    design = fenced_block(text, "gate-perf-design")
+    budgets_text = fenced_block(text, "gate-budgets")
+    if design is None or budgets_text is None:
+        problems.append(
+            f"DOC COUNT: cannot derive: {source} has no gate-perf-design/"
+            "gate-budgets block"
+        )
+        return values
+    unmeasured: dict[str, int] = {}
+    if null_cost is not None:
+        placeholder, replacement = null_cost
+        for line in design.splitlines():
+            if placeholder not in line:
+                continue
+            tier = line.split("=", 1)[1].split("|", 1)[0].strip()
+            unmeasured[tier] = unmeasured.get(tier, 0) + 1
+        design = re.sub(rf"\b{re.escape(placeholder)}\b", replacement, design)
+    rows = parse_perf_design(design, [])
+    budgets = parse_perf_budgets(budgets_text, [])
+    values[f"{prefix}_rows"] = float(len(rows))
+    values[f"{prefix}_targets"] = float(
+        len({row.name.split("::", 1)[0] for row in rows})
+    )
+    for tier in sorted({row.tier for row in rows}):
+        tier_rows = [row for row in rows if row.tier == tier]
+        total = sum(row.cost for row in tier_rows)
+        values[f"{prefix}_cost_{tier}"] = total
+        values[f"{prefix}_cost_{tier}_rounded"] = float(round(total))
+        values[f"{prefix}_rows_{tier}"] = float(len(tier_rows))
+        values[f"{prefix}_unmeasured_{tier}"] = float(unmeasured.get(tier, 0))
+    values[f"{prefix}_families"] = float(1 + len(budgets.named))
+    values[f"{prefix}_named_families"] = float(len(budgets.named))
+    values[f"{prefix}_namespaces"] = float(len(budgets.members))
+    summary = check_perf_relations(rows, budgets, [])
+    relations = next(
+        (line for line in summary if "gate-perf-relations:" in line), None
+    )
+    match = relations and re.search(
+        r"gate-perf-relations: ([0-9]+) orthogonal, ([0-9]+) composite, "
+        r"([0-9]+) re-measurement, ([0-9]+) baseline of",
+        relations,
+    )
+    if match is None:
+        problems.append(
+            f"DOC COUNT: cannot derive: the checker printed no gate-perf-relations "
+            f"summary for {source}"
+        )
+        return values
+    (
+        values[f"{prefix}_orthogonal"],
+        values[f"{prefix}_composite"],
+        values[f"{prefix}_re_measurement"],
+        values[f"{prefix}_baseline_rows"],
+    ) = (float(group) for group in match.groups())
+    return values
+
+
+def _harness_gate_counts(root: Path, problems: list[str]) -> dict[str, float]:
+    """The counts the harness's own `gate-*` blocks determine."""
+    gate_path = root / "tests" / "GATE.md"
+    try:
+        text = gate_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        problems.append("DOC COUNT: cannot derive: tests/GATE.md does not exist")
+        return {}
+    design = fenced_block(text, "gate-perf-design")
+    budgets_text = fenced_block(text, "gate-budgets")
+    if design is None or budgets_text is None:
+        problems.append(
+            "DOC COUNT: cannot derive: tests/GATE.md has no gate-perf-design/"
+            "gate-budgets block"
+        )
+        return {}
+    inner: list[str] = []
+    rows = parse_perf_design(design, inner)
+    budgets = parse_perf_budgets(budgets_text, inner)
+    if inner:
+        # The perf declaration itself does not parse; the perf check above
+        # names every reason, so the derived counts are noted, not re-failed.
+        problems.append(
+            "note: the documented harness counts are not derived this run: the "
+            "gate-perf-design/gate-budgets blocks do not parse (see the perf "
+            "declaration problems above)"
+        )
+        return {}
+    values = _gate_block_counts(text, "tests/GATE.md", "harness", problems)
+    values["harness_netem_rows"] = float(
+        max(
+            0,
+            sum(
+                1
+                for row in rows
+                if row.name.startswith("netem_scenarios::")
+                and row.relation is not None
+                and row.relation.family is None
+            )
+            - 1,
+        )
+    )
+    probe_rows = [row for row in rows if any(c.startswith("probe-") for c in row.cells)]
+    values["harness_probe_rows"] = float(len(probe_rows))
+    probe_reference = budgets.named.get("probe")
+    values["harness_other_probe_rows"] = float(
+        len([row for row in probe_rows if row.name != probe_reference])
+    )
+    return values
+
+
+def _draft_gate_counts(root: Path, problems: list[str]) -> dict[str, float]:
+    """The counts the `rtp_mux` draft declaration's own blocks determine."""
+    path = root / "tools" / "PERF_PENDING_rtp_mux.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        problems.append(
+            "DOC COUNT: cannot derive: tools/PERF_PENDING_rtp_mux.md does not "
+            "exist; if the draft was applied and deleted, drop its entries from "
+            "DOC_COUNTS in tools/check-gate.py"
+        )
+        return {}
+    return _gate_block_counts(
+        text,
+        "tools/PERF_PENDING_rtp_mux.md",
+        "draft",
+        problems,
+        null_cost=("TBD", "0"),
+    )
+
+
+def _noise_band_counters(root: Path, problems: list[str]) -> dict[str, float]:
+    """`len(COUNT_NOISE_BANDS_BYTES)` from `tools/mandate_compare.py`."""
+    path = root / "tools" / "mandate_compare.py"
+    spec = importlib.util.spec_from_file_location("mandate_compare_doc_counts", path)
+    if spec is None or spec.loader is None:
+        problems.append(
+            f"DOC COUNT: cannot derive: {path} cannot be loaded for "
+            "COUNT_NOISE_BANDS_BYTES"
+        )
+        return {}
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # noqa: BLE001 - any import failure is the point
+        problems.append(
+            f"DOC COUNT: cannot derive: {path} failed to import ({error!r}) for "
+            "COUNT_NOISE_BANDS_BYTES"
+        )
+        return {}
+    bands = getattr(module, "COUNT_NOISE_BANDS_BYTES", None)
+    if not isinstance(bands, dict):
+        problems.append(
+            f"DOC COUNT: cannot derive: {path} defines no COUNT_NOISE_BANDS_BYTES dict"
+        )
+        return {}
+    return {"noise_band_counters": float(len(bands))}
+
+
+def doc_count_values(root: Path, problems: list[str]) -> dict[str, float]:
+    """Every value the verified prose counts are checked against."""
+    values: dict[str, float] = {}
+    producers = _doc_json(root, "tools/mandate-producers.json", problems)
+    arms = _doc_json(root, "tools/mandate-arms.json", problems)
+    baseline = _doc_json(root, "tools/mandate-baseline.json", problems)
+
+    if producers is not None:
+        entries = producers.get("producers") or []
+        values["producers"] = float(len(entries))
+        values["next_producer"] = float(len(entries) + 1)
+        verdicts = [
+            entry for entry in entries if entry.get("id") == "rtp_mux"
+        ]
+        if not verdicts:
+            problems.append(
+                "DOC COUNT: cannot derive: tools/mandate-producers.json declares no "
+                "rtp_mux producer, so its verdict sections are unknown"
+            )
+        else:
+            count = float(len(verdicts[0].get("verdicts") or []))
+            values["verdicts"] = count
+            values["evidence_files"] = 2 * count
+
+    if arms is not None:
+        cells = arms.get("cells") or {}
+        values["arms_probe"] = float(
+            sum(1 for key in cells if key.startswith("probe/"))
+        )
+
+    if baseline is not None:
+        recorded = baseline.get("arms") or []
+        values["baseline_arms"] = float(len(recorded))
+        values["arms_total"] = float(len(recorded))
+        values["arms_rtp_mux"] = float(
+            sum(1 for arm in recorded if arm.get("producer") == "rtp_mux")
+        )
+        values["baseline_probes"] = float(
+            sum(1 for arm in recorded if arm.get("producer") == "netem_test")
+        )
+        by_mandate: dict[str, int] = {}
+        for arm in recorded:
+            mandate = arm.get("mandate")
+            by_mandate[mandate] = by_mandate.get(mandate, 0) + 1
+        for mandate in ("M1", "M2", "M3", "M4"):
+            values[f"arms_{mandate}"] = float(by_mandate.get(mandate, 0))
+        mandates = baseline.get("mandates") or {}
+        panels = sum(int(record.get("panels") or 0) for record in mandates.values())
+        values["baseline_panels"] = float(panels)
+        values["baseline_plot_files"] = float(2 * panels)
+        duration = baseline.get("duration_seconds")
+        if isinstance(duration, (int, float)):
+            values["baseline_duration"] = float(duration)
+
+    values.update(_harness_gate_counts(root, problems))
+    draft = _draft_gate_counts(root, problems)
+    values.update(draft)
+    if "draft_families" in draft and "harness_families" in values:
+        # "every declared reference": both crates' baseline rows.
+        values["references_total"] = (
+            draft["draft_families"] + values["harness_families"]
+        )
+    values.update(_noise_band_counters(root, problems))
+    return values
+
+
+def check_doc_counts(root: Path) -> tuple[list[str], list[str]]:
+    """Verify every documented count that a command determines.
+
+    Returns ``(problems, summary)``. A count whose sentence or source is gone
+    is a problem, not a skip: the alternative is a check that cannot fail once
+    the number it guarded has been deleted.
+    """
+    problems: list[str] = []
+    values = doc_count_values(root, problems)
+    checked = 0
+    for entry in DOC_COUNTS:
+        for relpath in entry.docs:
+            path = root / relpath
+            try:
+                text = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                problems.append(f"DOC COUNT: {relpath} does not exist")
+                continue
+            matches = list(re.finditer(entry.pattern, text, re.IGNORECASE))
+            if not matches:
+                problems.append(
+                    f"DOC COUNT: {relpath} no longer states {entry.label!r}; a "
+                    "verified count that has left the prose cannot be checked - "
+                    "restore the sentence or drop this entry from DOC_COUNTS in "
+                    "tools/check-gate.py"
+                )
+                continue
+            for match in matches:
+                for index, key in enumerate(entry.keys):
+                    written = match.group(index + 1)
+                    given = _doc_number(written)
+                    derived = values.get(key)
+                    if given is None:
+                        problems.append(
+                            f"DOC COUNT: {relpath}: {entry.label!r} reads "
+                            f"{written!r}, which is not a number"
+                        )
+                        continue
+                    if derived is None:
+                        problems.append(
+                            f"DOC COUNT: {relpath}: {entry.label!r} cannot be "
+                            f"checked: nothing determined a value for {key!r} "
+                            f"({entry.authority})"
+                        )
+                        continue
+                    checked += 1
+                    if abs(given - derived) > DOC_COUNT_TOLERANCE:
+                        problems.append(
+                            f"DOC COUNT: {relpath}: {entry.label!r} says "
+                            f"{written!r}, but {derived:g} is what determines it "
+                            f"({entry.authority}); update the document, or the "
+                            "declaration if the change is intended"
+                        )
+    for entry in DOC_DERIVED:
+        path = root / entry.doc
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            problems.append(f"DOC COUNT: {entry.doc} does not exist")
+            continue
+        marker = re.search(entry.marker, text, re.MULTILINE)
+        if marker is None:
+            problems.append(
+                f"DOC COUNT: {entry.doc} no longer has the sentence {entry.label!r} "
+                "was derived into; restore it or drop this entry from DOC_DERIVED "
+                "in tools/check-gate.py"
+            )
+            continue
+        end = re.search(entry.until, text[marker.end() :], re.MULTILINE)
+        stop = marker.end() + end.start() if end else len(text)
+        region = text[marker.start() : stop]
+        if entry.pointer not in region:
+            problems.append(
+                f"DOC COUNT: {entry.doc}: {entry.label!r} no longer names "
+                f"{entry.pointer!r}; a derived count whose command is not named is "
+                "unreadable - point the sentence at the command that prints it"
+            )
+        for pattern, why in entry.forbidden:
+            transcribed = re.search(pattern, region)
+            if transcribed:
+                problems.append(
+                    f"DOC COUNT: {entry.doc}: {entry.label!r} has a transcription "
+                    f"back: {transcribed.group(0)!r} is {why}, and the number is "
+                    f"already printed by {entry.pointer!r}"
+                )
+    summary = [
+        f"  gate-doc-counts: {checked} verified count(s) across "
+        f"{len({d for e in DOC_COUNTS for d in e.docs})} doc(s), "
+        f"{len(DOC_DERIVED)} derived inventory claim(s) pinned to their checker"
+    ]
+    return problems, summary
 
 
 @dataclass(frozen=True)
@@ -2250,6 +3021,19 @@ def main() -> int:
         print(f"PERF DECLARATION: {problem}")
     bad = bad or bool(perf_problems)
 
+    # The documented counts: a number in prose that a command already
+    # determines is verified against the source that determines it, or has left
+    # the prose for the command that prints it. Harness-only, because the
+    # documents are the harness's operating doc and the counts are this
+    # repository's declarations.
+    if layout().is_harness:
+        doc_problems, doc_summary = check_doc_counts(layout().root)
+        for problem in doc_problems:
+            print(problem)
+        bad = bad or bool(doc_problems)
+    else:
+        doc_summary = []
+
     if bad:
         print(
             f"\nmanifest has {len(manifest)} entries, binaries report "
@@ -2277,6 +3061,8 @@ def main() -> int:
             f"{diagnostic} diagnostic-only"
         )
     for line in perf_summary:
+        print(line)
+    for line in doc_summary:
         print(line)
     return 0
 
