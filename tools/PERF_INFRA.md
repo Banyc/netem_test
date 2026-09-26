@@ -123,6 +123,22 @@ assert the NEW intended behaviour with a vacuity check — never deleted, and
 never loosened to fit.** A test asserting superseded RFC-derived arithmetic is
 not a reason to leave a measured field defect in place.
 
+**How to make a consumer build a local `rtp` for a measurement.** The
+checked-in manifests keep the published git tag — `rtp_mux/Cargo.toml` pins
+`rtp v0.0.94` and only comments out `# rtp = { path = "../rtp" }` — and must
+not be repointed for a measurement: uncommenting that line changes what every
+later run builds, and the crates-level `DEPENDENCY_SOURCES.md` calls the
+resulting tag-vs-local mismatch the "silent verdict" trap. The supported
+route is the frozen-suite snapshot, which exports each sibling's committed
+tree and rewrites every inter-component git-tag locator to the exported
+sibling's relative path: `tools/perf-loop snapshot` (the rewrite, its record
+in `frozen_dep_rewrites` and the refusal to run a suite whose sibling edges
+still resolve from a tag are in `tools/PERF_LOOP.md`). For a one-off
+measurement outside that flow, copy the consumer and the sibling `rtp` into a
+scratch directory under the build tmp root and repoint **only the copy's**
+manifest; a copy left inside the crate tree is the scratch `tools/hygiene.py`
+reports.
+
 ### Where the path stands today
 
 Facts and numbers, as recorded at this writing.
@@ -250,6 +266,12 @@ frozen executable per role, then runs each seed in both roles and reports
 readiness and a verdict; `analyze` recomputes the analysis on a preserved
 result without rerunning anything.
 
+That one-liner is a digest of `tools/PERF_LOOP.md`: its introduction and
+`snapshot` section (the freeze and the locator rewrite), plus `Frozen
+executables and counterbalanced order`, `Rendered graph evidence
+(mandatory)`, `Safe paths and workspace topology` and `Verdicts and exit
+codes`.
+
 Its cost is the freeze plus one timed run per role per seed (the documented
 defaults are `--seeds 11,21 --window-seconds 30` with a warmup), so it is much
 slower than `tools/mandate-check`. Use it when a delta needs attribution
@@ -299,6 +321,21 @@ These own the mandate outcomes today; their settings are immutable.
 
 A missing regime gets a **new** test written down in the owning crate's
 `GATE.md` — never a retuned old one.
+
+### Workspaces during active work
+
+Work on the interactive path runs in sibling jj workspaces, each registered
+by the repo of the crate it tracks, so a `crates/` listing may hold several
+`<crate>_ws` directories at once — one per crate being worked on, plus a
+preserved candidate — beside the crates' default checkouts; such a directory
+is a registered workspace, not a stale copy. A crate's local checkout can
+also be ahead of what its consumers build: `crates/rtp`'s `dev` bookmark sits
+at commit `61fc7ba9` (`test(rtp): measure the lone tail's repair deadline on
+a seeded connection`), one commit past `rtp v0.0.94`. The authority for what a
+run actually built is the **tag the consumer pins** — `rtp_mux/Cargo.toml`
+pins `rtp v0.0.94`, and `mandate-check.json` records the resolved `rtp_mux`
+revision — while the local `dev` is the authority only for local edits, not
+for the measurement.
 
 ### Running a single arm or a single probe
 
