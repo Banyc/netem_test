@@ -61,9 +61,13 @@ def main():
     if plan.get("sleep"):
         time.sleep(plan["sleep"])
     for line in plan.get("stdout") or []:
-        print(line)
+        # Flush per line: the real smoke set streams its output, and the
+        # per-test timing is an observation of that stream.
+        print(line, flush=True)
+        if plan.get("line_sleep"):
+            time.sleep(plan["line_sleep"])
     for line in plan.get("stderr") or []:
-        print(line, file=sys.stderr)
+        print(line, file=sys.stderr, flush=True)
     for mandate, spec in (plan.get("mandates") or {}).items():
         if spec.get("json") is not None:
             pathlib.Path(out, mandate + ".json").write_text(
@@ -248,12 +252,17 @@ M4_ROWS = _m4_rows()
 
 PASS_LINES = [
     "running 4 tests",
+    "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   24.5",
     "MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0",
+    "test m1_interactive_tail_latency ... ok",
     "MANDATE M2 PASS delivery=1.000 amp=3.61 budget=6.0",
+    "test m2_interactive_delivery_and_wire ... ok",
     "MANDATE M3 PASS goodput=0.52 floor=0.35 link_mib_s=8.0",
+    "test m3_bulk_goodput_fraction ... ok",
     "MANDATE M4 PASS flows=4 clean_delivery_min=1.000 hostile_delivery_min=0.998 "
     "clean_imbalance=0.004 hostile_imbalance=0.008 imbalance_bound=0.010 "
     "fair_share=0.2500 delivery_floor=0.995 clean_p99_max=121.0 ceiling=250.0",
+    "test m4_interactive_lane_fairness ... ok",
     "test result: ok. 4 passed; 0 failed",
 ]
 
@@ -435,6 +444,63 @@ class MandateCheckTest(unittest.TestCase):
             self.assertIn(f"plot: {path}", stdout)
         self.assertIn(
             f"report:  {(self.out / MANDATE_CHECK.REPORT_NAME).resolve()}", stdout
+        )
+
+    def test_report_records_per_test_and_per_mandate_timings(self):
+        plan = self.healthy_plan()
+        plan["line_sleep"] = 0.05
+        code, stdout, stderr = self.run_tool(plan)
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        timings = report["timings"]
+        self.assertIn("streamed-line-arrival", timings["method"])
+        self.assertIn("gap before the test started", timings["method"])
+        self.assertEqual(timings["origin"], "smoke-child-start")
+        self.assertEqual(
+            [entry["name"] for entry in timings["tests"]],
+            [
+                "m1_interactive_tail_latency",
+                "m2_interactive_delivery_and_wire",
+                "m3_bulk_goodput_fraction",
+                "m4_interactive_lane_fairness",
+            ],
+        )
+        for entry in timings["tests"]:
+            self.assertEqual(entry["target"], "mandate_smoke")
+            self.assertEqual(entry["state"], "ok")
+            self.assertGreater(entry["duration_seconds"], 0)
+        measured = {
+            mandate: report["mandates"][mandate]["duration_seconds"]
+            for mandate in ("M1", "M2", "M3", "M4")
+        }
+        self.assertEqual(set(measured), {"M1", "M2", "M3", "M4"})
+        for duration in measured.values():
+            self.assertGreater(duration, 0)
+        self.assertIn("duration: ", stdout)
+        self.assertIn("bracketed wall-clock", stdout)
+
+    def test_derive_timings_brackets_results_and_mandates(self):
+        events = [
+            {"seconds": 1.0, "line": "running 3 tests"},
+            {"seconds": 3.0, "line": "MANDATE M1 PASS p99=1.0"},
+            {"seconds": 3.5, "line": "test m1_x ... ok"},
+            {"seconds": 4.0, "line": "test m2_y has been running for over 60 seconds"},
+            {"seconds": 9.5, "line": "test m2_y ... FAILED"},
+            {"seconds": 10.0, "line": "test m3_z ... ignored, perf tier"},
+            {"seconds": 12.0, "line": "MANDATE M2 FAIL delivery=0.0"},
+        ]
+        timings = MANDATE_CHECK.derive_timings(events, "mandate_smoke")
+        self.assertEqual(
+            [entry["name"] for entry in timings["tests"]], ["m1_x", "m2_y", "m3_z"]
+        )
+        first, second, third = timings["tests"]
+        self.assertEqual((first["state"], first["duration_seconds"]), ("ok", 3.5))
+        self.assertEqual(first["started_at_seconds"], 0.0)
+        self.assertEqual((second["state"], second["duration_seconds"]), ("FAILED", 6.0))
+        self.assertEqual((third["state"], third["duration_seconds"]), ("ignored", None))
+        self.assertEqual(
+            [(entry["mandate"], entry["duration_seconds"]) for entry in timings["mandates"]],
+            [("M1", 3.0), ("M2", 9.0)],
         )
 
     def test_quick_asks_the_smoke_set_for_its_shortest_windows(self):

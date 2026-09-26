@@ -104,13 +104,14 @@ Into `--dir` (the path is printed, and recorded in the report):
 - `plots/<mandate>-<panel>.svg`, and `.png` unless `--no-rasterize` — the
   verified panels, each checked for series geometry and for every declared
   bound;
-- `mandate-check.json` — `schema`, `ok`, `exit_code`, `verdict`,
-  `started_at`, `duration_seconds`, the exact `command` and `cwd`,
+- `mandate-check.json` — `schema` (`mandate-check/2`), `ok`, `exit_code`,
+  `verdict`, `started_at`, `duration_seconds`, the exact `command` and `cwd`,
   `rtp_mux.path` with its `revision`/`change_id`/`revision_source` (`jj` or
   `git`, `null` when neither resolves — never fabricated), the smoke set's
-  exit code and `timed_out` flag, a `mandates` record per mandate
-  (`declared`, `verdict`, the parsed `values`, the verbatim `raw_line`, the
-  `plots` paths, `series_counts`, `panels`), and every `problem` found.
+  exit code and `timed_out` flag, a `timings` record (below), a `mandates`
+  record per mandate (`declared`, `verdict`, the parsed `values`, the verbatim
+  `raw_line`, `finished_at_seconds`, `duration_seconds`, the `plots` paths,
+  `series_counts`, `panels`), and every `problem` found.
 
 The verdict block printed on stdout carries the same information: the
 revision and command, one line per mandate with its measured values, the
@@ -122,6 +123,44 @@ by this run and not left behind by an earlier one. Only a directory that is
 empty or that carries an earlier run's `mandate-check.json` or
 `mandate-smoke.log` is cleared; a directory holding anything else is refused
 rather than trimmed.
+
+## The per-test timings
+
+`timings` records the wall-clock the runner observed, per test and per
+mandate, so a declared nominal cost can be compared with what the run actually
+took and a tier overrun is visible per test rather than only in total:
+
+```json
+"timings": {
+  "method": "streamed-line-arrival: ...",
+  "origin": "smoke-child-start",
+  "tests": [
+    {"target": "mandate_smoke", "name": "m2_interactive_delivery_and_wire",
+     "state": "ok", "started_at_seconds": 0.0,
+     "finished_at_seconds": 24.698, "duration_seconds": 24.698}
+  ],
+  "mandates": [
+    {"mandate": "M2", "finished_at_seconds": 24.698, "duration_seconds": 24.698}
+  ]
+}
+```
+
+It is a measurement, not a proxy: the smoke set's output is read as a stream,
+and the arrival of each libtest result line and each `MANDATE` line is
+timestamped against the child's start. A test's duration is the bracket
+between its completion and the previous completion (0 for the first, i.e. the
+child's start); a mandate's duration is bracketed the same way between its
+neighbouring `MANDATE` lines. Because the smoke set serialises its own
+measurements, the completions arrive in run order; a bracket includes the gap
+before the test started (lock wait, fixture setup), which is why the method is
+recorded rather than the numbers being reported bare. A test with no result
+line, or an `ignored` test, is recorded with its state and a null duration.
+
+The declaring side is the owning crate's `gate-perf-design` block, and
+`tools/check-gate.py` is what compares the two: it fails when a declared cost
+has drifted past the tolerance the crate declares, and when a measured test
+exceeds its tier budget. It only compares a row whose `<target>::<test>` the
+report measured, and it says how many rows it compared.
 
 ## Exit codes
 

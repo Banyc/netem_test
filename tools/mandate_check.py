@@ -8,6 +8,19 @@ command runs it with ``--release``, renders each mandate's panels through
 can verify from a machine, not from prose, that the mandated checks ran and
 what they measured.
 
+It also times the run per test and per mandate. The smoke set is read as a
+stream (not waited on and then read whole), so the arrival of every libtest
+completion line and every ``MANDATE`` line is timestamped against the child's
+start. Those arrivals give each test and each mandate a wall-clock duration
+bracketed between two observed lines: the smoke set serialises its own
+measurements, so the completions arrive in run order, and a per-test duration
+includes the gap before the test started (fixture setup, lock wait). The
+report records the method alongside the numbers so a reader knows what was
+measured, and a declared nominal cost that has drifted from this measured
+wall-clock is visible rather than assumed (the owning crate's
+``gate-perf-design`` block states the declared cost, ``check-gate.py``
+compares them).
+
     ./tools/mandate-check [--rtp-mux <path>] [--dir <out>] [--quick]
 
 ## The contract
@@ -82,10 +95,11 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
 - ``plots/<mandate>-<panel>.svg`` (and ``.png`` unless ``--no-rasterize``) —
   the verified panels;
 - ``mandate-check.json`` — per mandate its pass/fail verdict, the measured
-  values parsed from the ``MANDATE`` lines, the plot paths and the panel
-  series counts, plus the run's exact command, the ``rtp_mux`` source
-  revision (its ``jj`` or ``git`` commit when resolvable), the wall-clock
-  duration, every problem found and the exit code.
+  values parsed from the ``MANDATE`` lines, the per-test and per-mandate
+  wall-clock timings observed on the child's output stream, the plot paths
+  and the panel series counts, plus the run's exact command, the ``rtp_mux``
+  source revision (its ``jj`` or ``git`` commit when resolvable), the
+  wall-clock duration, every problem found and the exit code.
 
 The six expected evidence files and the ``plots`` directory are removed from
 ``--dir`` before the smoke set runs, so evidence found afterwards was
@@ -120,6 +134,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -137,9 +152,12 @@ DEFAULT_CARGO = "cargo"
 REPORT_NAME = "mandate-check.json"
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/1"
+REPORT_SCHEMA = "mandate-check/2"
 REVISION_TIMEOUT_SECONDS = 30.0
 LOG_TAIL_LINES = 20
+# How long the line reader may take to drain after the child exits or is
+# killed, before the run is reported with whatever the reader captured.
+READER_JOIN_SECONDS = 10.0
 
 EXIT_OK = 0
 EXIT_EVIDENCE_FAILURE = 2
@@ -155,6 +173,21 @@ MANDATE_LINE_RE = re.compile(
 VALUE_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)$")
 COMMIT_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 CHANGE_ID_RE = re.compile(r"^[a-z]{10,}$")
+# A libtest result line: `test <name> ... ok` / `... FAILED` / `... ignored,
+# <reason>`. The marker and the result are flushed together, so the result's
+# arrival is the test's end. A libtest progress note
+# (`test <name> has been running for over 60 seconds`) and the smoke set's own
+# lines do not match a state and are not completions.
+TEST_RESULT_RE = re.compile(r"^test (?P<name>\S+) \.\.\. ?(?P<tail>.*)$")
+TEST_STATES = ("ok", "FAILED", "ignored")
+MANDATE_TIMING_RE = re.compile(r"^MANDATE (?P<mandate>M[0-9]+) ")
+TIMING_METHOD = (
+    "streamed-line-arrival: a test's completion is the arrival of its libtest "
+    "result line, and its duration is bracketed against the previous "
+    "completion (0 for the first, the child's start); a mandate's duration is "
+    "bracketed the same way against its neighbouring MANDATE lines. A bracket "
+    "includes the gap before the test started"
+)
 
 
 def _load_sibling(name):
@@ -388,10 +421,14 @@ def smoke_command(cargo):
 
 
 def run_smoke(command, *, crate, out_dir, quick, timeout):
-    """Run the smoke set, returning its combined output and how it ended.
+    """Run the smoke set, returning its output, how it ended and its timeline.
 
     The child gets its own process group so a timeout kills the test binary
-    and not just the cargo that spawned it.
+    and not just the cargo that spawned it. Its combined output is read as a
+    stream and every line is timestamped against the child's start, so the
+    per-test and per-mandate timings are observations of the run rather than
+    proxies for it. ``events`` is that timeline; ``output`` is the same lines
+    rejoined, so every reader that only wants the text is unaffected.
     """
     env = dict(os.environ)
     env[OUT_DIR_ENV] = str(out_dir)
@@ -406,20 +443,117 @@ def run_smoke(command, *, crate, out_dir, quick, timeout):
         stderr=subprocess.STDOUT,
         text=True,
         errors="replace",
+        bufsize=1,
         start_new_session=True,
     )
+    started = time.monotonic()
+    events = []
+
+    def pump():
+        for line in process.stdout:
+            events.append(
+                {"seconds": round(time.monotonic() - started, 3), "line": line.rstrip("\n")}
+            )
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
     try:
-        output, _ = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
         timed_out = False
     except subprocess.TimeoutExpired:
         _kill_process_group(process)
-        output, _ = process.communicate()
+        process.wait()
         timed_out = True
+    reader.join(timeout=READER_JOIN_SECONDS)
+    output = "\n".join(event["line"] for event in events)
+    if output:
+        output += "\n"
     return {
         "exit_code": process.returncode,
         "timed_out": timed_out,
-        "output": output or "",
+        "output": output,
+        "events": events,
     }
+
+
+def derive_timings(events, target):
+    """The run's per-test and per-mandate wall-clock, from the line timeline.
+
+    Every libtest result line and every ``MANDATE`` line is an observed
+    instant. A test's duration is the bracket between its result's arrival and
+    the previous result's, a mandate's the bracket between its ``MANDATE``
+    line and the previous one; the first bracket runs from the child's start.
+    A ``FAILED`` or ``ignored`` result is recorded with its state and, for
+    ``ignored``, a null duration (it never ran). Nothing here is inferred: an
+    absent line stays absent.
+    """
+    tests = []
+    mandates = []
+    previous_completion = 0.0
+    previous_mandate = 0.0
+    for event in events:
+        line = event["line"].strip()
+        seconds = event["seconds"]
+        mandate = MANDATE_TIMING_RE.match(line)
+        if mandate is not None:
+            mandates.append(
+                {
+                    "mandate": mandate.group("mandate"),
+                    "finished_at_seconds": seconds,
+                    "duration_seconds": round(max(seconds - previous_mandate, 0.0), 3),
+                }
+            )
+            previous_mandate = seconds
+            continue
+        result = TEST_RESULT_RE.match(line)
+        if result is None:
+            continue
+        tail = result.group("tail").strip()
+        state = next(
+            (
+                candidate
+                for candidate in TEST_STATES
+                if tail == candidate or tail.startswith(candidate + " ")
+                or tail.startswith(candidate + ",")
+            ),
+            None,
+        )
+        if state is None:
+            # A libtest progress note (`has been running for over 60
+            # seconds`) is not a completion.
+            continue
+        entry = {
+            "target": target,
+            "name": result.group("name"),
+            "state": state,
+            "started_at_seconds": previous_completion,
+            "finished_at_seconds": seconds,
+            "duration_seconds": None,
+        }
+        if state != "ignored":
+            entry["duration_seconds"] = round(
+                max(seconds - previous_completion, 0.0), 3
+            )
+            previous_completion = seconds
+        tests.append(entry)
+    return {
+        "method": TIMING_METHOD,
+        "origin": "smoke-child-start",
+        "tests": tests,
+        "mandates": mandates,
+    }
+
+
+def apply_mandate_timings(report, timings):
+    """Attach each mandate's measured wall-clock to its record in the report."""
+    by_mandate = {entry["mandate"]: entry for entry in timings["mandates"]}
+    for mandate, record in report["mandates"].items():
+        entry = by_mandate.get(mandate)
+        if entry is None:
+            continue
+        record["finished_at_seconds"] = entry["finished_at_seconds"]
+        record["duration_seconds"] = entry["duration_seconds"]
+    report["timings"] = timings
 
 
 def _kill_process_group(process):
@@ -514,9 +648,12 @@ def build_report(args, crate, out_dir, command, revision, quick, timeout):
                 "plots": [],
                 "series_counts": [],
                 "panels": 0,
+                "finished_at_seconds": None,
+                "duration_seconds": None,
             }
             for mandate in MANDATE_IDS
         },
+        "timings": {"method": TIMING_METHOD, "origin": "smoke-child-start", "tests": [], "mandates": []},
         "problems": [],
     }
 
@@ -543,6 +680,9 @@ def verdict_block(report):
         verdict = record["verdict"] or "MISSING"
         measured = " ".join(f"{key}={value}" for key, value in record["values"].items())
         lines.append(f"{mandate} {verdict}  {measured}".rstrip())
+        duration = record.get("duration_seconds")
+        if duration is not None:
+            lines.append(f"  duration: {duration:.2f}s (bracketed wall-clock)")
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
     duration = report["duration_seconds"]
@@ -577,6 +717,10 @@ def evaluate(args, out_dir, report, run):
         "timed_out": run["timed_out"],
         "log": str(log_path),
     }
+    # The per-test and per-mandate wall-clock observed on the child's output
+    # stream, so a cost the declaration claims can be compared with what the
+    # run actually took, per test, rather than only in total.
+    apply_mandate_timings(report, derive_timings(run.get("events") or [], SMOKE_TARGET))
     problems = report["problems"]
     if run["timed_out"]:
         problems.append(
