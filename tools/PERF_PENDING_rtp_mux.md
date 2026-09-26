@@ -4,15 +4,16 @@
 unenforced there. This file is the exact set of blocks that crate's `GATE.md`
 needs: the `gate-perf-design` rows, the `gate-budgets` block and the
 `gate-coverage-gaps` lines. Every row also declares its relation to the
-baseline (see "The relation each row declares" below). It is a draft, not an
+baseline of its own family (see "The relation each row declares" below). It is
+a draft, not an
 authority — the numbers become `rtp_mux`'s when that crate's iteration lands
 them in its own `GATE.md`, where `python3 ../netem_test/tools/check-gate.py
 --crate . rtp_mux tests GATE.md` will enforce them.
 
 **Nothing here retunes an arm, threshold, window, cadence or tier.** The rows
 only name tests that already exist, the tier each already has in
-`rtp_mux/GATE.md`, the cells each already covers, and now the dimensions each
-varies from the stated baseline.
+`rtp_mux/GATE.md`, the cells each already covers, the family baseline each is
+stated against, and the dimensions each varies from that baseline.
 
 Derived from the landed `crates/rtp_mux` tree at commit
 `5c3ab564ecd1a036347e75aae508e7ca2fced41f` (`dev`, "test(rtp_mux): measure the
@@ -67,131 +68,163 @@ A cost is a number only where a document already records one; the rest are
 
 ## The relation each row declares
 
-Every row carries its relation to the baseline named in `gate-budgets`
-(`mandate_smoke::m1_interactive_tail_latency`): `baseline` for that row itself,
-`orthogonal` when the row's cells vary exactly one dimension from it,
-`composite(<dimension>[,<dimension>…])` when they vary several, and
+Every row carries its relation to the baseline of **its own family**: a
+relation with a trailing `@<family>` is derived against that
+`baseline.<family>` row, and a relation naming none against the default
+`baseline = mandate_smoke::m1_interactive_tail_latency` (the M1-clean cadence
+cell). The kinds are `baseline` for a family's reference row itself,
+`orthogonal` when the row's cells vary exactly one dimension from that
+reference, `composite(<dimension>[,<dimension>…])` when they vary several, and
 `re-measurement(<reason>)` when they vary none. `check-gate.py` derives the
 varied dimensions from the row's own cells — a dimension whose value differs
-from the baseline's, or that the baseline does not state at all (a dimension
-the row does not name is inherited) — and refuses a label that disagrees with
-that derivation, so these are not a judgement call. Against that baseline the
-94 rows are **1 baseline**, **2 orthogonal**
-(`mandate_smoke::m2_interactive_delivery_and_wire`, which varies only `metric`,
-and `rtp_mux_jitter::jitter_burst_loss_arms`, which varies only `impairment`),
-**91 composite**, and no re-measurement — nothing here repeats the baseline's
-cell, so no row is labelled one rather than guessed at.
+from its family reference's, or that the reference does not state at all (a
+dimension the row does not name is inherited) — and refuses a label that
+disagrees with that derivation, so these are not a judgement call. Nor is a
+row stated against a reference of a family it belongs to by inspection: which
+family a row belongs to is exactly what the `@<family>` suffix declares, and
+`check-gate.py` only enforces that the family exists, that a family's
+reference row carries its `baseline@<family>` label, and that every declared
+family is used by some row.
 
-That split is the finding, not a re-cut of the arms. The set is anchored on one
-M1-clean cadence cell, and every other family moves several of the axes its own
-cell names: an M3/M4 row moves `lane` with `rate`/`flows` and `metric`; a
-`perf_probe` or `mux_ceiling_probe` row moves `layer`, `shape`, `scale` and
-`metric`; a `hol_probe` row moves `latency`, `loss`, `bulk` and often
-`variant`. Read against that one baseline, a result on almost any row here
-cannot be attributed to a single dimension, and the declaration now says so
-instead of leaving it to prose. Nothing here needs its windows, cadences or
-tiers retuned to fix that: an attributable arm for a family is a **new** arm
-stated one axis away from a reference, and that is a change to the tests, not
-to these labels. Nothing the draft cannot determine was guessed: the labels are
-the checker's derivation, and the `TBD` costs stay `TBD`.
+The set splits into **29 families** plus the default: the four mandates, the
+constitution gate, the per-target probe groups (the rtp and mux echo ceilings,
+the two instrument-sanity arms, the hostile-preset probes), the `hol_probe`
+regimes, `hol_verify4`, the decomposed frame-reorder and FEC arms, the
+interactive cadence arms, the reorder, decomposition and latency-sweep arms,
+the contested-latency pair, the mux-over-rtp arms, the fairness and longrun
+arms, and the lone-tail arms. Each family's reference is the arm that already
+states that family's common context most completely — which is what makes a
+member one dimension away attributable — never a retuned arm. Against those
+references the 94 rows are **46 orthogonal**, **16 composite**, **3
+re-measurement** and **29 baseline** (one per family).
+
+The composites are the 14 rows for which no arm in their own family is within
+one declared dimension, plus 2 whose nearest declared arm sits in another
+family: `jitter_nonloss_impairments` is one declared dimension (`impairment`)
+from the `hol_probe` clean-link arms, and `jitter_interactive_bulk_and_loss` is
+one (`metric`) from `jitter_interactive_with_bulk`; both are filed where the
+rest of their cell context lives, and both are attributable if refiled. All 16
+are listed with their dimensions in the checker's output
+(`gate-perf-composite:`), and each is a candidate for a **new** single-axis arm
+beside it rather than for a retuned one. The three re-measurements are arms
+whose declared cells repeat their reference's own point (the member's cell
+omits axes the reference states, so they are inherited): `jitter_interactive_with_loss`
+against `jitter_interactive_solo`, `hol_rtt100_ge5_shared_dual_lane` against
+`hol_rtt100_ge5_shared`, and `mux_stream_fairness_longrun` against
+`rtp_longrun::multiflow_duallane`. Each is labelled rather than silently
+orthogonal, because a declared duplicate cell is exactly what a shortening
+pass needs to see.
+
+The partition itself is the choice; the **partition-invariant** number is how
+many rows have another arm exactly one declared dimension away. 61 of the 94
+do; the other 33 have none. Of those 33, 11 are arms whose declared cell
+states only axes a richer neighbour already states (so the neighbour is at
+zero dimensions but the two are not the same arm — an omitted axis, the limit
+the checker cannot see), 8 are used as their family's reference (so they are
+baselines, not confounded arms) and 14 land as composites. Nothing here needs
+its windows, cadences or tiers retuned to fix that: an attributable arm for a
+family is a **new** arm stated one axis away from a reference, and that is a
+change to the tests, not to these labels. Nothing the draft cannot determine
+was guessed: the labels are the checker's derivation, and the `TBD` costs stay
+`TBD`.
 
 ## The blocks to paste into `crates/rtp_mux/GATE.md`
 
 ```gate-perf-design
 mandate_smoke::m1_interactive_tail_latency = default | 50.0 | baseline | baseline@impairment=clean2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+scale=256B+metric=p99
 mandate_smoke::m2_interactive_delivery_and_wire = default | 54.1 | orthogonal | M2@impairment=clean2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+metric=own-wire
-mandate_smoke::m3_bulk_goodput_fraction = default | 61.6 | composite(lane,metric,rate,scale) | M3@lane=bulk+rate=1MiBps+scale=2MiB+metric=capacity-fraction
-mandate_smoke::m4_interactive_lane_fairness = default | 31.2 | composite(arm-set,flows,metric) | M4@lane=dual+flows=4+arm-set=clean-and-hostile+metric=per-flow-share
-rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | composite(arm-set,metric) | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=own-wire-budget
-rtp_mux_jitter::jitter_duallane_constitution_gate_p99 = full | 105 | composite(arm-set,metric) | M1@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=p99-median-of-3
-rtp_mux_jitter::jitter_decomposition = perf | 280 | composite(arms,impairment,load,metric) | loss-vs-queue@impairment=loss2pct-iid+jitter=5ms+load=bulk-burst+arms=solo-loss-bulk-combined+metric=p99-decomposition
-rtp_mux_jitter::jitter_frame_reorder_decomposition = perf | 140 | composite(impairment,layer,load,metric,reorder) | frame-reorder@layer=rtp-frame+reorder=receiver-fast-forward+impairment=loss2pct-iid+load=bulk-burst+metric=p99-decomposition
-rtp_mux_jitter::jitter_frame_reorder_fec_arms = perf | 210 | composite(fec,impairment,layer,reorder) | frame-reorder-fec@layer=rtp-frame+reorder=fast-forward+fec=on+impairment=loss2pct-iid
-rtp_mux_jitter::jitter_frame_reorder_fec_bulk_loss_reorder = perf | 140 | composite(fec,impairment,layer,load,reorder) | frame-reorder-fec@layer=rtp-frame+reorder=fast-forward+fec=on+load=bulk+impairment=loss2pct-iid
-rtp_mux_jitter::jitter_fec_arms_2pct = perf | 175 | composite(fec,impairment,metric) | fec-tuning@impairment=loss2pct-iid+fec=off-stock-prompt+metric=parity-and-latency
-rtp_mux_jitter::jitter_fec_arms_6pct = perf | 175 | composite(fec,impairment,metric) | fec-tuning@impairment=loss6pct-iid+fec=off-stock-prompt+metric=parity-and-latency
-rtp_mux_jitter::jitter_nonloss_impairments = perf | 210 | composite(impairment,loss) | non-loss-impairment@impairment=jitter-reorder-dup-rate+loss=none+metric=p99
-rtp_mux_jitter::jitter_reorder_rate_curve = perf | 140 | composite(impairment,rate) | reorder-rate@impairment=reorder+rate=curve+metric=p99
-rtp_mux_jitter::jitter_reorder_direction = perf | 70 | composite(direction,impairment) | reorder-direction@impairment=reorder+direction=c2s-and-s2c+metric=p99
-rtp_mux_jitter::jitter_interactive_solo = perf | 35 | composite(impairment,lane) | M1@lane=interactive+flows=1+impairment=loss2pct-iid+jitter=5ms+shape=cadence
-rtp_mux_jitter::jitter_interactive_with_loss = perf | 35 | composite(impairment,lane) | M1@lane=interactive+flows=1+impairment=loss2pct-iid
-rtp_mux_jitter::jitter_interactive_with_bulk = perf | 130 | composite(impairment,lane,load) | M1@lane=interactive+flows=1+load=bulk-burst+impairment=loss2pct-iid
-rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf | 35 | composite(impairment,lane,load,metric) | M2@lane=interactive+flows=1+load=bulk-burst+impairment=loss2pct-iid+metric=own-wire
-rtp_mux_jitter::jitter_duallane_arms = perf | 280 | composite(load,reorder) | dual-lane-matched-load@lane=dual+load=bulk-matched+reorder=fast-forward-and-strict
+mandate_smoke::m3_bulk_goodput_fraction = default | 61.6 | baseline@m3-bulk | M3@lane=bulk+rate=1MiBps+scale=2MiB+metric=capacity-fraction
+mandate_smoke::m4_interactive_lane_fairness = default | 31.2 | composite(arm-set,flows)@fairness | M4@lane=dual+flows=4+arm-set=clean-and-hostile+metric=per-flow-share
+rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=own-wire-budget
+rtp_mux_jitter::jitter_duallane_constitution_gate_p99 = full | 105 | orthogonal@constitution | M1@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=p99-median-of-3
+rtp_mux_jitter::jitter_decomposition = perf | 280 | composite(arms,jitter)@decomposition | loss-vs-queue@impairment=loss2pct-iid+jitter=5ms+load=bulk-burst+arms=solo-loss-bulk-combined+metric=p99-decomposition
+rtp_mux_jitter::jitter_frame_reorder_decomposition = perf | 140 | baseline@decomposition | frame-reorder@layer=rtp-frame+reorder=receiver-fast-forward+impairment=loss2pct-iid+load=bulk-burst+metric=p99-decomposition
+rtp_mux_jitter::jitter_frame_reorder_fec_arms = perf | 210 | baseline@frame-reorder | frame-reorder-fec@layer=rtp-frame+reorder=fast-forward+fec=on+impairment=loss2pct-iid
+rtp_mux_jitter::jitter_frame_reorder_fec_bulk_loss_reorder = perf | 140 | orthogonal@frame-reorder | frame-reorder-fec@layer=rtp-frame+reorder=fast-forward+fec=on+load=bulk+impairment=loss2pct-iid
+rtp_mux_jitter::jitter_fec_arms_2pct = perf | 175 | baseline@fec | fec-tuning@impairment=loss2pct-iid+fec=off-stock-prompt+metric=parity-and-latency
+rtp_mux_jitter::jitter_fec_arms_6pct = perf | 175 | orthogonal@fec | fec-tuning@impairment=loss6pct-iid+fec=off-stock-prompt+metric=parity-and-latency
+rtp_mux_jitter::jitter_nonloss_impairments = perf | 210 | composite(impairment,loss)@lone-tail | non-loss-impairment@impairment=jitter-reorder-dup-rate+loss=none+metric=p99
+rtp_mux_jitter::jitter_reorder_rate_curve = perf | 140 | orthogonal@reorder | reorder-rate@impairment=reorder+rate=curve+metric=p99
+rtp_mux_jitter::jitter_reorder_direction = perf | 70 | baseline@reorder | reorder-direction@impairment=reorder+direction=c2s-and-s2c+metric=p99
+rtp_mux_jitter::jitter_interactive_solo = perf | 35 | baseline@interactive | M1@lane=interactive+flows=1+impairment=loss2pct-iid+jitter=5ms+shape=cadence
+rtp_mux_jitter::jitter_interactive_with_loss = perf | 35 | re-measurement(second-arm-same-declared-point)@interactive | M1@lane=interactive+flows=1+impairment=loss2pct-iid
+rtp_mux_jitter::jitter_interactive_with_bulk = perf | 130 | orthogonal@interactive | M1@lane=interactive+flows=1+load=bulk-burst+impairment=loss2pct-iid
+rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf | 35 | composite(load,metric)@interactive | M2@lane=interactive+flows=1+load=bulk-burst+impairment=loss2pct-iid+metric=own-wire
+rtp_mux_jitter::jitter_duallane_arms = perf | 280 | composite(load,reorder)@dual-lane | dual-lane-matched-load@lane=dual+load=bulk-matched+reorder=fast-forward-and-strict
 rtp_mux_jitter::jitter_burst_loss_arms = perf | 420 | orthogonal | M1@impairment=gilbert-elliott-burst+jitter=5ms+lane=dual+metric=p99
-rtp_mux_jitter::jitter_request_response_arms = perf | 1170 | composite(depth,impairment,jitter,shape) | M1@shape=request-response+depth=1+impairment=loss5pct-ge+jitter=100ms+metric=p99
-rtp_mux_jitter::jitter_latency_dimension_arms = perf | 385 | composite(impairment,latency) | M1@latency=sweep+impairment=loss2pct-iid+metric=p99
-rtp_mux_jitter::jitter_cellular_timeline_arms = perf | 70 | composite(impairment,jitter) | M1@impairment=cellular-timeline+jitter=bursty+metric=p99
-rtp_mux_jitter::jitter_bulk_idle_restart_arm = perf | 35 | composite(lane,load,metric,rate) | M3@lane=bulk+load=bulk-idle-restart+rate=1MiBps+metric=capacity-fraction
-rtp_mux_jitter::jitter_shared_bottleneck_arms = perf | TBD | composite(latency,load) | M1@load=shared-bottleneck+latency=sweep+metric=p99
-dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction = full | 45 | composite(lane,metric,rate,scale) | M3@lane=bulk+rate=link+scale=saturated+metric=capacity-fraction
-hol_probe::fec_gaming_treatment_has_bad_path_and_large_capacity_headroom = default | TBD | composite(layer,metric) | instrument-sanity@layer=rtp-fec+metric=path-and-headroom
-hol_probe::fec_saturated_pair_keys_loss_to_the_same_rtp_sequence = default | TBD | composite(layer,metric) | instrument-sanity@layer=rtp-fec+metric=sequence-keying
-hol_probe::dual_lane_asym_frame_delivers_and_tears_down = full | TBD | composite(asym,layer,metric) | hol-dual-lane@lane=dual+asym=yes+layer=rtp-frame+metric=delivery-and-teardown
-hol_probe::hol_cap400_solo = full | TBD | composite(bulk,loss,rate) | hol@rate=400kbps+loss=iid1+bulk=none+metric=p99
-hol_probe::hol_cap400_shared = full | TBD | composite(bulk,loss,rate) | hol@rate=400kbps+loss=iid1+bulk=shared+metric=p99
-hol_probe::hol_cap400_fec_solo = perf | TBD | composite(bulk,fec,loss,rate) | hol-fec@rate=400kbps+loss=iid1+fec=on+bulk=none+metric=p99
-hol_probe::hol_cap400_loss1_split_shared = perf | TBD | composite(bulk,loss,rate) | hol@rate=400kbps+loss=iid1+bulk=split-and-shared+metric=p99
-hol_probe::hol_cap400_shared_frame_delivery_diag = full | TBD | composite(bulk,layer,loss,rate,report) | hol-frame@rate=400kbps+loss=iid1+bulk=shared+layer=rtp-frame+report=diag
-hol_probe::hol_rtt100_clean_solo = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=none+bulk=none+flows=1+metric=p99
-hol_probe::hol_rtt100_clean_shared = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=none+bulk=shared+flows=1+metric=p99
-hol_probe::hol_rtt100_clean_split = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=none+bulk=split+flows=1+metric=p99
-hol_probe::hol_rtt100_clean_shared_frame_delivery_diag = full | TBD | composite(bulk,latency,layer,loss,report) | hol-frame@latency=100ms+loss=none+bulk=shared+layer=rtp-frame+report=diag
-hol_probe::hol_rtt100_ge5_solo = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=ge5-burst+bulk=none+flows=1+metric=p99
-hol_probe::hol_rtt100_ge5_shared = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=ge5-burst+bulk=shared+flows=1+metric=p99
-hol_probe::hol_rtt100_ge5_split = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=ge5-burst+bulk=split+flows=1+metric=p99
-hol_probe::hol_rtt100_ge5_shared_frame_delivery = full | TBD | composite(bulk,latency,layer,loss) | hol-frame@latency=100ms+loss=ge5-burst+bulk=shared+layer=rtp-frame+metric=p99
-hol_probe::hol_rtt100_ge5_v2_solo = full | TBD | composite(bulk,latency,loss,variant) | hol@latency=100ms+loss=ge5-burst+bulk=none+variant=v2+metric=p99
-hol_probe::hol_rtt100_ge5_v2_shared = full | TBD | composite(bulk,latency,loss,variant) | hol@latency=100ms+loss=ge5-burst+bulk=shared+variant=v2+metric=p99
-hol_probe::hol_rtt100_ge5_v3_solo = full | TBD | composite(bulk,latency,loss,variant) | hol@latency=100ms+loss=ge5-burst+bulk=none+variant=v3+metric=p99
-hol_probe::hol_rtt100_ge5_v3_shared = full | TBD | composite(bulk,latency,loss,variant) | hol@latency=100ms+loss=ge5-burst+bulk=shared+variant=v3+metric=p99
-hol_probe::hol_rtt100_ge5_v3_split = full | TBD | composite(bulk,latency,loss,variant) | hol@latency=100ms+loss=ge5-burst+bulk=split+variant=v3+metric=p99
-hol_probe::hol_rtt100_ge1_loss1_solo = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=ge1-burst-and-iid1+bulk=none+metric=p99
-hol_probe::hol_rtt100_ge1_loss1_shared = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=ge1-burst-and-iid1+bulk=shared+metric=p99
-hol_probe::hol_rtt100_ge1_loss1_split = full | TBD | composite(bulk,latency,loss) | hol@latency=100ms+loss=ge1-burst-and-iid1+bulk=split+metric=p99
-hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag = full | TBD | composite(bulk,latency,layer,loss,report) | hol-frame@latency=100ms+loss=ge1-burst+bulk=shared+layer=rtp-frame+report=diag
-hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery = full | TBD | composite(flows,latency,layer,loss,metric) | hol@latency=100ms+loss=ge5-burst+flows=2+layer=rtp-frame+metric=delivery
-hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full | TBD | composite(flows,latency,layer,loss,metric) | M4@latency=100ms+loss=ge5-burst+flows=4+layer=rtp-frame+metric=per-flow-delivery
-hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag = full | TBD | composite(flows,latency,layer,loss,report) | hol-dual-lane@latency=100ms+loss=ge5-burst+flows=2+layer=rtp-frame+report=diag
-hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag = full | TBD | composite(fec,flows,latency,loss,report) | hol-dual-lane@latency=100ms+loss=ge5-burst+flows=2+fec=stock+report=diag
-hol_probe::hol_rtt100_ge5_shared_dual_lane = full | TBD | composite(bulk,latency,loss) | hol-dual-lane@latency=100ms+loss=ge5-burst+bulk=shared+metric=p99
-hol_probe::hol_rtt100_ge5_shared_dual_lane_frame_delivery = full | TBD | composite(latency,layer,loss) | hol-dual-lane@latency=100ms+loss=ge5-burst+layer=rtp-frame+metric=p99
-hol_probe::hol_rtt100_ge5_shared_dual_lane_asym_frame_diag = full | TBD | composite(asym,latency,layer,loss,report) | hol-dual-lane@latency=100ms+loss=ge5-burst+asym=yes+layer=rtp-frame+report=diag
-hol_probe::hol_rtp_mux_fec_default_on_recovery = full | TBD | composite(fec,impairment,layer,loss) | hol-fec-recovery@layer=rtp-mux+fec=default-on+impairment=fec-gaming-fat-pipe+loss=20pct
-hol_probe::hol_paced_bulk_median_p99_regression = full | TBD | composite(bulk,metric,shape) | hol-paced@bulk=shared+shape=paced-bulk+metric=p99-median
-hol_probe::hol_hostile_solo = full | TBD | composite(bulk,impairment) | hol@impairment=hostile-preset+bulk=none+metric=p99
-hol_probe::hol_hostile_shared = full | TBD | composite(bulk,impairment) | hol@impairment=hostile-preset+bulk=shared+metric=p99
-hol_probe::hol_hostile_split = full | TBD | composite(bulk,impairment) | hol@impairment=hostile-preset+bulk=split+metric=p99
-hol_probe::hol_hostile_shared_frame_delivery_diag = full | TBD | composite(bulk,impairment,layer,report) | hol-frame@impairment=hostile-preset+bulk=shared+layer=rtp-frame+report=diag
-hol_probe::hol_rtt40_ge1_solo = full | TBD | composite(bulk,latency,loss) | hol@latency=20ms+loss=ge1-burst+bulk=none+metric=p99
-hol_probe::hol_rtt40_ge1_shared = full | TBD | composite(bulk,latency,loss) | hol@latency=20ms+loss=ge1-burst+bulk=shared+metric=p99
-hol_probe::hol_rtt40_ge1_split = full | TBD | composite(bulk,latency,loss) | hol@latency=20ms+loss=ge1-burst+bulk=split+metric=p99
-hol_probe::hol_rtt40_ge1_loss1_solo = full | TBD | composite(bulk,latency,loss) | hol@latency=20ms+loss=ge1-burst-and-iid1+bulk=none+metric=p99
-hol_probe::hol_rtt40_ge1_loss1_shared = full | TBD | composite(bulk,latency,loss) | hol@latency=20ms+loss=ge1-burst-and-iid1+bulk=shared+metric=p99
-hol_probe::hol_rtt40_ge1_loss1_split = full | TBD | composite(bulk,latency,loss) | hol@latency=20ms+loss=ge1-burst-and-iid1+bulk=split+metric=p99
-hol_verify4::v4_clean_muxbulk = perf | TBD | composite(impairment,load,metric) | bulk-lane-ab@lane=dual+impairment=clean+load=bulk+metric=goodput-ab
-hol_verify4::v4_ge5_muxbulk = perf | TBD | composite(impairment,load,metric) | bulk-lane-ab@lane=dual+impairment=ge5-burst+load=bulk+metric=goodput-ab
-contested_latency::contested_capped_clean = full | TBD | composite(jitter,loss,metric,rate) | contested@rate=cap+jitter=0+loss=0+metric=p99-with-bulk
-contested_latency::contested_capped_jitter_loss = perf | TBD | composite(jitter,loss,metric,rate) | contested@rate=cap+jitter=on+loss=on+metric=p99-with-bulk
-contested_latency::contested_hostile = perf | TBD | composite(impairment,metric) | contested@impairment=hostile-preset+metric=p99-with-bulk
-perf_probe::controller_fat_pipe_has_only_fixed_shaping = default | TBD | composite(lane,metric) | instrument-sanity@lane=controller-fat-pipe+metric=shaping-determinism
-perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss = default | TBD | composite(lane,metric) | instrument-sanity@lane=deterministic-iid-loss-fat-pipe+metric=loss-determinism
-perf_probe::probe_rtp_echo_4mib_direct = standard | TBD | composite(layer,metric,scale,shape,transport) | ceiling@layer=rtp+transport=direct+shape=echo+scale=4MiB+metric=throughput
-perf_probe::probe_rtp_echo_4mib_mss8k = standard | TBD | composite(layer,metric,mss,scale,shape,transport) | ceiling@layer=rtp+transport=direct+shape=echo+mss=8k+scale=4MiB+metric=throughput
-perf_probe::probe_hostile_goodput_30s = full | TBD | composite(impairment,layer,metric,scale) | ceiling@layer=rtp+impairment=hostile-preset+scale=30s+metric=goodput
-perf_probe::probe_hostile_message_latency = full | TBD | composite(impairment,layer,metric,shape) | ceiling@layer=rtp+impairment=hostile-preset+shape=request-response+metric=latency
-mux_ceiling_probe::probe_mux_echo_1mib_direct = standard | TBD | composite(layer,metric,scale,shape,transport) | loopback-ceiling@layer=mux+transport=direct+shape=echo+scale=1MiB+metric=throughput
-mux_ceiling_probe::probe_mux_echo_1mib_mss8k = standard | TBD | composite(layer,metric,mss,scale,shape,transport) | loopback-ceiling@layer=mux+transport=direct+shape=echo+mss=8k+scale=1MiB+metric=throughput
-mux_ceiling_probe::probe_mux_sink_4mib_direct = standard | TBD | composite(layer,metric,scale,shape,transport) | loopback-ceiling@layer=mux+transport=direct+shape=sink+scale=4MiB+metric=throughput
-mux_ceiling_probe::probe_mux_sink_4mib_mss8k = standard | TBD | composite(layer,metric,mss,scale,shape,transport) | loopback-ceiling@layer=mux+transport=direct+shape=sink+mss=8k+scale=4MiB+metric=throughput
-mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke = default | TBD | composite(impairment,metric,scale) | mux-over-rtp@impairment=lossy+scale=400KiB+metric=delivery-and-goodput
-mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf = default | TBD | composite(impairment,load,metric,scale) | mux-over-rtp@impairment=lossy+load=contended+scale=400KiB+metric=delivery-and-goodput
-mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf = default | TBD | composite(load,metric) | small-stream-while-bulk@load=bulk+shape=cadence+metric=ordering
-mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full | TBD | composite(impairment,metric,scale) | mux-over-rtp@impairment=hostile-preset+scale=400MiB+metric=goodput
-mux_stream_fairness::mux_stream_fairness_sweep = full | TBD | composite(arm-set,flows,metric) | fairness-sweep@flows=multi+arm-set=homogeneous-heterogeneous-throttled+metric=jain
-mux_stream_fairness::mux_stream_fairness_longrun = full | TBD | composite(flows,metric,scale) | fairness-longrun@flows=multi+scale=multi-minute+metric=per-flow-share
-rtp_longrun::longrun_duallane = full | TBD | composite(metric,scale) | dual-lane-longrun@lane=dual+scale=multi-minute+metric=goodput-and-tail
-rtp_longrun::multiflow_duallane = full | TBD | composite(flows,metric,scale) | multi-flow-longrun@lane=dual+flows=multi+scale=multi-minute+metric=per-flow-share
+rtp_mux_jitter::jitter_request_response_arms = perf | 1170 | baseline@lone-tail | M1@shape=request-response+depth=1+impairment=loss5pct-ge+jitter=100ms+metric=p99
+rtp_mux_jitter::jitter_latency_dimension_arms = perf | 385 | baseline@latency-sweep | M1@latency=sweep+impairment=loss2pct-iid+metric=p99
+rtp_mux_jitter::jitter_cellular_timeline_arms = perf | 70 | composite(impairment,jitter)@lone-tail | M1@impairment=cellular-timeline+jitter=bursty+metric=p99
+rtp_mux_jitter::jitter_bulk_idle_restart_arm = perf | 35 | orthogonal@m3-bulk | M3@lane=bulk+load=bulk-idle-restart+rate=1MiBps+metric=capacity-fraction
+rtp_mux_jitter::jitter_shared_bottleneck_arms = perf | TBD | orthogonal@latency-sweep | M1@load=shared-bottleneck+latency=sweep+metric=p99
+dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction = full | 45 | composite(rate,scale)@m3-bulk | M3@lane=bulk+rate=link+scale=saturated+metric=capacity-fraction
+hol_probe::fec_gaming_treatment_has_bad_path_and_large_capacity_headroom = default | TBD | baseline@fec-instrument-sanity | instrument-sanity@layer=rtp-fec+metric=path-and-headroom
+hol_probe::fec_saturated_pair_keys_loss_to_the_same_rtp_sequence = default | TBD | orthogonal@fec-instrument-sanity | instrument-sanity@layer=rtp-fec+metric=sequence-keying
+hol_probe::dual_lane_asym_frame_delivers_and_tears_down = full | TBD | baseline@dual-lane | hol-dual-lane@lane=dual+asym=yes+layer=rtp-frame+metric=delivery-and-teardown
+hol_probe::hol_cap400_solo = full | TBD | baseline@hol-cap400 | hol@rate=400kbps+loss=iid1+bulk=none+metric=p99
+hol_probe::hol_cap400_shared = full | TBD | orthogonal@hol-cap400 | hol@rate=400kbps+loss=iid1+bulk=shared+metric=p99
+hol_probe::hol_cap400_fec_solo = perf | TBD | orthogonal@hol-cap400 | hol-fec@rate=400kbps+loss=iid1+fec=on+bulk=none+metric=p99
+hol_probe::hol_cap400_loss1_split_shared = perf | TBD | orthogonal@hol-cap400 | hol@rate=400kbps+loss=iid1+bulk=split-and-shared+metric=p99
+hol_probe::hol_cap400_shared_frame_delivery_diag = full | TBD | composite(bulk,layer,report)@hol-cap400 | hol-frame@rate=400kbps+loss=iid1+bulk=shared+layer=rtp-frame+report=diag
+hol_probe::hol_rtt100_clean_solo = full | TBD | orthogonal@hol-split | hol@latency=100ms+loss=none+bulk=none+flows=1+metric=p99
+hol_probe::hol_rtt100_clean_shared = full | TBD | orthogonal@hol-ge5-shared | hol@latency=100ms+loss=none+bulk=shared+flows=1+metric=p99
+hol_probe::hol_rtt100_clean_split = full | TBD | baseline@hol-split | hol@latency=100ms+loss=none+bulk=split+flows=1+metric=p99
+hol_probe::hol_rtt100_clean_shared_frame_delivery_diag = full | TBD | orthogonal@hol-shared-frame | hol-frame@latency=100ms+loss=none+bulk=shared+layer=rtp-frame+report=diag
+hol_probe::hol_rtt100_ge5_solo = full | TBD | orthogonal@hol-ge5-shared | hol@latency=100ms+loss=ge5-burst+bulk=none+flows=1+metric=p99
+hol_probe::hol_rtt100_ge5_shared = full | TBD | baseline@hol-ge5-shared | hol@latency=100ms+loss=ge5-burst+bulk=shared+flows=1+metric=p99
+hol_probe::hol_rtt100_ge5_split = full | TBD | orthogonal@hol-ge5-shared | hol@latency=100ms+loss=ge5-burst+bulk=split+flows=1+metric=p99
+hol_probe::hol_rtt100_ge5_shared_frame_delivery = full | TBD | orthogonal@hol-ge5-shared | hol-frame@latency=100ms+loss=ge5-burst+bulk=shared+layer=rtp-frame+metric=p99
+hol_probe::hol_rtt100_ge5_v2_solo = full | TBD | orthogonal@hol-ge5-solo | hol@latency=100ms+loss=ge5-burst+bulk=none+variant=v2+metric=p99
+hol_probe::hol_rtt100_ge5_v2_shared = full | TBD | orthogonal@hol-ge5-shared | hol@latency=100ms+loss=ge5-burst+bulk=shared+variant=v2+metric=p99
+hol_probe::hol_rtt100_ge5_v3_solo = full | TBD | baseline@hol-ge5-solo | hol@latency=100ms+loss=ge5-burst+bulk=none+variant=v3+metric=p99
+hol_probe::hol_rtt100_ge5_v3_shared = full | TBD | orthogonal@hol-ge5-shared | hol@latency=100ms+loss=ge5-burst+bulk=shared+variant=v3+metric=p99
+hol_probe::hol_rtt100_ge5_v3_split = full | TBD | orthogonal@hol-ge5-solo | hol@latency=100ms+loss=ge5-burst+bulk=split+variant=v3+metric=p99
+hol_probe::hol_rtt100_ge1_loss1_solo = full | TBD | orthogonal@hol-solo | hol@latency=100ms+loss=ge1-burst-and-iid1+bulk=none+metric=p99
+hol_probe::hol_rtt100_ge1_loss1_shared = full | TBD | orthogonal@hol-ge5-shared | hol@latency=100ms+loss=ge1-burst-and-iid1+bulk=shared+metric=p99
+hol_probe::hol_rtt100_ge1_loss1_split = full | TBD | orthogonal@hol-split | hol@latency=100ms+loss=ge1-burst-and-iid1+bulk=split+metric=p99
+hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag = full | TBD | baseline@hol-shared-frame | hol-frame@latency=100ms+loss=ge1-burst+bulk=shared+layer=rtp-frame+report=diag
+hol_probe::hol_rtt100_ge5_two_interactive_frame_delivery = full | TBD | orthogonal@hol-dual-lane-frame | hol@latency=100ms+loss=ge5-burst+flows=2+layer=rtp-frame+metric=delivery
+hol_probe::hol_rtt100_ge5_four_interactive_frame_delivery = full | TBD | composite(flows,metric)@hol-dual-lane-frame | M4@latency=100ms+loss=ge5-burst+flows=4+layer=rtp-frame+metric=per-flow-delivery
+hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag = full | TBD | baseline@hol-dual-lane-frame | hol-dual-lane@latency=100ms+loss=ge5-burst+flows=2+layer=rtp-frame+report=diag
+hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_stock_diag = full | TBD | orthogonal@hol-dual-lane-frame | hol-dual-lane@latency=100ms+loss=ge5-burst+flows=2+fec=stock+report=diag
+hol_probe::hol_rtt100_ge5_shared_dual_lane = full | TBD | re-measurement(second-arm-same-declared-point)@hol-ge5-shared | hol-dual-lane@latency=100ms+loss=ge5-burst+bulk=shared+metric=p99
+hol_probe::hol_rtt100_ge5_shared_dual_lane_frame_delivery = full | TBD | orthogonal@hol-ge5-shared | hol-dual-lane@latency=100ms+loss=ge5-burst+layer=rtp-frame+metric=p99
+hol_probe::hol_rtt100_ge5_shared_dual_lane_asym_frame_diag = full | TBD | orthogonal@hol-dual-lane-frame | hol-dual-lane@latency=100ms+loss=ge5-burst+asym=yes+layer=rtp-frame+report=diag
+hol_probe::hol_rtp_mux_fec_default_on_recovery = full | TBD | composite(fec,impairment,layer,loss)@fec | hol-fec-recovery@layer=rtp-mux+fec=default-on+impairment=fec-gaming-fat-pipe+loss=20pct
+hol_probe::hol_paced_bulk_median_p99_regression = full | TBD | composite(metric,shape)@hol-shared-frame | hol-paced@bulk=shared+shape=paced-bulk+metric=p99-median
+hol_probe::hol_hostile_solo = full | TBD | orthogonal@hol-solo | hol@impairment=hostile-preset+bulk=none+metric=p99
+hol_probe::hol_hostile_shared = full | TBD | orthogonal@hol-ge5-shared | hol@impairment=hostile-preset+bulk=shared+metric=p99
+hol_probe::hol_hostile_split = full | TBD | orthogonal@hol-split | hol@impairment=hostile-preset+bulk=split+metric=p99
+hol_probe::hol_hostile_shared_frame_delivery_diag = full | TBD | orthogonal@hol-shared-frame | hol-frame@impairment=hostile-preset+bulk=shared+layer=rtp-frame+report=diag
+hol_probe::hol_rtt40_ge1_solo = full | TBD | orthogonal@hol-solo | hol@latency=20ms+loss=ge1-burst+bulk=none+metric=p99
+hol_probe::hol_rtt40_ge1_shared = full | TBD | baseline@hol-rtt40 | hol@latency=20ms+loss=ge1-burst+bulk=shared+metric=p99
+hol_probe::hol_rtt40_ge1_split = full | TBD | orthogonal@hol-rtt40 | hol@latency=20ms+loss=ge1-burst+bulk=split+metric=p99
+hol_probe::hol_rtt40_ge1_loss1_solo = full | TBD | baseline@hol-solo | hol@latency=20ms+loss=ge1-burst-and-iid1+bulk=none+metric=p99
+hol_probe::hol_rtt40_ge1_loss1_shared = full | TBD | orthogonal@hol-solo | hol@latency=20ms+loss=ge1-burst-and-iid1+bulk=shared+metric=p99
+hol_probe::hol_rtt40_ge1_loss1_split = full | TBD | orthogonal@hol-solo | hol@latency=20ms+loss=ge1-burst-and-iid1+bulk=split+metric=p99
+hol_verify4::v4_clean_muxbulk = perf | TBD | baseline@hol-verify4 | bulk-lane-ab@lane=dual+impairment=clean+load=bulk+metric=goodput-ab
+hol_verify4::v4_ge5_muxbulk = perf | TBD | orthogonal@hol-verify4 | bulk-lane-ab@lane=dual+impairment=ge5-burst+load=bulk+metric=goodput-ab
+contested_latency::contested_capped_clean = full | TBD | baseline@contested | contested@rate=cap+jitter=0+loss=0+metric=p99-with-bulk
+contested_latency::contested_capped_jitter_loss = perf | TBD | composite(jitter,loss)@contested | contested@rate=cap+jitter=on+loss=on+metric=p99-with-bulk
+contested_latency::contested_hostile = perf | TBD | orthogonal@hostile-probes | contested@impairment=hostile-preset+metric=p99-with-bulk
+perf_probe::controller_fat_pipe_has_only_fixed_shaping = default | TBD | baseline@instrument-sanity | instrument-sanity@lane=controller-fat-pipe+metric=shaping-determinism
+perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss = default | TBD | composite(lane,metric)@instrument-sanity | instrument-sanity@lane=deterministic-iid-loss-fat-pipe+metric=loss-determinism
+perf_probe::probe_rtp_echo_4mib_direct = standard | TBD | baseline@rtp-ceiling | ceiling@layer=rtp+transport=direct+shape=echo+scale=4MiB+metric=throughput
+perf_probe::probe_rtp_echo_4mib_mss8k = standard | TBD | orthogonal@rtp-ceiling | ceiling@layer=rtp+transport=direct+shape=echo+mss=8k+scale=4MiB+metric=throughput
+perf_probe::probe_hostile_goodput_30s = full | TBD | baseline@hostile-probes | ceiling@layer=rtp+impairment=hostile-preset+scale=30s+metric=goodput
+perf_probe::probe_hostile_message_latency = full | TBD | composite(metric,shape)@hostile-probes | ceiling@layer=rtp+impairment=hostile-preset+shape=request-response+metric=latency
+mux_ceiling_probe::probe_mux_echo_1mib_direct = standard | TBD | baseline@mux-ceiling-echo | loopback-ceiling@layer=mux+transport=direct+shape=echo+scale=1MiB+metric=throughput
+mux_ceiling_probe::probe_mux_echo_1mib_mss8k = standard | TBD | orthogonal@mux-ceiling-echo | loopback-ceiling@layer=mux+transport=direct+shape=echo+mss=8k+scale=1MiB+metric=throughput
+mux_ceiling_probe::probe_mux_sink_4mib_direct = standard | TBD | baseline@mux-ceiling-sink | loopback-ceiling@layer=mux+transport=direct+shape=sink+scale=4MiB+metric=throughput
+mux_ceiling_probe::probe_mux_sink_4mib_mss8k = standard | TBD | orthogonal@mux-ceiling-sink | loopback-ceiling@layer=mux+transport=direct+shape=sink+mss=8k+scale=4MiB+metric=throughput
+mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke = default | TBD | baseline@mux-over-rtp | mux-over-rtp@impairment=lossy+scale=400KiB+metric=delivery-and-goodput
+mux_over_rtp_perf::mux_over_rtp_400kib_lossy_contended_perf = default | TBD | orthogonal@mux-over-rtp | mux-over-rtp@impairment=lossy+load=contended+scale=400KiB+metric=delivery-and-goodput
+mux_over_rtp_perf::mux_over_rtp_small_stream_while_bulk_perf = default | TBD | composite(load,metric,shape)@mux-over-rtp | small-stream-while-bulk@load=bulk+shape=cadence+metric=ordering
+mux_over_rtp_perf::mux_over_rtp_400mib_hostile_perf = full | TBD | orthogonal@hostile-probes | mux-over-rtp@impairment=hostile-preset+scale=400MiB+metric=goodput
+mux_stream_fairness::mux_stream_fairness_sweep = full | TBD | composite(arm-set,metric)@fairness | fairness-sweep@flows=multi+arm-set=homogeneous-heterogeneous-throttled+metric=jain
+mux_stream_fairness::mux_stream_fairness_longrun = full | TBD | re-measurement(second-arm-same-declared-point)@fairness | fairness-longrun@flows=multi+scale=multi-minute+metric=per-flow-share
+rtp_longrun::longrun_duallane = full | TBD | orthogonal@fairness | dual-lane-longrun@lane=dual+scale=multi-minute+metric=goodput-and-tail
+rtp_longrun::multiflow_duallane = full | TBD | baseline@fairness | multi-flow-longrun@lane=dual+flows=multi+scale=multi-minute+metric=per-flow-share
 ```
 
 ```gate-budgets
@@ -200,6 +233,34 @@ standard = 600
 full = 7200
 perf = 7200
 baseline = mandate_smoke::m1_interactive_tail_latency
+baseline.constitution = rtp_mux_jitter::jitter_duallane_constitution_gate
+baseline.contested = contested_latency::contested_capped_clean
+baseline.decomposition = rtp_mux_jitter::jitter_frame_reorder_decomposition
+baseline.dual-lane = hol_probe::dual_lane_asym_frame_delivers_and_tears_down
+baseline.fairness = rtp_longrun::multiflow_duallane
+baseline.fec = rtp_mux_jitter::jitter_fec_arms_2pct
+baseline.fec-instrument-sanity = hol_probe::fec_gaming_treatment_has_bad_path_and_large_capacity_headroom
+baseline.frame-reorder = rtp_mux_jitter::jitter_frame_reorder_fec_arms
+baseline.hol-cap400 = hol_probe::hol_cap400_solo
+baseline.hol-dual-lane-frame = hol_probe::hol_rtt100_ge5_dual_lane_two_interactive_frame_diag
+baseline.hol-ge5-shared = hol_probe::hol_rtt100_ge5_shared
+baseline.hol-ge5-solo = hol_probe::hol_rtt100_ge5_v3_solo
+baseline.hol-rtt40 = hol_probe::hol_rtt40_ge1_shared
+baseline.hol-shared-frame = hol_probe::hol_rtt100_ge1_shared_frame_delivery_diag
+baseline.hol-solo = hol_probe::hol_rtt40_ge1_loss1_solo
+baseline.hol-split = hol_probe::hol_rtt100_clean_split
+baseline.hol-verify4 = hol_verify4::v4_clean_muxbulk
+baseline.hostile-probes = perf_probe::probe_hostile_goodput_30s
+baseline.instrument-sanity = perf_probe::controller_fat_pipe_has_only_fixed_shaping
+baseline.interactive = rtp_mux_jitter::jitter_interactive_solo
+baseline.latency-sweep = rtp_mux_jitter::jitter_latency_dimension_arms
+baseline.lone-tail = rtp_mux_jitter::jitter_request_response_arms
+baseline.m3-bulk = mandate_smoke::m3_bulk_goodput_fraction
+baseline.mux-ceiling-echo = mux_ceiling_probe::probe_mux_echo_1mib_direct
+baseline.mux-ceiling-sink = mux_ceiling_probe::probe_mux_sink_4mib_direct
+baseline.mux-over-rtp = mux_over_rtp_perf::mux_over_rtp_lossy_perf_smoke
+baseline.reorder = rtp_mux_jitter::jitter_reorder_direction
+baseline.rtp-ceiling = perf_probe::probe_rtp_echo_4mib_direct
 drift = 0.5
 drift_floor_s = 10.0
 ```
@@ -212,6 +273,15 @@ to its measured sum plus headroom **as a declared change** once the `TBD` rows
 have been measured — a tier sum over its budget is a checker failure, so an
 unmeasured budget is what forces the measurement.
 
+The gaps below record two kinds of hole. The cells the product does not claim
+(`M1@lane=single`, `soak@scale=multi-hour`, …) are the first. The
+`attribution@baseline-family=…` lines are the second: a family whose reference
+is not within one declared dimension of one of its rows, so that row is a
+composite no existing arm can attribute. They name the row, the dimensions it
+differs in, and the single-axis arm beside it that would close the gap. They
+exist because the declaration is not allowed to imply an attribution the arms
+cannot support.
+
 ```gate-coverage-gaps
 M1@lane=single = the constitution's M1 arms run on the production dual-lane topology; a single-connection transport tail is covered by rtp's burst-loss and bufferbloat gates, whose perf declarations are pending, and is not claimed here.
 M3@lane=single = M3 is asserted on the deployment's bulk lane (dual_lane_mandates); the single-connection goodput floor is rtp's, and its declaration is pending.
@@ -223,6 +293,12 @@ rate-asymmetry@impairment=rate-asymmetry = only the asym frame-delivery diag arm
 loaded-lone-tail@shape=request-response+load=bulk = the lone-tail arms run with the bulk lane idle; the request/response shape under a loaded bulk lane is not covered.
 cellular-request-response@lane=cellular-timeline+shape=request-response = the cellular timeline arms use the cadence shape only.
 policer@impairment=policer = a token-bucket policer (as opposed to the shaper and queue the harness models) is not in the impairment instrument, so no arm can cover it.
+attribution@baseline-family=fec = hol_probe::hol_rtp_mux_fec_default_on_recovery is four declared dimensions from the family's reference jitter_fec_arms_2pct (fec, impairment, layer, loss); no existing arm can attribute it, so a single-axis FEC-recovery arm beside it is what closes this.
+attribution@baseline-family=decomposition = rtp_mux_jitter::jitter_decomposition is two declared dimensions (arms, jitter) from its only sibling jitter_frame_reorder_decomposition, and no arm states its own arm-set; a decomposition arm varying one axis is what closes this.
+attribution@baseline-family=dual-lane = rtp_mux_jitter::jitter_duallane_arms is two declared dimensions (load, reorder) from its only sibling dual_lane_asym_frame_delivers_and_tears_down; a single-axis dual-lane arm is what closes this.
+attribution@baseline-family=contested = contested_latency::contested_capped_jitter_loss is two declared dimensions (jitter, loss) from its clean reference; a one-axis contested arm (jitter alone, or loss alone) is what closes this.
+attribution@baseline-family=instrument-sanity = perf_probe::deterministic_iid_loss_fat_pipe_is_fixed_seeded_iid_loss is two declared dimensions (lane, metric) from perf_probe::controller_fat_pipe_has_only_fixed_shaping; the two share neither, so a lane or metric arm beside either closes this.
+attribution@baseline-family=lone-tail = rtp_mux_jitter::jitter_request_response_arms is two declared dimensions from each of its family's other rows (impairment with jitter, and impairment with loss); a request/response arm varying one axis is what closes this.
 ```
 
 ## How to make the draft real

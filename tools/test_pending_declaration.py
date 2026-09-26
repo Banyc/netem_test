@@ -9,11 +9,14 @@ checkout, and a checked-in draft must not resolve them — so this test pins the
 properties the checker would reject on the day it is applied, using only the
 draft's own text: every row parses as `<target>::<test> = <tier> | <cost> |
 <relation> | <cell>[,...]` under the checker's grammar, the declared relation
-agrees with the dimensions the row's cells vary (the checker's own derivation,
-so a composite arm cannot be drafted as an orthogonal one), no row is declared
-twice, every tier a row names has a budget, the baseline names a row, every gap
-carries a well-formed cell and a reason, and the rows whose cost is a number fit
-their tier's budget. A `TBD` cost is allowed by design (the draft is where the
+agrees with the dimensions the row's cells vary against the baseline of the
+family it names (the checker's own derivation, so a composite arm cannot be
+drafted as an orthogonal one, and a row cannot be stated against a family the
+block does not declare), no row is declared twice, every tier a row names has a
+budget, every `baseline`/`baseline.<family>` line names a row, every declared
+baseline is used by a row other than its own reference, every gap carries a
+well-formed cell and a reason, and the rows whose cost is a number fit their
+tier's budget. A `TBD` cost is allowed by design (the draft is where the
 measurement is still owed) and is what the checker refuses when the block lands.
 """
 
@@ -46,6 +49,7 @@ class PendingDeclarationTest(unittest.TestCase):
         self.gaps = block("gate-coverage-gaps")
         budgets = {}
         baseline = None
+        named = {}
         for line in self.budgets_text.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -55,9 +59,17 @@ class PendingDeclarationTest(unittest.TestCase):
             key, value = key.strip(), value.strip()
             if key == "baseline":
                 baseline = value
+            elif key.startswith("baseline."):
+                family = key[len("baseline.") :]
+                self.assertNotIn(family, named, f"baseline {family!r} is declared twice")
+                self.assertTrue(
+                    CHECK_GATE.CELL_KEY_RE.match(family),
+                    f"baseline family {family!r} is not a name",
+                )
+                named[family] = value
             elif key in CHECK_GATE.PERF_TIERS:
                 budgets[key] = float(value)
-        self.budgets, self.baseline = budgets, baseline
+        self.budgets, self.baseline, self.named = budgets, baseline, named
         self.rows = []
         for number, line in enumerate(self.design.splitlines(), start=1):
             line = line.strip()
@@ -125,11 +137,39 @@ class PendingDeclarationTest(unittest.TestCase):
             self.baseline,
             0.5,
             10.0,
+            self.named,
         )
         problems: list[str] = []
         summary = CHECK_GATE.check_perf_relations(rows, budgets, problems)
         self.assertEqual(problems, [], "\n".join(problems))
         self.assertIn("gate-perf-relations:", "\n".join(summary))
+
+    def test_the_baselines_are_well_formed_and_used(self):
+        """Every declared baseline names a row, and a row states against it."""
+        names = {name for name, _, _, _, _ in self.rows}
+        self.assertIsNotNone(self.baseline, "gate-budgets names no baseline row")
+        self.assertIn(
+            self.baseline, names, f"the default baseline {self.baseline!r} is not a row"
+        )
+        for family, row in self.named.items():
+            self.assertIn(
+                row, names, f"baseline.{family} names {row!r}, which is not a row"
+            )
+        # Every family must have a row other than its own reference stated
+        # against it: a baseline no row uses is a stale reference.
+        for family, row in [(None, self.baseline)] + list(self.named.items()):
+            used = [
+                name
+                for name, _tier, _cost, relation, _coverage in self.rows
+                if name != row
+                and CHECK_GATE.parse_relation(relation)[0] is not None
+                and CHECK_GATE.parse_relation(relation)[0].family == family
+            ]
+            self.assertTrue(
+                used,
+                f"no row is stated against the baseline "
+                f"{'default' if family is None else family!r}",
+            )
 
     def test_every_used_tier_has_a_budget_and_a_measured_row_fits_it(self):
         names = {name for name, _, _, _, _ in self.rows}
