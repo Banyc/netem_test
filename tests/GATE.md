@@ -10,11 +10,19 @@ opt-in scenario and its tier. The manifest is machine-checked by
 without the manifest being updated, making an unnoticed `#[ignore]` skip
 impossible.
 
-Run the checker after adding, removing, or re-tiering any scenario:
+Run the checker after adding, removing, or re-tiering any scenario. Both
+commands below are written for this crate's root, one level above this file:
+`tools/check-gate.py` is the path from there, and the parameterized form's
+`--crate .` is the directory it is run in, not the one this file lives in.
 
 ```sh
 python3 tools/check-gate.py
 ```
+
+From this file's directory the same check is `python3 ../tools/check-gate.py` —
+the checker derives the crate root from its own path — and the parameterized
+form from there names the root instead of `.`:
+`python3 ../tools/check-gate.py --crate .. tests tests/tests tests/GATE.md`.
 
 The same gate through the parameterized form the sibling crates use (the
 scenario directory is `tests/tests`, one level below this package's own root):
