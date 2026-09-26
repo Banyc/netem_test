@@ -68,6 +68,7 @@ in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. The
 `gate-asserting` block records the report-only/asserting split.
 
 ```gate-default-required
+netem_scenarios::netem_blackout_gate_drops_then_resumes
 netem_scenarios::netem_delay_adds_latency
 netem_scenarios::netem_duplicate_produces_extra_packets
 netem_scenarios::netem_four_state_loss_drops_some
@@ -103,6 +104,7 @@ body: a `perf` scenario containing `assert!`/`assert_eq!`/`assert_ne!`/
 (an asserting check filed under the report-only tier would never run).
 
 ```gate-asserting
+netem_scenarios::netem_blackout_gate_drops_then_resumes
 netem_scenarios::netem_delay_adds_latency
 netem_scenarios::netem_duplicate_produces_extra_packets
 netem_scenarios::netem_four_state_loss_drops_some
