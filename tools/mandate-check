@@ -4,9 +4,10 @@
 The battery is `mandate_check.main`; everything after it is the history step:
 
 1. **archive** the run's artifacts under a durable root (`$PERF_ARCHIVE_DIR`,
-   default `~/.net-perf-history`) so the numbers survive the temp tree they were
-   written in. A run directory under a temp root is swept; an incident earlier in
-   this workspace proved the cost of that;
+   default `.net-perf-history` in the working directory, self-ignoring) so the
+   numbers survive the temp tree they were written in. A run directory under a
+   temp root is swept; an incident earlier in this workspace proved the cost of
+   that;
 2. **compare** it to the previous archived run and write `vs-prev.md` with the
    degradation figure per arm and metric, using the Rust tool
    (`netem-test/src/bin/perf-history.rs`), which also re-invokes the existing A/B

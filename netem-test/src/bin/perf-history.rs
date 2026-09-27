@@ -34,9 +34,10 @@
 //!     [--baseline <run-dir>] [--no-archive] [--only-compare] [--no-ab]
 //! ```
 //!
-//! `$PERF_ARCHIVE_DIR` relocates the archive; `$PERF_BASELINE_DIR` compares
-//! against a chosen run instead of the previous one (that is how a run is
-//! compared against what is deployed, when the previous run is itself suspect).
+//! `$PERF_ARCHIVE_DIR` relocates the archive (default `.net-perf-history` in the
+//! working directory, self-ignoring); `$PERF_BASELINE_DIR` compares against a
+//! chosen run instead of the previous one (that is how a run is compared against
+//! what is deployed, when the previous run is itself suspect).
 
 use std::collections::BTreeMap;
 use std::env;
@@ -49,9 +50,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const REPORT_NAME: &str = "mandate-check.json";
 const LOG_NAME: &str = "mandate-smoke.log";
 
-/// Where runs are archived. Durable by construction: never under a temp root
-/// and never inside a repo, so a commit cannot carry it and a checkout cannot
-/// lose it.
+/// Where runs are archived: `.net-perf-history` in the working directory, so
+/// each repo carries its own history beside the work it describes. The
+/// directory writes a `*` `.gitignore` for itself (the idiom the workspace's
+/// `local/` uses), because an archive that lands inside a repo must not become a
+/// working-copy change.
 const DEFAULT_ARCHIVE_DIR: &str = ".net-perf-history";
 
 /// Exit status for a run whose interactive tail regressed. Distinct from 1
@@ -112,10 +115,7 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
 fn archive_dir() -> PathBuf {
     match env::var("PERF_ARCHIVE_DIR") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
-        _ => match env::var("HOME") {
-            Ok(home) if !home.trim().is_empty() => PathBuf::from(home).join(DEFAULT_ARCHIVE_DIR),
-            _ => PathBuf::from(DEFAULT_ARCHIVE_DIR),
-        },
+        _ => PathBuf::from(DEFAULT_ARCHIVE_DIR),
     }
 }
 
@@ -188,6 +188,13 @@ fn archive_entry(run_dir: &Path, label: &str) -> Result<PathBuf> {
     let base = archive_dir().join(label);
     fs::create_dir_all(&base)
         .map_err(|e| Failure(format!("cannot create {}: {e}", base.display())))?;
+    // Self-ignoring at the archive *root*, so one `*` covers every label and an
+    // archive inside a repo stays out of the working copy.
+    let root = archive_dir();
+    let ignore = root.join(".gitignore");
+    if !ignore.exists() {
+        let _ = fs::write(&ignore, "*\n");
+    }
 
     let report = run_dir.join(REPORT_NAME);
     if !report.is_file() {
@@ -693,7 +700,7 @@ fn usage() -> String {
         "  --only-compare     exit 0 even on an M1 degradation (report-only)",
         "  --no-ab            skip the mandate_compare.py coverage/claim verdict",
         "",
-        "$PERF_ARCHIVE_DIR relocates the archive; $PERF_BASELINE_DIR chooses a baseline.",
+        "$PERF_ARCHIVE_DIR relocates the archive (default ./.net-perf-history); $PERF_BASELINE_DIR chooses a baseline.",
     ]
     .join("\n")
 }
