@@ -657,7 +657,15 @@ hole.
 
 **`tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
 a producer printed becomes an `arms` entry in `mandate-check.json` (schema
-`mandate-check/7`, which over `/6` records the per-arm *instrument* readings a
+`mandate-check/9`, which over `/8` records `delivery_granularity`: one entry per
+mandate that declares a `delivery_floor`, holding the units that floor
+tolerates at the run's own smallest offered count and the count that first
+breaches it, because a delivery floor is a ratio over counted units and three
+decimals of that ratio cannot state how many units a breach costs — so an arm
+that reports a `delivery` under a declared floor and not the `sent`/`recv`
+counts it is their quotient is refused rather than recorded as a ratio nothing
+counts; `/8` over `/7` adds `duration_note`; `/7`, which over `/6` records the
+per-arm *instrument* readings a
 producer prints — for `rtp_mux` its `[m1-censoring] arm=…` rows — under
 `censoring`, and the arms a mandate's line panel was given and stated under
 `mandates.<id>.censoring_arms`, so the verdict the `M1-latency` pixels cannot

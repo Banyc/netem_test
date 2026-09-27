@@ -193,7 +193,16 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   and the panel series counts, plus the run's exact command, the ``rtp_mux``
   source revision (its ``jj`` or ``git`` commit and change ids, and the tree
   that revision points at, each when resolvable), the wall-clock duration,
-  every problem found and the exit code. ``schema`` is ``mandate-check/8``:
+  every problem found and the exit code. ``schema`` is ``mandate-check/9``:
+  over ``mandate-check/8`` it adds ``delivery_granularity`` -- one record per
+  mandate that declares a ``delivery_floor``, holding the floor, the smallest
+  ``offered`` count its delivery arms reported, the units of slack that floor
+  buys at that count (``budget_units``), the count that first breaches it
+  (``min_failing_units``), the run's worst shortfall in units
+  (``units_short_max``), that breach as a duration of the arm's own offer
+  (``block_ms``, null when no window is stated) and one entry per arm with its
+  own counts and budget. A ``/8`` reader keeps working: the key is new and the
+  fields ``/8`` defines are unchanged. ``mandate-check/8``
   over ``mandate-check/7`` it adds ``duration_note`` to every mandate timing
   and every mandate record, and it makes ``duration_seconds`` **null on a
   mandate whose bracket the report's own two-decimal resolution renders as
@@ -249,7 +258,10 @@ be compared as if it were that run's measurement.
   reading (its latency panel would state no verdict), a
   missing/empty/mis-shaped declaration or data file, a malformed,
   unattributable, undeclared or absent arm line, a per-arm reading for an arm
-  no line panel draws, a target that ran tests
+  no line panel draws, a delivery floor with no unit counts to read it in (an
+  arm that reports a delivery ratio under a declared floor owes the ``sent``
+  and ``recv`` counts it is their quotient, since three decimals of a ratio
+  cannot state the units the floor tolerates), a target that ran tests
   without one libtest per-test stamp to time them from, a per-test time that
   cannot fit its target's own total, or a panel that could not be rendered or
   verified. The evidence is not trustworthy, whatever the verdicts said.
@@ -298,7 +310,7 @@ REPORT_NAME = "mandate-check.json"
 # name is its registry entry's.
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/8"
+REPORT_SCHEMA = "mandate-check/9"
 ARMS_DECLARATION_NAME = "mandate-arms.json"
 ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
 PRODUCERS_DECLARATION_NAME = "mandate-producers.json"
@@ -447,6 +459,22 @@ ARM_WINDOW_KEYS = {
     "elapsed_seconds": "elapsed_seconds",
     "measured_s": "measured_seconds",
 }
+# A delivery mandate's floor is a *ratio*, but the quantity it is a floor over
+# is a count of units the arm itself offers and receives, so the floor has a
+# size: ``floor(offered x (1 - floor))`` units of slack, and the next unit
+# fails. One unit is ``1 / offered`` of the ratio, which three printed decimals
+# cannot state, so an arm that reports a delivery under a declared floor owes
+# the counts the ratio is their quotient -- the arm record's own normalised
+# ``sent``/``received`` counters (the producer's ``sent=``/``recv=`` fields) --
+# and a breach is only attributable with them.
+DELIVERY_KEY = "delivery"
+DELIVERY_FLOOR_KEY = "delivery_floor"
+DELIVERY_OFFERED_COUNTER = "sent"
+DELIVERY_RECEIVED_COUNTER = "received"
+# The ratio's printed resolution: the arms print ``delivery=1.000``, so a figure
+# its own counts cannot produce to within half a printed step is not that
+# quotient and the units recorded beside it would be a different measurement.
+DELIVERY_PRINT_STEP = 1e-3
 # A value's optional unit suffix: the producer prints `12345B` and `12.3s`. The
 # number is recorded; the unit is not a second quantity to compare.
 ARM_UNIT_SUFFIXES = ("B", "s")
@@ -1875,6 +1903,7 @@ def build_report(args, out_dir, declared, selected, quick, timeout):
         "arms": [],
         "arm_notes": [],
         "censoring": {},
+        "delivery_granularity": {},
         "arm_declaration": {
             "path": str(MODULE_DIR / ARMS_DECLARATION_NAME),
             "schema": ARMS_DECLARATION_SCHEMA,
@@ -1939,6 +1968,184 @@ def apply_arm_records(report, events, declaration, producer, problems):
     return arms
 
 
+def _delivery_count(value):
+    """A unit count, or ``None``: a non-negative integer and not a bool."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0 or value != int(value):
+        return None
+    return int(value)
+
+
+def check_delivery_granularity(arms, report):
+    """Every declared delivery floor as the count of units it tolerates.
+
+    The delivery mandates assert a *ratio*, but what the ratio is made of is a
+    count of units the arm itself offers and receives, so the floor has a size
+    in units -- ``floor(offered x (1 - floor))`` of slack and the next unit
+    fails -- and a breach has an event size. A ratio printed to three decimals
+    cannot state either, so an arm that reports a ``delivery`` under a mandate
+    that declares a ``delivery_floor``, and does not report the counts the ratio
+    is their quotient, is refused here: the floor would be a bound over no unit
+    anyone can count, and a failure of it would be unattributable. The block
+    this records (and ``verdict_block`` prints) states the floor, the run's
+    smallest offer, the unit budget that gets, the first count that breaches
+    it, the worst shortfall in units, and that breach as a duration of the
+    offering arm's own window -- so the next reader of a delivery failure reads
+    an event rather than the third decimal of a ratio.
+
+    Returns the problems; fills ``report["delivery_granularity"]``.
+    """
+    problems = []
+    recorded = {}
+    for mandate in report["mandate_order"]:
+        section = (report["mandates"] or {}).get(mandate) or {}
+        values = section.get("values") or {}
+        floor = values.get(DELIVERY_FLOOR_KEY)
+        delivery_arms = [
+            arm
+            for arm in arms
+            if arm.get("mandate") == mandate
+            and DELIVERY_KEY in (arm.get("values") or {})
+        ]
+        # A mandate that printed no line has no floor to read, and its absent
+        # line is already a problem of its own: nothing here may add a second
+        # complaint about the same absence.
+        if section.get("raw_line") is None:
+            continue
+        # A mandate that reports any delivery figure owes the floor those
+        # figures are read against: without it the reported delivery is read
+        # against no bound, and the units a breach costs cannot be stated. M1
+        # reports none (its arms carry a delivery the M2 mandate owns), so the
+        # obligation is the mandate's own line, not the arms it happens to
+        # share with another section.
+        delivery_values = sorted(key for key in values if DELIVERY_KEY in key)
+        if floor is None:
+            if delivery_values:
+                problems.append(
+                    f"{mandate}: the line reports {', '.join(delivery_values)} "
+                    f"but declares no {DELIVERY_FLOOR_KEY}, so the delivery it "
+                    "reports is read against no bound and the units it "
+                    "tolerates cannot be stated"
+                )
+            continue
+        if (
+            isinstance(floor, bool)
+            or not isinstance(floor, (int, float))
+            or not 0.0 < floor <= 1.0
+        ):
+            problems.append(
+                f"{mandate}: the declared {DELIVERY_FLOOR_KEY} {floor!r} is not "
+                "a fraction in (0, 1], so it names no bound a delivery can be "
+                "read against"
+            )
+            continue
+        if not delivery_arms:
+            problems.append(
+                f"{mandate}: the line declares a {DELIVERY_FLOOR_KEY} of {floor} "
+                "but no arm of this mandate reports a delivery value, so the "
+                "floor is declared over no measurement and its unit budget "
+                "cannot be stated"
+            )
+            continue
+        entries = []
+        for arm in delivery_arms:
+            counters = arm.get("counters") or {}
+            offered = _delivery_count(counters.get(DELIVERY_OFFERED_COUNTER))
+            received = _delivery_count(counters.get(DELIVERY_RECEIVED_COUNTER))
+            printed = (arm.get("values") or {}).get(DELIVERY_KEY)
+            if offered is None or received is None or offered == 0:
+                problems.append(
+                    f"{arm['id']} reports {DELIVERY_KEY}={printed} under "
+                    f"{mandate}'s {DELIVERY_FLOOR_KEY} {floor} without the "
+                    "counts that ratio is the quotient of (the arm's "
+                    f"{DELIVERY_OFFERED_COUNTER}/{DELIVERY_RECEIVED_COUNTER} "
+                    "fields), so the number of units the floor tolerates "
+                    "cannot be stated and a breach of it cannot be attributed "
+                    "to an event size"
+                )
+                continue
+            if received > offered:
+                problems.append(
+                    f"{arm['id']} reports {DELIVERY_RECEIVED_COUNTER}="
+                    f"{received} against {DELIVERY_OFFERED_COUNTER}={offered}, "
+                    "so its delivery ratio is above a whole: a flow cannot "
+                    "deliver more units than it offered"
+                )
+                continue
+            ratio = received / offered
+            if (
+                not isinstance(printed, bool)
+                and isinstance(printed, (int, float))
+                and abs(printed - ratio) > DELIVERY_PRINT_STEP / 2
+            ):
+                problems.append(
+                    f"{arm['id']} reports {DELIVERY_KEY}={printed} for "
+                    f"{DELIVERY_RECEIVED_COUNTER}={received} of "
+                    f"{DELIVERY_OFFERED_COUNTER}={offered}, which is "
+                    f"{ratio:.6f}: the ratio is not the quotient of the counts "
+                    "recorded beside it, so neither the ratio nor those units "
+                    "can be read as this arm's delivery"
+                )
+            budget_units = math.floor(offered * (1.0 - floor))
+            entries.append(
+                {
+                    "id": arm["id"],
+                    "offered": offered,
+                    "received": received,
+                    "units_short": offered - received,
+                    "budget_units": budget_units,
+                    "window_seconds": arm_window_seconds(arm, values),
+                }
+            )
+        if not entries:
+            continue
+        # The tightest budget is the smallest offer's, and the breach is timed
+        # against that same arm's window: the arm that tolerates fewest units is
+        # the one whose breach is the cheapest to reach, so it is the one whose
+        # granularity the mandate states.
+        smallest = min(entries, key=lambda entry: (entry["offered"], entry["id"]))
+        offered_min = smallest["offered"]
+        budget_units = math.floor(offered_min * (1.0 - floor))
+        min_failing_units = budget_units + 1
+        window = smallest["window_seconds"]
+        block_ms = (
+            round(min_failing_units * window * 1000.0 / offered_min, 1)
+            if window
+            else None
+        )
+        recorded[mandate] = {
+            "floor": floor,
+            "offered_min": offered_min,
+            "budget_units": budget_units,
+            "min_failing_units": min_failing_units,
+            "units_short_max": max(entry["units_short"] for entry in entries),
+            "block_ms": block_ms,
+            "arms": sorted(entries, key=lambda entry: entry["id"]),
+        }
+    report["delivery_granularity"] = recorded
+    return problems
+
+
+def arm_window_seconds(arm, mandate_values):
+    """The window the arm ran for, from its own line or from its mandate's.
+
+    The M4 flow arms' lines carry counts but no window (their mandate's line
+    does), and the M1/M2 arms' lines carry both, so the window is read from
+    whichever of the two states it -- and a mandate that states neither leaves
+    the breach's duration unstated rather than invented.
+    """
+    for candidate in (
+        (arm.get("windows") or {}).get("window_seconds"),
+        mandate_values.get("window_s"),
+    ):
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+            continue
+        if math.isfinite(candidate) and candidate > 0:
+            return float(candidate)
+    return None
+
+
 def verdict_block(report):
     """The human- and machine-readable block printed on every exit path."""
     lines = [
@@ -1996,6 +2203,23 @@ def verdict_block(report):
             )
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
+    for mandate in report["mandate_order"]:
+        reading = (report.get("delivery_granularity") or {}).get(mandate)
+        if not reading:
+            continue
+        breach = f"{reading['min_failing_units']} counted unit(s)"
+        if reading.get("block_ms") is not None:
+            breach += (
+                f" of this run's smallest offer ({reading['block_ms']:.1f}ms at "
+                f"{reading['offered_min']} units per window)"
+            )
+        lines.append(
+            f"delivery: {mandate} floor={reading['floor']} "
+            f"offered_min={reading['offered_min']} "
+            f"budget_units={reading['budget_units']} "
+            f"units_short_max={reading['units_short_max']}  "
+            f"-> a breach of the floor is {breach}, not the ratio's third decimal"
+        )
     for producer_id, entry in sorted((report.get("censoring") or {}).items()):
         arms = entry.get("arms") or {}
         readings = ", ".join(
@@ -2454,6 +2678,13 @@ def main(argv=None):
     first = report["producers"].get(report["producers_selected"][0]) or {}
     report["command"] = first.get("command")
     report["cwd"] = first.get("path")
+    # A report-wide check: the arms of every selected producer are in the report
+    # by now, and a delivery floor's unit budget is a property of the run's own
+    # counts rather than of one producer's output stream.
+    granularity_problems = check_delivery_granularity(report["arms"], report)
+    if granularity_problems:
+        report["problems"].extend(granularity_problems)
+        codes.append(EXIT_EVIDENCE_FAILURE)
     if EXIT_EVIDENCE_FAILURE in codes:
         exit_code = EXIT_EVIDENCE_FAILURE
     elif EXIT_MANDATE_FAILURE in codes:

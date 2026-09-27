@@ -301,7 +301,7 @@ PASS_LINES = [
     "[mandate-smoke lone_tail] sent=  240 recv=  240 delivery=1.000 p50=    0.3 "
     "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
     "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
-    "MANDATE M2 PASS delivery=1.000 amp=3.61 budget=6.0",
+    "MANDATE M2 PASS delivery=1.000 amp=3.61 budget=6.0 delivery_floor=0.995",
     "test m2_interactive_delivery_and_wire ... ok <86.162s>",
     "[mandate-smoke m3/rep1] delivered 0.963 MiB/s over 2.0004s, shaper forwarded "
     "0.972 MiB/s, capacity 1.000 MiB/s, fraction 0.963 (820148 / 992240 bytes)",
@@ -311,21 +311,25 @@ PASS_LINES = [
     "0.967 MiB/s, capacity 1.000 MiB/s, fraction 0.958 (815872 / 990128 bytes)",
     "MANDATE M3 PASS goodput=0.52 floor=0.35 link_mib_s=8.0",
     "test m3_bulk_goodput_fraction ... ok <60.589s>",
-    "[mandate-smoke m4/clean flow A] sent=  120 recv=  120 delivery=1.000 "
+    "[mandate-smoke m4/clean flow A] sent= 1200 recv= 1200 delivery=1.000 "
     "share=0.2502 offered=1269600B delivered=1269600B p50=   22.0 p90=   41.0 "
     "p99=  118.4 max=  240.0",
-    "[mandate-smoke m4/clean flow B] sent=  120 recv=  120 delivery=1.000 "
+    "[mandate-smoke m4/clean flow B] sent= 1200 recv= 1200 delivery=1.000 "
     "share=0.2498 offered=1269600B delivered=1269600B p50=   23.5 p90=   42.0 "
     "p99=  121.0 max=  244.0",
-    "[mandate-smoke m4/clean flow C] sent=  120 recv=  120 delivery=1.000 "
+    "[mandate-smoke m4/clean flow C] sent= 1200 recv= 1200 delivery=1.000 "
     "share=0.2501 offered=1269600B delivered=1269600B p50=   21.8 p90=   40.0 "
     "p99=  116.7 max=  238.0",
-    "[mandate-smoke m4/clean flow D] sent=  120 recv=  120 delivery=1.000 "
+    "[mandate-smoke m4/clean flow D] sent= 1200 recv= 1200 delivery=1.000 "
     "share=0.2499 offered=1269600B delivered=1269600B p50=   24.1 p90=   43.0 "
     "p99=  119.9 max=  246.0",
     "[mandate-smoke m4/clean  ] ideal_share=0.2500 min_share=0.2498 "
     "max_share=+0.2502 imbalance=0.0016 window=12s wall=24.3s",
-    "[mandate-smoke m4/hostile flow A] sent=  120 recv=  120 delivery=0.998 "
+    # 1198 of 1200 is 0.998 to the three decimals the line prints: a delivery
+    # figure its own counts cannot produce is what `check_delivery_granularity`
+    # refuses, so the fixture is its own quotient rather than a ratio nothing
+    # counts to.
+    "[mandate-smoke m4/hostile flow A] sent= 1200 recv= 1198 delivery=0.998 "
     "share=0.2480 offered=1269600B delivered=1267000B p50=   96.0 p90=  180.0 "
     "p99=  402.0 max=  900.0",
     "[mandate-smoke m4/hostile] ideal_share=0.2500 min_share=0.2480 "
@@ -336,7 +340,7 @@ PASS_LINES = [
     # The real line prints the hostile arm's own p99 guard beside the mandate
     # ceiling, and that measurement is what names the series the latency panel's
     # ceiling bound governs; the plotter refuses a crossed bound without it.
-    "hostile_p99_guard=900.0",
+    "hostile_p99_guard=900.0 window_s=12.0",
     "test m4_interactive_lane_fairness ... ok <23.037s>",
     "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; "
     "finished in 86.16s",
@@ -1302,7 +1306,7 @@ class MandateCheckTest(unittest.TestCase):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         report = self.report()
-        self.assertEqual(report["schema"], "mandate-check/8")
+        self.assertEqual(report["schema"], "mandate-check/9")
         # The schema bump is over `/5`: a `/5` reader's keys keep their meaning
         # (a test's `duration_seconds` is still its own seconds, and the arm
         # record is untouched), and the new keys say where a duration came
@@ -1312,7 +1316,10 @@ class MandateCheckTest(unittest.TestCase):
         # panel actually states). `/8` over `/7` adds `duration_note` and makes
         # a mandate's `duration_seconds` null when its bracket resolves to no
         # duration at the report's own precision -- only a figure that could
-        # never be trusted becomes null, so a `/7` reader keeps working.
+        # never be trusted becomes null, so a `/7` reader keeps working. `/9`
+        # over `/8` adds `delivery_granularity`: the units a declared delivery
+        # floor tolerates at the run's own offered count, which is a new key and
+        # leaves every `/8` field as it was.
         self.assertEqual(
             sorted(report["censoring"]),
             ["rtp_mux"],
@@ -1414,7 +1421,7 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(rep["cells"][0].split("@")[0], "M3")
         # The M4 flow arms inherit the arm family's cells by longest prefix.
         flow = arms["M4/m4/clean flow C"]
-        self.assertEqual(flow["sample_count"], 120)
+        self.assertEqual(flow["sample_count"], 1200)
         self.assertEqual(flow["counters"]["offered_bytes"], 1269600)
         self.assertEqual(flow["counters"]["delivered_bytes"], 1269600)
         self.assertIn("flows=4", flow["cells"][0])
@@ -1430,6 +1437,110 @@ class MandateCheckTest(unittest.TestCase):
         self.assertGreater(report["arm_declaration"]["declared_cells"], 0)
         self.assertIn("arms: 16 measured", stdout)
         self.assertIn("M1 arms: 3 (clean, hostile, lone_tail), 1840 sample(s)", stdout)
+
+    # -- the delivery floor's own units ------------------------------------
+
+    def test_delivery_granularity_states_the_units_each_floor_tolerates(self):
+        # A delivery mandate asserts a ratio, but what it is a floor over is a
+        # count of units the arm offers and receives, so the floor has a size:
+        # `floor(offered x (1 - floor))` lost units are tolerated and the next
+        # one breaches it. Three decimals of the ratio cannot state that, so the
+        # report states it in units, and times the breach against the window of
+        # the arm that tolerates fewest -- the arm whose breach is the cheapest
+        # to reach is the one whose granularity the mandate states.
+        code, stdout, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        granularity = report["delivery_granularity"]
+        self.assertEqual(sorted(granularity), ["M2", "M4"])
+        m4 = granularity["M4"]
+        self.assertEqual(m4["floor"], 0.995)
+        self.assertEqual(m4["offered_min"], 1200)
+        self.assertEqual(m4["budget_units"], 6)
+        self.assertEqual(m4["min_failing_units"], 7)
+        self.assertEqual(m4["units_short_max"], 2)
+        self.assertEqual(m4["block_ms"], 70.0)
+        hostile = [
+            entry for entry in m4["arms"] if entry["id"].endswith("hostile flow A")
+        ]
+        self.assertEqual(len(hostile), 1)
+        self.assertEqual(hostile[0]["offered"], 1200)
+        self.assertEqual(hostile[0]["received"], 1198)
+        self.assertEqual(hostile[0]["units_short"], 2)
+        self.assertEqual(hostile[0]["budget_units"], 6)
+        # M2's arms state their own windows, so the tightest budget is the
+        # lone-tail arm's: 240 offered over 15 s tolerates `floor(240 x 0.005)`
+        # = 1 lost message and breaches at the second, 125 ms of its own offer.
+        m2 = granularity["M2"]
+        self.assertEqual(m2["offered_min"], 240)
+        self.assertEqual(m2["budget_units"], 1)
+        self.assertEqual(m2["min_failing_units"], 2)
+        self.assertEqual(m2["units_short_max"], 0)
+        self.assertEqual(m2["block_ms"], 125.0)
+        self.assertIn(
+            "delivery: M4 floor=0.995 offered_min=1200 budget_units=6 "
+            "units_short_max=2",
+            stdout,
+        )
+        self.assertIn("a breach of the floor is 7 counted unit(s)", stdout)
+        self.assertIn("delivery: M2 floor=0.995 offered_min=240", stdout)
+        self.assertIn("is 2 counted unit(s)", stdout)
+
+    def test_a_delivery_arm_without_its_counts_is_refused(self):
+        # The ratio with nothing counting under it: this arm's delivery is 1198
+        # of 1200 units, and with the received count removed the units the floor
+        # tolerates -- and so the size of any breach of it -- cannot be stated
+        # at all, which is exactly what a reader of a rare delivery failure
+        # needs to know.
+        plan = self.healthy_plan(
+            stdout=[
+                line.replace(
+                    "sent= 1200 recv= 1198 delivery=0.998",
+                    "sent= 1200 delivery=0.998",
+                )
+                for line in PASS_LINES
+            ]
+        )
+        self.reject(
+            plan,
+            "M4/m4/hostile flow A reports delivery=0.998 under M4's "
+            "delivery_floor 0.995 without the counts that ratio is the "
+            "quotient of",
+        )
+
+    def test_a_delivery_ratio_its_counts_cannot_produce_is_refused(self):
+        # A ratio that is not its own quotient is a measurement of something
+        # else, and any unit budget recorded beside it would be arithmetic over
+        # counts that do not belong to that ratio.
+        plan = self.healthy_plan(
+            stdout=[
+                line.replace(
+                    "sent= 1200 recv= 1200 delivery=1.000",
+                    "sent= 1200 recv= 1200 delivery=0.990",
+                )
+                for line in PASS_LINES
+            ]
+        )
+        self.reject(
+            plan,
+            "which is 1.000000: the ratio is not the quotient of the counts "
+            "recorded beside it",
+        )
+
+    def test_a_delivery_reported_without_a_floor_is_refused(self):
+        # The obligation is the mandate's own line: a line that reports a
+        # delivery minimum must declare the floor those figures are read
+        # against, or the reported delivery is read against no bound at all.
+        plan = self.healthy_plan(
+            stdout=[
+                line.replace("delivery_floor=0.995 ", "") for line in PASS_LINES
+            ]
+        )
+        self.reject(
+            plan,
+            "M4: the line reports clean_delivery_min, hostile_delivery_min but "
+            "declares no delivery_floor",
+        )
 
     def test_m1_without_a_censoring_reading_is_refused(self):
         # The panel that cannot show its own failure: a peak that returned and a

@@ -227,7 +227,7 @@ Into `--dir` (the path is printed, and recorded in the report):
   paints an absence as a near-vertical climb, and the two readings of the
   `M1-latency` panel are the same pixels, so the panel states the instrument's
   verdict instead of leaving it to the reader's eye;
-- `mandate-check.json` — `schema` (`mandate-check/7`), `ok`, `exit_code`,
+- `mandate-check.json` — `schema` (`mandate-check/9`), `ok`, `exit_code`,
   `verdict`, `started_at`, `duration_seconds`, `producers_declared` and
   `producers_selected`, a `producers` record per *declared* producer (`id`,
   `package`, `target`, `source`, `selected`, the resolved `path`, `sections`,
@@ -253,12 +253,23 @@ Into `--dir` (the path is printed, and recorded in the report):
   `targets[]` record, per target, libtest's own `finished in` total, how many
   tests ran and how many carried a stamp, the summed and largest stamped
   seconds, the observed overlap factor, and whether those seconds fit that
-  total, an `arms`
+  total, a `delivery_granularity` record per mandate that declares a
+  `delivery_floor` (`floor`, `offered_min`, `budget_units`, `min_failing_units`,
+  `units_short_max`, `block_ms`, and one entry per arm with its `offered`,
+  `received`, `units_short`, `budget_units` and `window_seconds`), an `arms`
   record per arm (below), the prose `arm_notes` and the `arm_declaration` the
   cells came from, and every `problem` found, each prefixed with the producer
   it came from. A target that ran tests without a single stamp, and a stamped
   time that cannot fit its target's own total, are `problem`s and fail the run
-  as absent or impossible evidence rather than being written as a number.
+  as absent or impossible evidence rather than being written as a number. A
+  `delivery` reported under a declared `delivery_floor` without the `sent` and
+  `recv` counts that ratio is their quotient is a `problem` too: a floor is a
+  ratio over counted units, so without them the number of units it tolerates is
+  unstatable and a breach of it cannot be attributed to an event size. That
+  unit budget is what the report's own `delivery:` line states on every run —
+  the floor, the smallest count the run offered, the units of slack at that
+  count, the count that first breaches it, and the worst shortfall observed in
+  units.
 
 The `rtp_mux` and `smoke` keys a `mandate-check/4` reader reads are kept as
 that producer's identity record and run record, and are `null` when it was not
