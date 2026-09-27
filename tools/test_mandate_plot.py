@@ -2332,6 +2332,149 @@ class MandatePlotTest(unittest.TestCase):
         )
         self.assertIn("furthest -0.2, 9.1 px from the bound", statement)
 
+    # -- the forced panel summary: every panel states what it drew -----------
+
+    def summary_check(self, document, declaration=None, fault=None):
+        """Measure one rendered SVG back against its own drawn geometry."""
+        declaration = declaration or DROP_IMBALANCE_DECLARATION
+        panel = declaration["panels"][0]
+        series = DROP_IMBALANCE_SERIES
+        bounds = MANDATE.mirrored_bounds(panel["bounds"])
+        axis = MANDATE.bar_axis_extent(series, bounds, None)
+        plot_height = MANDATE.bar_plot_height(len(series))
+        stated = [
+            str(bound["label"])
+            for bound, _ in MANDATE.sliver_bound_statements(
+                series, bounds, axis, plot_height
+            )
+        ]
+        return MANDATE.check_panel_summary_stated(
+            panel["id"],
+            panel["chart"],
+            panel.get("x_label") or declaration["x_label"],
+            panel.get("y_label") or declaration["y_label"],
+            series,
+            bounds,
+            axis,
+            document,
+            plot_height,
+            stated,
+            None,
+            fault,
+        )
+
+    def test_the_summary_states_axis_series_bounds_pixels_and_reading(self):
+        # The forced summary, and the check that reads it back: the block a
+        # reader takes in at a glance, with the bound's own pixel position
+        # measured from the SVG's drawn `y1` rather than asserted.
+        code, stderr, out = self.render_mandate(
+            DROP_IMBALANCE_DECLARATION, DROP_IMBALANCE_ROWS, "M4blk"
+        )
+        self.assertEqual(code, 0, stderr)
+        text = (out / "M4-imbalance.summary.txt").read_text(encoding="utf-8")
+        self.assertIn("panel imbalance  chart=bar  axis=-1..0.0605", text)
+        self.assertIn("x=flow (1..4)", text)
+        self.assertIn("y=departure from the fair share", text)
+        self.assertIn("series: clean 4 pts -1..-1; hostile 4 pts", text)
+        self.assertIn("bound: 'fair-share bound \u00b11.0%' y=0.01 px=", text)
+        self.assertIn("reason=declaration drawn=stated-as-sliver", text)
+        self.assertIn(
+            "bound: 'fair-share bound -1.0%' y=-0.01 px=", text
+        )
+        self.assertIn("reason=declaration-band drawn=unlabelled", text)
+        self.assertIn("reading: clean -1..-1 (4 pts); hostile", text)
+        svg = (out / "M4-imbalance.svg").read_text(encoding="utf-8")
+        drawn = [float(y) for y in MANDATE.DRAWN_BOUND_RE.findall(svg)]
+        parsed = MANDATE.read_panel_summary(svg)
+        self.assertEqual([entry["px"] for entry in parsed["bounds"]], drawn)
+
+    def test_a_panel_without_a_summary_is_refused(self):
+        # red: the same panel with its `<desc>` removed. The plot step refuses
+        # it, so a summary-less panel cannot reach a run's evidence.
+        document = self.render_sliver(
+            DROP_IMBALANCE_DECLARATION, DROP_IMBALANCE_ROWS, "M4sum0"
+        )
+        self.assertEqual(self.summary_check(document), [])
+        silent = MANDATE.PANEL_SUMMARY_RE.sub("", document)
+        self.assertNotEqual(silent, document)
+        problems = self.summary_check(silent)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("carries no panel summary", problems[0])
+
+    def test_a_summary_that_is_not_the_drawn_panel_is_refused(self):
+        # red: a summary carrying a number the run did not measure is worse than
+        # silence, because the reader trusts it instead of the pixels.
+        document = self.render_sliver(
+            DROP_IMBALANCE_DECLARATION, DROP_IMBALANCE_ROWS, "M4sum1"
+        )
+        parsed = MANDATE.read_panel_summary(document)
+        parsed["reading"] = "clean 0..0 (4 pts)"
+        tampered = MANDATE.introduce_panel_summary(
+            MANDATE.PANEL_SUMMARY_RE.sub("", document), parsed
+        )
+        problems = self.summary_check(tampered)
+        self.assertTrue(problems)
+        self.assertIn("'reading'", problems[0])
+
+    def test_a_fault_render_says_which_mandate_and_what_it_did_to_the_scale(self):
+        code, stderr, out = self.render_mandate(
+            DROP_IMBALANCE_DECLARATION,
+            DROP_IMBALANCE_ROWS,
+            "M4fault",
+            "--fault",
+            "M4_drop",
+        )
+        self.assertEqual(code, 0, stderr)
+        text = (out / "M4-imbalance.summary.txt").read_text(encoding="utf-8")
+        self.assertIn("fault: M4_drop", text)
+        self.assertIn("fault scale:", text)
+        self.assertIn("fair-share bound \u00b11.0%", text)
+        self.assertIn("2.1 px of this axis", text)
+        svg = (out / "M4-imbalance.svg").read_text(encoding="utf-8")
+        self.assertEqual(MANDATE.read_panel_summary(svg)["fault"], "M4_drop")
+        # a fault belongs to the mandate it names, not to every panel
+        self.assertIsNone(MANDATE.mandate_fault("M4", "M1_latency"))
+        self.assertEqual(MANDATE.mandate_fault("M4", "M4_drop"), "M4_drop")
+
+    def test_a_fault_is_refused_where_the_summary_does_not_state_it(self):
+        # red: the panel that took the fault but whose summary says nothing.
+        code, stderr, out = self.render_mandate(
+            DROP_IMBALANCE_DECLARATION,
+            DROP_IMBALANCE_ROWS,
+            "M4fault2",
+            "--fault",
+            "M4_drop",
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M4-imbalance.svg").read_text(encoding="utf-8")
+        parsed = MANDATE.read_panel_summary(svg)
+        parsed["fault"] = None
+        silent = MANDATE.introduce_panel_summary(
+            MANDATE.PANEL_SUMMARY_RE.sub("", svg), parsed
+        )
+        problems = self.summary_check(silent, fault="M4_drop")
+        self.assertTrue(problems)
+        self.assertIn("'fault'", problems[0])
+
+    def test_a_panel_with_no_bound_says_none_by_design(self):
+        block = MANDATE.panel_summary_block(
+            {
+                "panel": "goodput",
+                "chart": "bar",
+                "axis": [0.0, 1.0],
+                "x_label": "rep (1..3)",
+                "y_label": "MiB/s",
+                "series": [
+                    {"name": "goodput", "points": 3, "min": 0.948, "max": 0.953}
+                ],
+                "bounds": [],
+                "reading": "goodput 0.948..0.953 (3 pts)",
+                "fault": None,
+            }
+        )
+        self.assertIn("bound: none by design", block)
+        self.assertNotIn("fault:", block)
+
     def test_a_panel_labelled_with_a_sibling_s_unit_is_refused(self):
         series = [("fraction", [(1.0, 0.958217), (2.0, 0.958271)])]
         # red: the label the preserved run drew on the fraction panel -- the

@@ -187,13 +187,30 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
 - ``mandate-smoke.log`` — the smoke set's combined stdout/stderr;
 - ``plots/<mandate>-<panel>.svg`` (and ``.png`` unless ``--no-rasterize``) —
   the verified panels;
+- ``plots/<mandate>-<panel>.summary.txt`` — beside every verified panel, one
+  compact block saying what it drew: its axis and units, its series and their
+  drawn ranges, every bound line with its label, value, pixel position, band
+  and why it is drawn, its reading in the quantity's own units, and, for a
+  deliberate-fault run, that it is a fault render. The block is also printed by
+  this command (prefixed ``summary|``) and carried in the report, so the run's
+  own output states every panel's reading. It is **mandatory**: the plot step
+  refuses a panel without one and this command refuses a run whose panels lack
+  one, so a summary-less panel can never be read as a PASS;
 - ``mandate-check.json`` — per mandate its pass/fail verdict, the measured
   values parsed from the ``MANDATE`` lines, the per-test and per-mandate
   wall-clock timings observed on the child's output stream, the plot paths
-  and the panel series counts, plus the run's exact command, the ``rtp_mux``
+  the panel series counts and ``panel_summaries`` (one object per panel: the
+  panel id, chart, axis, axis labels, series with their drawn ranges, every
+  bound with its pixel position and reason, the reading, the fault selector
+  when the run took one, and the printed ``block``), plus the run's exact
+  command, the ``rtp_mux``
   source revision (its ``jj`` or ``git`` commit and change ids, and the tree
   that revision points at, each when resolvable), the wall-clock duration,
-  every problem found and the exit code. ``schema`` is ``mandate-check/9``:
+  every problem found and the exit code. ``schema`` is ``mandate-check/10``:
+  over ``mandate-check/9`` it adds ``mandates.<id>.panel_summaries`` and the
+  ``plots/<panel>.summary.txt`` sidecars, and requires them (a run whose panels
+  lack summaries is an evidence failure). A ``/9`` reader keeps working: the key
+  is new and the fields ``/9`` defines are unchanged. ``mandate-check/9``
   over ``mandate-check/8`` it adds ``delivery_granularity`` -- one record per
   mandate that declares a ``delivery_floor``, holding the floor, the smallest
   ``offered`` count its delivery arms reported, the units of slack that floor
@@ -302,6 +319,9 @@ MANDATE_IDS = ("M1", "M2", "M3", "M4")
 PRIMARY_PRODUCER = "rtp_mux"
 OUT_DIR_ENV = "MANDATE_CHECK_DIR"
 QUICK_ENV = "MANDATE_SMOKE_QUICK"
+# The producers read this themselves (`rtp_mux`'s `fault()`); the runner reads it
+# too, so the panels of the mandate it names state that they are fault renders.
+FAULT_ENV = "MANDATE_SMOKE_FAULT"
 DEFAULT_TIMEOUT_SECONDS = 900.0
 DEFAULT_CARGO = "cargo"
 REPORT_NAME = "mandate-check.json"
@@ -310,7 +330,7 @@ REPORT_NAME = "mandate-check.json"
 # name is its registry entry's.
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/9"
+REPORT_SCHEMA = "mandate-check/10"
 ARMS_DECLARATION_NAME = "mandate-arms.json"
 ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
 PRODUCERS_DECLARATION_NAME = "mandate-producers.json"
@@ -1760,14 +1780,18 @@ def _kill_process_group(process):
         process.kill()
 
 
-def render_mandate(mandate, out_dir, *, rasterize, browser, run_values=None, run_censoring=None):
+def render_mandate(
+    mandate, out_dir, *, rasterize, browser, run_values=None, run_censoring=None, fault=None
+):
     """Render one mandate's declared panels, returning ``(summary, problems)``.
 
     ``run_values`` is this mandate's parsed ``MANDATE`` line, handed to the
     plotter so a bound whose bars cross it can name the run's own per-arm
     guards instead of reading as a breach the verdict tolerates. ``run_censoring``
     is this mandate's per-arm instrument readings, handed over so a latency
-    panel states the verdict its pixels cannot carry.
+    panel states the verdict its pixels cannot carry. ``fault`` is the run's
+    ``MANDATE_SMOKE_FAULT`` selector, handed over so the mandate it names states
+    on every panel that this is a fault render.
     """
     declaration = out_dir / f"{mandate}.json"
     data = out_dir / f"{mandate}.csv"
@@ -1791,6 +1815,7 @@ def render_mandate(mandate, out_dir, *, rasterize, browser, run_values=None, run
             browser=browser,
             run_values=run_values,
             run_censoring=run_censoring,
+            fault=fault,
         )
     except (MANDATE_PLOT.MandatePlotError, MANDATE_PLOT.RENDER.RenderGraphError) as error:
         return None, [f"{mandate}: {error}"]
@@ -1798,23 +1823,50 @@ def render_mandate(mandate, out_dir, *, rasterize, browser, run_values=None, run
 
 
 def _verify_plots(mandate, summary):
-    """Every written panel must exist, be non-empty, and carry series geometry."""
+    """Every written panel must exist, be non-empty, carry series geometry, and
+    carry the summary of what it drew.
+
+    The summary is mandatory: a run whose plots lack one must not report PASS,
+    because then the only statement of what a panel shows is the render, and a
+    reader has to infer what the producer already knew. A panel that reached the
+    disk without a summary is a missing evidence file, not a note.
+    """
     problems = []
     counts = summary.get("series_counts") or []
+    panels = summary.get("panels")
     if not summary.get("svg"):
         problems.append(f"{mandate}: rendering declared no panel")
-    if len(counts) != summary.get("panels"):
+    if len(counts) != panels:
         problems.append(
             f"{mandate}: {len(counts)} panel series count(s) for "
-            f"{summary.get('panels')} declared panel(s)"
+            f"{panels} declared panel(s)"
         )
     for count in counts:
         if count <= 0:
             problems.append(f"{mandate}: a rendered panel carries no series data")
+    summaries = summary.get("summaries") or []
+    if len(summaries) != panels:
+        problems.append(
+            f"{mandate}: {len(summaries)} panel summary(ies) for {panels} "
+            "declared panel(s); every panel owes a summary of what it drew, so a "
+            "run without one cannot report PASS"
+        )
+    for document in summaries:
+        if not document.get("panel") or not document.get("block"):
+            problems.append(
+                f"{mandate}: a panel summary names no panel or carries no "
+                "readable block"
+            )
     for path in list(summary.get("svg") or []) + list(summary.get("png") or []):
         written = Path(path)
         if not written.is_file() or written.stat().st_size == 0:
             problems.append(f"{mandate}: the plot {written} is missing or empty")
+        sidecar = written.with_suffix(".summary.txt")
+        if not sidecar.is_file() or sidecar.stat().st_size == 0:
+            problems.append(
+                f"{mandate}: the panel {written} has no {sidecar.name} beside it, "
+                "so its summary is not in the run's evidence"
+            )
     return problems
 
 
@@ -1928,6 +1980,7 @@ def build_report(args, out_dir, declared, selected, quick, timeout):
                 "plots": [],
                 "series_counts": [],
                 "panels": 0,
+                "panel_summaries": [],
                 "censoring_arms": [],
                 "finished_at_seconds": None,
                 "duration_seconds": None,
@@ -2203,6 +2256,12 @@ def verdict_block(report):
             )
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
+        # The panel's own statement of what it drew, printed with the run so a
+        # reader knows what every panel shows without opening an SVG. The lines
+        # are prefixed so a reader (or a checker) can lift them back out.
+        for document in record.get("panel_summaries") or []:
+            for line in str(document.get("block") or "").splitlines():
+                lines.append(f"  summary| {line}")
     for mandate in report["mandate_order"]:
         reading = (report.get("delivery_granularity") or {}).get(mandate)
         if not reading:
@@ -2385,6 +2444,7 @@ def evaluate_producer(args, producer, out_dir, report, run, declaration):
             browser=args.browser,
             run_values=(records.get(mandate) or {}).get("values"),
             run_censoring=(censoring if mandate == censoring_mandate else None),
+            fault=args.fault,
         )
         if summary is not None:
             stated = sorted(summary.get("censoring") or [])
@@ -2400,6 +2460,7 @@ def evaluate_producer(args, producer, out_dir, report, run, declaration):
             )
             section["series_counts"] = list(summary.get("series_counts") or [])
             section["panels"] = summary.get("panels", 0)
+            section["panel_summaries"] = list(summary.get("summaries") or [])
             problems.extend(_verify_plots(mandate, summary))
         problems.extend(render_problems)
     problems.extend(mandate_duration_problems(report, producer))
@@ -2514,6 +2575,17 @@ def parse_args(argv):
         default=True,
         help="verify and keep the panel SVGs only; skip the external PNG step",
     )
+    parser.add_argument(
+        "--fault",
+        default=None,
+        metavar="NAME",
+        help=(
+            f"the deliberate-fault selector this run took (default: ${FAULT_ENV} "
+            "from the environment, which the producers read too); the mandate it "
+            "names states on every panel that this is a fault render, which arm "
+            "it perturbs and what it did to the scale"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2561,6 +2633,8 @@ def select_producers(declared, requested, problems):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.fault is None:
+        args.fault = (os.environ.get(FAULT_ENV) or "").strip() or None
     started = time.monotonic()
     declaration_problems = []
     try:

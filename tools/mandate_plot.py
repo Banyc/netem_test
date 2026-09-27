@@ -69,6 +69,23 @@ silenced by softening a declaration:
   bound, no visible departure) keeps the refusal. Both halves are refused by
   name: a sliver-bound panel that states nothing, and a stated one whose
   numbers are not the drawn points' and the drawn axis' own.
+- **the panel-summary test** — `check_panel_summary_stated` requires every panel
+  to carry a summary of what it drew, and measures it back out of the artifact.
+  `AGENTS.md`'s report rule is that the tool's own message is the oracle, and a
+  panel a reader can only read from its pixels is how the *producer's* answer
+  gets inferred from a render: an `exit=2` read as a plot refusal, a panel count
+  read as files, a filtered-out test's silence read as a pass. So a panel states,
+  in the machine-readable `<desc class="panel-summary">` it carries, its chart,
+  axis and axis labels, its series with the range and count of the points drawn,
+  every bound line with its value, pixel position, band pixels and why it is
+  drawn, its reading in the quantity's own units, and -- for a run that took a
+  `MANDATE_SMOKE_FAULT` selector -- that it is a fault render rather than a
+  refusal. Absent and false are refused alike: the summary's numbers are
+  recomputed from the drawn points, the drawn axis and the drawn
+  `class="bound"` lines, and a panel with no bound states `none by design`, so
+  "no summary" is never a legitimate state. `tools/mandate-check` writes each
+  block to `plots/<panel>.summary.txt`, carries it in `mandate-check.json` under
+  `panel_summaries`, and prints it with the run.
 - **the governance test** — a bound drawn across a bar panel whose bars split
   around it (an outlier split: at most a third of them beyond it, the rest not)
   is a departure whose meaning lives in *the run*: an arm's own guard may
@@ -2571,6 +2588,404 @@ def check_sliver_bound_stated(
     return problems
 
 
+# -- the panel summary: what a panel drew, stated with the panel -------------
+#
+# "The tool's own message is the oracle": a panel the master can only read from
+# its pixels makes the reader infer the producer's answer from a render, which is
+# how four artifacts were mis-read in one day. So a panel carries, and a refused
+# plot step enforces, a summary of what it drew -- its axis and units, its
+# series, every bound line with the pixel it sits at, the band it has and why it
+# is drawn, and the reading its data gives in the quantity's own units. The
+# summary is written beside the SVG/PNG, returned in the runner's JSON, and
+# printed by the runner, so the master never has to open an SVG to know what it
+# shows.
+#
+# `check_panel_summary_stated` is `check_readings_stated`'s family -- a claim
+# measured back out of the artifact -- extended from one caption to the whole
+# panel: the numbers a summary prints are recomputed from the drawn points, the
+# drawn axis and the drawn bound lines, and a summary that is absent or false
+# refuses the panel exactly as a sub-pixel band does. This is the summary of
+# *every* panel, including one with no bound (`none by design`), so "absent
+# summary" is never a legitimate state.
+PANEL_SUMMARY_RE = re.compile(
+    r'<desc class="panel-summary">(?P<body>.*?)</desc>', re.S
+)
+SVG_OPENING_RE = re.compile(r"<svg\b[^>]*>")
+LEGEND_TEXT_RE = re.compile(r"<text[^>]*>(?P<label>[^<]*)</text>")
+BOUND_DRAWN_LABELLED = "labelled"
+BOUND_DRAWN_UNLABELLED = "unlabelled"
+BOUND_DRAWN_STATED_SLIVER = "stated-as-sliver"
+SUMMARY_PIXEL_SLACK = 0.05
+
+
+def bound_reason(bound):
+    """Why a drawn bound line is on the panel, as one token.
+
+    The plan decides it and the summary states it, so a reader of a panel with
+    several lines knows which is the declaration's and which is the run's own
+    arm's, guard's or series' bound without reconstructing `bar_bound_plan`.
+    """
+    if bound.get("band_arm") is not None:
+        return "declaration-band"
+    if bound.get("guard_key") is not None:
+        return "run-guard"
+    if bound.get("series"):
+        return "series-guard"
+    if bound.get("arms"):
+        return "run-arm"
+    if bound.get("governs_none"):
+        return "declaration-unclaimed"
+    return "declaration"
+
+
+def mandate_fault(mandate, fault):
+    """The deliberate-fault selector that belongs to this mandate, or ``None``.
+
+    The producer's selector names the mandate it perturbs (`M4_drop` perturbs
+    M4), and a run that took a fault owes every panel it drew the statement that
+    it is a fault render -- nobody may read a fault render as a refusal, and
+    nobody should have to compare two directories to learn that a panel was
+    drawn from perturbed input.
+    """
+    if not fault:
+        return None
+    value = str(fault).strip()
+    if value == mandate or value.startswith(mandate + "_"):
+        return value
+    return None
+
+
+def drawn_series_name(chart, name):
+    """The series name the panel's own legend draws for this chart.
+
+    Both chart families label their legend through `series_label` -- the bar
+    chart applies it as it draws, and a line/CDF chart is handed the prettified
+    names -- so the summary names the legend's own text rather than the
+    producer's column name.
+    """
+    return series_label(name)
+
+
+def legend_series_labels(markup):
+    """The series labels a panel's legend draws, in draw order."""
+    match = LEGEND_GROUP_RE.search(markup)
+    if match is None:
+        return []
+    return [html.unescape(label) for label in LEGEND_TEXT_RE.findall(match.group(1))]
+
+
+def panel_reading(chart, series, bounds, extent, plot_height):
+    """What a panel's data says, in the quantity's own units, as one sentence.
+
+    Per series it is the drawn range and the number of drawn points, and per
+    bound the furthest departure the bars draw with its pixel distance -- the two
+    things a reader otherwise has to measure off the render. Both are recomputed
+    from the drawn points and the drawn axis by `check_panel_summary_stated`, so
+    a sentence that is not the run's is refused.
+    """
+    values = _bound_values(series)
+    span = extent[1] - extent[0]
+    parts = []
+    for name, points in series:
+        scores = [value for _, value in points]
+        if not scores:
+            continue
+        parts.append(
+            f"{drawn_series_name(chart, name)} {sliver_number(min(scores))}.."
+            f"{sliver_number(max(scores))} ({len(scores)} pts)"
+        )
+    for bound in bounds:
+        # The panel's own definition of a departure is `crossing_values` (the
+        # minority beyond the line, which `governed_label` counts), so the
+        # reading uses it rather than a bare furthest value: on `M4-latency`
+        # under `M4_drop` the furthest value from the 250 ms ceiling is the
+        # fault's *starved* `0`, 60 px below a cap it passes, and reporting it
+        # as the bound's departure would name the wrong direction.
+        crossed = crossing_values(values, bound["y"])
+        if not crossed:
+            continue
+        y = float(bound["y"])
+        furthest = max(crossed, key=lambda value: abs(value - y))
+        pixels = abs(furthest - y) / span * plot_height
+        if pixels < MIN_BOUND_PIXELS:
+            continue
+        # `beyond`/`under` are the words `governed_label` already uses for a
+        # crossing, so the reading states the panel's own attribution rather
+        # than a second one: on a cap whose bars straddle it, the minority below
+        # is what the label calls "under it", not a breach the reading invents.
+        side = "beyond" if furthest > y else "under"
+        parts.append(
+            f"{len(crossed)} of {len(values)} values {side} {bound['label']!r} "
+            f"by up to {sliver_number(abs(furthest - y))} ({pixels:.1f} px)"
+        )
+    return "; ".join(parts)
+
+
+def panel_summary_document(
+    panel_id,
+    chart,
+    x_label,
+    y_label,
+    series,
+    bounds,
+    extent,
+    markup,
+    stated_labels,
+    plot_height,
+    run_values=None,
+    fault=None,
+):
+    """The summary a panel carries: what it drew, with the drawn coordinates.
+
+    The pixel position and the band pixels of each bound are measured the way the
+    other checks measure them (`DRAWN_BOUND_RE` for the drawn `y1`, and
+    `bound_band_pixels` for the band), and the series' range and point count come
+    from the drawn points, so the document is the drawn panel's own arithmetic
+    rather than a second, possibly disagreeing, computation.
+    """
+    drawn_pixels = [float(y) for y in DRAWN_BOUND_RE.findall(markup)]
+    drawn_labels = [declared for declared, _, _ in label_boxes(markup)]
+    entries = []
+    for index, bound in enumerate(bounds):
+        label = str(bound["label"])
+        # A drawn label carries the bound's own label *plus* the clauses naming
+        # what it governs (and a wrap splits it), so the label's presence is a
+        # prefix, the same test `render_mandate` uses for "every declared bound
+        # is labelled".
+        has_label = any(declared.startswith(label) for declared in drawn_labels)
+        if label in stated_labels:
+            state = BOUND_DRAWN_STATED_SLIVER
+        elif bound.get("unlabelled") or not has_label:
+            state = BOUND_DRAWN_UNLABELLED
+        else:
+            state = BOUND_DRAWN_LABELLED
+        # The band is the bar panel's measure -- a line panel's crossing of a
+        # ceiling is the line above it, and `check_panel_axis` does not apply its
+        # band test there -- so a line/CDF panel states `n/a` rather than a
+        # coincidental sliver at the nearest sample, which is a number a reader
+        # could mistake for a defect.
+        band_pixels = None
+        if chart == "bar":
+            _, band_pixels = bound_band_pixels(
+                series, bounds, bound, extent, plot_height, run_values
+            )
+        entries.append(
+            {
+                "label": label,
+                "value": float(bound["y"]),
+                "px": drawn_pixels[index] if index < len(drawn_pixels) else None,
+                "band_px": band_pixels,
+                "reason": bound_reason(bound),
+                "drawn": state,
+            }
+        )
+    return {
+        "panel": panel_id,
+        "chart": chart,
+        "axis": [float(extent[0]), float(extent[1])],
+        "x_label": x_label,
+        "y_label": y_label,
+        "series": [
+            {
+                "name": drawn_series_name(chart, name),
+                "points": len(points),
+                "min": min((value for _, value in points), default=None),
+                "max": max((value for _, value in points), default=None),
+            }
+            for name, points in series
+        ],
+        "bounds": entries,
+        "reading": panel_reading(chart, series, bounds, extent, plot_height),
+        "fault": fault,
+    }
+
+
+def panel_summary_block(document):
+    """The summary as the compact human-readable block every reader sees."""
+    axis = document["axis"]
+    lines = [
+        f"panel {document['panel']}  chart={document['chart']}  "
+        f"axis={sliver_number(axis[0])}..{sliver_number(axis[1])}  "
+        f"x={document['x_label']}  y={document['y_label']}"
+    ]
+    if document["series"]:
+        lines.append(
+            "  series: "
+            + "; ".join(
+                f"{entry['name']} {entry['points']} pts "
+                f"{sliver_number(entry['min'])}..{sliver_number(entry['max'])}"
+                for entry in document["series"]
+            )
+        )
+    if document["bounds"]:
+        for entry in document["bounds"]:
+            pixel = "unplaced" if entry["px"] is None else f"{entry['px']:.1f}"
+            band = (
+                "n/a"
+                if entry["band_px"] is None
+                else f"{entry['band_px']:.1f}px"
+            )
+            lines.append(
+                f"  bound: {entry['label']!r} y={sliver_number(entry['value'])} "
+                f"px={pixel} band={band} "
+                f"reason={entry['reason']} drawn={entry['drawn']}"
+            )
+    else:
+        lines.append("  bound: none by design")
+    lines.append(f"  reading: {document['reading']}")
+    if document.get("fault"):
+        lines.append(
+            f"  fault: {document['fault']} — a deliberate input fault on this "
+            "mandate's arm; the arm it perturbs failed as intended, so this is a "
+            "fault render and not a refused panel"
+        )
+        slivers = [
+            entry
+            for entry in document["bounds"]
+            if entry["drawn"] == BOUND_DRAWN_STATED_SLIVER
+            and entry["band_px"] is not None
+        ]
+        if slivers:
+            lines.append(
+                "  fault scale: "
+                + "; ".join(
+                    f"{entry['label']!r} is {entry['band_px']:.1f} px of this "
+                    f"axis and stated at px={entry['px']:.1f}"
+                    for entry in slivers
+                )
+            )
+    return "\n".join(lines)
+
+
+def introduce_panel_summary(markup, document):
+    """Insert a panel's summary as a machine-readable ``<desc>`` in its SVG."""
+    body = html.escape(json.dumps(document, sort_keys=True))
+    desc = f'<desc class="panel-summary">{body}</desc>'
+    match = SVG_OPENING_RE.search(markup)
+    if match is None:
+        return markup
+    return markup[: match.end()] + desc + markup[match.end() :]
+
+
+def read_panel_summary(markup):
+    """The summary a written panel carries, or ``None`` when it carries none."""
+    match = PANEL_SUMMARY_RE.search(markup)
+    if match is None:
+        return None
+    try:
+        document = json.loads(html.unescape(match.group("body")))
+    except (ValueError, TypeError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def check_panel_summary_stated(
+    panel_id,
+    chart,
+    x_label,
+    y_label,
+    series,
+    bounds,
+    extent,
+    markup,
+    plot_height,
+    stated_labels,
+    run_values=None,
+    fault=None,
+):
+    """Problems that leave a panel without a true statement of what it drew.
+
+    `AGENTS.md` makes a panel that cannot show its failure a defect; a panel that
+    cannot *say* what it shows is the same defect read by a person, and it is how
+    four artifacts were mis-read in one day. So the summary is mandatory and is
+    checked against the drawn coordinates: the parsed `<desc>` must equal the
+    document recomputed from the drawn points, the drawn axis and the drawn bound
+    lines, the number of summary bounds must equal the number of ``class="bound"``
+    lines the SVG draws, each stated pixel must be a drawn line's own ``y1``, and
+    the series names must be the legend's own labels. An absent summary and a
+    false one are refused alike, the way an absent reading and a false reading
+    are.
+    """
+    expected = panel_summary_document(
+        panel_id,
+        chart,
+        x_label,
+        y_label,
+        series,
+        bounds,
+        extent,
+        markup,
+        stated_labels,
+        plot_height,
+        run_values,
+        fault,
+    )
+    match = PANEL_SUMMARY_RE.search(markup)
+    if match is None:
+        return [
+            f"panel {panel_id!r}: it carries no panel summary, so the only thing "
+            "that says what it drew is the render and the reader has to infer the "
+            "producer's answer from it. Every panel owes a <desc "
+            'class="panel-summary"> stating its axis, its series, every bound '
+            "line with its pixel position and why it is drawn, and its reading; "
+            "a plot step that cannot produce one is refused"
+        ]
+    try:
+        stated = json.loads(html.unescape(match.group("body")))
+    except (ValueError, TypeError) as error:
+        return [
+            f"panel {panel_id!r}: its panel summary is not readable JSON "
+            f"({error}), so nothing can be measured against it"
+        ]
+    problems = []
+    if not isinstance(stated, dict):
+        return [
+            f"panel {panel_id!r}: its panel summary is a {type(stated).__name__}, "
+            "not an object of the panel's own fields"
+        ]
+    for key in expected:
+        if key in stated and stated[key] == expected[key]:
+            continue
+        problems.append(
+            f"panel {panel_id!r}: its summary's {key!r} is {stated.get(key)!r} "
+            f"where the drawn panel measures {expected[key]!r}; a summary that is "
+            "not the drawn panel's is worse than none, because the reader trusts "
+            "it instead of the pixels"
+        )
+    extra = sorted(set(stated) - set(expected))
+    if extra:
+        problems.append(
+            f"panel {panel_id!r}: its summary carries field(s) {extra} the drawn "
+            "panel does not define, so at least one number is about something "
+            "other than this render"
+        )
+    drawn_lines = [float(y) for y in DRAWN_BOUND_RE.findall(markup)]
+    if len(drawn_lines) != len(bounds):
+        problems.append(
+            f"panel {panel_id!r}: it draws {len(drawn_lines)} bound line(s) and "
+            f"its summary states {len(bounds)}, so a drawn bound is unaccounted "
+            "for or a stated one is not drawn"
+        )
+    else:
+        for entry, drawn_y in zip(expected["bounds"], drawn_lines):
+            if entry["px"] is None or abs(entry["px"] - drawn_y) <= SUMMARY_PIXEL_SLACK:
+                continue
+            problems.append(
+                f"panel {panel_id!r}: its summary states the bound "
+                f"{entry['label']!r} at px={entry['px']}, where the SVG draws that "
+                f"line at y1={drawn_y}; the summary has to be the drawn geometry"
+            )
+    legend = legend_series_labels(markup)
+    expected_names = [entry["name"] for entry in expected["series"]]
+    if legend and legend != expected_names:
+        problems.append(
+            f"panel {panel_id!r}: its summary names the series {expected_names}, "
+            f"where the drawn legend names {legend}; a summary of series the panel "
+            "does not draw is a claim about another panel"
+        )
+    return problems
+
+
 def check_named_values_in_axis(panel_id, bounds, guards, extent, plot_height=None):
     """Problems that make a named value unreadable: the axis does not resolve it.
 
@@ -4366,7 +4781,15 @@ def check_axis_label(panel_id, y_label, series, *, declared, carried):
 
 
 def panel_markup(
-    title, x_label, y_label, panel, points, run_values=None, run_censoring=None, panels=None
+    title,
+    x_label,
+    y_label,
+    panel,
+    points,
+    run_values=None,
+    run_censoring=None,
+    panels=None,
+    fault=None,
 ):
     """Markup for one declared panel, as exactly one ``<svg>`` document span.
 
@@ -4427,6 +4850,7 @@ def panel_markup(
         if chart == "bar"
         else []
     )
+    stated_slivers = [str(bound["label"]) for bound, _ in sliver_statements]
     if sliver_statements:
         stated_slivers = "; ".join(sentence for _, sentence in sliver_statements)
         note = f"{note}; {stated_slivers}" if note else stated_slivers
@@ -4542,8 +4966,40 @@ def panel_markup(
             x_bounds=drawn_x_bounds,
             x_scale=x_scale,
         )
+    # The panel's own statement of what it drew, injected into the SVG and then
+    # measured back out of it: a panel produced without a true summary is refused
+    # (`check_panel_summary_stated`), the way a panel without a legible bound is.
+    summary_document = panel_summary_document(
+        panel["id"],
+        chart,
+        panel_x_label,
+        panel_y_label,
+        series,
+        drawn_bounds,
+        axis,
+        markup,
+        stated_slivers,
+        plot_height,
+        run_values,
+        fault,
+    )
+    markup = introduce_panel_summary(markup, summary_document)
     problems = (
-        check_label_fit(panel["id"], markup)
+        check_panel_summary_stated(
+            panel["id"],
+            chart,
+            panel_x_label,
+            panel_y_label,
+            series,
+            drawn_bounds,
+            axis,
+            markup,
+            plot_height,
+            stated_slivers,
+            run_values,
+            fault,
+        )
+        + check_label_fit(panel["id"], markup)
         + check_label_overlap(panel["id"], markup)
         + check_series_labels(panel["id"], markup, series)
         + check_canvas_text_fit(panel["id"], markup)
@@ -4637,6 +5093,7 @@ def render_mandate(
     browser=None,
     run_values=None,
     run_censoring=None,
+    fault=None,
 ):
     """Validate one mandate, write and verify its panels, and rasterize them.
 
@@ -4688,6 +5145,7 @@ def render_mandate(
         "mandate": mandate,
         "panels": len(panels),
         "series_counts": [],
+        "summaries": [],
         "svg": [],
         "png": [],
         "browser": None,
@@ -4696,8 +5154,17 @@ def render_mandate(
     }
     for panel in panels:
         panel_id = panel["id"]
+        panel_fault = mandate_fault(mandate, fault)
         markup = panel_markup(
-            title, x_label, y_label, panel, points, run_values, run_censoring, panels
+            title,
+            x_label,
+            y_label,
+            panel,
+            points,
+            run_values,
+            run_censoring,
+            panels,
+            panel_fault,
         )
         problems = RENDER.validate_panel(0, markup)
         if problems:
@@ -4749,6 +5216,28 @@ def render_mandate(
         ]
         if missing:
             _fail(f"{svg_path} does not label every declared bound; missing {missing}")
+        # A panel's own statement of what it drew is mandatory, written beside
+        # the SVG/PNG it describes and read back out of the artifact the runner
+        # ships, so a reader (or the master) never has to open an SVG to know
+        # what it shows. A panel that reached here without one cannot: the check
+        # in `panel_markup` refuses it first.
+        document = read_panel_summary(written)
+        if document is None:
+            _fail(
+                f"{svg_path} carries no panel summary, so the run cannot state "
+                "what it drew; a panel is written with its summary or it is not "
+                "written"
+            )
+        document["block"] = panel_summary_block(document)
+        summary_path = out_dir / f"{mandate}-{panel_id}.summary.txt"
+        try:
+            summary_path.write_text(document["block"] + "\n", encoding="utf-8")
+        except OSError as error:
+            _fail(
+                f"panel {panel_id!r} wrote its SVG but not its summary to "
+                f"{summary_path}: {error}"
+            )
+        summary["summaries"].append(document)
         summary["series_counts"].append(count)
         summary["svg"].append(str(svg_path))
 
@@ -4868,6 +5357,16 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--fault",
+        default=None,
+        metavar="NAME",
+        help=(
+            "this run's MANDATE_SMOKE_FAULT selector, when the run took one: "
+            "the mandate it names has every panel state that it is a fault "
+            "render, which arm the fault perturbs and what it did to the scale"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="print a JSON summary of the produced panels",
@@ -4882,6 +5381,7 @@ def main(argv=None):
             browser=args.browser,
             run_values=load_run_values(args.run_values),
             run_censoring=load_censoring(args.run_censoring),
+            fault=args.fault,
         )
     except (MandatePlotError, RENDER.RenderGraphError) as error:
         print(f"mandate_plot: error: {error}", file=sys.stderr)
@@ -4897,6 +5397,8 @@ def main(argv=None):
         if summary["rasterized"]:
             for path in summary["png"]:
                 print(f"png: {path}")
+        for document in summary["summaries"]:
+            print(document["block"])
     return 0
 
 

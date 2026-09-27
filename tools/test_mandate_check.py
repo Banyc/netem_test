@@ -631,6 +631,61 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(len(m4["plots"]), 4)
         self.assertEqual(m4["series_counts"], [8, 8, 8, 16])
 
+    def test_every_panel_carries_its_mandatory_summary(self):
+        # The forced summary: in the report, beside every plot, and printed by
+        # the runner, so a reader never has to open an SVG to know what it shows.
+        code, stdout, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        for mandate in ("M1", "M2", "M3", "M4"):
+            section = report["mandates"][mandate]
+            self.assertEqual(
+                len(section["panel_summaries"]), section["panels"], mandate
+            )
+            for document in section["panel_summaries"]:
+                self.assertTrue(document["panel"], document)
+                self.assertIn("panel ", document["block"])
+                self.assertIn("axis=", document["block"])
+                self.assertIn("reading:", document["block"])
+        sidecar = self.out / "plots" / "M1-latency.summary.txt"
+        self.assertTrue(sidecar.is_file())
+        self.assertIn("panel latency", sidecar.read_text(encoding="utf-8"))
+        self.assertIn("summary| panel latency", stdout)
+
+    def test_a_run_whose_panels_lack_a_summary_is_an_evidence_failure(self):
+        # red: the summary is mandatory, so an evidence set without one cannot
+        # report PASS. The count is the first thing measured.
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        summary = {
+            "panels": 2,
+            "series_counts": [1, 1],
+            "svg": report["mandates"]["M1"]["plots"],
+            "summaries": [],
+        }
+        problems = MANDATE_CHECK._verify_plots("M1", summary)
+        self.assertTrue(problems)
+        self.assertIn("panel summary", problems[0])
+
+    def test_a_panel_whose_summary_sidecar_is_missing_is_an_evidence_failure(self):
+        # red: the summary has to be in the run's evidence, not only in the SVG.
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        plots = report["mandates"]["M1"]["plots"]
+        sidecar = Path(plots[0]).with_suffix(".summary.txt")
+        sidecar.unlink()
+        summary = {
+            "panels": 2,
+            "series_counts": [1, 1],
+            "svg": plots,
+            "summaries": report["mandates"]["M1"]["panel_summaries"],
+        }
+        problems = MANDATE_CHECK._verify_plots("M1", summary)
+        self.assertTrue(problems)
+        self.assertIn("no M1-latency.summary.txt beside it", problems[0])
+
     def test_verdict_block_names_every_plot_and_the_report(self):
         code, stdout, _ = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0)
@@ -1306,7 +1361,7 @@ class MandateCheckTest(unittest.TestCase):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         report = self.report()
-        self.assertEqual(report["schema"], "mandate-check/9")
+        self.assertEqual(report["schema"], "mandate-check/10")
         # The schema bump is over `/5`: a `/5` reader's keys keep their meaning
         # (a test's `duration_seconds` is still its own seconds, and the arm
         # record is untouched), and the new keys say where a duration came
