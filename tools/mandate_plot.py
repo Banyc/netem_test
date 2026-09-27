@@ -868,9 +868,30 @@ def drawable_bounds(panel, series, bounds, run_values):
 
     The single place both the drawing and the artifact's own verification read
     the plan from, so a panel and the check on it cannot disagree about how many
-    lines a declaration calls for.
+    lines a declaration calls for. The run's per-arm bounds (and its guards) are
+    drawn where they are drawn per arm, and the guards that name a whole series
+    are drawn beside them.
     """
-    return mirrored_bounds(effective_bounds(panel, series, bounds, run_values))
+    return mirrored_bounds(bar_bound_plan(panel, series, bounds, run_values))
+
+
+def bar_bound_plan(panel, series, bounds, run_values):
+    """The un-mirrored bound lines a bar panel draws, as the run's own plan.
+
+    The declaration's bounds, the run's per-arm bounds (`effective_bounds`) and
+    the run's per-series guards (`series_guard_bounds`) in one list, so the
+    drawing and every check that measures the drawn lines read the same plan --
+    a check measuring a different plan from the one the chart drew would be
+    measuring nothing.
+    """
+    plan = effective_bounds(panel, series, bounds, run_values)
+    already = {float(bound["y"]) for bound in plan if bound.get("guard_key") is not None}
+    plan = plan + [
+        bound
+        for bound in series_guard_bounds(panel, series, bounds, run_values)
+        if bound["y"] not in already
+    ]
+    return with_drawn_guards(plan)
 
 
 def _bound_values(series):
@@ -1672,6 +1693,13 @@ def run_arm_names(series, run_values):
     enumerate the arms in the order the producer measured them -- which is the
     order the producer writes the panel's bars in. That is what lets a per-arm
     bound be drawn over the arm it belongs to rather than over all of them.
+
+    Where the run states no per-arm measurement of the quantity but does state
+    a guard for every arm, the guards' own keys enumerate them
+    (`clean_wire_guard` -> arm `clean`), in the run's order. Without that
+    fallback a panel drawing exactly the arms the run guards would have no arms
+    to place them on, and would name guards it could not draw -- the defect the
+    wire panel's sentence had.
     """
     if not isinstance(run_values, dict) or len(series) != 1:
         return []
@@ -1683,18 +1711,67 @@ def run_arm_names(series, run_values):
         name = key[: -len(quantity) - 1]
         if name and name not in names:
             names.append(name)
-    return names
+    if len(names) >= 2:
+        return names
+    guarded = []
+    for key in run_values:
+        if not isinstance(key, str) or not key.endswith(GUARD_KEY_SUFFIX):
+            continue
+        prefix, _, statistic = key[: -len(GUARD_KEY_SUFFIX)].rpartition("_")
+        if statistic and statistic in quantity and prefix not in guarded:
+            guarded.append(prefix)
+    return guarded if len(guarded) >= 2 else []
+
+
+def per_arm_guard(arm, quantity, run_values):
+    """The run's own guard for one arm's quantity, as ``(key, value)``, or ``None``.
+
+    A `MANDATE` line names a per-arm guard as `<arm>_<statistic>_guard`
+    (`hostile_wire_guard`), and the statistic is the *quantity* the guard is
+    about: `wire` in the wire panel's series `wire_x`. That is the same filter
+    the caption's own clause applies (`run_guards`), so a guard about another
+    quantity (`hostile_p99_guard`) is never read as a bound on this panel's
+    axis -- a bound on something the panel does not measure would look like
+    evidence.
+    """
+    if not isinstance(run_values, dict):
+        return None
+    for key in run_values:
+        value = run_values[key]
+        if not isinstance(key, str) or not key.endswith(GUARD_KEY_SUFFIX):
+            continue
+        if not numeric(value):
+            continue
+        prefix, _, statistic = key[: -len(GUARD_KEY_SUFFIX)].rpartition("_")
+        if statistic and statistic in quantity and prefix == arm:
+            return key, float(value)
+    return None
+
+
+def arm_bound_source(arm, quantity, run_values):
+    """The run's own key and value for one arm's bound on a quantity.
+
+    Two shapes, in the run's own order of authority: the run's restated bound
+    for the arm (`<arm>_<quantity>_floor`), and then its per-arm *guard* for the
+    quantity (`hostile_wire_guard` on a panel whose series is `wire_x`). The
+    guard is the shape the caption named and no line carried: a guard a panel
+    names is a bound the panel owes the reader, and a named bound the panel does
+    not draw is the crossing the reader has to take on trust.
+    """
+    if not isinstance(run_values, dict):
+        return None
+    for suffix in PER_ARM_BOUND_SUFFIXES:
+        key = f"{arm}_{quantity}{suffix}"
+        value = run_values.get(key)
+        if numeric(value):
+            return key, float(value)
+    return per_arm_guard(arm, quantity, run_values)
 
 
 def per_arm_bound(arm, quantity, run_values):
     """The run's own bound for one arm's quantity, or ``None`` when it states none."""
-    if not isinstance(run_values, dict):
-        return None
-    for suffix in PER_ARM_BOUND_SUFFIXES:
-        value = run_values.get(f"{arm}_{quantity}{suffix}")
-        if numeric(value):
-            return float(value)
-    return None
+    source = arm_bound_source(arm, quantity, run_values)
+    return None if source is None else source[1]
 
 
 def quantity_bound(quantity, run_values):
@@ -1736,31 +1813,41 @@ def arm_bound_values(panel, series, bounds, run_values):
 
     The split is offered only where it is a fact about the run: one bar series,
     one declared bound, the panel's categories being exactly the arms the run
-    enumerates, and the run restating the quantity's bound at a *different*
-    value. Where it applies, the declared bound governs the reference arms and
-    the run's own is drawn over the rest, so the panel shows which floor
-    belongs to which arm.
+    enumerates, and the run stating a bound of its own for at least one of them.
+    That bound is either a restatement of the quantity's bound at a *different*
+    value or the arm's own **guard**. Where it applies, the declared bound
+    governs the reference arms and the run's own is drawn over the rest, so the
+    panel shows which floor belongs to which arm.
+
+    The guard half is the measured `M2-wire` defect: the panel's caption read
+    `run guards hostile_wire_guard=10 lone_wire_guard=14` and the artifact drew
+    one line, at the 6x budget, on an axis reaching 14.70 -- so a `lone_tail`
+    bar at 6.21x sat *above* the budget on a PASS with no line to cross, and the
+    reader had to take the tolerance on trust from a sentence.
     """
     if panel["chart"] != "bar" or len(bounds) != 1 or len(series) != 1:
         return None
     declared = float(bounds[0]["y"])
-    restated = quantity_bound(series[0][0], run_values)
-    if restated is None or restated[1] == declared:
-        return None
     arms = run_arm_names(series, run_values)
     categories = sorted({x for _, points in series for x, _ in points})
     if len(arms) < 2 or categories != [float(index + 1) for index in range(len(arms))]:
         return None
+    quantity = series[0][0]
+    restated = quantity_bound(quantity, run_values)
+    own = {arm: arm_bound_source(arm, quantity, run_values) for arm in arms}
+    if restated is None and not any(source is not None for source in own.values()):
+        return None
     guarded = guarded_arms(arms, run_values)
-    if not guarded or len(guarded) == len(arms):
+    if not guarded:
         return None
     values = {}
     for arm in arms:
-        own = per_arm_bound(arm, series[0][0], run_values)
-        if own is not None:
-            values[arm] = own
-        else:
+        if own[arm] is not None:
+            values[arm] = own[arm][1]
+        elif restated is not None:
             values[arm] = restated[1] if arm in guarded else declared
+        else:
+            values[arm] = declared
     return values
 
 
@@ -1770,14 +1857,15 @@ def effective_bounds(panel, series, bounds, run_values):
     With no restatement this is the declared bounds, unchanged. With one, each
     segment carries the arms it governs and the x-window it is drawn over, and
     names the run's own key when its value is the run's rather than the
-    declaration's -- so a run whose arms have different floors is drawn as
-    different floors rather than as one line a reader has to guess at.
+    declaration's -- so a run whose arms have different floors or guards is
+    drawn as different lines rather than as one line a reader has to guess at.
     """
     values = arm_bound_values(panel, series, bounds, run_values)
     if values is None:
         return [dict(bound) for bound in bounds]
     arms = list(values)
-    restated = quantity_bound(series[0][0], run_values)
+    quantity = series[0][0]
+    restated = quantity_bound(quantity, run_values)
     segments = []
     start = 0
     while start < len(arms):
@@ -1786,20 +1874,97 @@ def effective_bounds(panel, series, bounds, run_values):
         while end < len(arms) and values[arms[end]] == value:
             end += 1
         run = arms[start:end]
+        source = arm_bound_source(run[0], quantity, run_values)
+        if source is None and restated is not None:
+            source = restated
+        segment = {
+            "y": value,
+            "label": (
+                bounds[0]["label"]
+                if value == float(bounds[0]["y"])
+                else f"run {source[0]}={source[1]:g}"
+            ),
+            "arms": run,
+            "window": [float(index + 1) for index in range(start, end)],
+        }
+        if source is not None and source[0].endswith(GUARD_KEY_SUFFIX):
+            # The key this line *is*, so the label states it once rather than
+            # listing it again among the guards the bound is read against.
+            segment["guard_key"] = source[0]
+        segments.append(segment)
+        start = end
+    declared_value = float(bounds[0]["y"])
+    if all(segment["y"] != declared_value for segment in segments):
+        # Every arm of this run states a bound of its own, so the declaration's
+        # own is no arm's assertion -- and `render_mandate` requires a declared
+        # bound to be labelled, so it is drawn across the panel saying exactly
+        # that rather than being dropped or left reading as one arm's floor.
         segments.append(
             {
-                "y": value,
-                "label": (
-                    bounds[0]["label"]
-                    if value == float(bounds[0]["y"])
-                    else f"run {restated[0]}={restated[1]:g}"
-                ),
-                "arms": run,
-                "window": [float(index + 1) for index in range(start, end)],
+                "y": declared_value,
+                "label": bounds[0]["label"],
+                "arms": [],
+                "window": [1.0, float(len(arms))],
+                "governs_none": True,
             }
         )
-        start = end
     return segments
+
+
+def with_drawn_guards(plan):
+    """Tag a bar panel's bound plan where the run's guards are drawn as lines.
+
+    A guard the panel draws gets a line of its own labelling the arms it
+    governs, so the sentence that used to name it on the bound it is read
+    against would only repeat what the line beside it already shows. Both the
+    drawing (`drawable_bounds`) and the check that demands the drawn labels
+    (`check_bound_arm_governance`) read the plan through here, so they cannot
+    disagree about whether the guards are drawn.
+    """
+    if any(bound.get("guard_key") is not None for bound in plan):
+        for bound in plan:
+            bound.setdefault("guards_drawn", True)
+    return plan
+
+
+def series_guard_bounds(panel, series, bounds, run_values):
+    """The bound lines a bar panel owes the run's per-*series* guards.
+
+    `M2-wire` names its guards per arm (`hostile_wire_guard`) and
+    `effective_bounds` draws them over the arm's own band. A panel whose series
+    are statistics rather than arms -- `M4-latency` draws `clean_p50`,
+    `clean_p99`, `hostile_p50`, `hostile_p99` -- names them as the series plus
+    the guard suffix, and that guard's line spans the plot, labelled with the
+    series it governs. Measured on a recorded `M4-latency` panel, its caption
+    read `run guards hostile_p99_guard=900` over an axis reaching 945 and the
+    artifact drew one line (the 250 ms ceiling), so its four bars past the
+    ceiling on a PASS had no line showing they were inside their own arm's
+    guard.
+
+    Nothing is guessed: the guard's key has to be a drawn series' name plus the
+    suffix exactly, so a guard whose statistic merely shares a token with a
+    drawn series (`hostile_p99_guard` against a panel drawing `clean`/
+    `hostile`) stays a clause on the bound rather than becoming a line on a
+    quantity it does not bound.
+    """
+    if panel["chart"] != "bar" or len(bounds) != 1:
+        return []
+    names = [name for name, _ in series]
+    declared = float(bounds[0]["y"])
+    extra = []
+    for key, value in run_guards(run_values, series, bounds[0]["label"]):
+        owner = key[: -len(GUARD_KEY_SUFFIX)]
+        if owner not in names or value == declared:
+            continue
+        extra.append(
+            {
+                "y": value,
+                "label": f"run {key}={value:g}",
+                "series": owner,
+                "guard_key": key,
+            }
+        )
+    return extra
 
 
 def check_bound_arm_governance(panel_id, panel, series, bounds, run_values, markup):
@@ -1820,7 +1985,7 @@ def check_bound_arm_governance(panel_id, panel, series, bounds, run_values, mark
     peak of 1567.1 ms cross the 250 ms ceiling on a panel saying nothing about
     the arm's own 3200 ms p99 guard.
     """
-    planned = effective_bounds(panel, series, bounds, run_values)
+    planned = bar_bound_plan(panel, series, bounds, run_values)
     # The *run's* per-arm plan, not the declaration's bands: this check is about
     # one line drawn across arms whose own floors differ, while a band's two arms
     # are the declaration's own and are measured by `check_two_sided_bound_drawn`.
@@ -2096,6 +2261,50 @@ def check_named_values_in_axis(panel_id, bounds, guards, extent, plot_height=Non
             f"the {what} (y={value:g}) that the panel names: it is {where}, and a "
             f"named value the axis does not show is a claim the reader has no way "
             "to check"
+        )
+    return problems
+
+
+def check_named_guards_drawn(panel_id, guards, extent, markup, plot_height=None):
+    """Problems that make a guard the panel *names* unreadable: no line at it.
+
+    `AGENTS.md`'s second panel test asks whether each drawn bound applies to
+    every series it crosses; the mirror of it is whether every bound the panel
+    names is drawn at all. A caption reading `run guards hostile_wire_guard=10
+    lone_wire_guard=14` on a panel whose only line is the 6x budget tells the
+    reader a tolerance the artifact cannot show: a bar above the budget and
+    below its own guard is *between two lines* on the evidence and one line
+    plus a sentence on the panel. Measured on the recorded `M2-wire` artifact,
+    the axis reached 14.70 -- so both guards fit -- and the SVG carried one
+    `class="bound"` line, at 6.0.
+
+    Both sides are read off the artifact: the guards are the values the panel's
+    own drawn labels name (`named_guard_values`), and the lines are the y each
+    drawn bound sits at (`drawn_bound_values`, back through the drawn axis).
+    """
+    if not guards:
+        return []
+    low, high = extent
+    span = high - low
+    if not span > 0:
+        return [f"panel {panel_id!r}: the axis {low!r}..{high!r} has no span"]
+    if plot_height is None:
+        plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    drawn = drawn_bound_values(markup, extent)
+    # A drawn y is printed to a tenth of a pixel, so half a pixel of the axis is
+    # the widest a rounding artefact can be; anything further is another line.
+    slack = 0.5 / plot_height * span
+    problems = []
+    for value in guards:
+        if any(abs(value - line) <= slack for line in drawn):
+            continue
+        problems.append(
+            f"panel {panel_id!r}: its label names the guard {value:g}, but the "
+            f"artifact draws {len(drawn)} bound line(s) at {[round(line, 4) for line in drawn]} "
+            "and none of them is that guard: a tolerance the panel names and "
+            "does not draw is a claim the reader has to take on trust, and a "
+            "bar between that guard and the bound it is read against has no "
+            "second line to sit inside"
         )
     return problems
 
@@ -3175,6 +3384,11 @@ def governed_label(bound, series, run_values, crossing=True):
     clauses = []
     if bound.get("arms"):
         clauses.append(f"governs {' '.join(bound['arms'])}")
+    if bound.get("governs_none"):
+        clauses.append(
+            "governs no arm of this run: every arm states a guard of its own, "
+            "drawn on its own band"
+        )
     if bound.get("series"):
         clauses.append(f"governs series {bound['series']}")
     window = bound_governed_x(bound)
@@ -3188,8 +3402,27 @@ def governed_label(bound, series, run_values, crossing=True):
         crossing_clauses = []
         crossed = crossing_values(values, bound["y"])
         if crossed:
-            crossing_clauses.append(f"{len(crossed)} of {len(values)} bars beyond it")
-        guards = run_guards(run_values, series, bound["label"])
+            # `crossing_values` returns whichever side of the bound is the
+            # minority -- and a guard line can sit *below* the bars (`M2`'s
+            # wire panel draws each arm's own guard, and a run is free to guard
+            # an arm tighter than the declaration's budget). A clause that said
+            # `beyond it` for bars under the line would name a departure that
+            # did not happen, in the direction it did not happen in.
+            side = "beyond" if crossed[0] > bound["y"] else "under"
+            crossing_clauses.append(
+                f"{len(crossed)} of {len(values)} bars {side} it"
+            )
+        # A guard the panel draws as its own line is read off that line's own
+        # label (`run hostile_wire_guard=10 [governs hostile]`), so the sentence
+        # that used to carry it is dropped rather than repeated -- and a bound
+        # that *is* a guard does not list itself among the guards it is read
+        # against. Where nothing is drawn, the clause stays: naming a guard the
+        # panel cannot place on the axis is the reading the clause owes.
+        guards = (
+            []
+            if bound.get("guard_key") is not None or bound.get("guards_drawn")
+            else run_guards(run_values, series, bound["label"])
+        )
         if guards:
             crossing_clauses.append(
                 "run guards "
@@ -3723,6 +3956,9 @@ def panel_markup(
         + check_tick_labels_distinct(panel["id"], markup)
         + check_note_fit(panel["id"], markup)
         + check_two_sided_bound_drawn(panel["id"], drawn_bounds, axis, markup)
+        + check_named_guards_drawn(
+            panel["id"], guards, axis, markup, plot_height
+        )
         + (
             check_departure_view_stated(
                 panel["id"],

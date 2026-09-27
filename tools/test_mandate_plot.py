@@ -726,6 +726,16 @@ class MandatePlotTest(unittest.TestCase):
         self.assertIn("1 of 3 bars beyond it", document)
         self.assertIn("hostile_wire_guard=10", document)
         self.assertIn("lone_wire_guard=14", document)
+        # Named *and* drawn: three lines, each labelled with the arm it governs,
+        # so the crossing bar is inside its own arm's guard rather than above a
+        # budget no line of it was placed under.
+        self.assertEqual(document.count('class="bound"'), 3)
+        for label in (
+            "M2 wire budget 6x [governs clean; 1 of 3 bars beyond it]",
+            "run hostile_wire_guard=10 [governs hostile]",
+            "run lone_wire_guard=14 [governs lone]",
+        ):
+            self.assertIn(label, document)
         # the data itself is untouched: the same three bars, at the same heights
         rects = MANDATE.re.findall(r'<rect x="[-0-9.]+\w*"', document)
         self.assertTrue(rects)
@@ -852,8 +862,12 @@ class MandatePlotTest(unittest.TestCase):
         )
         self.assertEqual(code, 0, stderr)
         document = (out / "M4-delivery.svg").read_text(encoding="utf-8")
-        # the breach is named, and no unrelated guard is pulled in by name
-        self.assertIn("1 of 8 bars beyond it", document)
+        # The breach is named, on the side it happened: the one bar below a
+        # *floor* used to be announced as `1 of 8 bars beyond it`, which reads
+        # as a bar over a ceiling. The clause states the side it measured, and
+        # no unrelated guard is pulled in by name.
+        self.assertIn("1 of 8 bars under it", document)
+        self.assertNotIn("beyond it", document)
         self.assertNotIn("hostile_p99_guard", document)
         self.assertIn("band view", document)
 
@@ -1034,7 +1048,14 @@ class MandatePlotTest(unittest.TestCase):
         self.assertIn("panel 'latency'", stderr)
         self.assertIn("does not fit the plot area", stderr)
 
-    def test_a_long_guard_list_wraps_into_the_plot(self):
+    def test_a_guard_for_every_arm_is_drawn_on_its_own_band_and_inside_the_plot(self):
+        # The four-arm wire panel: the run states a guard for *every* arm, so no
+        # arm is left for the declaration's budget to govern. The panel draws
+        # each arm's guard over that arm's own band and the declared bound
+        # across the whole plot saying exactly that it governs no arm -- rather
+        # than one budget line a reader has to read as four different arms'
+        # floors. Every label it draws, including the long declared one, has to
+        # lie inside the plot.
         rows = [
             ["panel", "series", "x", "y"],
             ["wire", "wire_x", 1.0, 2.1],
@@ -1058,18 +1079,61 @@ class MandatePlotTest(unittest.TestCase):
             "--run-values",
             json.dumps(WIRE_FOUR_ARM_RUN_VALUES),
         )
-        self.assertGreater(len(boxes), 1, "a four-arm guard list has to wrap")
+        self.assertGreater(len(boxes), 1, "the labels have to wrap or be several")
         self.assertEqual(MANDATE.check_label_fit("wire", document), [])
         for declared, _, (x0, y0, x1, y1) in boxes:
             self.assertGreaterEqual(x0, plot[0])
             self.assertLessEqual(x1, plot[2])
             self.assertGreaterEqual(y0, plot[1])
             self.assertLessEqual(y1, plot[3])
-        # the whole sentence survives in the first line's title and the lines
-        # re-join to it, so a wrapped label is still one annotation
-        self.assertEqual(" ".join(line for _, line, _ in boxes), boxes[0][0])
-        self.assertIn("clean_wire_guard=3", boxes[0][0])
-        self.assertIn("burst_wire_guard=21", boxes[0][0])
+        # Every guard the run states is on the panel, on its own band, and the
+        # declared bound is there too saying it governs none of them.
+        titles = [declared for declared, _, _ in boxes]
+        self.assertEqual(document.count('class="bound"'), 5)
+        for key in (
+            "clean_wire_guard=3",
+            "hostile_wire_guard=10",
+            "lone_wire_guard=14",
+            "burst_wire_guard=21",
+        ):
+            self.assertTrue(
+                any(title.startswith(f"run {key}") for title in titles), titles
+            )
+        self.assertTrue(
+            any(title.startswith("M2 wire budget 6x") for title in titles), titles
+        )
+        self.assertTrue(
+            any("governs no arm of this run" in title for title in titles), titles
+        )
+        # The wrapped lines of one label re-join to the sentence in its title,
+        # so a wrapped label is still one annotation. Only the *first* drawn
+        # line of a wrap carries the whole sentence in its `<title>`; the rest
+        # are continuation elements with no title of their own.
+        groups: list[list] = []
+        for element in MANDATE.re.findall(
+            r'<text class="bound-label"[^>]*>(.*?)</text>', document, MANDATE.re.S
+        ):
+            title = MANDATE.re.search(r"<title>(.*?)</title>", element, MANDATE.re.S)
+            line = MANDATE.re.sub(r"<title>.*?</title>", "", element).strip()
+            if title is not None:
+                groups.append([MANDATE.html.unescape(title.group(1)), [line]])
+            else:
+                self.assertTrue(groups, f"a continuation line with no label: {line!r}")
+                groups[-1][1].append(line)
+        for declared, lines in groups:
+            self.assertEqual(" ".join(lines), declared, lines)
+        self.assertEqual(
+            sum(len(lines) for _, lines in groups),
+            len(boxes),
+            "every drawn line belongs to exactly one label",
+        )
+        wrapped = [declared for declared, lines in groups if len(lines) > 1]
+        self.assertEqual(len(wrapped), 1, "the declared label is the one that wraps")
+        self.assertIn(
+            "governs no arm of this run",
+            wrapped[0],
+            "the wrapped label is the declared budget, not a guard's",
+        )
 
     def test_a_narrow_governed_window_moves_the_label_inside_the_plot(self):
         # A bound governing the first of three categories has a line only as
@@ -1143,17 +1207,38 @@ class MandatePlotTest(unittest.TestCase):
             ["wire", "wire_x", 2.0, 9.5],
             ["wire", "wire_x", 3.0, 8.1],
         ]
+        # Three arms, the number of bars the panel draws: a run enumerating four
+        # arms over a three-bar panel attributes nothing, and the guards it
+        # names would then have no band to be drawn on.
+        run_values = {
+            "clean_wire_x": 7.2,
+            "hostile_wire_x": 9.5,
+            "lone_wire_x": 8.1,
+            "budget": 6.0,
+            "clean_wire_guard": 3.0,
+            "hostile_wire_guard": 10.0,
+            "lone_wire_guard": 14.0,
+        }
         document, plot, boxes = self.rendered_labels(
             WIRE_DECLARATION,
             rows,
             "M2all",
             "--run-values",
-            json.dumps(WIRE_FOUR_ARM_RUN_VALUES),
+            json.dumps(run_values),
         )
-        self.assertEqual(len(boxes), 1)
-        self.assertIn("M2 wire budget 6x", boxes[0][1])
         self.assertNotIn("beyond it", document)
-        self.assertIn("run guards", boxes[0][1])
+        self.assertNotIn("under it", document)
+        # Every guard the run states is drawn, and the declared budget says it
+        # governs no arm.
+        titles = [declared for declared, _, _ in boxes]
+        self.assertEqual(document.count('class="bound"'), 4)
+        for key in ("clean_wire_guard=3", "hostile_wire_guard=10", "lone_wire_guard=14"):
+            self.assertTrue(
+                any(title.startswith(f"run {key}") for title in titles), titles
+            )
+        self.assertTrue(
+            any("governs no arm of this run" in title for title in titles), titles
+        )
         ticks = [
             float(value)
             for value in MANDATE.re.findall(r'text-anchor="end">([-0-9.]+)<', document)
@@ -1161,7 +1246,7 @@ class MandatePlotTest(unittest.TestCase):
         self.assertGreater(
             ticks[-1],
             max(value for _, value in MANDATE.run_guards(
-                WIRE_FOUR_ARM_RUN_VALUES,
+                run_values,
                 [("wire_x", [])],
                 "M2 wire budget 6x",
             )),
@@ -1171,10 +1256,14 @@ class MandatePlotTest(unittest.TestCase):
             self.assertGreaterEqual(x0, plot[0])
             self.assertLessEqual(x1, plot[2])
 
-    def test_a_lone_bar_beyond_the_bound_names_the_crossing_and_the_guards(self):
-        # The other boundary case, and the one the audit's label was for: one of
-        # three bars past the budget, with the run's own guards named, all of it
-        # inside the plot area.
+    def test_a_lone_bar_beyond_the_budget_is_drawn_under_its_own_arm_s_guard(self):
+        # The other boundary case, and the one this drawing exists for: one of
+        # three bars past the *declared budget*, with the run's guards drawn on
+        # the arms they govern. Before this the panel drew one line, the 6x
+        # budget across every arm, on an axis reaching 14.70 -- so the `lone`
+        # bar at 6.63 sat above the budget on a PASS with no line to cross, and
+        # the tolerance was a sentence the reader had to trust. Now the line
+        # over the `lone` band is its own guard at 14x, and the bar is under it.
         document, plot, boxes = self.rendered_labels(
             WIRE_DECLARATION,
             WIRE_ROWS,
@@ -1182,14 +1271,93 @@ class MandatePlotTest(unittest.TestCase):
             "--run-values",
             json.dumps(WIRE_RUN_VALUES),
         )
-        self.assertEqual(len(boxes), 1)
-        self.assertEqual(boxes[0][1], boxes[0][0])
-        self.assertIn("1 of 3 bars beyond it", boxes[0][1])
-        self.assertIn("hostile_wire_guard=10", boxes[0][1])
-        self.assertIn("lone_wire_guard=14", boxes[0][1])
+        titles = [declared for declared, _, _ in boxes]
+        self.assertEqual(
+            titles,
+            [
+                "M2 wire budget 6x [governs clean; 1 of 3 bars beyond it]",
+                "run hostile_wire_guard=10 [governs hostile]",
+                "run lone_wire_guard=14 [governs lone]",
+            ],
+        )
         for _, _, (x0, _, x1, _) in boxes:
             self.assertGreaterEqual(x0, plot[0])
             self.assertLessEqual(x1, plot[2])
+        # The drawn geometry, not the label: the line over the `lone` band is
+        # the 14x guard, and the 6.633 lone bar's top is below it and above the
+        # 6x budget.
+        panel = WIRE_DECLARATION["panels"][0]
+        series = [("wire_x", [(1.0, 2.151595), (2.0, 5.000262), (3.0, 6.633134)])]
+        bounds = MANDATE._bound_specs(panel)
+        drawn_bounds = MANDATE.drawable_bounds(panel, series, bounds, WIRE_RUN_VALUES)
+        axis = MANDATE.bar_axis_extent(
+            series, drawn_bounds, WIRE_RUN_VALUES, MANDATE.bar_plot_height(len(series))
+        )
+        values = MANDATE.drawn_bound_values(document, axis)
+        self.assertEqual(len(values), 3, values)
+        spans = MANDATE.re.findall(
+            r'class="bound" x1="([-0-9.]+)" y1="([-0-9.]+)" x2="([-0-9.]+)"', document
+        )
+        rightmost = max(spans, key=lambda span: float(span[2]))
+        guard = MANDATE.drawn_bound_values(
+            f'<rect x="72.0" y="24.0" width="864.0" height="228.0" class="plot-bg"/>'
+            f'<line class="bound" x1="{rightmost[0]}" y1="{rightmost[1]}" '
+            f'x2="{rightmost[2]}" y2="{rightmost[1]}" />',
+            axis,
+        )[0]
+        self.assertAlmostEqual(guard, 14.0, places=2)
+        lone_bar = 6.633134
+        self.assertGreater(lone_bar, 6.0, "the lone bar is past the budget")
+        self.assertLess(lone_bar, guard, "and inside its own arm's guard")
+
+    def test_a_guard_that_is_named_and_not_drawn_is_refused(self):
+        # The vacuity of the guard-drawing rule, as a predicate and end to end.
+        # Both halves are the *pre-fix* artifact: one line, the 6x budget across
+        # every arm, with the run's guards named on its caption and no line at
+        # either of them. The predicate reads the drawn lines back out of the
+        # SVG, so a renderer that stopped drawing a guard it names goes red.
+        panel = WIRE_DECLARATION["panels"][0]
+        series = MANDATE.panel_series(panel, _points(WIRE_ROWS))
+        bounds = MANDATE._bound_specs(panel)
+        plan = MANDATE.drawable_bounds(panel, series, bounds, WIRE_RUN_VALUES)
+        axis = MANDATE.bar_axis_extent(
+            series, plan, WIRE_RUN_VALUES, MANDATE.bar_plot_height(len(series))
+        )
+        guards = MANDATE.named_guard_values(
+            series, plan, WIRE_RUN_VALUES, crossing=True
+        )
+        self.assertEqual(guards, [10.0, 14.0])
+        drawn = MANDATE.svg_bar_chart(
+            "t", "x", "value", series, plan, axis, WIRE_RUN_VALUES
+        )
+        self.assertEqual(MANDATE.check_named_guards_drawn("wire", guards, axis, drawn), [])
+        stripped = MANDATE.svg_bar_chart(
+            "t", "x", "value", series, [plan[0]], axis, WIRE_RUN_VALUES
+        )
+        problems = MANDATE.check_named_guards_drawn("wire", guards, axis, stripped)
+        self.assertEqual(len(problems), 2, problems)
+        for value in ("10", "14"):
+            self.assertTrue(
+                any(f"names the guard {value}" in problem for problem in problems),
+                problems,
+            )
+        # End to end: the same stripping through the render path refuses the
+        # panel rather than writing one that names guards it does not draw.
+        plan_of = MANDATE.drawable_bounds
+        with mock.patch.object(
+            MANDATE, "drawable_bounds", lambda *a, **k: [plan_of(*a, **k)[0]]
+        ):
+            code, stderr, _ = self.render_mandate(
+                WIRE_DECLARATION,
+                WIRE_ROWS,
+                "M2nodraw",
+                "--run-values",
+                json.dumps(WIRE_RUN_VALUES),
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("names the guard 10", stderr)
+        self.assertIn("names the guard 14", stderr)
+        self.assertIn("take on trust", stderr)
 
     # -- healthy renders ---------------------------------------------------
 
@@ -2586,7 +2754,7 @@ class MandatePlotTest(unittest.TestCase):
         self.assertNotEqual(code, 0, stderr)
         self.assertIn("would be the floor of neither", stderr)
 
-    def test_a_run_that_restates_nothing_owes_no_per_arm_split(self):
+    def test_a_run_that_states_a_per_arm_bound_owes_a_line_over_that_arm(self):
         # The other half of the vacuity: the split is offered only where the
         # run restates the quantity's bound at a different value. M4's own
         # per-flow delivery floor is the value its declaration draws, and the
@@ -2609,8 +2777,12 @@ class MandatePlotTest(unittest.TestCase):
             MANDATE.effective_bounds(delivery, series, bounds, M4_DELIVERY_RUN_VALUES),
             [{"y": 1.0, "label": "M2 delivery floor 1.000"}],
         )
-        # With one series the run's own arms are not enumerated, so nothing can
-        # be attributed per arm and the panel keeps its single declared line.
+        # The wire panel is the opposite case: it restates no budget, but the
+        # run states a guard of its own for two of its three arms, and those
+        # guards *are* those arms' bounds. Each is drawn over the arm it
+        # governs, and the declaration's budget keeps the one arm no guard
+        # claims -- which is what makes the lone bar's 6.63 a value under its
+        # own 14x guard rather than a breach of a 6x line drawn across it.
         wire = {
             "id": "wire",
             "chart": "bar",
@@ -2619,12 +2791,22 @@ class MandatePlotTest(unittest.TestCase):
         }
         wire_series = [("wire_x", [(1.0, 2.15), (2.0, 5.0), (3.0, 6.63)])]
         wire_bounds = MANDATE._bound_specs(wire)
-        self.assertIsNone(
-            MANDATE.arm_bound_values(wire, wire_series, wire_bounds, M2_RUN_VALUES)
+        self.assertEqual(
+            MANDATE.arm_bound_values(wire, wire_series, wire_bounds, M2_RUN_VALUES),
+            {"clean": 6.0, "hostile": 10.0, "lone": 14.0},
         )
         self.assertEqual(
-            MANDATE.effective_bounds(wire, wire_series, wire_bounds, M2_RUN_VALUES),
-            [{"y": 6.0, "label": "M2 wire budget 6x"}],
+            [
+                (plan["y"], plan["arms"], plan["window"], plan["label"])
+                for plan in MANDATE.effective_bounds(
+                    wire, wire_series, wire_bounds, M2_RUN_VALUES
+                )
+            ],
+            [
+                (6.0, ["clean"], [1.0], "M2 wire budget 6x"),
+                (10.0, ["hostile"], [2.0], "run hostile_wire_guard=10"),
+                (14.0, ["lone"], [3.0], "run lone_wire_guard=14"),
+            ],
         )
 
     def test_a_line_bound_names_the_guard_of_every_arm_it_crosses(self):
