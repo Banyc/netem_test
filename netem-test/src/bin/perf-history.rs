@@ -521,11 +521,21 @@ fn metric_rows(
     rows
 }
 
+/// The metrics whose rise rejects a run. `max` is deliberately **not** here: it is
+/// reported, not enforced. The lone-tail arm's maximum is not reproducible at the
+/// same settings -- ten runs measured 256.0-1863.7 ms, a 7.28x spread with a
+/// coefficient of variation of 0.63 -- so a hard rejection on it fires on noise.
+/// It just did: a battery was rejected for `lone_tail max 1523 -> 3912 ms` while
+/// both runs recorded the same `rtp_mux` revision, i.e. a run-to-run excursion.
+/// A percentile is different: the same arm's p99 has a cv of 0.067, which is why
+/// the percentiles, not the order statistic, carry the rejection.
+const M1_REJECTION_METRICS: &[&str] = &["p50", "p90", "p99", "p999"];
+
 /// The rows that are an M1 regression: an interactive arm's latency rose.
 fn m1_degradations(rows: &[Row]) -> Vec<&Row> {
     rows.iter()
         .filter(|row| row.worse)
-        .filter(|row| LATENCY_METRICS.contains(&row.metric.as_str()))
+        .filter(|row| M1_REJECTION_METRICS.contains(&row.metric.as_str()))
         .filter(|row| {
             // The arm part of `<producer>/<arm>`, which must itself carry no
             // further `/`: that is what separates the interactive arms from the
