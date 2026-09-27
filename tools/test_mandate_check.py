@@ -709,6 +709,21 @@ class MandateCheckTest(unittest.TestCase):
         self.assertIn(MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET, stdout)
         self.assertIn("4/4 test(s) stamped by libtest", stdout)
         self.assertIn("fit=yes", stdout)
+        # The existing per-mandate assertion above (`assertGreater(duration, 0)`)
+        # covers one half of the property a `duration:` line owes; here is the
+        # half it cannot see: a duration must be a measurement or be absent with
+        # its reason, so the runner's own check passes and no `0.00s` is
+        # printed for a bracket nobody can trust. Every one of these four
+        # brackets resolves, because this plan sleeps between lines.
+        self.assertEqual(
+            MANDATE_CHECK.mandate_duration_problems(
+                report,
+                {"id": "rtp_mux", "verdicts": ["M1", "M2", "M3", "M4"]},
+            ),
+            [],
+        )
+        self.assertNotIn("duration: 0.00s", stdout)
+        self.assertNotIn("unmeasured", stdout)
 
     def test_derive_timings_takes_each_duration_from_its_own_stamp(self):
         # The stream order and the stamps disagree on purpose: a bracket would
@@ -756,6 +771,128 @@ class MandateCheckTest(unittest.TestCase):
                 ("M1", MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET),
                 ("M2", MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET),
             ],
+        )
+
+    def test_a_bracket_that_prints_as_zero_is_reported_unmeasured_and_says_why(self):
+        # The real shape, from a recorded run (M1 0.002 s, M2 51.216 s): two
+        # sections that read one shared arm measurement print their MANDATE
+        # lines in the same instant, so the second closes a bracket that
+        # brackets no run of its own. The record used to keep 0.002 and the
+        # report printed `duration: 0.00s (stream-bracket-of-mandate-lines)` --
+        # a figure no reader can tell from "not measured". The interval is
+        # still measured; what is refused is calling it a duration.
+        events = [
+            {"seconds": 0.5, "line": "running 4 tests"},
+            {"seconds": 51.216, "line": "MANDATE M2 PASS delivery=1.000"},
+            {
+                "seconds": 51.216,
+                "line": "test m2_interactive_delivery_and_wire ... ok <49.945s>",
+            },
+            {"seconds": 51.218, "line": "MANDATE M1 PASS p99=90.8"},
+            {
+                "seconds": 51.218,
+                "line": "test m1_interactive_tail_latency ... ok <49.947s>",
+            },
+            {
+                "seconds": 51.5,
+                "line": "test result: ok. 2 passed; 0 failed; 0 ignored; "
+                "0 measured; 0 filtered out; finished in 51.00s",
+            },
+        ]
+        timings = MANDATE_CHECK.derive_timings(events, "mandate_smoke")
+        m2, m1 = timings["mandates"]
+        # The section that closed the shared run's bracket reports its seconds,
+        # and carries no note: it has nothing to disclaim.
+        self.assertEqual(m2["mandate"], "M2")
+        self.assertEqual(m2["duration_seconds"], 51.216)
+        self.assertIsNone(m2["duration_note"])
+        # The section whose line was printed in the same instant reports no
+        # duration, keeps the source naming where the bracket came from, and
+        # carries the interval it measured plus the reason it is not this
+        # section's own wall-clock.
+        self.assertEqual(m1["mandate"], "M1")
+        self.assertIsNone(m1["duration_seconds"])
+        self.assertEqual(
+            m1["duration_source"], MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET
+        )
+        self.assertIn("empty bracket", m1["duration_note"])
+        self.assertIn("0.002s", m1["duration_note"])
+        self.assertIn("MANDATE M2", m1["duration_note"])
+        # The rule is the report's own resolution, not a tolerance of its own:
+        # a millisecond is still not a duration at the precision it prints.
+        self.assertTrue(MANDATE_CHECK._renders_as_zero(0.002))
+        self.assertFalse(MANDATE_CHECK._renders_as_zero(0.01))
+
+    def test_the_duration_check_is_red_on_a_printable_zero_and_green_on_the_record_written(self):
+        # The check the report owes: `0.00s` is refused whether or not a note
+        # explains it (the reader still sees `0.00s`), absent-and-explained
+        # passes, and absent-with-no-reason is refused too -- otherwise a
+        # section nobody measured and one whose bracket was dropped look alike.
+        producer = {"id": "rtp_mux", "verdicts": ["M1"]}
+        record = {
+            "raw_line": "MANDATE M1 PASS p99=90.8",
+            "duration_seconds": 0.0,
+            "duration_source": MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET,
+            "duration_note": None,
+        }
+        report = {"mandates": {"M1": record}}
+        problems = MANDATE_CHECK.mandate_duration_problems(report, producer)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("M1", problems[0])
+        self.assertIn("0.00s", problems[0])
+        record["duration_note"] = "the arms were measured under M2's bracket"
+        self.assertEqual(
+            len(MANDATE_CHECK.mandate_duration_problems(report, producer)),
+            1,
+            "a note does not buy a printed zero",
+        )
+        record["duration_seconds"] = None
+        self.assertEqual(
+            MANDATE_CHECK.mandate_duration_problems(report, producer), []
+        )
+        record["duration_note"] = None
+        problems = MANDATE_CHECK.mandate_duration_problems(report, producer)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("say why", problems[0])
+        # A section that printed no MANDATE line has no duration to be true
+        # about; that absence is named as its own failure elsewhere.
+        record["raw_line"] = None
+        self.assertEqual(
+            MANDATE_CHECK.mandate_duration_problems(report, producer), []
+        )
+
+    def test_a_run_whose_brackets_do_not_resolve_reports_unmeasured_not_zero(self):
+        # End to end: a plan whose lines arrive together leaves every mandate
+        # bracket unresolvable. The run still passes -- an unmeasurable bracket
+        # is not a failure, it is a figure that must not be printed as one --
+        # and every `duration:` line says unmeasured with its reason.
+        code, stdout, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        # This plan emits its lines with no pause, so the intervals between its
+        # MANDATE lines are line-read gaps far below the report's resolution:
+        # M2, M3 and M4 each close a bracket that is not a duration. (M1's own
+        # bracket runs from the child's start, so it carries the process spawn
+        # and is the one bracket here that legitimately resolves; it is checked
+        # by the invariant below rather than pinned to a state.)
+        for mandate in ("M2", "M3", "M4"):
+            record = report["mandates"][mandate]
+            self.assertIsNone(record["duration_seconds"], record)
+            self.assertIn("empty bracket", record["duration_note"])
+        for mandate in report["mandate_order"]:
+            record = report["mandates"][mandate]
+            if record["duration_seconds"] is None:
+                self.assertTrue(record["duration_note"], record)
+            else:
+                self.assertGreater(record["duration_seconds"], 0, record)
+        self.assertIn("duration: unmeasured (empty bracket:", stdout)
+        self.assertNotIn("duration: 0.00s", stdout)
+        self.assertEqual(
+            MANDATE_CHECK.mandate_duration_problems(
+                report,
+                {"id": "rtp_mux", "verdicts": ["M1", "M2", "M3", "M4"]},
+            ),
+            [],
         )
 
     def test_a_stamp_less_result_is_marked_and_never_bracketed(self):
@@ -1165,14 +1302,17 @@ class MandateCheckTest(unittest.TestCase):
         code, stdout, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         report = self.report()
-        self.assertEqual(report["schema"], "mandate-check/7")
+        self.assertEqual(report["schema"], "mandate-check/8")
         # The schema bump is over `/5`: a `/5` reader's keys keep their meaning
         # (a test's `duration_seconds` is still its own seconds, and the arm
         # record is untouched), and the new keys say where a duration came
         # from rather than changing what the old ones name. `/7` over `/6` adds
         # the per-arm instrument readings the plots state, in `censoring` (one
         # record per producer) and `censoring_arms` (the arms a mandate's line
-        # panel actually states).
+        # panel actually states). `/8` over `/7` adds `duration_note` and makes
+        # a mandate's `duration_seconds` null when its bracket resolves to no
+        # duration at the report's own precision -- only a figure that could
+        # never be trusted becomes null, so a `/7` reader keeps working.
         self.assertEqual(
             sorted(report["censoring"]),
             ["rtp_mux"],

@@ -28,7 +28,15 @@ The child's lines are still read as a stream and timestamped against the
 child's start, which is what orders the tests and what a *mandate's* duration
 is still bracketed from: the ``MANDATE`` line is printed from inside the test
 that measured it, so the harness's stamp is available for the test and not for
-the section, and the bracket is labelled as what it is. Each per-target record
+the section, and the bracket is labelled as what it is. A bracket that the
+report's own two-decimal resolution renders as ``0.00`` is **not** reported as
+a duration — that figure cannot be told from "not measured", and a mandate
+whose line is printed in the same instant as its neighbour's (two sections
+reading one shared arm measurement) closes exactly that bracket — so it is
+recorded as absent with a ``duration_note`` naming the interval measured and
+why it is not this section's own wall-clock, and a mandate whose duration is
+neither measurable nor explained is an evidence failure rather than a
+plausible-looking row. Each per-target record
 says how many of its tests carried a stamp and whether the stamped per-test
 times fit the target's own ``finished in`` total, so a number that cannot be
 one test's own time is a named failure rather than a plausible-looking row.
@@ -185,8 +193,16 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   and the panel series counts, plus the run's exact command, the ``rtp_mux``
   source revision (its ``jj`` or ``git`` commit and change ids, and the tree
   that revision points at, each when resolvable), the wall-clock duration,
-  every problem found and the exit code. ``schema`` is ``mandate-check/7``:
-  over ``mandate-check/6`` it adds ``censoring`` -- one record per producer
+  every problem found and the exit code. ``schema`` is ``mandate-check/8``:
+  over ``mandate-check/7`` it adds ``duration_note`` to every mandate timing
+  and every mandate record, and it makes ``duration_seconds`` **null on a
+  mandate whose bracket the report's own two-decimal resolution renders as
+  ``0.00``** — a bracket that resolves to no duration is reported as absent and
+  says why, rather than printed as ``0.00s``, which a reader cannot tell from
+  ``not measured``. A ``/7`` reader keeps working: the key is new, a
+  resolvable bracket's ``duration_seconds`` and ``duration_source`` are
+  unchanged, and only a figure that could never be trusted becomes null.
+  ``mandate-check/7`` over ``mandate-check/6`` adds ``censoring`` -- one record per producer
   that declares M1, holding the instrument, the mandate and every per-arm
   reading that producer printed (``[m1-censoring] arm=...``) -- and
   ``mandates.<id>.censoring_arms``, the arms a mandate's line panel was given
@@ -213,7 +229,7 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   (the prose-only arm lines, with their mandate when one can be attributed)
   and ``arm_declaration`` (the declaration the cells were read from).
   so a reader of ``mandate-check/2`` or ``mandate-check/3`` keeps working, and
-  the fields those schemas define are unchanged by ``mandate-check/7``.
+  the fields those schemas define are unchanged by ``mandate-check/8``.
 
 The eight expected evidence files, the ``plots`` directory, and this
 command's own ``mandate-check.json`` and ``mandate-smoke.log`` are removed from
@@ -282,7 +298,7 @@ REPORT_NAME = "mandate-check.json"
 # name is its registry entry's.
 LOG_NAME = "mandate-smoke.log"
 PLOTS_DIRNAME = "plots"
-REPORT_SCHEMA = "mandate-check/7"
+REPORT_SCHEMA = "mandate-check/8"
 ARMS_DECLARATION_NAME = "mandate-arms.json"
 ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
 PRODUCERS_DECLARATION_NAME = "mandate-producers.json"
@@ -354,6 +370,12 @@ DURATION_SOURCE_HARNESS = "libtest-report-time"
 # from inside the test, so there is no per-section stamp), so it stays the
 # bracket between two `MANDATE` lines and says so.
 DURATION_SOURCE_STREAM_BRACKET = "stream-bracket-of-mandate-lines"
+# The decimals a duration is printed with, and therefore the only resolution at
+# which a duration is a measurement. A bracket that this resolution renders as
+# `0.00` is not reported as a duration: `0.00s` and "not measured" are the same
+# figure to a reader, so an unresolvable bracket is reported **absent** and
+# carries the note that says why instead.
+DURATION_DECIMALS = 2
 # The harness's own per-test stamp, read from a result line's tail or from the
 # bare state line a test that prints splits its completion into.
 TEST_STAMP_RE = re.compile(
@@ -463,7 +485,8 @@ TIMING_METHOD = (
     "mandate's duration is still the bracket between its neighbouring MANDATE "
     "lines and is marked with that source, because the MANDATE line is printed "
     "from inside the test that measured the section and no per-section stamp "
-    "exists"
+    "exists, and a bracket this report's own resolution renders as '0.00s' is "
+    "reported as absent with the note that says why rather than as a duration"
 )
 
 
@@ -1343,6 +1366,62 @@ def _result_state(tail):
     )
 
 
+def _renders_as_zero(seconds):
+    """Whether the report's own precision would print ``seconds`` as ``0.00``.
+
+    The question is asked in the terms the figure is printed in, not against a
+    tolerance of the runner's own: what makes a duration untrustworthy is that
+    the number the reader sees is `0.00`, which is what "not measured" looks
+    like too. Asking the format rather than a chosen epsilon keeps the rule and
+    the rendering from drifting apart.
+    """
+    return float(f"{seconds:.{DURATION_DECIMALS}f}") == 0.0
+
+
+def _mandate_bracket(mandate, seconds, previous_seconds, previous_label):
+    """One mandate's bracket, or the reason it is not a duration.
+
+    The bracket is the interval between this ``MANDATE`` line and the previous
+    one. It is the section's own wall-clock only while one section ran inside
+    that interval: a section whose line is printed in the same instant as its
+    neighbour's -- because the two read one shared measurement, so the one that
+    measured printed first and the one that read it printed a few milliseconds
+    later -- closes a bracket holding no run of its own, and the run it asserts
+    on was timed inside the bracket of the section that measured it. At the
+    report's own resolution that bracket *is* zero, and a zero rendered as a
+    duration is the one thing this cannot do: no reader can tell it from "not
+    measured". So an unresolvable bracket is reported **absent**, with the
+    interval it measured kept in the note, and a resolvable one as its seconds.
+    The note names what the stream shows -- the interval and the line it closed
+    against -- and not which section did the measuring, which the stream does
+    not say.
+    """
+    bracket = round(max(seconds - previous_seconds, 0.0), 3)
+    entry = {
+        "mandate": mandate,
+        "finished_at_seconds": seconds,
+        "duration_seconds": bracket,
+        "duration_source": DURATION_SOURCE_STREAM_BRACKET,
+        "duration_note": None,
+    }
+    if not _renders_as_zero(bracket):
+        return entry
+    entry["duration_seconds"] = None
+    entry["duration_note"] = (
+        f"empty bracket: this MANDATE line was printed {bracket:.3f}s after "
+        f"{previous_label}, so the interval between the two verdict lines is "
+        "not a duration this section spent -- at the report's "
+        f"{DURATION_DECIMALS}-decimal resolution it is zero, which is what "
+        "'unmeasured' looks like too. The bracket is a section's own "
+        "wall-clock only while one section runs inside it, and two sections "
+        "that read one shared arm measurement print their lines in the same "
+        "instant: the second closes an interval holding no run of its own, "
+        "and the run it asserts on is timed inside the bracket of the "
+        "section that measured it"
+    )
+    return entry
+
+
 def derive_timings(events, target, serial=False):
     """The run's per-test and per-mandate wall-clock, from the line timeline.
 
@@ -1369,12 +1448,19 @@ def derive_timings(events, target, serial=False):
     to no more than the target's own total, which is an impossibility check a
     concurrent target cannot support because its tests legitimately overlap.
     Either way no single stamped time may exceed that total.
+
+    A mandate's bracket is a duration only when it resolves to one: a bracket
+    the report's precision renders as zero is recorded as absent with the note
+    that says why ([`_mandate_bracket`]), so a section nobody measured and a
+    section that spent no wall-clock of its own are told apart rather than both
+    printed as ``0.00s``.
     """
     tests = []
     mandates = []
     problems = []
     previous_completion = 0.0
     previous_mandate = 0.0
+    previous_mandate_id = None
     total_seconds = None
     awaiting = None
 
@@ -1402,14 +1488,19 @@ def derive_timings(events, target, serial=False):
         mandate = MANDATE_TIMING_RE.match(line)
         if mandate is not None:
             mandates.append(
-                {
-                    "mandate": mandate.group("mandate"),
-                    "finished_at_seconds": seconds,
-                    "duration_seconds": round(max(seconds - previous_mandate, 0.0), 3),
-                    "duration_source": DURATION_SOURCE_STREAM_BRACKET,
-                }
+                _mandate_bracket(
+                    mandate.group("mandate"),
+                    seconds,
+                    previous_mandate,
+                    (
+                        f"MANDATE {previous_mandate_id}'s line"
+                        if previous_mandate_id is not None
+                        else "the child's start"
+                    ),
+                )
             )
             previous_mandate = seconds
+            previous_mandate_id = mandate.group("mandate")
             continue
         total = TEST_TOTAL_RE.match(line)
         if total is not None:
@@ -1588,6 +1679,50 @@ def apply_mandate_timings(report, timings, producer):
         record["finished_at_seconds"] = entry["finished_at_seconds"]
         record["duration_seconds"] = entry["duration_seconds"]
         record["duration_source"] = entry.get("duration_source")
+        record["duration_note"] = entry.get("duration_note")
+
+
+def mandate_duration_problems(report, producer):
+    """A mandate's reported duration must be one, or absent and explained.
+
+    The ``duration:`` line is read as a measurement, so it owes the two
+    properties that make one: a duration the report's own precision renders as
+    ``0.00`` is refused *whether or not* a note explains it (the reader sees
+    ``0.00s``), and an absent duration is refused unless the record carries the
+    note that says why it is absent -- otherwise a section nobody measured and
+    a section whose line was dropped look the same. A section that printed no
+    ``MANDATE`` line at all has neither a duration nor a line to be true about,
+    and is already a failure of its own; it is skipped here.
+
+    Only mandate durations are checked. A ``libtest-report-time`` stamp is
+    either present or absent, never a bracket, so a sub-millisecond test's
+    stamped ``0.0s`` is that test's own measurement and says its source.
+    """
+    problems = []
+    for mandate in producer["verdicts"]:
+        record = report["mandates"][mandate]
+        if record.get("raw_line") is None:
+            continue
+        duration = record.get("duration_seconds")
+        note = record.get("duration_note")
+        if duration is None:
+            if not note:
+                problems.append(
+                    f"{mandate}: its MANDATE line printed but the record carries "
+                    "neither a duration nor a note saying why it has none, so a "
+                    "reader cannot tell an unmeasured section from one whose "
+                    "bracket was dropped; an absent duration must say why"
+                )
+            continue
+        if _renders_as_zero(duration):
+            problems.append(
+                f"{mandate}: reports a duration of {duration:.3f}s, which the "
+                f"report's {DURATION_DECIMALS}-decimal resolution prints as "
+                "0.00s -- a figure no reader can tell from 'not measured'. A "
+                "bracket that resolves to zero must be reported as absent (with "
+                "the note that says why), never as a duration"
+            )
+    return problems
 
 
 def _kill_process_group(process):
@@ -1768,6 +1903,7 @@ def build_report(args, out_dir, declared, selected, quick, timeout):
                 "finished_at_seconds": None,
                 "duration_seconds": None,
                 "duration_source": None,
+                "duration_note": None,
             }
     return report
 
@@ -1845,9 +1981,18 @@ def verdict_block(report):
         measured = " ".join(f"{key}={value}" for key, value in record["values"].items())
         lines.append(f"{mandate} {verdict}  {measured}".rstrip())
         duration = record.get("duration_seconds")
+        note = record.get("duration_note")
         if duration is not None:
             lines.append(
-                f"  duration: {duration:.2f}s ({record.get('duration_source') or 'unstated'})"
+                f"  duration: {duration:.{DURATION_DECIMALS}f}s "
+                f"({record.get('duration_source') or 'unstated'})"
+            )
+        elif note:
+            lines.append(f"  duration: unmeasured ({note})")
+        elif record.get("raw_line") is not None:
+            lines.append(
+                "  duration: unmeasured (its MANDATE line printed but the record "
+                "carries neither a bracket nor a reason)"
             )
         for path in record["plots"]:
             lines.append(f"  plot: {path}")
@@ -2033,6 +2178,7 @@ def evaluate_producer(args, producer, out_dir, report, run, declaration):
             section["panels"] = summary.get("panels", 0)
             problems.extend(_verify_plots(mandate, summary))
         problems.extend(render_problems)
+    problems.extend(mandate_duration_problems(report, producer))
 
     report["problems"].extend(
         f"{producer['id']}: {problem}" for problem in problems
