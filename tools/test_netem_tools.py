@@ -28,9 +28,12 @@ itself is read from the command's own behaviour (`claim_of`), so a cell's
 answer is checked against the comparison's, not against a restatement of it.
 """
 
+import importlib.util
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -113,6 +116,18 @@ def binary():
 
 
 BINARY = binary()
+
+
+def _load_diff():
+    """Import `tools/pyformat_diff.py` without letting its CLI run."""
+    spec = importlib.util.spec_from_file_location("pyformat_diff", TOOLS / "pyformat_diff.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pyformat_diff"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+DIFF = _load_diff()
 
 
 def arm_with(
@@ -950,6 +965,237 @@ class MandateCompareTest(unittest.TestCase):
             [str(BINARY), "mandate-compare", str(path)], capture_output=True, text=True, timeout=60
         )
         return completed.returncode, completed.stdout, completed.stderr
+
+
+class PyFormatTest(unittest.TestCase):
+    """Exercise `netem-tools py-format`'s Python `format()` compatibility.
+
+    The claims this class checks are the ones the plot-tool port depends on:
+    that the Rust formatter reproduces CPython's output for the specs on the
+    value path, and that the differential which says so is capable of saying
+    otherwise. The oracle is always CPython itself -- `python3` computes every
+    expected string in-process, and the `pyformat_diff.py` driver runs a real
+    CPython in a child process -- never a second Python restatement of the
+    rules, which would only prove the two restatements agree.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="py-format-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def test_the_realized_pairs_from_the_recorded_runs_agree(self):
+        # `tools/pyformat-realized-pairs.txt` is the set of float (spec, value)
+        # pairs `mandate_plot.py` actually formats, captured from the recorded
+        # runs by `tools/pyformat_instrument.py`. This is the tightest form of
+        # the claim: not a cross product, the calls themselves -- including the
+        # ones inside refusal strings, which come from runs the plot refuses.
+        pairs_file = TOOLS / "pyformat-realized-pairs.txt"
+        self.assertTrue(pairs_file.is_file(), f"missing fixture: {pairs_file}")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(TOOLS / "pyformat_diff.py"),
+                "--pairs",
+                str(pairs_file),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        output = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, output)
+        attempted = int(_field(output, "pairs attempted"))
+        agreed = int(_field(output, "agreements"))
+        formatted = int(_field(output, "formatted pairs"))
+        self.assertGreaterEqual(attempted, 8000, output)
+        self.assertEqual(agreed, attempted, output)
+        # Every realized spec is a valid one, so no pair may be rejected by
+        # both sides: a both-rejected pair here means the fixture's kind tags
+        # or the oracle stopped working, and `agreements` alone would not say so.
+        self.assertEqual(formatted, attempted, output)
+
+    def test_every_realized_spec_is_in_the_declared_plot_spec_set(self):
+        # Otherwise the cross-product differential could be green while missing
+        # a spec the plot uses -- the fixture would be checking a surface the
+        # tool does not actually have.
+        realized = {
+            spec for _kind, _value, spec in DIFF.read_pairs(TOOLS / "pyformat-realized-pairs.txt")
+        }
+        declared = set(DIFF.PLOT_SPECS)
+        self.assertGreaterEqual(len(realized), 8, realized)
+        missing = realized - declared
+        self.assertEqual(missing, set(), f"specs the differential never crosses: {missing}")
+
+    def test_the_value_set_the_differential_crosses_spans_the_boundaries(self):
+        # A corpus concentrated in one decade cannot see a boundary error; the
+        # `g` rule flips at 1e-5 and at 10**p, so the set must straddle both.
+        values = DIFF.read_corpus(DIFF.CORPUS) + list(DIFF.EDGE_VALUES)
+        self.assertGreaterEqual(len(values), 4000, "the committed corpus is too thin")
+        self.assertTrue(any(v < 0 for v in values), "no negative value")
+        self.assertTrue(any(v == 0 for v in values), "no zero")
+        self.assertTrue(any(0 < v < 1e-4 for v in values), "nothing below 1e-4")
+        self.assertTrue(any(1e-4 <= v < 0.1 for v in values), "nothing in [1e-4, 0.1)")
+        self.assertTrue(any(1e6 < v < 1e8 for v in values), "nothing between 1e6 and 1e8")
+
+    def test_the_differential_agrees_over_the_committed_corpus(self):
+        completed = subprocess.run(
+            [sys.executable, str(TOOLS / "pyformat_diff.py")],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        output = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, output)
+        attempted = int(_field(output, "pairs attempted"))
+        agreed = int(_field(output, "agreements"))
+        formatted = int(_field(output, "formatted pairs"))
+        self.assertGreaterEqual(attempted, 100_000, output)
+        self.assertEqual(agreed, attempted, output)
+        # The surface includes one deliberately invalid spec (`_,.2f`), so some
+        # pairs are both-rejected; most must still exercise the formatter, or a
+        # broken oracle would read as agreement.
+        self.assertGreater(formatted, attempted // 2, output)
+        self.assertIn("disagreements   = 0", output)
+
+    def test_the_differential_reports_a_planted_disagreement(self):
+        # The comparator's own teeth: hand it a formatter that is wrong on
+        # purpose (Rust's `.4f` where Python's corpus wants `.4g`) and it must
+        # name the disagreement rather than pass. A differential that cannot
+        # fail is the same defect as an assertion that cannot fail.
+        stub = self.root / "wrong-format"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "for line in sys.stdin:\n"
+            "    parts = line.rstrip('\\n').split('\\t', 2)\n"
+            "    value = float(parts[1]) if len(parts) > 1 else 0.0\n"
+            "    print('ok\\t' + format(value, '.4f'))\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        values = [12345.6789, 0.5, 1e7, 2.675]
+        attempted, agreed, formatted, disagreements, _messages = DIFF.compare(
+            values, [".4g"], stub, max_disagreements=10
+        )
+        self.assertGreater(attempted, 0)
+        self.assertEqual(formatted, 0, "the stub returned no usable output")
+        self.assertLess(agreed, attempted, "the planted defect was not caught")
+        self.assertTrue(disagreements)
+        _value, spec, rust, python = disagreements[0]
+        self.assertEqual(spec, ".4g")
+        self.assertTrue(rust.startswith("ok\t"), rust)
+        self.assertNotEqual(rust, python)
+        self.assertEqual(rust.split("\t", 1)[1], format(12345.6789, ".4f"))
+
+    def test_the_single_call_face_matches_cpython(self):
+        pairs = (
+            (2.675, ".2f", "2.67"),
+            (0.5, ".0f", "0"),
+            (1.5, ".0f", "2"),
+            (1.005, ".2f", "1.00"),
+            (1e23, ".0f", "99999999999999991611392"),
+            (1e23, "g", "1e+23"),
+            (12345.6789, "g", "12345.7"),
+            (12345.6789, ".4g", "1.235e+04"),
+            (0.255, ".1%", "25.5%"),
+            (-1.5, "08.1f", "-00001.5"),
+            (1e16, "", "1e+16"),
+            (1.5, ".1", "2e+00"),
+        )
+        for value, spec, expected in pairs:
+            self.assertEqual(format(value, spec), expected, "the oracle moved")
+            completed = subprocess.run(
+                [str(BINARY), "py-format", "--value", repr(value), "--spec", spec],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.rstrip("\n"), expected, (value, spec))
+        # Teeth: the naive spellings differ for these pairs, so the assertions
+        # above are not satisfied by any formatter that happens to agree.
+        self.assertNotEqual(format(12345.6789, ".4f"), format(12345.6789, ".4g"))
+        self.assertNotEqual(format(1.0, ""), format(1.0, "g"))
+        self.assertEqual(format(12345.6789, ".4f"), "12345.6789")
+        self.assertEqual(format(1.0, "g"), "1")
+        self.assertEqual(format(1.0, ""), "1.0")
+
+    def test_the_stdin_face_streams_ok_and_err_lines(self):
+        requests = (
+            "f\t1.5\t.1\n"
+            "i\t1234567\t,\n"
+            "s\tabc\t>5\n"
+            "f\tfloat('nan')\t.2f\n"
+        )
+        completed = subprocess.run(
+            [str(BINARY), "py-format"],
+            input=requests,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = completed.stdout.splitlines()
+        self.assertEqual(len(lines), 4, completed.stdout)
+        self.assertEqual(lines[0], "ok\t2e+00")
+        self.assertEqual(lines[1], "ok\t1,234,567")
+        self.assertEqual(lines[2], "ok\t  abc")
+        self.assertTrue(lines[3].startswith("err\t"), lines[3])
+
+    def test_the_g_threshold_is_the_measured_rule(self):
+        # The rule CPython implements, measured here rather than assumed: after
+        # rounding to `p` significant digits, let `decpt` be the digit string's
+        # decimal-point position; exponent notation iff `decpt <= -4 or
+        # decpt > p`. Every row is checked against CPython *and* against the
+        # Rust tool, and the rule is checked against CPython's notation. The
+        # rows go through one `py-format` invocation's stdin face: spawning a
+        # process per row costs ~50 s of the suite for no extra coverage.
+        rows = [
+            (float(10**exponent), exponent + 1, precision, f".{precision}g")
+            for precision in range(2, 9)
+            for exponent in range(-8, 9)
+        ]
+        requests = "".join(
+            f"f\t{value!r}\t{spec}\n" for value, _decpt, _precision, spec in rows
+        )
+        completed = subprocess.run(
+            [str(BINARY), "py-format"],
+            input=requests,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        answers = completed.stdout.splitlines()
+        self.assertEqual(len(answers), len(rows), completed.stdout[:200])
+        for (value, decpt, precision, spec), answer in zip(rows, answers):
+            expected = format(value, spec)
+            rule = "exp" if (decpt <= -4 or decpt > precision) else "fix"
+            seen = "exp" if "e" in expected else "fix"
+            self.assertEqual(seen, rule, (value, precision, expected))
+            self.assertEqual(answer, f"ok\t{expected}", (value, precision))
+        self.assertGreater(len(rows), 100, "the boundary sweep is too small")
+        # Vacuity: the off-by-one rule (`decpt > p - 1`) predicts exponent
+        # notation at `decpt == p`, where CPython is fixed, so the rule above
+        # is not a tautology. `10**(p-1)` has `decpt == p`.
+        mispredicted = []
+        for p in range(2, 9):
+            value = float(10 ** (p - 1))
+            seen = "exp" if "e" in format(value, f".{p}g") else "fix"
+            off_by_one = "exp" if (p <= -4 or p > p - 1) else "fix"
+            if seen != off_by_one:
+                mispredicted.append((p, value, seen, off_by_one))
+        self.assertTrue(mispredicted, "the off-by-one rule predicts every row")
+
+
+def _field(output, label):
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(label) and "=" in stripped:
+            after = stripped.split("=", 1)[1].strip()
+            token = after.split()[0] if after else ""
+            return token
+    raise AssertionError(f"{label!r} not reported:\n{output}")
 
 
 if __name__ == "__main__":
