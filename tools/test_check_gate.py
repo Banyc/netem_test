@@ -1728,6 +1728,154 @@ class CheckGateEnvTierDirectReadTest(EnvTierFixture):
         self.rejects("surface fixture-runner-env: CARGO_TARGET_DIR is passed to")
 
 
+# A crate whose names reach `env::var` through the two forwarders that are not a
+# `fn`: a `let`-bound closure whose parameter receives the literal at the call
+# site, and a `const`/`static` string alias handed to `env::var` in place of a
+# literal. Both are real reads, and both are invisible to a scan that follows
+# only `fn`s and string literals -- the same defect shape as the direct-literal
+# gap: a declaration that is correct is refused as stale, leaving a real
+# variable unrecordable.
+FORWARDER_KNOB_RS = r'''fn env_parse(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+pub fn iterations() -> u64 {
+    env_parse("FIXTURE_ITERATIONS", 10)
+}
+
+/// The closure forwarder: `env_usize` is a reader, so `closure_forwarded` is one
+/// too, and the literal at its call site is the name it forwards.
+pub fn closure_forwarded(key: &str) -> u64 {
+    let env_usize = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    env_usize(key, 7)
+}
+
+pub fn closure_read() -> u64 {
+    closure_forwarded("FIXTURE_CLOSURE")
+}
+
+/// A `const` string alias handed to `env::var`: no literal stands at the call,
+/// so there is nothing for the direct half to match on.
+const ALIAS_NAME: &str = "FIXTURE_ALIAS";
+
+pub fn alias_read() -> Option<String> {
+    std::env::var(ALIAS_NAME).ok()
+}
+
+static OS_ALIAS_NAME: &str = "FIXTURE_OS_ALIAS";
+
+pub fn alias_read_os() -> Option<std::ffi::OsString> {
+    std::env::var_os(OS_ALIAS_NAME)
+}
+
+/// `ALIAS_NAME` declared *again* inside a raw string, after the real one: an
+/// alias map built from `code` alone takes this declaration, hands
+/// `FIXTURE_ALIAS_IN_STRING` to the real `env::var(ALIAS_NAME)` above, drops
+/// `FIXTURE_ALIAS` from the reads, and lets a surface naming it pass.
+pub const RAW_ALIAS_DECL_MENTION: &str =
+    r#"const ALIAS_NAME: &str = "FIXTURE_ALIAS_IN_STRING";"#;
+
+/// The new forms written in prose rather than in code: a closure body, an
+/// `env::var(ALIAS_NAME)` call and a `const` declaration are mentions here.
+pub const RAW_FORM_MENTIONS: &str = r#"let env_usize = |k: &str| std::env::var(k);
+env_usize("FIXTURE_CLOSURE_MENTION");
+std::env::var(ALIAS_NAME);
+const FIXTURE_ALIAS_DECL_MENTION: &str = "FIXTURE_ALIAS_DECL_MENTION";"#;
+
+// `env_usize("FIXTURE_CLOSURE_LINE_MENTION", 0)` on a doc line is prose too.
+'''
+
+
+class CheckGateEnvTierForwarderTest(EnvTierFixture):
+    """The names a closure and a `const` alias forward to `env::var`.
+
+    Detection of the surface is two-sided -- a script names it and a source
+    reads it -- so a name the reader scan cannot see is a name the declaration
+    cannot record: adding it trips the stale-declaration half, which is the
+    grammar refusing a *true* statement. These cases pin both forwarders as
+    reads, and pin the mention side, because counting a mention as a read makes
+    the stale half fail open.
+    """
+
+    EXTRA_SOURCES = {"src/forwarder_knob.rs": FORWARDER_KNOB_RS}
+
+    CHURN = (
+        "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py | "
+        "per-dial loss rate under a sized load | fixture-liveness@shape=churn"
+    )
+
+    FORWARDED = (
+        "fixture-forwarded = FIXTURE_ALIAS,FIXTURE_CLOSURE,FIXTURE_OS_ALIAS | - "
+        "| the names read through a closure forwarder and a const string alias "
+        "| fixture-liveness@shape=forwarder"
+    )
+
+    FORM_MENTIONS = (
+        "fixture-form-mentions = FIXTURE_ALIAS_DECL_MENTION,"
+        "FIXTURE_ALIAS_IN_STRING,FIXTURE_CLOSURE_LINE_MENTION,"
+        "FIXTURE_CLOSURE_MENTION | - | the new forms only prose mentions "
+        "| fixture-liveness@shape=form-mention"
+    )
+
+    def test_a_closure_forwarded_name_and_a_const_alias_are_reads(self):
+        self.declare(self.CHURN + "\n" + self.FORWARDED)
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("gate-env-tier: 2 env-scaled surface(s), 5 variable(s)", output)
+        self.assertIn("FIXTURE_ALIAS, FIXTURE_CLOSURE, FIXTURE_OS_ALIAS", output)
+
+    def test_a_closure_forwarded_name_the_declaration_omits_is_refused(self):
+        self.declare(self.CHURN)
+        self.rejects(
+            "FIXTURE_CLOSURE is read by src/forwarder_knob.rs and set by no script"
+        )
+
+    def test_a_const_alias_name_the_declaration_omits_is_refused(self):
+        self.declare(self.CHURN)
+        self.rejects(
+            "FIXTURE_ALIAS is read by src/forwarder_knob.rs and set by no script"
+        )
+
+    def test_a_quoted_alias_declaration_cannot_shadow_the_real_one(self):
+        """`ALIAS_NAME` is re-declared inside a raw string, after the real one.
+
+        An alias map built from `code` alone takes the quoted declaration, hands
+        `FIXTURE_ALIAS_IN_STRING` to the real `env::var(ALIAS_NAME)`, drops
+        `FIXTURE_ALIAS` from the reads and lets the surface below pass -- the
+        stale half failing open on a mention.
+        """
+        self.declare(
+            self.CHURN
+            + "\n"
+            + self.FORWARDED
+            + "\nfixture-shadow = FIXTURE_ALIAS_IN_STRING | - | a name only the "
+            "quoted declaration names | fixture-liveness@shape=shadow"
+        )
+        self.rejects(
+            "surface fixture-shadow: FIXTURE_ALIAS_IN_STRING is passed to no "
+            "env-reading function of this crate"
+        )
+
+    def test_the_new_forms_only_a_mention_names_are_still_stale(self):
+        self.declare(
+            self.CHURN + "\n" + self.FORWARDED + "\n" + self.FORM_MENTIONS
+        )
+        self.rejects(
+            "surface fixture-form-mentions: FIXTURE_ALIAS_DECL_MENTION, "
+            "FIXTURE_ALIAS_IN_STRING, FIXTURE_CLOSURE_LINE_MENTION, "
+            "FIXTURE_CLOSURE_MENTION is passed to no env-reading function of "
+            "this crate"
+        )
+
+
 class CheckGateScenarioDirectoryTest(CheckGatePerfFixture):
     """`--crate`'s scenario directory is reconciled with the package's targets.
 

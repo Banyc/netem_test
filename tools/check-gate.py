@@ -196,6 +196,21 @@ ENV_READ_RE = re.compile(r"env::var(?:_os)?\s*\(")
 # ...and the same call with a literal argument. Group 1 is the name it reads: a
 # literal handed straight to `env::var` is a read and needs no helper to be one.
 ENV_LITERAL_RE = re.compile(r'env::var(?:_os)?\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+# `env::var(NAME)`/`env::var_os(NAME)` where the argument is a bare identifier.
+ENV_IDENT_RE = re.compile(r"env::var(?:_os)?\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+# The header of a closure bound by `let`: `let NAME = |…|`, `let NAME: T = move |…|`.
+# A closure is a second crate-local forwarder, and one the `fn`-only scan cannot
+# see: its parameter receives the literal at the call site exactly as a `fn`'s
+# does, so callers of a reader closure forward a name just the same.
+CLOSURE_RE = re.compile(
+    r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]*)?=\s*(?:move\s*)?\|"
+)
+# A `const`/`static` string alias: `const NAME: &str = "VALUE"`. Groups are the
+# alias and the literal that is read when an alias is handed to `env::var`.
+CONST_STR_RE = re.compile(
+    r"\b(?:pub(?:\s*\([^)]*\))?\s+)?(?:const|static)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&(?:'static\s+)?str\s*=\s*\"([^\"\n]*)\""
+)
 # A file the crate could use to run a test batch: the only place a variable can
 # be set for a child process.
 RUNNER_SUFFIXES = frozenset(
@@ -3304,34 +3319,46 @@ def _script_env_names(script: Path) -> set[str]:
 def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
     """`ENV_NAME -> {source}` for the names this crate's sources read from the env.
 
-    A name reaches `env::var` one of two ways, so this is two scans over the same
-    source text. A literal handed **straight** to `env::var`/`var_os` is a read
-    wherever it stands -- including in a module-scope initializer no function
-    body encloses -- and is found by scanning the whole source. A literal handed
-    to a crate-local **helper** that parses it (`env_parse("SOAK_DIALERS", 16)`)
-    is forwarded to `env::var` by the helper, so it is found through the helper's
-    caller and only if the helper is itself a reader: the reader set is the
-    transitive closure over crate-local calls, because a one-hop scan would
-    report no surface at all for the wrapper form and the detection would be
-    vacuously silent.
+    A name reaches `env::var` one of four ways, so this is four scans over the
+    same source text. A literal handed **straight** to `env::var`/`var_os` is a
+    read wherever it stands -- including in a module-scope initializer no
+    function body encloses -- and is found by scanning the whole source. A
+    literal handed to a crate-local **forwarder** that parses it
+    (`env_parse("SOAK_DIALERS", 16)`) is forwarded to `env::var` by that
+    forwarder, so it is found through the forwarder's caller and only if the
+    forwarder is itself a reader: the reader set is the transitive closure over
+    crate-local calls, because a one-hop scan would report no surface at all for
+    the wrapper form and the detection would be vacuously silent. A forwarder is
+    a `fn` **or a `let`-bound closure** (`let env_usize = |key: &str| { … }`),
+    and the closure half is not cosmetic: a `|key: &str|` reader's parameter
+    receives the literal at the call site exactly as a `fn`'s does, so a
+    `fn`-only scan leaves every name it forwards invisible -- and a name the
+    scan cannot see cannot be declared, because the stale-declaration half then
+    refuses the true record. Finally a name may be spelled once as a
+    `const`/`static` string alias and handed to `env::var` by that alias
+    (`const ENV: &str = "RTP_RTX_DUP"; … std::env::var(ENV)`), which is a read
+    with no literal at the call and no call site to read one from.
 
-    Both scans read **comment- and literal-stripped** text: an
+    All four scans read **comment- and literal-stripped** text: an
     `env::var("NAME")` written in a doc comment, or written inside a string
     constant, is prose about a read rather than a read, and the stale-declaration
     half of the check is only as strong as the reads it can tell from a mention.
     Bare-name resolution over-approximates across modules, which is why a name
-    counts only when the script side names it too.
+    counts only when the script side names it too; the alias map is kept
+    **per file** precisely so a name defined in one module cannot be handed to a
+    read in another, which is the one place that over-approximation would make a
+    declared-but-unread name look read and so make the stale half fail open.
 
     Each source is therefore viewed twice, at one length so that every offset
-    agrees: `code` with literals intact, which is where a direct call and a
-    forwarded name are spelled, and `quiet` with their contents blanked, which
-    is what a mention looks like. A direct call is one whose own text survived
-    into `quiet` -- a call written inside a string constant did not, since the
-    whole literal was blanked -- and a forwarded name is read out of the
-    literal in `code`, because that is where the name lives.
+    agrees: `code` with literals intact, which is where a direct call, an alias
+    literal and a forwarded name are spelled, and `quiet` with their contents
+    blanked, which is what a mention looks like. A direct call is one whose own
+    text survived into `quiet` -- a call written inside a string constant did
+    not, since the whole literal was blanked -- and a forwarded name is read out
+    of the literal in `code`, because that is where the name lives.
     """
     sources: list[tuple[Path, str, str]] = []
-    functions: list[tuple[str, str, str, Path]] = []
+    forwarders: list[tuple[str, str, str, Path]] = []
     for path in sorted(root.rglob("*.rs")):
         if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
@@ -3346,14 +3373,22 @@ def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
             if start == -1:
                 continue
             end = _brace_end(quiet, start)
-            functions.append((match.group(1), code[start:end], quiet[start:end], path))
+            forwarders.append(
+                (match.group(1), code[start:end], quiet[start:end], path)
+            )
+        for match in CLOSURE_RE.finditer(quiet):
+            body = _closure_body(code, quiet, match.end())
+            if body is not None:
+                forwarders.append((match.group(1), body[0], body[1], path))
     readers = {
-        name for name, _, calls_body, _ in functions if ENV_READ_RE.search(calls_body)
+        name
+        for name, _, calls_body, _ in forwarders
+        if ENV_READ_RE.search(calls_body)
     }
     changed = True
     while changed:
         changed = False
-        for name, _, calls_body, _ in functions:
+        for name, _, calls_body, _ in forwarders:
             if name in readers:
                 continue
             if any(call in readers for call in CALL_RE.findall(calls_body)):
@@ -3368,9 +3403,26 @@ def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
             if not ENV_READ_RE.match(quiet, match.start()):
                 continue
             _remember_env_read(found, match.group(1), path, root)
-    for _, code_body, calls_body, path in functions:
+        # The aliased read: `env::var(ENV)` where `ENV` is this file's
+        # `const`/`static` string. The call is matched in `quiet`, so an
+        # `env::var(ENV)` written in a comment or a string constant is a
+        # mention; the declaration is matched in `code`, because `quiet` has the
+        # literal blanked -- and the declaration's text up to the opening quote
+        # is required to be identical in both views, which is what tells a real
+        # `const` from one quoted in prose (the quote itself is blanked too).
+        aliases = {
+            match.group(1): match.group(2)
+            for match in CONST_STR_RE.finditer(code)
+            if code[match.start() : match.start(2) - 1]
+            == quiet[match.start() : match.start(2) - 1]
+        }
+        for match in ENV_IDENT_RE.finditer(quiet):
+            literal = aliases.get(match.group(1))
+            if literal is not None:
+                _remember_env_read(found, literal, path, root)
+    for _, code_body, calls_body, path in forwarders:
         # The forwarded read: the literal sits in the arguments of a call to a
-        # crate-local function that reads the env. The call is found in the
+        # crate-local forwarder that reads the env. The call is found in the
         # blanked view and its arguments taken from the other, since both are
         # the same length and the name is inside the literal.
         for match in CALL_RE.finditer(calls_body):
@@ -3380,6 +3432,28 @@ def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
             for literal in STRING_LITERAL_RE.findall(arguments):
                 _remember_env_read(found, literal, path, root)
     return found
+
+
+def _closure_body(
+    code: str, quiet: str, header_end: int
+) -> tuple[str, str] | None:
+    """Both views of the body whose closure header ends at ``header_end``.
+
+    A header is `|params|` optionally followed by `-> Type`, and the body is
+    either a braced block or a single expression ended by its statement's `;`.
+    The body is located in the blanked view, so a `{` or a `;` inside a string
+    constant or a comment cannot be mistaken for the body's start or end, and
+    both views are returned because the caller needs the call sites (`quiet`, so
+    a call written in a mention is not one) and the literals (`code`).
+    """
+    brace = quiet.find("{", header_end)
+    semi = quiet.find(";", header_end)
+    if brace != -1 and (semi == -1 or brace < semi):
+        end = _brace_end(quiet, brace)
+        return code[brace:end], quiet[brace:end]
+    if semi == -1:
+        return None
+    return code[header_end:semi], quiet[header_end:semi]
 
 
 def _remember_env_read(
