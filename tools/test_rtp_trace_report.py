@@ -253,6 +253,49 @@ class TraceReportTest(unittest.TestCase):
             5.1,
         )
 
+    def test_a_clipped_y_axis_draws_the_excess_at_the_frame_top(self):
+        """A sample above `y_clip` is drawn at a fixed pixel, not its own, and
+        the clip is marked so the panel can say what it did."""
+        series = [("arm", [(0.0, 20.0), (1.0, 30.0), (2.0, 1400.0)])]
+        markup = REPORT.svg_line_chart(
+            "clipped",
+            "t (s)",
+            "latency (ms)",
+            series,
+            (-5.0, 262.5),
+            [(250.0, "ceiling")],
+            markers=True,
+            y_clip=250.0,
+        )
+        self.assertIn('class="y-clip"', markup)
+        cys = [
+            float(value)
+            for value in re.findall(r'<circle class="sample"[^>]*cy="([-0-9.]+)"', markup)
+        ]
+        self.assertEqual(len(cys), 3, cys)
+        # y grows downward, so the third sample is the outlier drawn at the
+        # frame's top (`Y_CLIP_INSET_PX`), above every sample on its own value
+        self.assertLess(cys[2], cys[0])
+        self.assertLess(cys[2], 40.0)
+        self.assertAlmostEqual(cys[2], REPORT.PAD_TOP + REPORT.Y_CLIP_INSET_PX)
+        # on the same axis without a clip the same point is drawn off the top of
+        # the frame entirely, which is what a clipped axis exists to avoid
+        plain = REPORT.svg_line_chart(
+            "plain",
+            "t (s)",
+            "latency (ms)",
+            series,
+            (-5.0, 262.5),
+            [(250.0, "ceiling")],
+            markers=True,
+        )
+        self.assertNotIn('class="y-clip"', plain)
+        plain_cys = [
+            float(value)
+            for value in re.findall(r'<circle class="sample"[^>]*cy="([-0-9.]+)"', plain)
+        ]
+        self.assertLess(plain_cys[2], REPORT.PAD_TOP)
+
     @staticmethod
     def write_csv(path, *rows):
         if len(rows) == 1 and rows[0] and isinstance(rows[0][0], (list, tuple)):

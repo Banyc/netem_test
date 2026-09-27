@@ -329,6 +329,17 @@ is on the panel rather than inferred from the line's shape.
 ARM_READING_LINE_HEIGHT_PX = 13.0
 """The line height of the per-arm reading band a line panel reserves."""
 
+Y_CLIP_INSET_PX = 2.0
+"""How far below the frame's top edge a clipped sample is drawn.
+
+A panel whose axis is clipped (`svg_line_chart`'s `y_clip`) draws every sample
+above the clip at a fixed pixel instead of at its own value, so one outlier
+cannot set the axis and compress every body. The inset keeps those samples off
+the frame's own border -- a value flush with the border is a value at the axis'
+top, which is not what it is -- while leaving them clearly above the line the
+clip value itself draws.
+"""
+
 ARM_READING_TOP_PX = 10.0
 """The drop from the legend to the first baseline of the reading band."""
 
@@ -547,6 +558,7 @@ def svg_line_chart(
     note="",
     x_bounds=None,
     x_scale="linear",
+    y_clip=None,
 ):
     """A line or CDF chart, with optional labelled bound lines on either axis.
 
@@ -572,6 +584,15 @@ def svg_line_chart(
     the tick labels then carry four significant figures rather than one decimal,
     because `0.0` for the bottom of a log axis is a value the axis does not
     contain.
+
+    ``y_clip`` is the answer to the same problem on the y axis, where a log
+    scale is not available (a latency series reaches zero): a value above the
+    clip is drawn at `Y_CLIP_INSET_PX` below the frame's top rather than at its
+    own pixel, so a single outlier cannot set the axis and compress every body.
+    The axis itself is still linear and the clip is statement-visible: a
+    `class="y-clip"` line marks the top, and the caller owes the reader the
+    clip value and how many samples it took (`mandate_plot.line_axis_clip` and
+    the panel's own note).
     """
     series = [(name, decimate(points)) for name, points in series if points]
     if not series:
@@ -607,12 +628,20 @@ def svg_line_chart(
         return PAD_LEFT + (value - x_min) / (x_max - x_min) * plot_width
 
     def sy(value):
+        if y_clip is not None and value > y_clip:
+            return plot_top + Y_CLIP_INSET_PX
         return plot_top + (y_max - value) / (y_max - y_min) * plot_height
 
     parts = [
         f"<section><h2>{html.escape(title)}</h2><svg viewBox=\"0 0 {WIDTH} {HEIGHT}\" role=\"img\">",
         f"<rect x=\"{PAD_LEFT}\" y=\"{plot_top}\" width=\"{plot_width}\" height=\"{plot_height}\" class=\"plot-bg\"/>",
     ]
+    if y_clip is not None:
+        parts.append(
+            f'<line class="y-clip" x1="{PAD_LEFT}" y1="{plot_top:.1f}" '
+            f'x2="{WIDTH - PAD_RIGHT}" y2="{plot_top:.1f}" '
+            f'stroke="{BOUND_STROKE}" stroke-width="1.4"/>'
+        )
     for tick in range(6):
         fraction = tick / 5
         if logarithmic:
@@ -644,10 +673,11 @@ def svg_line_chart(
                     f"<circle class=\"sample\" cx=\"{sx(x):.1f}\" cy=\"{sy(y):.1f}\" "
                     f"r=\"{SAMPLE_MARKER_RADIUS_PX}\" fill=\"{color}\"/>"
                 )
+    bound_label_boxes = []
     for y_value, label in bounds or []:
         y = sy(y_value)
         parts.append(f"<line class=\"bound\" x1=\"{PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{WIDTH - PAD_RIGHT}\" y2=\"{y:.1f}\" stroke=\"{BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
-        markup, _ = bound_label_markup(
+        markup, layout = bound_label_markup(
             label,
             WIDTH - PAD_RIGHT,
             y,
@@ -655,6 +685,7 @@ def svg_line_chart(
             BOUND_LABEL_STYLE,
         )
         parts.append(markup)
+        bound_label_boxes.extend(layout["boxes"])
     for x_value, label in x_bounds or []:
         x = sx(x_value)
         plot = (PAD_LEFT, plot_top, WIDTH - PAD_RIGHT, HEIGHT - PAD_BOTTOM)
@@ -685,10 +716,23 @@ def svg_line_chart(
                 )
                 row += 1
         parts.append("</g>")
+    # A note is prose about the frame, drawn *inside* it, so it goes into room
+    # no bound label drew in -- the same rule the bar chart's `note_baselines`
+    # applies. A label near the top of the plot (a ceiling the axis is drawn to)
+    # otherwise sits exactly where a note lands, and neither is readable.
+    note_top = plot_top + 13
+    if note_rows and bound_label_boxes:
+        # `note_top` is a *baseline*, so the clearance is the label's own descent
+        # plus this text's ascent: a baseline set merely below the box's bottom
+        # draws the note's glyphs back up into it.
+        note_top = max(
+            note_top,
+            max(box[3] for box in bound_label_boxes) + LABEL_ASCENT_PX + 2.0,
+        )
     for index, line in enumerate(note_rows):
         parts.append(
             f'<text class="panel-note" x="{PAD_LEFT + LABEL_INSET_PX:.1f}" '
-            f'y="{plot_top + 13 + index * ARM_READING_LINE_HEIGHT_PX:.1f}" '
+            f'y="{note_top + index * ARM_READING_LINE_HEIGHT_PX:.1f}" '
             f'style="{NOTE_LABEL_STYLE}">{html.escape(line)}</text>'
         )
     parts.append(f"<text x=\"{WIDTH / 2}\" y=\"{HEIGHT - 5}\" text-anchor=\"middle\">{html.escape(x_label)}</text>")
@@ -750,7 +794,15 @@ def cdf_points(samples):
 
 
 def svg_cdf_chart(
-    title, x_label, y_label, series, bounds=None, note="", x_bounds=None, x_scale="linear"
+    title,
+    x_label,
+    y_label,
+    series,
+    bounds=None,
+    note="",
+    x_bounds=None,
+    x_scale="linear",
+    y_clip=None,
 ):
     """One or more empirical CDFs on a fixed 0-100% percentile axis.
 
@@ -771,6 +823,7 @@ def svg_cdf_chart(
         note=note,
         x_bounds=x_bounds,
         x_scale=x_scale,
+        y_clip=y_clip,
     )
 
 

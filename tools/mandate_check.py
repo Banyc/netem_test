@@ -189,8 +189,10 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
 - ``plots/<mandate>-<panel>.svg`` (and ``.png`` unless ``--no-rasterize``) —
   the verified panels;
 - ``plots/<mandate>-<panel>.summary.txt`` — beside every verified panel, one
-  compact block saying what it drew: both axis extents and units, its series and their
-  drawn ranges, every bound line with its label, value, pixel position, band
+  compact block saying what it drew: both axis extents and units, the clip a
+  line panel's y axis applies (its value, the samples it took and their
+  maximum), its series and their drawn ranges, every bound line with its label,
+  value, pixel position, band
   and why it is drawn, its reading in the quantity's own units, and, for a
   deliberate-fault run, that it is a fault render. The block is also printed by
   this command (prefixed ``summary|``) and carried in the report, so the run's
@@ -201,8 +203,9 @@ Into ``--dir`` (default: a fresh directory beneath ``$TMPDIR``):
   values parsed from the ``MANDATE`` lines, the per-test and per-mandate
   wall-clock timings observed on the child's output stream, the plot paths
   the panel series counts and ``panel_summaries`` (one object per panel: the
-  panel id, chart, both drawn axis extents, axis labels, series with their ranges, every
-  bound with its pixel position and reason, the reading, the fault selector
+  panel id, chart, both drawn axis extents, its y-axis clip, axis labels, series
+  with their ranges, every bound with its pixel position and reason, the reading,
+  the fault selector
   when the run took one, and the printed ``block``), plus the run's exact
   command, the ``rtp_mux``
   source revision (its ``jj`` or ``git`` commit and change ids, and the tree

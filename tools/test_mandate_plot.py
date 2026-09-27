@@ -248,6 +248,52 @@ SERIES_GUARD_ROWS = (
 
 SERIES_GUARD_VALUES = {"ceiling": 250.0, "hostile_p99_guard": 900.0, "flows": 4}
 
+# A line panel one lone-tail outlier would otherwise set the axis on: three
+# bodies whose own ranges are tens of milliseconds against a 250 ms ceiling, and
+# a single 1400 ms sample. The bodies are what the reader compares, so the axis
+# is clipped at the value the panel is read against.
+CLIP_DECLARATION = {
+    "mandate": "M1",
+    "title": "M1 interactive tail latency (clean vs hostile vs lone tail)",
+    "x_label": "elapsed time (s)",
+    "y_label": "latency (ms)",
+    "panels": [
+        {
+            "id": "latency",
+            "chart": "line",
+            "series": [
+                {"name": "clean"},
+                {"name": "hostile"},
+                {"name": "lone_tail"},
+            ],
+            "bounds": [
+                {
+                    "y": 250.0,
+                    "label": "M1 ceiling 250 ms",
+                    "series": "lone_tail",
+                }
+            ],
+        }
+    ],
+}
+
+CLIP_ROWS = (
+    [["panel", "series", "x", "y"]]
+    + [["latency", "clean", float(i), 20.0 + (i % 20)] for i in range(200)]
+    + [["latency", "hostile", float(i), 40.0 + 2 * (i % 20)] for i in range(200)]
+    + [["latency", "lone_tail", float(i), 10.0 + (i % 20)] for i in range(200)]
+    + [["latency", "lone_tail", 199.0, 1400.0]]
+)
+
+CLIP_SERIES = [
+    ("clean", [(float(i), 20.0 + (i % 20)) for i in range(200)]),
+    ("hostile", [(float(i), 40.0 + 2 * (i % 20)) for i in range(200)]),
+    (
+        "lone_tail",
+        [(float(i), 10.0 + (i % 20)) for i in range(200)] + [(199.0, 1400.0)],
+    ),
+]
+
 DROP_IMBALANCE_SERIES = [
     ("clean", [(float(x), -1.0) for x in (1, 2, 3, 4)]),
     (
@@ -2741,6 +2787,124 @@ class MandatePlotTest(unittest.TestCase):
         labels = [declared for declared, _, _ in MANDATE.label_boxes(svg)]
         self.assertTrue(
             any("governs series hostile_p99" in label for label in labels), labels
+        )
+
+    # -- a line panel's axis is not set by one outlier -----------------------
+
+    def test_one_outlier_no_longer_sets_the_latency_axis(self):
+        # green: the 1400 ms sample is clipped at the 250 ms the panel is read
+        # against, and the axis is the anchor's -- so the bodies it compresses
+        # are resolvable and the outlier is still drawn, at the frame's top.
+        code, stderr, out = self.render_mandate(
+            CLIP_DECLARATION, CLIP_ROWS, "M1clip"
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        parsed = MANDATE.read_panel_summary(svg)
+        self.assertEqual(
+            parsed["y_clip"], {"value": 250.0, "clipped": 1, "max": 1400.0}
+        )
+        self.assertIn('class="y-clip"', svg)
+        self.assertIn(
+            "y axis clipped at 250: 1 of 601 value(s) up to 1400 drawn at the "
+            "top edge",
+            svg,
+        )
+        self.assertLess(parsed["axis"][1], 1400.0)
+        # the body the outlier used to compress is now drawn at a real scale:
+        # the clean arm's own range is at least twice the height it had on the
+        # axis the lone-tail peak set.
+        bounds = [{"y": 250.0, "label": "M1 ceiling 250 ms"}]
+        plot_height = MANDATE.REPORT.line_plot_height(3, 0)
+        unclipped = MANDATE.REPORT.extent_including_bounds(
+            MANDATE.REPORT.finite_extent(CLIP_SERIES), [(250.0, "")]
+        )
+        clipped = MANDATE.line_axis_extent(
+            CLIP_SERIES, bounds, None, plot_height
+        )
+        clean = [value for _, value in CLIP_SERIES[0][1]]
+        spread = max(clean) - min(clean)
+        before = spread / (unclipped[1] - unclipped[0]) * plot_height
+        after = spread / (clipped[1] - clipped[0]) * plot_height
+        self.assertGreater(after, 2 * before, (before, after))
+
+    def test_an_axis_that_still_reaches_the_outlier_is_refused(self):
+        # red, at the check: the same panel measured against the axis the old
+        # policy drew -- the data's own extent, outlier and all.
+        code, stderr, out = self.render_mandate(
+            CLIP_DECLARATION, CLIP_ROWS, "M1clip2"
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        bounds = [{"y": 250.0, "label": "M1 ceiling 250 ms"}]
+        unclipped = MANDATE.REPORT.extent_including_bounds(
+            MANDATE.REPORT.finite_extent(CLIP_SERIES), [(250.0, "")]
+        )
+        problems = MANDATE.check_line_axis_clip_stated(
+            "latency",
+            "line",
+            CLIP_SERIES,
+            bounds,
+            unclipped,
+            svg,
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("one outlier set the axis", problems[0])
+        self.assertIn("1400", problems[0])
+
+    def test_a_clip_the_panel_does_not_state_is_refused(self):
+        # red: the clipped axis drawn without the sentence that says so.
+        code, stderr, out = self.render_mandate(
+            CLIP_DECLARATION, CLIP_ROWS, "M1clip3"
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        bounds = [{"y": 250.0, "label": "M1 ceiling 250 ms"}]
+        clipped = MANDATE.line_axis_extent(
+            CLIP_SERIES, bounds, None, MANDATE.REPORT.line_plot_height(3, 0)
+        )
+        self.assertEqual(
+            MANDATE.check_line_axis_clip_stated(
+                "latency", "line", CLIP_SERIES, bounds, clipped, svg
+            ),
+            [],
+        )
+        silent = MANDATE.PANEL_NOTE_RE.sub("", svg)
+        self.assertNotEqual(silent, svg)
+        problems = MANDATE.check_line_axis_clip_stated(
+            "latency", "line", CLIP_SERIES, bounds, clipped, silent
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("does not state it", problems[0])
+
+    def test_a_tail_inside_the_axis_owes_no_clip(self):
+        # The predicate's edge: a peak a multiple of the read-at value but a
+        # *minority* of the samples is an outlier and clips; a peak the axis can
+        # hold is the data's own extent and clips nothing.
+        inside = [("arm", [(float(i), 200.0) for i in range(20)])]
+        self.assertEqual(
+            MANDATE.line_clip_owed(inside, [{"y": 250.0, "label": "ceil"}]),
+            None,
+        )
+        # a peak the axis must hold because it is not a minority
+        majority = [
+            (
+                "arm",
+                [(float(i), 400.0 + i) for i in range(100)]
+                + [(float(i), 100.0) for i in range(100)],
+            )
+        ]
+        self.assertEqual(
+            MANDATE.line_clip_owed(
+                majority, [{"y": 250.0, "label": "ceil"}]
+            ),
+            None,
+        )
+        self.assertEqual(
+            MANDATE.line_clip_owed(
+                CLIP_SERIES, [{"y": 250.0, "label": "ceil"}]
+            ),
+            250.0,
         )
 
     def test_a_panel_labelled_with_a_sibling_s_unit_is_refused(self):

@@ -69,6 +69,19 @@ silenced by softening a declaration:
   bound, no visible departure) keeps the refusal. Both halves are refused by
   name: a sliver-bound panel that states nothing, and a stated one whose
   numbers are not the drawn points' and the drawn axis' own.
+- **the axis-clip test** — `check_line_axis_clip_stated` is the same panel test on
+  the other axis: a line panel's y axis is the data's own extent, so one outlier
+  sets it and compresses every body. Measured on a recorded `M1-latency`, the
+  axis `-28.7..603.3` drew the clean body's own 20.1-46.7 ms range as `5.8 px` of
+  the plot -- a change in the clean tail was sub-pixel. `line_clip_owed` names
+  the value the panel is read against (its highest bound) once the run's peak
+  stands `Y_CLIP_FACTOR` beyond it while the values past it stay under
+  `Y_CLIP_SHARE` of the samples; `line_axis_extent` draws the axis to that value
+  and `rtp_trace_report.svg_line_chart` draws the samples above it at the
+  frame's top edge. Two halves are refused: an axis that still reaches the peak
+  (the outlier set it), and a clipped panel whose face does not state the clip
+  value, how many samples it took and how far they reached. A declaration that
+  pinned its own `y_extent`, and a panel with no outlier, owe neither.
 - **the panel-summary test** — `check_panel_summary_stated` requires every panel
   to carry a summary of what it drew, and measures it back out of the artifact.
   `AGENTS.md`'s report rule is that the tool's own message is the oracle, and a
@@ -2411,13 +2424,200 @@ def bar_axis_extent(series, bounds, run_values=None, plot_height=None):
     )
 
 
-def line_axis_extent(series, bounds, pinned=None):
-    """The y extent of a line or CDF panel, as the report's own chart lays it out."""
+# -- a line panel's axis must not be set by one outlier -------------------
+#
+# `AGENTS.md`'s first panel test is "would a regression be visible at this
+# scale?", and on a line panel the scale is the data's own extent -- so a single
+# lone-tail maximum sets it and compresses every body. Measured on the recorded
+# `M1-latency`, the axis `-28.7..603.3` drew the clean body's own 20.1-46.7 ms
+# range as 5.8 px of a 137 px plot, so a change in the clean tail was sub-pixel:
+# the delivery panels' defect, on the other axis. The remedy is a *clipped* axis:
+# the axis is drawn to the value the panel is read against, and the values above
+# it are drawn at the frame's top edge with the clip value and how many samples
+# it took stated on the panel's face and in its summary.
+Y_CLIP_FACTOR = 1.5
+"""How far beyond the read-at value a drawn value is an outlier.
+
+A latency panel's impaired arm routinely reaches past a clean ceiling, so the
+clip must not fire on a tail the axis is meant to hold. Above this multiple of
+the panel's highest bound, and only while the values past that bound stay a
+minority, the axis is the anchor's and the excess is a clipped excursion.
+"""
+
+Y_CLIP_SHARE = 0.01
+"""The share of a panel's values past its read-at value the clip may hide.
+
+A clip is only honest while it takes outliers: with more than a hundredth of
+the samples above the bound, the bound is not the panel's scale in the first
+place and the axis has to carry them.
+"""
+
+Y_CLIP_LINE_RE = re.compile(r'class="y-clip"')
+"""The mark a clipped axis draws at the frame's top, so the clip is visible."""
+
+
+def line_clip_owed(series, bounds):
+    """The value a line panel's axis must be clipped at, or ``None``.
+
+    The predicate on its own -- the policy `line_axis_clip` adds the
+    declaration's pinned extent to it, and the check that measures the *drawn*
+    axis against it calls this directly. Kept separate from the drawing for
+    exactly that reason: a renderer that stopped clipping must be refused by a
+    check that did not stop expecting it.
+
+    Three conditions, all measured from the panel's own points and bounds: the
+    highest drawn value lies at least `Y_CLIP_FACTOR` beyond the panel's own
+    read-at value (its highest bound), the values past that bound are no more
+    than `Y_CLIP_SHARE` of the samples, and there is at least one of them.
+    """
+    if not bounds:
+        return None
+    values = _bound_values(series)
+    if not values:
+        return None
+    anchor = max(float(bound["y"]) for bound in bounds)
+    if not anchor > 0.0:
+        return None
+    if max(values) < Y_CLIP_FACTOR * anchor:
+        return None
+    above = [value for value in values if value > anchor]
+    if not above or len(above) > Y_CLIP_SHARE * len(values):
+        return None
+    return anchor
+
+
+def line_axis_clip(series, bounds, pinned=None):
+    """The value a line panel's drawn axis clips at, or ``None``.
+
+    A declaration that pinned its own `y_extent` keeps it: the producer's
+    explicit scale is not the policy's to override, and the panel states the
+    extent it draws either way.
+    """
+    if pinned is not None:
+        return None
+    return line_clip_owed(series, bounds)
+
+
+def y_clip_document_for(series, clip):
+    """The clip a line axis with this clip value carries, as the summary states it.
+
+    ``None`` when the axis draws no sample above the clip: the statement is owed
+    only where a value is actually drawn at the frame's edge, so a predicate
+    that fired on data the axis still resolves states nothing.
+    """
+    if clip is None:
+        return None
+    values = _bound_values(series)
+    above = [value for value in values if value > clip]
+    if not above:
+        return None
+    return {
+        "value": float(clip),
+        "clipped": len(above),
+        "max": float(max(above)),
+    }
+
+
+def y_clip_document(series, bounds, extent):
+    """The clip the *drawn* line axis applies, or ``None``.
+
+    Read from the drawn geometry rather than from the policy: an axis whose top
+    is still at or above the highest value draws every sample at its own pixel,
+    so the predicate's clip is not the panel's.
+    """
+    values = _bound_values(series)
+    if not values or extent[1] >= max(values):
+        return None
+    clip = line_clip_owed(series, bounds)
+    return y_clip_document_for(series, clip)
+
+
+def y_clip_statement(series, clip):
+    """The sentence a clipped axis owes its reader, or ``""``.
+
+    A sample drawn at a fixed pixel is a value the reader cannot measure off the
+    panel, so the panel says what the clip is, how many samples it took and how
+    far they reached. It is prose on the panel's own face (`drawn_notes`), which
+    is where `check_line_axis_clip_stated` reads it back from.
+    """
+    document = y_clip_document_for(series, clip)
+    if document is None:
+        return ""
+    return (
+        f"y axis clipped at {sliver_number(document['value'])}: "
+        f"{document['clipped']} of {len(_bound_values(series))} value(s) up to "
+        f"{sliver_number(document['max'])} drawn at the top edge"
+    )
+
+
+def check_line_axis_clip_stated(
+    panel_id, chart, series, bounds, extent, markup, pinned=None
+):
+    """Problems that let one outlier set a line panel's axis, or hide the clip.
+
+    Two halves, one property each. **The axis must not be set by the outlier**:
+    when `line_clip_owed` says the panel is read against a value the run's peak
+    stands far above, the drawn top has to be the clipped one -- an axis that
+    still reaches the peak is the defect this policy exists to close, and it is
+    refused with the two numbers that show it. **The panel must say so**: the
+    clip is drawn as a `class="y-clip"` mark and stated on the face, because a
+    sample at a fixed pixel is a value the reader cannot measure. A declaration
+    that pinned its own extent, and a panel with no outlier, owe neither.
+    """
+    if chart != "line":
+        return []
+    owed = line_clip_owed(series, bounds)
+    if owed is None or pinned is not None:
+        return []
+    values = _bound_values(series)
+    peak = max(values)
+    if extent[1] >= peak:
+        above = [value for value in values if value > owed]
+        return [
+            f"panel {panel_id!r}: its axis tops out at {extent[1]:.4g}, which "
+            f"reaches the {peak:g} the run drew, while {len(above)} of "
+            f"{len(values)} value(s) lie above the {owed:g} the panel is read "
+            "against: one outlier set the axis, so every body is drawn to its "
+            "scale and a change in either is sub-pixel. Draw the axis to the "
+            "read-at value and state where it clips"
+        ]
+    problems = []
+    if not Y_CLIP_LINE_RE.search(markup):
+        problems.append(
+            f"panel {panel_id!r}: its axis is clipped at {owed:g} and draws no "
+            'class="y-clip" mark at the frame top, so the clipped samples are '
+            "drawn at a pixel the panel does not explain"
+        )
+    statement = y_clip_statement(series, owed)
+    if statement and statement not in " ".join(drawn_notes(markup)):
+        problems.append(
+            f"panel {panel_id!r}: its axis is clipped at {owed:g} and the panel "
+            "does not state it, so a sample drawn at the frame's top edge reads "
+            "as a value at the axis' own top rather than as an excursion past "
+            f"it. Missing from the panel's face: {statement!r}"
+        )
+    return problems
+
+
+def line_axis_extent(series, bounds, pinned=None, plot_height=None):
+    """The y extent of a line or CDF panel, as the report's own chart lays it out.
+
+    The data's own extent, unless `line_clip_owed` names a clip: then the axis
+    is drawn to the value the panel is read against (plus the frame's headroom
+    and the pixel floor `axis_with_headroom` spends), and the values above it
+    are drawn at the frame's top edge by `svg_line_chart`'s `y_clip`.
+    """
     if pinned is not None:
         return pinned
-    return REPORT.extent_including_bounds(
+    extent = REPORT.extent_including_bounds(
         REPORT.finite_extent(series), [(bound["y"], "") for bound in bounds]
     )
+    clip = line_axis_clip(series, bounds)
+    if clip is None or not clip > extent[0]:
+        return extent
+    if plot_height is None:
+        plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    return axis_with_headroom(extent[0], clip, clip, plot_height)
 
 
 def panel_axis_extent(panel, series, bounds, run_values, plot_height):
@@ -2436,7 +2636,7 @@ def panel_axis_extent(panel, series, bounds, run_values, plot_height):
         if pinned is not None:
             return pinned
         return bar_axis_extent(series, bounds, run_values, plot_height)
-    return line_axis_extent(series, bounds, pinned)
+    return line_axis_extent(series, bounds, pinned, plot_height)
 
 
 def panel_x_axis_extent(chart, series):
@@ -2922,7 +3122,11 @@ def panel_reading(chart, series, bounds, extent, plot_height):
             continue
         y = float(bound["y"])
         furthest = max(crossed, key=lambda value: abs(value - y))
-        pixels = abs(furthest - y) / span * plot_height
+        # The pixel distance is the *drawn* one: on a clipped axis a departure
+        # past the clip is drawn at the frame's top edge, so measuring it at its
+        # own value would state a pixel the panel does not draw.
+        drawn = min(max(furthest, extent[0]), extent[1])
+        pixels = abs(drawn - y) / span * plot_height
         if pixels < MIN_BOUND_PIXELS:
             continue
         # `beyond`/`under` are the words `governed_label` already uses for a
@@ -3001,6 +3205,7 @@ def panel_summary_document(
         "chart": chart,
         "axis": [float(extent[0]), float(extent[1])],
         "x_axis": [float(x_low), float(x_high)],
+        "y_clip": y_clip_document(series, bounds, extent),
         "x_label": x_label,
         "y_label": y_label,
         "series": [
@@ -3032,6 +3237,13 @@ def panel_summary_block(document):
         )
         + f"x={document['x_label']}  y={document['y_label']}"
     ]
+    clip = document.get("y_clip")
+    if clip:
+        lines.append(
+            "  y_clip: clipped at "
+            f"{sliver_number(clip['value'])} — {clip['clipped']} drawn value(s) "
+            f"up to {sliver_number(clip['max'])} are drawn at the frame's top edge"
+        )
     if document["series"]:
         lines.append(
             "  series: "
@@ -5090,6 +5302,10 @@ def panel_markup(
     # drawn lines -- measures the bounds the panel actually draws.
     drawn_bounds = drawable_bounds(panel, series, bounds, run_values)
     pinned = _require_extent(panel.get("y_extent"), f"panels.{panel['id']}.y_extent")
+    # A line panel whose axis is clipped owes the reader the clip value and what
+    # it took, and that sentence is a note row, so it is reserved below before
+    # the plot height is computed.
+    y_clip = line_axis_clip(series, drawn_bounds, pinned) if chart == "line" else None
     # A line panel reserves a band above the plot for its per-arm readings, so
     # the plot it draws -- and therefore the axis every check below measures --
     # is the one that band leaves.
@@ -5110,6 +5326,9 @@ def panel_markup(
         scale_note = cdf_scale_note(series, reference_arms, x_scale)
         if scale_note:
             note = f"{note}; {scale_note}" if note else scale_note
+    if y_clip is not None:
+        clip_note = y_clip_statement(series, y_clip)
+        note = f"{note}; {clip_note}" if note else clip_note
     note_rows = len(REPORT.wrap_label(note, REPORT.READING_PLOT_WIDTH)) if note else 0
     plot_height = (
         REPORT.line_plot_height(len(series), reading_rows + note_rows)
@@ -5226,6 +5445,7 @@ def panel_markup(
             readings=readings,
             note=note,
             x_bounds=drawn_x_bounds,
+            y_clip=y_clip,
         )
     else:
         labelled = [
@@ -5241,6 +5461,7 @@ def panel_markup(
             note=note,
             x_bounds=drawn_x_bounds,
             x_scale=x_scale,
+            y_clip=y_clip,
         )
     # The panel's own statement of what it drew, injected into the SVG and then
     # measured back out of it: a panel produced without a true summary is refused
@@ -5325,6 +5546,9 @@ def panel_markup(
             )
             + check_crossing_series_governed(
                 panel["id"], chart, series, drawn_bounds, run_values, markup
+            )
+            + check_line_axis_clip_stated(
+                panel["id"], chart, series, drawn_bounds, axis, markup, pinned
             )
             + check_x_bound_drawn(
                 panel["id"],
