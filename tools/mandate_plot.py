@@ -2624,6 +2624,208 @@ def value_at(points, x):
     return points[-1][1]
 
 
+# -- a cdf panel's x axis, and the region it has to keep legible ----------
+#
+# A latency CDF reaches into whatever tail its worst arm has. `M1-cdf`, drawn
+# from a real run, put the `lone_tail` maximum at 1017.77 ms on a linear axis,
+# so the whole `clean` curve -- the arm M1 is a standing priority for -- ended at
+# 112.55 ms, 11.1 % of the 864 px plot, with its p99 at 9.2 %. The panel was not
+# lying; it was answering a question about the tail with a picture in which the
+# reference arm was a sliver. So the axis is put on base-10 logarithms whenever
+# a linear one would leave that arm below `MIN_REFERENCE_REACH_SHARE`, and the
+# check below measures the *drawn* axis -- read back out of the panel's own tick
+# labels -- so a renderer that quietly went back to a linear axis is refused.
+
+MIN_REFERENCE_REACH_SHARE = 0.5
+"""The least share of a cdf panel's x axis its reference arm must reach.
+
+The share is measured from the axis' low edge to the reference arm's own
+largest drawn sample. On the recorded `M1-cdf` that is 11.1 % on a linear axis
+and 78.0 % on the log axis the policy picks, against a floor of half the width:
+the number says what "the curve the reader most needs to see is a sliver" means
+in pixels, and it is the same number the policy is driven by.
+"""
+
+X_AXIS_TICK_RE = re.compile(
+    rf'<text x="[-0-9.]+" y="{REPORT.HEIGHT - 24}" text-anchor="middle">([^<]*)</text>'
+)
+"""The x tick labels a report chart draws, in the report's own encoding."""
+
+
+def x_axis_share(x_min, x_max, scale, value):
+    """Where ``value`` sits on an axis, as a share of that axis' span."""
+    if scale == "log":
+        low, high = math.log10(x_min), math.log10(x_max)
+        return (math.log10(value) - low) / (high - low)
+    return (value - x_min) / (x_max - x_min)
+
+
+def _straight_line_residual(values, fractions):
+    """The largest relative departure of ``values`` from a straight line."""
+    low, high = min(values), max(values)
+    span = high - low
+    if span <= 0.0:
+        return float("inf")
+    count = len(values)
+    mean_x = sum(fractions) / count
+    mean_y = sum(values) / count
+    denominator = sum((x - mean_x) ** 2 for x in fractions)
+    if denominator <= 0.0:
+        return float("inf")
+    slope = (
+        sum((x - mean_x) * (y - mean_y) for x, y in zip(fractions, values))
+        / denominator
+    )
+    intercept = mean_y - slope * mean_x
+    return max(
+        abs(y - (intercept + slope * x)) for x, y in zip(fractions, values)
+    ) / span
+
+
+def drawn_x_scale(markup):
+    """``log`` or ``linear``: the scale the panel's own ticks put its axis on.
+
+    Read out of the artifact rather than taken from the renderer's own argument:
+    the ticks are drawn at equal fractions of the plot width, each with a value,
+    so the model that reproduces them is the model the panel drew. A linear axis
+    puts those values on an arithmetic sequence and a logarithmic one puts their
+    logarithms there, and the model with the smaller relative residual wins. An
+    axis whose ticks cannot be read -- too few, or a value no logarithm takes --
+    is taken as linear, which is what every panel that does not ask for a log
+    axis draws.
+    """
+    values = []
+    for text in X_AXIS_TICK_RE.findall(markup):
+        try:
+            values.append(float(text))
+        except ValueError:
+            return "linear"
+    if len(values) < 4 or any(value <= 0.0 for value in values):
+        return "linear"
+    fractions = [index / (len(values) - 1) for index in range(len(values))]
+    logarithmic = _straight_line_residual([math.log10(value) for value in values], fractions)
+    arithmetic = _straight_line_residual(values, fractions)
+    return "log" if logarithmic < arithmetic else "linear"
+
+
+def reference_arm_names(series, run_values):
+    """The panel's arm names the run asserts no guard of its own for.
+
+    `arm_guard_tokens` reads the run's `*_guard` keys against the panel's own
+    legend, so the arms it leaves over are the ones the run makes no separate
+    claim about: `M1-cdf` draws `clean`, `hostile` and `lone_tail`, the run
+    guards the last two, and `clean` is therefore the arm the panel's comparison
+    is read for. A run that guards every arm or none leaves no reference arm,
+    and a panel with none owes this nothing.
+    """
+    guarded = {name for name, _ in arm_guard_tokens(series, run_values)}
+    if not guarded or len(guarded) == len(series):
+        return []
+    return [name for name, _ in series if name not in guarded]
+
+
+def reference_reach(series, reference):
+    """The samples the reference arms contribute, and the axis they sit on."""
+    values = [x for _, points in series for x, _ in points]
+    reach = [x for name, points in series if name in reference for x, _ in points]
+    if not values or not reach:
+        return [], (0.0, 0.0)
+    return reach, (min(values), max(values))
+
+
+def reference_reach_share(series, reference, scale):
+    """``(share, low, high, largest)`` for the reference arms, or ``None``."""
+    reach, (low, high) = reference_reach(series, reference)
+    if not reach or not high > low or (scale == "log" and low <= 0.0):
+        return None
+    largest = max(reach)
+    if scale == "log" and largest <= 0.0:
+        return None
+    return (x_axis_share(low, high, scale, largest), low, high, largest)
+
+
+def cdf_x_scale(series, reference):
+    """The x scale a cdf panel is drawn on, from its own dynamic range.
+
+    Logarithmic when a linear axis would leave the reference arm below
+    `MIN_REFERENCE_REACH_SHARE`; linear otherwise, and linear whatever the
+    spread when the axis cannot carry a logarithm (a sample at or below zero).
+    """
+    reach, (low, high) = reference_reach(series, reference)
+    if not reach or not high > low or low <= 0.0:
+        return "linear"
+    if reference_reach_share(series, reference, "linear")[0] >= MIN_REFERENCE_REACH_SHARE:
+        return "linear"
+    return "log"
+
+
+def cdf_scale_note(series, reference, scale):
+    """The sentence a cdf panel owes when its drawn axis still squeezes.
+
+    The log axis is the fix for the measured defect, and this is the case it
+    cannot fix: a reference arm narrower than half the width *even* on a log
+    axis (`20.1..25 ms` against a tail reaching a second), or an axis carrying a
+    zero that no logarithm takes. `AGENTS.md` allows a panel to say what it
+    cannot show, so it says this, and `check_cdf_reference_reach` accepts the
+    sentence in the place of the scale.
+    """
+    measured = reference_reach_share(series, reference, scale)
+    if measured is None:
+        return ""
+    share, low, high, largest = measured
+    if share >= MIN_REFERENCE_REACH_SHARE:
+        return ""
+    kind = "logarithmic (base 10)" if scale == "log" else "linear"
+    return (
+        f"x axis {kind}: the reference arm {' '.join(reference)} reaches "
+        f"{largest:.4g} on {low:.4g}..{high:.4g}, {share:.0%} of the width, so "
+        "the region that carries the failure is compressed at the left edge"
+    )
+
+
+def reference_reach_stated(markup, reference, share):
+    """Whether the panel's own text states that its reference arm is squeezed."""
+    text = " ".join(drawn_notes(markup))
+    return bool(text) and f"{share:.0%}" in text and any(
+        name in text for name in reference
+    )
+
+
+def check_cdf_reference_reach(panel_id, panel, series, reference, markup):
+    """Problems that squeeze a cdf panel's reference arm to a sliver.
+
+    `AGENTS.md`'s first panel test -- would a regression be visible at this
+    scale? -- for a distribution rather than a trajectory. The panel is read for
+    where its reference arm's body and tail sit, and an axis whose far tail is
+    orders of magnitude away leaves that body in the first tenth of the width:
+    measured on the `M1-cdf` artifact of a real run, the axis was
+    0.045..1017.77 ms linear, the `clean` curve ended at 112.55 ms -- 11.1 % of
+    the 864 px plot, its p99 at 9.2 %. The share is measured against the axis
+    the panel *drew*, read back from its own tick labels (`drawn_x_scale`), so a
+    renderer that quietly went back to a linear axis is refused rather than
+    believed. A panel that cannot reach the share even on a log axis owes the
+    reader a sentence saying so, and the sentence is accepted in its place.
+    """
+    if panel["chart"] != "cdf" or not reference:
+        return []
+    measured = reference_reach_share(series, reference, drawn_x_scale(markup))
+    if measured is None:
+        return []
+    share, low, high, largest = measured
+    if share >= MIN_REFERENCE_REACH_SHARE:
+        return []
+    if reference_reach_stated(markup, reference, share):
+        return []
+    return [
+        f"panel {panel_id!r}: the reference arm(s) {' '.join(reference)} reach "
+        f"{largest:.4g} on an x axis {low:.4g}..{high:.4g}, {share:.1%} of the "
+        f"width -- under the {MIN_REFERENCE_REACH_SHARE:.0%} a distribution "
+        "panel needs to show the shape of the arm it is read for, so the region "
+        "that carries the failure is a sliver; draw the axis on the scale that "
+        "keeps it legible, or state the squeeze on the panel"
+    ]
+
+
 def derived_x_bounds(panel, panels, points, mandate_x_label, mandate_y_label, run_values):
     """The bounds a sibling panel draws on the quantity this panel's x axis carries.
 
@@ -2809,8 +3011,18 @@ def check_x_bound_drawn(
                 "draw is a claim with no mark to read it against"
             )
             continue
-        span = drawn_range[1] - drawn_range[0]
-        want = left + (bound["x"] - drawn_range[0]) / span * (right - left)
+        # The mark's pixel has to be computed on the axis the panel actually
+        # drew, which is read back out of its own ticks: a log axis measured
+        # with a linear formula would report the ceiling as being somewhere
+        # else on the panel.
+        want = left + x_axis_share(
+            drawn_range[0],
+            drawn_range[1],
+            drawn_x_scale(markup)
+            if drawn_range[0] > 0.0 and bound["x"] > 0.0
+            else "linear",
+            bound["x"],
+        ) * (right - left)
         if min(abs(value - want) for value in drawn_xs) <= 1.5:
             continue
         problems.append(
@@ -3836,6 +4048,14 @@ def panel_markup(
     note = composition_note(
         panel, panels or [panel], points, x_label, y_label, run_values
     )
+    # A distribution panel's x axis is drawn on the scale that keeps its
+    # reference arm legible, and owes a sentence when no scale can.
+    reference_arms = reference_arm_names(series, run_values) if chart == "cdf" else []
+    x_scale = cdf_x_scale(series, reference_arms) if reference_arms else "linear"
+    if reference_arms:
+        scale_note = cdf_scale_note(series, reference_arms, x_scale)
+        if scale_note:
+            note = f"{note}; {scale_note}" if note else scale_note
     note_rows = len(REPORT.wrap_label(note, REPORT.READING_PLOT_WIDTH)) if note else 0
     plot_height = (
         REPORT.line_plot_height(len(series), reading_rows + note_rows)
@@ -3947,6 +4167,7 @@ def panel_markup(
             labelled,
             note=note,
             x_bounds=drawn_x_bounds,
+            x_scale=x_scale,
         )
     problems = (
         check_label_fit(panel["id"], markup)
@@ -3958,6 +4179,9 @@ def panel_markup(
         + check_two_sided_bound_drawn(panel["id"], drawn_bounds, axis, markup)
         + check_named_guards_drawn(
             panel["id"], guards, axis, markup, plot_height
+        )
+        + check_cdf_reference_reach(
+            panel["id"], panel, series, reference_arms, markup
         )
         + (
             check_departure_view_stated(

@@ -546,6 +546,7 @@ def svg_line_chart(
     readings=None,
     note="",
     x_bounds=None,
+    x_scale="linear",
 ):
     """A line or CDF chart, with optional labelled bound lines on either axis.
 
@@ -562,6 +563,15 @@ def svg_line_chart(
     against a latency CDF). A bound outside the drawn x range is not drawn as a
     line -- there is no pixel for it -- but its label is, so a mark the reader
     cannot see is still a sentence they can read.
+
+    ``x_scale`` is a distribution panel's answer to its own dynamic range: on a
+    linear axis a latency CDF reaching 1018 ms while its reference arm lives in
+    20-113 ms paints that arm as a sliver in the first ninth of the width, which
+    is the curve the reader most needs to see. `log` puts the axis on base-10
+    logarithms instead (`sx` below is the only place the choice is applied), and
+    the tick labels then carry four significant figures rather than one decimal,
+    because `0.0` for the bottom of a log axis is a value the axis does not
+    contain.
     """
     series = [(name, decimate(points)) for name, points in series if points]
     if not series:
@@ -587,7 +597,13 @@ def svg_line_chart(
     )
     plot_height = HEIGHT - plot_top - PAD_BOTTOM
 
+    logarithmic = x_scale == "log" and x_min > 0.0 and x_max > x_min
+    log_low = math.log10(x_min) if logarithmic else 0.0
+    log_span = math.log10(x_max) - log_low if logarithmic else 0.0
+
     def sx(value):
+        if logarithmic and value > 0.0:
+            return PAD_LEFT + (math.log10(value) - log_low) / log_span * plot_width
         return PAD_LEFT + (value - x_min) / (x_max - x_min) * plot_width
 
     def sy(value):
@@ -599,10 +615,15 @@ def svg_line_chart(
     ]
     for tick in range(6):
         fraction = tick / 5
-        x_value = x_min + (x_max - x_min) * fraction
+        if logarithmic:
+            x_value = 10.0 ** (log_low + log_span * fraction)
+            tick_text = f"{x_value:.4g}"
+        else:
+            x_value = x_min + (x_max - x_min) * fraction
+            tick_text = f"{x_value:.1f}"
         x = sx(x_value)
         parts.append(f"<line x1=\"{x:.1f}\" y1=\"{plot_top}\" x2=\"{x:.1f}\" y2=\"{HEIGHT - PAD_BOTTOM}\" class=\"grid\"/>")
-        parts.append(f"<text x=\"{x:.1f}\" y=\"{HEIGHT - 24}\" text-anchor=\"middle\">{x_value:.1f}</text>")
+        parts.append(f"<text x=\"{x:.1f}\" y=\"{HEIGHT - 24}\" text-anchor=\"middle\">{tick_text}</text>")
         y_value = y_min + (y_max - y_min) * fraction
         y = sy(y_value)
         parts.append(f"<line x1=\"{PAD_LEFT}\" y1=\"{y:.1f}\" x2=\"{WIDTH - PAD_RIGHT}\" y2=\"{y:.1f}\" class=\"grid\"/>")
@@ -728,7 +749,9 @@ def cdf_points(samples):
     ]
 
 
-def svg_cdf_chart(title, x_label, y_label, series, bounds=None, note="", x_bounds=None):
+def svg_cdf_chart(
+    title, x_label, y_label, series, bounds=None, note="", x_bounds=None, x_scale="linear"
+):
     """One or more empirical CDFs on a fixed 0-100% percentile axis.
 
     ``series`` is ``[(name, points)]`` with the percentile already carried in
@@ -747,6 +770,7 @@ def svg_cdf_chart(title, x_label, y_label, series, bounds=None, note="", x_bound
         bounds,
         note=note,
         x_bounds=x_bounds,
+        x_scale=x_scale,
     )
 
 

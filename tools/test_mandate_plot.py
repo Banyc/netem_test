@@ -3045,6 +3045,119 @@ class MandatePlotTest(unittest.TestCase):
         self.assertNotEqual(code, 0, stderr)
         self.assertIn("which the series it is drawn from does not measure", stderr)
 
+    def test_a_cdf_axis_keeps_its_reference_arm_legible(self):
+        # The measured defect: a latency CDF is read for where its *reference*
+        # arm's body and tail sit, and a linear axis out to the worst arm's
+        # tail paints that arm as a sliver at the left edge. On this fixture's
+        # numbers the `clean` curve ends at 107.674 ms on an axis running to
+        # 1567.11 ms: 6.9 % of the width. The axis goes logarithmic, and the
+        # share is measured back off the drawn artifact -- the reference arm's
+        # own largest sample against the axis the panel drew.
+        declaration = M1_ARMS_DECLARATION
+        panel = declaration["panels"][1]
+        series = MANDATE.panel_series(panel, _points(M1_ARMS_ROWS))
+        reference = MANDATE.reference_arm_names(series, M1_RUN_VALUES)
+        self.assertEqual(reference, ["clean"])
+        self.assertEqual(MANDATE.cdf_x_scale(series, reference), "log")
+        linear = MANDATE.reference_reach_share(series, reference, "linear")
+        self.assertAlmostEqual(linear[0], 0.0687, places=4)
+        code, stderr, out = self.render_mandate(
+            declaration,
+            M1_ARMS_ROWS,
+            "M1reach",
+            "--run-values",
+            json.dumps(M1_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        scale = MANDATE.drawn_x_scale(document)
+        self.assertEqual(scale, "log", "the axis the ticks put the panel on")
+        drawn = MANDATE.reference_reach_share(series, reference, scale)
+        self.assertGreaterEqual(drawn[0], MANDATE.MIN_REFERENCE_REACH_SHARE)
+        self.assertEqual(
+            MANDATE.check_cdf_reference_reach("cdf", panel, series, reference, document),
+            [],
+        )
+        # And the ink agrees with the measurement: the `clean` curve's own
+        # left-most and right-most points are both past the axis' halfway mark.
+        plot = MANDATE.panel_plot_rect("cdf", document)
+        clean = MANDATE.re.findall(
+            r'<polyline points="([^"]*)" fill="none" stroke="#2563eb"', document
+        )
+        self.assertEqual(len(clean), 1, clean)
+        xs = [float(point.split(",")[0]) for point in clean[0].split()]
+        span = plot[2] - plot[0]
+        self.assertGreaterEqual((min(xs) - plot[0]) / span, MANDATE.MIN_REFERENCE_REACH_SHARE)
+        self.assertGreaterEqual((max(xs) - plot[0]) / span, MANDATE.MIN_REFERENCE_REACH_SHARE)
+
+    def test_a_squeezed_cdf_reference_arm_is_refused_unless_the_panel_says_so(self):
+        # The vacuity, both halves, on the same panel and the same data: drawn
+        # on a linear axis the panel is refused with the measured share, and the
+        # same squeezed axis *stating* the share is accepted -- the escape
+        # `AGENTS.md` allows a frame that cannot show what it owes. The log
+        # axis is the third reading, and is the one the real panel takes.
+        panel = M1_ARMS_DECLARATION["panels"][1]
+        series = MANDATE.panel_series(panel, _points(M1_ARMS_ROWS))
+        reference = MANDATE.reference_arm_names(series, M1_RUN_VALUES)
+        drawn = [
+            (name, MANDATE.REPORT.decimate(points)) for name, points in series
+        ]
+        for scale, expected in (("linear", 1), ("log", 0)):
+            with self.subTest(scale=scale):
+                markup = MANDATE.REPORT.svg_cdf_chart(
+                    "M1 [cdf]",
+                    "latency (ms)",
+                    "percentile (%)",
+                    drawn,
+                    x_scale=scale,
+                )
+                self.assertEqual(MANDATE.drawn_x_scale(markup), scale)
+                problems = MANDATE.check_cdf_reference_reach(
+                    "cdf", panel, series, reference, markup
+                )
+                self.assertEqual(len(problems), expected, problems)
+                if problems:
+                    self.assertIn("6.9% of the width", problems[0])
+                    self.assertIn("clean", problems[0])
+        # The statement the renderer owes when even the drawn scale squeezes.
+        note = MANDATE.cdf_scale_note(series, reference, "linear")
+        self.assertIn("7% of the width", note)
+        self.assertIn("clean", note)
+        stated = MANDATE.REPORT.svg_cdf_chart(
+            "M1 [cdf]",
+            "latency (ms)",
+            "percentile (%)",
+            drawn,
+            x_scale="linear",
+            note=note,
+        )
+        # The note is drawn wrapped, and the wrap only ever breaks at spaces,
+        # so its lines re-join to the sentence the renderer owes.
+        self.assertEqual(" ".join(MANDATE.drawn_notes(stated)), note)
+        self.assertEqual(
+            MANDATE.check_cdf_reference_reach("cdf", panel, series, reference, stated),
+            [],
+        )
+
+    def test_a_cdf_panel_that_drops_the_scale_and_the_sentence_is_refused(self):
+        # End to end: a renderer that neither puts the axis on the scale that
+        # keeps the reference arm legible nor says that it cannot is refused,
+        # rather than writing a panel whose own subject is a sliver.
+        with mock.patch.object(
+            MANDATE, "cdf_x_scale", lambda *a, **k: "linear"
+        ), mock.patch.object(MANDATE, "cdf_scale_note", lambda *a, **k: ""):
+            code, stderr, _ = self.render_mandate(
+                M1_ARMS_DECLARATION,
+                M1_ARMS_ROWS,
+                "M1flat",
+                "--run-values",
+                json.dumps(M1_RUN_VALUES),
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("panel 'cdf'", stderr)
+        self.assertIn("6.9% of the width", stderr)
+        self.assertIn("sliver", stderr)
+
     def test_a_ceiling_beyond_the_drawn_x_range_is_stated_not_drawn(self):
         # A run whose samples all sit under the ceiling cannot draw the mark:
         # there is no pixel for a value past the axis. It still owes the
