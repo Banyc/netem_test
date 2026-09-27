@@ -2273,12 +2273,12 @@ class MandateCheckTest(unittest.TestCase):
         ]
         self.assertTrue(primary)
         for entry in primary:
-            # Structural, not path arithmetic: the declaration names its own
-            # package, and its checkout is the sibling directory of that name.
-            # Resolving both against the workspace and comparing is what a
-            # sandbox fixture breaks; comparing the *names* is what the property
-            # actually is.
-            self.assertEqual(Path(entry["default_path"]).name, entry["package"])
+            # The property is that a declared checkout *resolves to* the
+            # producer's own package directory. Comparing the raw name fails on
+            # the second producer, which declares `"."` -- itself -- so resolve
+            # against the workspace first.
+            resolved = (MANDATE_CHECK.WORKSPACE_ROOT / entry["default_path"]).resolve()
+            self.assertEqual(resolved.name, entry["package"])
 
     def test_default_out_dir_is_beneath_tmpdir(self):
         with mock.patch.dict(os.environ, {"TMPDIR": str(self.root)}):
