@@ -1100,7 +1100,7 @@ class MandateCheckTest(unittest.TestCase):
         self.assertNotIn("stale", (self.out / "M1.csv").read_text(encoding="utf-8"))
 
     def test_a_run_that_writes_no_report_leaves_no_earlier_runs_report(self):
-        # `tools/mandate-compare` reads `<dir>/mandate-check.json`, so a report
+        # the `mandate-compare` subcommand reads `<dir>/mandate-check.json`, so a report
         # left behind by an earlier run is compared as if it were this run's
         # measurement. A run that cannot write its own report must therefore
         # leave none at all: not the report, not the log that explains what the

@@ -10,8 +10,11 @@ The battery is `mandate_check.main`; everything after it is the history step:
    that;
 2. **compare** it to the previous archived run and write `vs-prev.md` with the
    degradation figure per arm and metric, using the Rust tool
-   (`netem-test/src/bin/perf-history.rs`), which also re-invokes the existing A/B
-   tool for the coverage and claim axes;
+   (`netem-test/src/bin/perf-history.rs`), which runs the coverage/claim
+   comparison in-process (the `mandate-compare` subcommand's own module, so
+   nothing shells out to Python) and also writes the run's `summary.md`; the
+   runner prints both text artifacts to stdout and refuses to pass a run whose
+   panels are missing (an evidence failure, exit 7);
 3. **fail the invocation on an M1 degradation.** M1 is the interactive tail and
    the standing priority: a run whose interactive tail is worse than the previous
    run's is a rejection, and the wrapper's exit status carries that so no caller

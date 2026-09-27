@@ -331,7 +331,7 @@ The eight expected evidence files, the `plots` directory, this command's own
 `--dir` before any producer runs — and before a checkout is validated — so
 evidence found afterwards was produced by this run and not left behind by an
 earlier one. Removing the earlier report is as load-bearing as removing the
-evidence: `tools/mandate-compare` reads `<dir>/mandate-check.json`, so a report
+evidence: the `mandate-compare` subcommand reads `<dir>/mandate-check.json`, so a report
 that survived a run which wrote none would be compared as if it were that
 run's measurement. Only a directory that is empty or that carries an earlier
 run's `mandate-check.json` or `mandate-smoke.log` is cleared; a directory
@@ -386,15 +386,15 @@ report measured, and it says how many rows it compared.
 
 ## Comparing a run with the committed baseline
 
-`arms` is what makes a shortening checkable, and `tools/mandate-compare` is
-what checks it: it diffs a fresh report against the committed
+`arms` is what makes a shortening checkable, and the `mandate-compare`
+subcommand is what checks it: it diffs a fresh report against the committed
 `tools/mandate-baseline.json` and reports, per arm, exactly which quantities
 moved. Every arm of every producer the report covers is compared, and the
 verdict block names both runs' producers, so a variant that dropped a whole
 producer's arms is not a green diff but a coverage regression.
 
 ```sh
-./tools/mandate-compare <run>/mandate-check.json
+cargo run -p netem-test --bin netem-tools -- mandate-compare <run>/mandate-check.json
 ```
 
 A **coverage regression** (exit `4`) is a movement that means the arm no longer

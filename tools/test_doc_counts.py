@@ -44,7 +44,7 @@ FIXTURE_FILES = (
     "tools/mandate-producers.json",
     "tools/mandate-arms.json",
     "tools/mandate-baseline.json",
-    "tools/mandate_compare.py",
+    "netem-test/src/tools/mandate_compare.rs",
     "tests/GATE.md",
 )
 

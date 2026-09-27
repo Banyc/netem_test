@@ -14,6 +14,7 @@
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod report;
+pub mod tools;
 
 /// Generic scenario-testing kit, compiled only when the `test-kit` feature is
 /// enabled: deterministic payloads, impairment presets, reporting stats,

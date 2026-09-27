@@ -57,7 +57,9 @@ runs every declared producer's perf target — `rtp_mux`'s smoke set and this
 workspace's own perf-tier probes — renders the smoke set's panels and writes
 `mandate-check.json`; run it and read the plots for any change to `rtp`, `mux`
 or `rtp_mux` (see `tools/MANDATE_SMOKE.md`). The per-arm records it writes are
-what `tools/mandate-compare` diffs against `tools/mandate-baseline.json`, so a
+what the `mandate-compare` subcommand of the `netem-tools` binary
+(`cargo run -p netem-test --bin netem-tools -- mandate-compare`) diffs against
+`tools/mandate-baseline.json`, so a
 shortening of any recorded arm can be shown coverage-neutral. The intention
 behind the constitution, and the inventory of the tools and gates that measure
 it, are in `tools/PERF_INFRA.md`.

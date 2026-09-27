@@ -1100,7 +1100,7 @@ def check_lane_roles() -> tuple[dict[str, str], list[str]]:
 # Prefer `verified` where a command in this repository determines the value
 # before the check runs (`tools/mandate-producers.json`, `tools/mandate-arms.json`,
 # `tools/mandate-baseline.json`, the harness's own `gate-*` blocks, and the
-# `mandate_compare.py` constants the documents quote). Prefer `derived` where
+# `mandate_compare.rs` constants the documents quote). Prefer `derived` where
 # the value belongs to a crate this gate cannot run - a sibling's ignored-test
 # inventory - because the checker that owns it there is the only authority, and
 # transcribing its output is exactly how the number rots.
@@ -1285,7 +1285,7 @@ DOC_COUNTS: tuple[DocCount, ...] = (
         docs=("tools/MANDATE_SMOKE.md",),
         pattern=rf"the ({_NUMERAL}) bulk-lane byte counters",
         keys=("count_floor_counters",),
-        authority="len(COUNT_FLOORS_BYTES) in tools/mandate_compare.py",
+        authority="len(COUNT_FLOORS_BYTES) in netem-test/src/tools/mandate_compare.rs",
     ),
     DocCount(
         label="reference families of the rtp_mux draft",
@@ -1656,29 +1656,45 @@ def _draft_gate_counts(root: Path, problems: list[str]) -> dict[str, float]:
     )
 
 
+def _rust_const_block(text: str, name: str) -> str | None:
+    """The text of a Rust `const <name> ... ];`, or None."""
+    start = text.find(f"const {name}")
+    if start < 0:
+        return None
+    end = text.find("];", start)
+    if end < 0:
+        return None
+    return text[start:end]
+
+
 def _count_floor_counters(root: Path, problems: list[str]) -> dict[str, float]:
-    """`len(COUNT_FLOORS_BYTES)` from `tools/mandate_compare.py`."""
-    path = root / "tools" / "mandate_compare.py"
-    spec = importlib.util.spec_from_file_location("mandate_compare_doc_counts", path)
-    if spec is None or spec.loader is None:
+    """`len(COUNT_FLOORS_BYTES)` from the Rust tool that owns the rule.
+
+    The comparison is the `netem-tools mandate-compare` subcommand, so the
+    declaration it derives the floors from is its Rust source: this reads the
+    const array's entries rather than importing a Python module that no longer
+    exists. A missing source or an unreadable const is a failure, not a skip.
+    """
+    path = root / "netem-test" / "src" / "tools" / "mandate_compare.rs"
+    if not path.is_file():
         problems.append(
-            f"DOC COUNT: cannot derive: {path} cannot be loaded for "
-            "COUNT_FLOORS_BYTES"
+            f"DOC COUNT: cannot derive: {path} does not exist, so "
+            "COUNT_FLOORS_BYTES has no declared source"
         )
         return {}
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as error:  # noqa: BLE001 - any import failure is the point
+    text = path.read_text(encoding="utf-8")
+    block = _rust_const_block(text, "COUNT_FLOORS_BYTES")
+    if block is None:
         problems.append(
-            f"DOC COUNT: cannot derive: {path} failed to import ({error!r}) for "
-            "COUNT_FLOORS_BYTES"
+            f"DOC COUNT: cannot derive: {path} declares no COUNT_FLOORS_BYTES "
+            "const array"
         )
         return {}
-    floors = getattr(module, "COUNT_FLOORS_BYTES", None)
-    if not isinstance(floors, dict):
+    floors = re.findall(r'\(\s*"[^"]+"\s*,\s*[0-9_]+\s*\)', block)
+    if not floors:
         problems.append(
-            f"DOC COUNT: cannot derive: {path} defines no COUNT_FLOORS_BYTES dict"
+            f"DOC COUNT: cannot derive: {path}'s COUNT_FLOORS_BYTES declares no "
+            '("<key>", <bytes>) entry'
         )
         return {}
     return {"count_floor_counters": float(len(floors))}

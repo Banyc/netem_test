@@ -264,7 +264,7 @@ than it is. It verifies the **declaration**, never the code: it cannot tell
 whether an arm's implementation still measures the cell the row names, so an
 arm retuned to a milder impairment while its declared cell keeps the old value
 reads exactly like an unchanged one — that is what the settings' immutability
-and `tools/mandate-compare`'s per-arm record are for. Its dimensions are the
+and the `mandate-compare` subcommand's per-arm record are for. Its dimensions are the
 cell's own keys, so a row that spells one physical axis under two names (a
 `loss=none` beside an `impairment=…`, or an `impairment` that already carries
 the loss) is derived as varying two dimensions: the confound is reported, the
@@ -284,8 +284,8 @@ match its cells is caught only when the cells of two families collide, and a
 cell name quietly added to a family's namespace is exactly as honest as its
 author. It also cannot see the code: a row whose cells are foreign to its
 family is reported, but whether the arm really measures the cell it names is
-not, which is what the settings' immutability and `tools/mandate-compare`'s
-per-arm record are for. What is **partition-invariant**, and therefore the
+not, which is what the settings' immutability and the `mandate-compare`
+subcommand's per-arm record are for. What is **partition-invariant**, and therefore the
 number to read for shortening, is how many rows have *some* other row one
 dimension away at all: a row with a one-dimension relative is attributable to
 that dimension whichever family it is filed under, and a row with none — every
@@ -303,7 +303,7 @@ own keys*, so a sparser reference scores at least as well as a richer one. The
 orthogonal count of a family is therefore the declared reference's, and where
 tied references split differently the composite/re-measurement counts move with
 the choice, so the reference stays visible in the run summary and in
-`tools/mandate-compare`'s per-arm record rather than being claimed derivable.
+the `mandate-compare` subcommand's per-arm record rather than being claimed derivable.
 
 `tools/check-gate.py` enforces the declaration for any crate whose `GATE.md`
 carries the blocks: an unknown target, an unknown test, a test declared in the
@@ -695,11 +695,11 @@ required, not decorative: a run that measured no arm, a mandate whose arm lines
 are gone, an arm line that cannot be attributed, and an arm that claims no
 declared cell each fail the run.
 
-**`tools/mandate-compare` turns a difference into a verdict.** It compares a
+**The `mandate-compare` subcommand turns a difference into a verdict.** It compares a
 fresh report with the committed `tools/mandate-baseline.json`:
 
 ```sh
-./tools/mandate-compare <run>/mandate-check.json
+cargo run -p netem-test --bin netem-tools -- mandate-compare <run>/mandate-check.json
 ```
 
 A **coverage regression** (exit `4`) is a movement that means the arm no longer
@@ -749,14 +749,14 @@ cells as declared cannot tell that arm from the `M1/clean` arm that records
 `lane=dual` as a claim red-flags the residue; a rule that read it as a non-claim
 stops comparing the 8 MiB. So the floor stays for exactly those unstated pairs,
 the pairs are named in every verdict, and a *claiming* cell consults no floor at
-all. `tools/mandate_compare.py`'s docstring and
+all. `netem-test/src/tools/mandate_compare.rs`'s docstring and
 `tools/mandate-arms.json`'s cell declarations are the authorities for the rule
 and the cells it reads.
 
 ### The checked-in baseline
 
 `tools/mandate-baseline.json` is the `mandate-check.json` of one real
-`tools/mandate-check` run, checked in so that `tools/mandate-compare` has a
+`tools/mandate-check` run, checked in so that the `mandate-compare` subcommand has a
 reference: it records the per-arm measurements a later run's coverage is
 compared against. It was taken with `tools/mandate-check --no-rasterize` (no
 `--quick`, and no other argument that reaches a producer — `--no-rasterize`

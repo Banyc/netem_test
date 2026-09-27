@@ -22,9 +22,10 @@
 //! The comparison is two-layered on purpose. The per-metric table below carries
 //! the **degradation figure** — absolute and percent, per arm, per metric —
 //! because that is the number a reader needs and a boolean cannot hold it. The
-//! multi-axis coverage/claim verdict stays with the A/B tool that already works
-//! (`mandate_compare.py`), invoked when present rather than reimplemented, so
-//! its semantics cannot drift from these two implementations disagreeing.
+//! multi-axis coverage/claim verdict is the crate's own `mandate_compare` module
+//! (the `mandate-compare` subcommand's implementation), called directly rather
+//! than reimplemented or shelled out to, so its semantics cannot drift from
+//! these two callers disagreeing.
 //!
 //! Usage
 //! -----
@@ -42,13 +43,20 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use netem_test::tools::json::{self, Json};
+use netem_test::tools::mandate_compare;
 
 /// The report a completed run writes, and the log its raw lines land in.
 const REPORT_NAME: &str = "mandate-check.json";
 const LOG_NAME: &str = "mandate-smoke.log";
+/// The run-level summary this bin writes beside `vs-prev.md`.
+const SUMMARY_NAME: &str = "summary.md";
+/// The rendered panels directory the summary names by absolute path.
+const PLOTS_DIRNAME: &str = "plots";
 
 /// Where runs are archived: `.net-perf-history` in the working directory, so
 /// each repo carries its own history beside the work it describes. The
@@ -61,6 +69,11 @@ const DEFAULT_ARCHIVE_DIR: &str = ".net-perf-history";
 /// (usage) and 2 (a run that could not be archived or compared) so a caller can
 /// tell "worse than last time" from "could not tell".
 const EXIT_M1_DEGRADATION: i32 = 6;
+
+/// Exit status for a run that owes an artifact it did not produce: no panels, a
+/// panel path that does not resolve, or a text artifact that was not written.
+/// An evidence failure is never a pass, so it has its own status.
+const EXIT_EVIDENCE_FAILURE: i32 = 7;
 
 /// Metrics compared per arm, in the order a reader wants them. Latency
 /// percentiles are the product's promise and lead; delivery and the own-wire
@@ -597,7 +610,7 @@ fn vs_prev_markdown(
         ));
     }
     if !ab_lines.is_empty() {
-        out.push_str("\n## coverage and claim verdict (mandate_compare.py)\n\n```\n");
+        out.push_str("\n## coverage and claim verdict (netem-tools mandate-compare)\n\n```\n");
         for line in ab_lines {
             out.push_str(line);
             out.push('\n');
@@ -607,52 +620,273 @@ fn vs_prev_markdown(
     out
 }
 
-// ─────────────── the optional reuse of the existing A/B tool ─────────────────
+// ────────────── the coverage/claim verdict, one implementation ───────────────
 
-/// The full A/B verdict from `mandate_compare.py`, when it is present. The
-/// per-metric table above answers "by how much"; this answers the multi-axis
-/// coverage and claim question, and it is *the existing tool's* answer rather
-/// than a second implementation of its semantics.
+/// The full coverage/claim verdict for the two reports, from the crate's own
+/// `mandate_compare` module. The per-metric table above answers "by how much";
+/// this answers the multi-axis coverage and claim question, and it is the same
+/// comparison the `netem-tools mandate-compare` subcommand runs — one
+/// implementation, so the two callers cannot disagree about the semantics.
 fn ab_verdict(baseline: &Path, candidate: &Path) -> Vec<String> {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|workspace| workspace.join("tools").join("mandate_compare.py"))
-        .unwrap_or_else(|| PathBuf::from("mandate_compare.py"));
-    if !script.is_file() {
-        return vec![format!(
-            "(mandate_compare.py not found at {} - coverage and claim axes not checked)",
-            script.display()
-        )];
+    mandate_compare::coverage_verdict(&candidate.join(REPORT_NAME), &baseline.join(REPORT_NAME))
+}
+
+// ─────────────────── the three owed artifacts ────────────────────────────────
+//
+// Every perf run owes **panels**, a run-level **summary** and a **vs-prev**
+// verdict, and the runner prints the two text artifacts to stdout rather than
+// leaving them to be opened. Same reasoning as the forced per-panel summary: an
+// artifact a reader must go and open is one a reader will skip, and "the numbers
+// were in a file" is how a regression gets read as a pass. The paths a summary
+// names are **absolute and canonicalized as of the run**, because every
+// path mis-resolution in this workspace has been a reader computing a location
+// instead of being told one.
+
+/// One rendered panel: its SVG, and the PNG and forced summary beside it when
+/// the run produced them. Every path is absolute and canonicalized, checked to
+/// resolve before it is written into a summary.
+#[derive(Default)]
+struct Panel {
+    stem: String,
+    svg: Option<PathBuf>,
+    png: Option<PathBuf>,
+    summary: Option<PathBuf>,
+}
+
+fn canonical(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
+        .map_err(|e| Failure(format!("{} does not resolve: {e}", path.display())))
+}
+
+/// Every panel a run rendered, with its absolute paths, or an evidence failure.
+///
+/// A panel is its SVG; a PNG or a `plots/<panel>.summary.txt` attaches to it.
+/// A stem with no SVG is refused — the SVG is the panel, and a summary pointing
+/// a reader at a PNG with no panel beside it is pointing at a raster of nothing.
+fn plot_files(run_dir: &Path) -> Result<Vec<Panel>> {
+    let plots = run_dir.join(PLOTS_DIRNAME);
+    if !plots.is_dir() {
+        return fail(format!(
+            "{} has no {PLOTS_DIRNAME}/ directory, so the run rendered no panels",
+            run_dir.display()
+        ));
     }
-    let python = env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let output = Command::new(python)
-        .arg(&script)
-        .arg(candidate.join(REPORT_NAME))
-        .arg("--baseline")
-        .arg(baseline.join(REPORT_NAME))
-        .output();
-    match output {
-        Ok(output) => {
-            let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| line.to_string())
-                .collect();
-            lines.extend(
-                String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(|line| line.to_string()),
-            );
-            if lines.is_empty() {
-                lines.push(format!(
-                    "mandate_compare.py exited {:?} with no output",
-                    output.status.code()
-                ));
-            }
-            lines
+    let mut panels: BTreeMap<String, Panel> = BTreeMap::new();
+    for entry in fs::read_dir(&plots)
+        .map_err(|e| Failure(format!("cannot read {}: {e}", plots.display())))?
+    {
+        let entry = entry.map_err(|e| Failure(format!("cannot read plot entry: {e}")))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
         }
-        Err(error) => vec![format!("could not run mandate_compare.py: {error}")],
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Some(stem) = name.strip_suffix(".svg") {
+            panels.entry(stem.to_string()).or_default().svg = Some(canonical(&path)?);
+        } else if let Some(stem) = name.strip_suffix(".png") {
+            panels.entry(stem.to_string()).or_default().png = Some(canonical(&path)?);
+        } else if let Some(stem) = name.strip_suffix(".summary.txt") {
+            panels.entry(stem.to_string()).or_default().summary = Some(canonical(&path)?);
+        }
     }
+    for (stem, panel) in panels.iter_mut() {
+        panel.stem = stem.clone();
+    }
+    let panels: Vec<Panel> = panels.into_values().collect();
+    if panels.is_empty() {
+        return fail(format!(
+            "{} holds no rendered panel, so the run owes evidence it did not produce",
+            plots.display()
+        ));
+    }
+    for panel in &panels {
+        if panel.svg.is_none() {
+            return fail(format!(
+                "the panel {} has no SVG (only a raster or a summary), so its \
+                 absolute path would name no panel",
+                panel.stem
+            ));
+        }
+    }
+    Ok(panels)
+}
+
+/// `(verdict, exit, revision)` from a run's report, "unreadable" when it cannot
+/// be read. Reported rather than refused: a summary still has the arms and the
+/// panels, and hiding them behind a parse error helps nobody.
+fn report_verdict(report: &Path) -> (String, String, String) {
+    let unreadable = (
+        "unreadable".to_string(),
+        "?".to_string(),
+        "unresolved".to_string(),
+    );
+    let Ok(text) = fs::read_to_string(report) else {
+        return unreadable;
+    };
+    let Ok(payload) = json::parse(&text) else {
+        return unreadable;
+    };
+    let verdict = payload
+        .get("verdict")
+        .and_then(Json::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let exit = payload
+        .get("exit_code")
+        .map(|value| match value {
+            Json::Int(number) => number.to_string(),
+            other => json::to_string(other),
+        })
+        .unwrap_or_else(|| "?".to_string());
+    let revision = payload
+        .get("rtp_mux")
+        .and_then(|rtp_mux| rtp_mux.get("revision"))
+        .and_then(Json::as_str)
+        .unwrap_or("unresolved")
+        .to_string();
+    (verdict, exit, revision)
+}
+
+/// The mandate verdicts a report recorded, in the report's own order.
+fn mandate_verdicts(report: &Path) -> Vec<(String, String)> {
+    let Ok(text) = fs::read_to_string(report) else {
+        return Vec::new();
+    };
+    let Ok(payload) = json::parse(&text) else {
+        return Vec::new();
+    };
+    let Some(mandates) = payload.get("mandates").and_then(Json::as_object) else {
+        return Vec::new();
+    };
+    mandates
+        .iter()
+        .map(|(name, entry)| {
+            (
+                name.clone(),
+                entry
+                    .get("verdict")
+                    .and_then(Json::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// One row per arm with its headline figures from the baseline comparison.
+fn arm_figure_table(rows: &[Row]) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_arm: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut worse: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        if !by_arm.contains_key(&row.arm) {
+            order.push(row.arm.clone());
+        }
+        if row.metric != "*" {
+            by_arm
+                .entry(row.arm.clone())
+                .or_default()
+                .insert(row.metric.clone(), figure(row));
+        }
+        if row.worse {
+            worse
+                .entry(row.arm.clone())
+                .or_default()
+                .push(row.metric.clone());
+        }
+    }
+    let mut out =
+        String::from("| arm | p50 | p99 | delivery | moved worse |\n|---|---|---|---|---|\n");
+    for arm in &order {
+        let cell = |key: &str| {
+            by_arm
+                .get(arm)
+                .and_then(|metrics| metrics.get(key))
+                .cloned()
+                .unwrap_or_else(|| "n/a".to_string())
+        };
+        let moved = worse
+            .get(arm)
+            .map(|metrics| metrics.join(", "))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!(
+            "| `{arm}` | {} | {} | {} | {moved} |\n",
+            cell("p50"),
+            cell("p99"),
+            cell("delivery")
+        ));
+    }
+    out
+}
+
+/// The run's own summary: its verdicts, its per-arm figures against the
+/// baseline, its M1 outcome, and every panel by absolute path.
+fn summary_markdown(
+    run_dir: &Path,
+    report: &Path,
+    baseline_label: &str,
+    rows: &[Row],
+    m1: &[&Row],
+    panels: &[Panel],
+) -> String {
+    let (verdict, exit, revision) = report_verdict(report);
+    let mut out = format!(
+        "# run summary\n\nrun: `{}`\nbaseline: `{baseline_label}`\n",
+        run_dir.display()
+    );
+    out.push_str(&format!(
+        "verdict: {verdict}  exit: {exit}  revision: {revision}\n\n"
+    ));
+    out.push_str("## mandates\n\n");
+    let mandates = mandate_verdicts(report);
+    if mandates.is_empty() {
+        out.push_str("the report records no mandate verdicts.\n\n");
+    } else {
+        out.push_str("| mandate | verdict |\n|---|---|\n");
+        for (mandate, verdict) in &mandates {
+            out.push_str(&format!("| {mandate} | {verdict} |\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str("## M1\n\n");
+    if m1.is_empty() {
+        out.push_str(
+            "no degradation: no interactive arm's latency rose beyond its noise band.\n\n",
+        );
+    } else {
+        out.push_str("**DEGRADATION** - this run is rejected.\n\n| arm | metric | figure | band |\n|---|---|---|---|\n");
+        for row in m1 {
+            out.push_str(&format!(
+                "| `{}` | {} | {} | +/-{:.0}% |\n",
+                row.arm,
+                row.metric,
+                figure(row),
+                row.band_percent
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str("## per-arm figures vs the baseline\n\n");
+    out.push_str(&arm_figure_table(rows));
+    out.push_str("\n## panels (absolute paths as of this run)\n\n");
+    out.push_str("| panel | svg | png | summary |\n|---|---|---|---|\n");
+    for panel in panels {
+        let display = |path: &Option<PathBuf>| match path {
+            Some(path) => format!("`{}`", path.display()),
+            None => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            panel.stem,
+            display(&panel.svg),
+            display(&panel.png),
+            display(&panel.summary)
+        ));
+    }
+    out
 }
 
 // ─────────────────────────────── the runner ──────────────────────────────────
@@ -720,14 +954,14 @@ fn usage() -> String {
         "  --label <name>     the archive series (default: mandate-check)",
         "  --no-archive       compare without archiving this run",
         "  --only-compare     exit 0 even on an M1 degradation (report-only)",
-        "  --no-ab            skip the mandate_compare.py coverage/claim verdict",
+        "  --no-ab            skip the coverage/claim verdict for this run",
         "",
         "$PERF_ARCHIVE_DIR relocates the archive (default ./.net-perf-history); $PERF_BASELINE_DIR chooses a baseline.",
     ]
     .join("\n")
 }
 
-fn run(args: Args) -> Result<i32> {
+fn run(args: Args, out: &mut impl Write) -> Result<i32> {
     let mut run_dir = args.run.clone();
     if run_dir.is_file() {
         run_dir = run_dir
@@ -755,71 +989,106 @@ fn run(args: Args) -> Result<i32> {
         }
         None => previous_run(&args.label, &candidate).unwrap_or_default(),
     };
-
-    if baseline.as_os_str().is_empty() {
-        let document = vs_prev_markdown(
-            &[],
-            "(none - this run is the first archived one)",
-            &candidate.display().to_string(),
-            &[],
-        );
-        let path = run_dir.join("vs-prev.md");
-        fs::write(&path, &document)
-            .map_err(|e| Failure(format!("cannot write vs-prev.md: {e}")))?;
-        copy(&path, &candidate.join("vs-prev.md"))?;
-        println!(
-            "perf-history: archived {} as the first run; no previous run to compare",
-            run_dir.display()
-        );
-        println!("vs-prev: {}", path.display());
-        return Ok(0);
-    }
-
-    let rows = metric_rows(&read_arms(&baseline)?, &read_arms(&candidate)?);
-    let ab_lines = if args.no_ab {
-        Vec::new()
+    let first_run = baseline.as_os_str().is_empty();
+    let baseline_label = if first_run {
+        "(none - this run is the first archived one)".to_string()
     } else {
-        ab_verdict(&baseline, &candidate)
+        baseline.display().to_string()
     };
-    let document = vs_prev_markdown(
+
+    // The panels are the artifact the summary points at. A run that produced
+    // none, or whose summary would name a path that does not resolve, is an
+    // evidence failure and never a pass.
+    let panels = match plot_files(&run_dir) {
+        Ok(panels) => panels,
+        Err(Failure(message)) => {
+            eprintln!("perf-history: EVIDENCE FAILURE - {message}");
+            return Ok(EXIT_EVIDENCE_FAILURE);
+        }
+    };
+
+    let (rows, ab_lines) = if first_run {
+        (Vec::new(), Vec::new())
+    } else {
+        let rows = metric_rows(&read_arms(&baseline)?, &read_arms(&candidate)?);
+        let ab = if args.no_ab {
+            Vec::new()
+        } else {
+            ab_verdict(&baseline, &candidate)
+        };
+        (rows, ab)
+    };
+    let m1 = m1_degradations(&rows);
+
+    let vs_prev = vs_prev_markdown(
         &rows,
-        &baseline.display().to_string(),
+        &baseline_label,
         &candidate.display().to_string(),
         &ab_lines,
     );
-    let path = run_dir.join("vs-prev.md");
-    fs::write(&path, &document).map_err(|e| Failure(format!("cannot write vs-prev.md: {e}")))?;
-    // With --no-archive the candidate *is* the run directory, so copying the
-    // document "into the archive" would copy a file onto itself and empty it.
+    let vs_prev_path = run_dir.join("vs-prev.md");
+    fs::write(&vs_prev_path, &vs_prev)
+        .map_err(|e| Failure(format!("cannot write vs-prev.md: {e}")))?;
+
+    let summary = summary_markdown(
+        &run_dir,
+        &run_dir.join(REPORT_NAME),
+        &baseline_label,
+        &rows,
+        &m1,
+        &panels,
+    );
+    let summary_path = run_dir.join(SUMMARY_NAME);
+    fs::write(&summary_path, &summary)
+        .map_err(|e| Failure(format!("cannot write {SUMMARY_NAME}: {e}")))?;
+
+    // Keep the archived copy's layout beside the panels it names, so the summary
+    // and its panels stay together wherever the run is read from: the archived
+    // summary carries the *archive's* absolute panel paths, not the run
+    // directory's (which a temp tree sweeps).
     if candidate != run_dir {
-        copy(&path, &candidate.join("vs-prev.md"))?;
+        copy(&vs_prev_path, &candidate.join("vs-prev.md"))?;
+        let archive_panels = plot_files(&candidate)?;
+        let archive_summary = summary_markdown(
+            &candidate,
+            &candidate.join(REPORT_NAME),
+            &baseline_label,
+            &rows,
+            &m1,
+            &archive_panels,
+        );
+        fs::write(candidate.join(SUMMARY_NAME), &archive_summary)
+            .map_err(|e| Failure(format!("cannot write the archived {SUMMARY_NAME}: {e}")))?;
     }
 
-    let mut worse = 0usize;
-    for row in rows.iter().filter(|row| row.worse) {
-        worse += 1;
-        println!("  WORSE {} {}: {}", row.arm, row.metric, figure(row));
+    // The run's own output carries both text artifacts verbatim, so nobody has
+    // to open a file to learn what the run says.
+    write!(out, "{summary}").map_err(|e| Failure(format!("cannot write stdout: {e}")))?;
+    write!(out, "\n{vs_prev}").map_err(|e| Failure(format!("cannot write stdout: {e}")))?;
+    writeln!(out, "summary:  {}", summary_path.display())
+        .map_err(|e| Failure(format!("cannot write stdout: {e}")))?;
+    writeln!(out, "vs-prev:  {}", vs_prev_path.display())
+        .map_err(|e| Failure(format!("cannot write stdout: {e}")))?;
+    if first_run {
+        writeln!(
+            out,
+            "perf-history: archived {} as the first run; no previous run to compare",
+            run_dir.display()
+        )
+        .map_err(|e| Failure(format!("cannot write stdout: {e}")))?;
     }
-    for line in &ab_lines {
-        println!("{line}");
-    }
-    println!("vs-prev: {}", path.display());
 
-    let degradations = m1_degradations(&rows);
-    if !degradations.is_empty() {
+    if !m1.is_empty() {
         eprintln!(
             "perf-history: M1 DEGRADATION - {} interactive metric(s) worse than the baseline, so this run is rejected",
-            degradations.len()
+            m1.len()
         );
-        for row in &degradations {
+        for row in &m1 {
             eprintln!("  {} {}: {}", row.arm, row.metric, figure(row));
         }
         if !args.only_compare {
             return Ok(EXIT_M1_DEGRADATION);
         }
-    }
-    if worse == 0 {
-        println!("no arm or metric moved worse beyond its noise band");
     }
     Ok(0)
 }
@@ -834,11 +1103,120 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match run(args) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    match run(args, &mut out) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("perf-history: error: {error}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_run_dir() -> PathBuf {
+        let counter = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("perf-history-rs-{}-{counter}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(PLOTS_DIRNAME)).expect("create run dir");
+        dir
+    }
+
+    /// A minimal but complete run: a report, a log with one arm line, and one
+    /// rendered panel with its forced summary.
+    fn write_minimal_run(dir: &Path) {
+        fs::write(
+            dir.join(REPORT_NAME),
+            r#"{"schema":"mandate-check/5","verdict":"PASS","exit_code":0,
+                 "mandates":{"M1":{"verdict":"PASS"},"M2":{"verdict":"PASS"}},
+                 "rtp_mux":{"revision":"abc123"},"arms":[]}"#,
+        )
+        .expect("report");
+        fs::write(
+            dir.join(LOG_NAME),
+            "[mandate-smoke clean] p99= 26.5 delivery= 1.000\n",
+        )
+        .expect("log");
+        fs::write(dir.join(PLOTS_DIRNAME).join("M1-latency.svg"), "<svg/>").expect("svg");
+        fs::write(
+            dir.join(PLOTS_DIRNAME).join("M1-latency.summary.txt"),
+            "summary| panel M1-latency\n",
+        )
+        .expect("panel summary");
+    }
+
+    fn args_for(dir: &Path) -> Args {
+        Args {
+            run: dir.to_path_buf(),
+            // A baseline equal to the run keeps the test independent of the
+            // environment and of the archive; the first-run path is exercised by
+            // the missing-panels case below.
+            baseline: Some(dir.to_path_buf()),
+            label: "test-series".to_string(),
+            archive: false,
+            only_compare: false,
+            no_ab: true,
+        }
+    }
+
+    #[test]
+    fn the_runner_prints_the_summary_and_vs_prev_and_names_every_panel_absolutely() {
+        let dir = temp_run_dir();
+        write_minimal_run(&dir);
+        let mut out = Vec::new();
+        let code = run(args_for(&dir), &mut out).expect("run");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        let summary = fs::read_to_string(dir.join(SUMMARY_NAME)).expect("summary written");
+        let vs_prev = fs::read_to_string(dir.join("vs-prev.md")).expect("vs-prev written");
+        assert!(
+            printed.contains(&summary),
+            "the summary body must be printed verbatim, not only written"
+        );
+        assert!(
+            printed.contains(&vs_prev),
+            "the vs-prev body must be printed verbatim, not only written"
+        );
+        // The summary states the run's verdicts and its M1 outcome.
+        assert!(summary.contains("verdict: PASS"), "{summary}");
+        assert!(summary.contains("| M1 | PASS |"), "{summary}");
+        assert!(summary.contains("no degradation"), "{summary}");
+        // Every panel is named by an absolute path that resolves as of the run.
+        let svg = dir
+            .join(PLOTS_DIRNAME)
+            .join("M1-latency.svg")
+            .canonicalize()
+            .expect("canonical svg");
+        let text = svg.to_str().expect("utf8 path");
+        assert!(
+            summary.contains(text),
+            "the summary must name the panel by its absolute path {text}"
+        );
+        assert!(
+            printed.contains(text),
+            "the printed output must carry the absolute panel path {text}"
+        );
+        assert!(svg.is_file(), "the named path must resolve");
+    }
+
+    #[test]
+    fn a_run_without_panels_is_an_evidence_failure() {
+        let dir = temp_run_dir();
+        write_minimal_run(&dir);
+        fs::remove_dir_all(dir.join(PLOTS_DIRNAME)).expect("remove plots");
+        let mut out = Vec::new();
+        let code = run(args_for(&dir), &mut out).expect("run");
+        assert_eq!(
+            code, EXIT_EVIDENCE_FAILURE,
+            "a run that rendered no panel must not pass"
+        );
     }
 }

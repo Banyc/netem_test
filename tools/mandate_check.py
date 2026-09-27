@@ -262,7 +262,7 @@ The eight expected evidence files, the ``plots`` directory, and this
 command's own ``mandate-check.json`` and ``mandate-smoke.log`` are removed from
 ``--dir`` before the smoke set runs, so evidence found afterwards was produced
 by this run rather than left behind by an earlier one. The previous report is
-removed for the same reason the evidence is: ``tools/mandate-compare`` reads
+removed for the same reason the evidence is: the ``mandate-compare`` subcommand reads
 ``<dir>/mandate-check.json``, so a report surviving a run that wrote none would
 be compared as if it were that run's measurement.
 
@@ -1273,7 +1273,7 @@ def prepare_output_dir(out_dir, log_names=(LOG_NAME,)):
     Every file this command's run writes is removed: the eight evidence files
     the producers produce, the ``plots`` directory, this command's report and
     every producer's log. The report is removed for the same reason the
-    evidence is — a reader (``tools/mandate-compare``) reads
+    evidence is — a reader (the ``mandate-compare`` subcommand) reads
     ``<dir>/mandate-check.json``, so one surviving a run that wrote none would
     be read as that run's measurement. Removal happens before a producer is
     built and before its checkout is validated, so no exit path can leave a
