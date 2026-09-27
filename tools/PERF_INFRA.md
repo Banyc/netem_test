@@ -118,12 +118,23 @@ using the same grammar the coverage cells use:
     gate-env-tier   soak-accept-churn = SOAK_DIALERS,SOAK_ITERATIONS | local/soak.py | per-dial liveness rate | liveness@shape=dial-churn
 
 The checker reads the surface from two artifacts rather than from a
-convention: a name counts when this crate's Rust sources pass it to a function
-that reads the process environment (the reader is the transitive closure over
-crate-local calls, because a name is normally handed to a wrapper —
-`env_parse("SOAK_DIALERS", 16)` — that forwards it to `env::var`, so a one-hop
-scan reports no surface at all and would be vacuously silent) **and** a script
-in the crate names it.
+convention: a name counts when this crate's Rust sources read it from the
+process environment **and** a script in the crate names it. A source reads one
+in either of two ways, so the reader half is two scans. A literal handed
+straight to `env::var`/`var_os` is a read wherever it stands, including a
+module-scope initializer no function body encloses. A literal handed to a
+crate-local *wrapper* — `env_parse("SOAK_DIALERS", 16)` — is forwarded to
+`env::var` by the wrapper, so it is read through the wrapper's caller and only
+if the wrapper is itself a reader: that set is the transitive closure over
+crate-local calls, because a one-hop scan reports no surface at all for the
+wrapper form and would be vacuously silent. Both scans read comment- and
+literal-stripped text, so an `env::var("NAME")` written in a doc comment or
+inside a string constant is a mention rather than a read — otherwise a
+declaration could be satisfied by prose, which is the stale-declaration rule
+failing open. A name the toolchain sets (`CARGO_TARGET_DIR`,
+`CARGO_TARGET_TMPDIR`) is excluded from the reader half: it is the runner's own
+environment rather than a knob of the crate, and the declaration grammar has no
+true line for one.
 
 The two halves are not symmetric, and the asymmetry is why the enforcement is
 stated against the sources' own set rather than against the intersection. A

@@ -170,6 +170,13 @@ CELL_PROPERTY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 CELL_DIMENSION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*=[^=,+\s]+$")
 # An environment variable name, as an env-scaled opt-in surface declares it.
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+# A name the toolchain sets for every build and every test process (`CARGO`,
+# `CARGO_TARGET_DIR`, `CARGO_TARGET_TMPDIR`, `CARGO_PKG_*`). A source that reads
+# one is reading the runner's own environment, not sizing a tier, so the
+# declaration grammar -- a load shape and coverage cells -- has no true line for
+# it and demanding one would be the same defect as refusing the ones it can
+# state. Excluded from the reader half, so it is never a surface's variable.
+TOOLCHAIN_ENV_RE = re.compile(r"^CARGO(?:$|_)")
 # A surface's `<load>` field: `<key>=<value>` items naming the shape a cost was
 # measured under. A key is one of the surface's variables at the count the
 # measurement sized it to, or the reserved `total` (the count the shape yields),
@@ -186,6 +193,8 @@ ENV_TIER_LOAD_BOUND_RE = re.compile(
 STRING_LITERAL_RE = re.compile(r'"([^"\n]*)"')
 # `env::var(…)`/`env::var_os(…)`, the one pair that reads the process environment.
 ENV_READ_RE = re.compile(r"env::var(?:_os)?\s*\(")
+# ...and the same call with a literal argument. Group 1 is the name it reads: a
+# literal handed straight to `env::var` is a read and needs no helper to be one.
 ENV_LITERAL_RE = re.compile(r'env::var(?:_os)?\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 # A file the crate could use to run a test batch: the only place a variable can
 # be set for a child process.
@@ -2823,7 +2832,9 @@ def check_env_tier(problems: list[str]) -> tuple[list[str], list[str]]:
 
     Detection is two-sided, which is what makes it an artifact rather than a
     guess: a name counts when a script in the crate *names* it and the crate's
-    Rust sources pass it to a function that reads the process environment. The
+    Rust sources read it from the process environment -- a literal handed
+    straight to `env::var`, or one forwarded to `env::var` by a crate-local
+    helper, over comment-stripped text so a mention in prose is not a read. The
     declaration is then enforced in both directions — every variable the
     sources read must be declared, and every declared variable must be read —
     and a surface the declaration omits is an error. The two halves are not
@@ -3293,48 +3304,237 @@ def _script_env_names(script: Path) -> set[str]:
 def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
     """`ENV_NAME -> {source}` for the names this crate's sources read from the env.
 
-    The reader side is a closure over the crate-local call graph, because a
-    name is almost never passed to `env::var` directly: it is passed to a
-    helper that parses it (`env_parse("SOAK_DIALERS", 16)`) which forwards it
-    to one that reads it, so a one-hop scan would report no surface at all and
-    the detection would be vacuously silent. Bare-name resolution
-    over-approximates across modules, which is why a name counts only when the
-    script side names it too.
+    A name reaches `env::var` one of two ways, so this is two scans over the same
+    source text. A literal handed **straight** to `env::var`/`var_os` is a read
+    wherever it stands -- including in a module-scope initializer no function
+    body encloses -- and is found by scanning the whole source. A literal handed
+    to a crate-local **helper** that parses it (`env_parse("SOAK_DIALERS", 16)`)
+    is forwarded to `env::var` by the helper, so it is found through the helper's
+    caller and only if the helper is itself a reader: the reader set is the
+    transitive closure over crate-local calls, because a one-hop scan would
+    report no surface at all for the wrapper form and the detection would be
+    vacuously silent.
+
+    Both scans read **comment- and literal-stripped** text: an
+    `env::var("NAME")` written in a doc comment, or written inside a string
+    constant, is prose about a read rather than a read, and the stale-declaration
+    half of the check is only as strong as the reads it can tell from a mention.
+    Bare-name resolution over-approximates across modules, which is why a name
+    counts only when the script side names it too.
+
+    Each source is therefore viewed twice, at one length so that every offset
+    agrees: `code` with literals intact, which is where a direct call and a
+    forwarded name are spelled, and `quiet` with their contents blanked, which
+    is what a mention looks like. A direct call is one whose own text survived
+    into `quiet` -- a call written inside a string constant did not, since the
+    whole literal was blanked -- and a forwarded name is read out of the
+    literal in `code`, because that is where the name lives.
     """
-    functions: list[tuple[str, str, Path]] = []
+    sources: list[tuple[Path, str, str]] = []
+    functions: list[tuple[str, str, str, Path]] = []
     for path in sorted(root.rglob("*.rs")):
         if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
-        text = _read_scanned(path)
-        if text is None:
+        raw = _read_scanned(path)
+        if raw is None:
             continue
-        for match in FN_RE.finditer(text):
-            start = text.find("{", match.end())
+        code = _strip_rust_comments(raw)
+        quiet = _strip_rust_comments(raw, blank_literals=True)
+        sources.append((path, code, quiet))
+        for match in FN_RE.finditer(quiet):
+            start = quiet.find("{", match.end())
             if start == -1:
                 continue
-            end = _brace_end(text, start)
-            functions.append((match.group(1), text[start:end], path))
-    readers = {name for name, body, _ in functions if ENV_READ_RE.search(body)}
+            end = _brace_end(quiet, start)
+            functions.append((match.group(1), code[start:end], quiet[start:end], path))
+    readers = {
+        name for name, _, calls_body, _ in functions if ENV_READ_RE.search(calls_body)
+    }
     changed = True
     while changed:
         changed = False
-        for name, body, _ in functions:
+        for name, _, calls_body, _ in functions:
             if name in readers:
                 continue
-            if any(call in readers for call in CALL_RE.findall(body)):
+            if any(call in readers for call in CALL_RE.findall(calls_body)):
                 readers.add(name)
                 changed = True
     found: dict[str, set[str]] = {}
-    for name, body, path in functions:
-        spans = [match.group(1) for match in ENV_LITERAL_RE.finditer(body)]
-        for match in CALL_RE.finditer(body):
-            if match.group(1) in readers:
-                spans.append(_call_arguments(body, match.end() - 1))
-        for span in spans:
-            for literal in STRING_LITERAL_RE.findall(span):
-                if ENV_NAME_RE.match(literal):
-                    found.setdefault(literal, set()).add(str(path.relative_to(root)))
+    for path, code, quiet in sources:
+        # The direct read: group 1 of the literal call is the name, so no
+        # helper and no call-argument extraction stands between it and here --
+        # but the call has to have survived `quiet` to be a call at all.
+        for match in ENV_LITERAL_RE.finditer(code):
+            if not ENV_READ_RE.match(quiet, match.start()):
+                continue
+            _remember_env_read(found, match.group(1), path, root)
+    for _, code_body, calls_body, path in functions:
+        # The forwarded read: the literal sits in the arguments of a call to a
+        # crate-local function that reads the env. The call is found in the
+        # blanked view and its arguments taken from the other, since both are
+        # the same length and the name is inside the literal.
+        for match in CALL_RE.finditer(calls_body):
+            if match.group(1) not in readers:
+                continue
+            arguments = _call_arguments(code_body, match.end() - 1)
+            for literal in STRING_LITERAL_RE.findall(arguments):
+                _remember_env_read(found, literal, path, root)
     return found
+
+
+def _remember_env_read(
+    found: dict[str, set[str]], literal: str, path: Path, root: Path
+) -> None:
+    """Record ``literal`` as a name ``path`` reads, if it is one to record.
+
+    A literal that is not shaped like an environment variable name is some other
+    string, and a toolchain name is not this crate's knob.
+    """
+    if not ENV_NAME_RE.match(literal) or TOOLCHAIN_ENV_RE.match(literal):
+        return
+    found.setdefault(literal, set()).add(str(path.relative_to(root)))
+
+
+def _strip_rust_comments(text: str, *, blank_literals: bool = False) -> str:
+    """The source text with every comment blanked to spaces, length preserved.
+
+    A call written in a comment is a mention, not a read, so the reader half has
+    to tell the two apart or a `env::var("NAME")` in a doc comment would satisfy
+    the stale-declaration rule it exists to guard. With ``blank_literals`` the
+    contents of every string and character literal are blanked as well, which
+    makes a call written *inside* one a mention too -- the same question, since
+    `r"env::var(\"NAME\")"` is a string constant rather than a read.
+
+    Comments are blanked rather than deleted so every offset and line number
+    still points into the original text, both views of one source are the same
+    length, and string and character literals are scanned rather than matched so
+    a `//` or an unbalanced brace inside one is not read as syntax.
+    """
+    out = list(text)
+    index = 0
+    size = len(text)
+    while index < size:
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            end = size if end == -1 else end
+            _blank(text, out, index, end)
+            index = end
+            continue
+        if text.startswith("/*", index):
+            end = _block_comment_end(text, index)
+            _blank(text, out, index, end)
+            index = end
+            continue
+        if text[index] == '"':
+            end = _string_end(text, index)
+            if blank_literals:
+                _blank(text, out, index, end)
+            index = end
+            continue
+        if text[index] in "rb" and (raw_end := _raw_string_end(text, index)) is not None:
+            if blank_literals:
+                _blank(text, out, index, raw_end)
+            index = raw_end
+            continue
+        if text[index] == "'" and (char_end := _char_literal_end(text, index)) is not None:
+            if blank_literals:
+                _blank(text, out, index, char_end)
+            index = char_end
+            continue
+        index += 1
+    return "".join(out)
+
+
+def _blank(text: str, out: list[str], start: int, end: int) -> None:
+    """Blank ``text[start:end]`` in ``out``, keeping its newlines in place."""
+    for position in range(start, end):
+        if text[position] != "\n":
+            out[position] = " "
+
+
+def _block_comment_end(text: str, start: int) -> int:
+    """The index just past the block comment whose `/*` is at ``start``.
+
+    Rust block comments nest, so the depth is counted.
+    """
+    depth = 0
+    index = start
+    size = len(text)
+    while index < size:
+        if text.startswith("/*", index):
+            depth += 1
+            index += 2
+            continue
+        if text.startswith("*/", index):
+            depth -= 1
+            index += 2
+            if depth == 0:
+                return index
+            continue
+        index += 1
+    return size
+
+
+def _string_end(text: str, start: int) -> int:
+    """The index just past the ordinary string literal whose `"` is at ``start``.
+
+    `start` is always a `"`, so this is reached for `"…"` and for the `"…"` of a
+    `b"…"`; an unterminated literal consumes the rest of the text.
+    """
+    index = start + 1
+    size = len(text)
+    while index < size:
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == '"':
+            return index + 1
+        index += 1
+    return size
+
+
+def _raw_string_end(text: str, start: int) -> int | None:
+    """The index just past the raw string literal starting at ``start``.
+
+    `None` when ``start`` begins no literal -- `r"…"`, `r#"…"#`, `br"…"` all
+    arrive here, but so does every identifier that starts with `r` or `b`, and
+    only a hash run followed by an opening quote makes one a literal.
+    """
+    index = start
+    if text.startswith(("br", "rb"), index):
+        index += 2
+    elif text[index] == "r":
+        index += 1
+    else:
+        return None
+    hashes = 0
+    while index < len(text) and text[index] == "#":
+        hashes += 1
+        index += 1
+    if index >= len(text) or text[index] != '"':
+        return None
+    closing = '"' + "#" * hashes
+    end = text.find(closing, index + 1)
+    return len(text) if end == -1 else end + len(closing)
+
+
+def _char_literal_end(text: str, start: int) -> int | None:
+    r"""The index just past the character literal whose `'` is at ``start``.
+
+    `None` for a lifetime or a loop label (`'a`, `'static`, `'outer:`), which is
+    not a literal and has no end to skip to. Treating one as a literal would hide
+    the code after it, so only `'\x'` and `'x'` are literals here.
+    """
+    if text.startswith("'", start + 1):
+        return start + 2
+    if text.startswith("\\", start + 1):
+        index = start + 2
+        while index < len(text) and text[index] != "'":
+            index += 1
+        return index + 1
+    if start + 2 < len(text) and text[start + 2] == "'":
+        return start + 3
+    return None
 
 
 def _brace_end(text: str, open_index: int) -> int:

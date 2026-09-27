@@ -1604,6 +1604,130 @@ class CheckGateEnvTierLoadTest(EnvTierFixture):
         self.rejects("got 6 field(s)")
 
 
+# A crate whose surface is read the three ways the reader half has to tell
+# apart: a literal handed straight to `env::var`, a literal forwarded to a
+# crate-local reader through a two-hop wrapper, and a literal that is only a
+# *mention* -- in a doc comment, in a block comment, inside an ordinary string
+# constant, inside a raw one. A mention is not a read: if the scan counted one,
+# a declaration naming it would pass the stale-declaration rule that exists to
+# catch exactly that. `CARGO_TARGET_DIR` is the runner's own environment, which
+# is no crate's knob.
+DIRECT_KNOB_RS = r'''//! `env::var("FIXTURE_COMMENTED")` is prose about a read, not a read.
+/* and `env::var("FIXTURE_BLOCK")` is prose in a block comment. */
+
+fn env_parse(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn hops(name: &str, default: u64) -> u64 {
+    env_parse(name, default)
+}
+
+pub fn forwarded() -> u64 {
+    hops("FIXTURE_FORWARDED", 16)
+}
+
+pub fn direct_cycles() -> u64 {
+    std::env::var("FIXTURE_DIRECT_CYCLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1500)
+}
+
+pub fn direct_dist_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("FIXTURE_DIST_DIR")
+}
+
+static MODULE_SCOPE: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("FIXTURE_MODULE_SCOPE").ok());
+
+static TARGET: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("CARGO_TARGET_DIR").ok());
+
+const DOC: &str = "env::var(\"FIXTURE_ESCAPED\")";
+const RAW: &str = r#"env::var("FIXTURE_RAW")"#;
+'''
+
+
+class CheckGateEnvTierDirectReadTest(EnvTierFixture):
+    """The literals the reader half has to tell from a mention.
+
+    A variable read by a direct `std::env::var("NAME")` literal is a read, and
+    without it in the reader set a declaration naming it trips the
+    stale-declaration half -- the grammar refusing a true statement. The other
+    side is a mention: an `env::var("NAME")` in a comment or inside a string
+    constant is prose, so a declaration resting on one must still be refused.
+    """
+
+    EXTRA_SOURCES = {"src/direct_knob.rs": DIRECT_KNOB_RS}
+
+    CHURN = (
+        "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+        "| per-dial loss rate under a sized load | fixture-liveness@shape=churn"
+    )
+
+    REAL = (
+        "fixture-direct = FIXTURE_DIRECT_CYCLES,FIXTURE_DIST_DIR,"
+        "FIXTURE_FORWARDED,FIXTURE_MODULE_SCOPE | - | the load the sources read "
+        "in-process | fixture-liveness@shape=direct"
+    )
+
+    MENTIONS = (
+        "fixture-mentions = FIXTURE_BLOCK,FIXTURE_COMMENTED,FIXTURE_ESCAPED,"
+        "FIXTURE_RAW | - | the names only a comment or a string constant "
+        "mentions | fixture-liveness@shape=mention"
+    )
+
+    def test_the_direct_literal_and_the_var_os_literal_are_reads(self):
+        self.declare(self.CHURN + "\n" + self.REAL)
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("gate-env-tier: 2 env-scaled surface(s), 6 variable(s)", output)
+        self.assertIn("FIXTURE_DIRECT_CYCLES, FIXTURE_DIST_DIR", output)
+
+    def test_a_direct_literal_the_declaration_omits_is_refused(self):
+        self.declare(self.CHURN)
+        self.rejects(
+            "FIXTURE_DIRECT_CYCLES is read by src/direct_knob.rs and set by no "
+            "script"
+        )
+
+    def test_the_reader_closure_still_reaches_a_two_hop_wrapper(self):
+        """`forwarded` -> `hops` -> `env_parse` -> `env::var` is a reader."""
+        self.declare(self.CHURN)
+        self.rejects(
+            "FIXTURE_FORWARDED is read by src/direct_knob.rs and set by no script"
+        )
+
+    def test_a_name_only_a_mention_names_is_still_stale(self):
+        self.declare(self.CHURN + "\n" + self.REAL + "\n" + self.MENTIONS)
+        self.rejects(
+            "surface fixture-mentions: FIXTURE_BLOCK, FIXTURE_COMMENTED, "
+            "FIXTURE_ESCAPED, FIXTURE_RAW is passed to no env-reading function "
+            "of this crate; a declared variable the crate never reads is a "
+            "stale declaration"
+        )
+
+    def test_a_toolchain_name_is_not_demanded_of_a_surface(self):
+        self.declare(self.CHURN + "\n" + self.REAL)
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("CARGO_TARGET_DIR", output)
+
+    def test_a_toolchain_name_is_not_a_declarable_variable(self):
+        self.declare(
+            self.CHURN
+            + "\n"
+            + self.REAL
+            + "\nfixture-runner-env = CARGO_TARGET_DIR | - | a name the "
+            "toolchain sets | fixture-liveness@shape=toolchain"
+        )
+        self.rejects("surface fixture-runner-env: CARGO_TARGET_DIR is passed to")
+
+
 class CheckGateScenarioDirectoryTest(CheckGatePerfFixture):
     """`--crate`'s scenario directory is reconciled with the package's targets.
 
