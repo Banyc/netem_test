@@ -26,7 +26,7 @@ test. The form and the checker's failure modes are in `tools/PERF_INFRA.md`
 ## The rule that selects a row
 
 A test is a row here when it exists to **measure a perf quantity** — latency,
-goodput, capacity fraction, own-wire, per-flow fairness, throughput, or an
+goodput, capacity fraction, offered-load latency, per-flow fairness, throughput, or an
 instrument-sanity property a measurement depends on. The 94 rows below cover
 the eleven measurement targets: `mandate_smoke`, `rtp_mux_jitter`,
 `dual_lane_mandates`, `hol_probe`, `hol_verify4`, `contested_latency`,
@@ -257,10 +257,10 @@ membership block above is a proposal whose rejection *is* the finding.
 
 ```gate-perf-design
 mandate_smoke::m1_interactive_tail_latency = default | 50.0 | baseline | baseline@impairment=clean2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+scale=256B+metric=p99
-mandate_smoke::m2_interactive_delivery_and_wire = default | 54.1 | orthogonal | M2@impairment=clean2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+metric=own-wire
+mandate_smoke::m2_offered_load_latency = default | 54.1 | orthogonal | M2@impairment=clean2pct-iid+latency=25ms+jitter=5ms+lane=dual+shape=cadence+flows=1+metric=offer-and-latency
 mandate_smoke::m3_bulk_goodput_fraction = default | 61.6 | baseline@m3-bulk | M3@lane=bulk+rate=1MiBps+scale=2MiB+metric=capacity-fraction
 mandate_smoke::m4_interactive_lane_fairness = default | 31.2 | composite(arm-set,flows)@fairness | M4@lane=dual+flows=4+arm-set=clean-and-hostile+metric=per-flow-share
-rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=own-wire-budget
+rtp_mux_jitter::jitter_duallane_constitution_gate = default | 40 | baseline@constitution | M2@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=offer-and-latency
 rtp_mux_jitter::jitter_duallane_constitution_gate_p99 = full | 105 | orthogonal@constitution | M1@lane=dual+shape=cadence+arm-set=clean-and-hostile+metric=p99-median-of-3
 rtp_mux_jitter::jitter_decomposition = perf | 280 | composite(arms,jitter)@decomposition | loss-vs-queue@impairment=loss2pct-iid+jitter=5ms+load=bulk-burst+arms=solo-loss-bulk-combined+metric=p99-decomposition
 rtp_mux_jitter::jitter_frame_reorder_decomposition = perf | 140 | baseline@decomposition | frame-reorder@layer=rtp-frame+reorder=receiver-fast-forward+impairment=loss2pct-iid+load=bulk-burst+metric=p99-decomposition
@@ -274,7 +274,7 @@ rtp_mux_jitter::jitter_reorder_direction = perf | 70 | baseline@reorder | reorde
 rtp_mux_jitter::jitter_interactive_solo = perf | 35 | baseline@interactive | M1@lane=interactive+flows=1+impairment=loss2pct-iid+jitter=5ms+shape=cadence
 rtp_mux_jitter::jitter_interactive_with_loss = perf | 35 | re-measurement(second-arm-same-declared-point)@interactive | M1@lane=interactive+flows=1+impairment=loss2pct-iid
 rtp_mux_jitter::jitter_interactive_with_bulk = perf | 130 | orthogonal@interactive | M1@lane=interactive+flows=1+load=bulk-burst+impairment=loss2pct-iid
-rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf | 35 | composite(load,metric)@interactive | M2@lane=interactive+flows=1+load=bulk-burst+impairment=loss2pct-iid+metric=own-wire
+rtp_mux_jitter::jitter_interactive_bulk_and_loss = perf | 35 | composite(load,metric)@interactive | M2@lane=interactive+flows=1+load=bulk-burst+impairment=loss2pct-iid+metric=offer-and-latency
 rtp_mux_jitter::jitter_duallane_arms = perf | 280 | composite(load,reorder)@dual-lane | dual-lane-matched-load@lane=dual+load=bulk-matched+reorder=fast-forward-and-strict
 rtp_mux_jitter::jitter_burst_loss_arms = perf | 420 | orthogonal | M1@impairment=gilbert-elliott-burst+jitter=5ms+lane=dual+metric=p99
 rtp_mux_jitter::jitter_request_response_arms = perf | 1170 | baseline@lone-tail | M1@shape=request-response+depth=1+impairment=loss5pct-ge+jitter=100ms+metric=p99

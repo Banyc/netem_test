@@ -27,16 +27,24 @@ failure, not a win.
   burst loss, jitter — **and for the request/response shape a real client
   sends**, not only a steady cadence. M1 is the operator's stated **top
   priority** where mandates conflict.
-- **M2 — the interactive lane still delivers, without inflating its own
-  wire.** M2 is not a byte count for its own sake. The operator's statement of
-  why it exists:
+- **M2 — the interactive lane is offered a known throughput and its latency
+  does not degrade under that offer.** The operator's statement of why it
+  exists:
 
   > the idea of M2 is to preserve normal throughput for interactive lane when
   > we doing aggressive latency improvement by M1, to prevent the case where
   > the interactive lane is ultra-low-latency but it can't sustain any real
   > traffic.
 
-  So M2 exists to stop M1 from winning at the lane's expense.
+  The mandate formalises that as a relation whose **input is the throughput**:
+  the arm offers a known rate, the lane must **deliver** it, and its **latency
+  must stay at the link's floor** under that offer — so the goodput is
+  *inferred* from the latency holding (a lane draining its offer cannot be
+  accumulating a queue, and one whose goodput fell would show the backlog as
+  latency or stop offering). So M2 exists to stop M1 from winning at the
+  lane's expense. The `own-wire multiple` this used to be stated as was
+  removed: it was an internal redundancy ratio whose user-visible consequence
+  was never stated.
 - **M3 — bulk goodput** as a fraction of the configured link rate, on the same
   production dual-lane topology.
 - **M4 — the interactive lane's split across several flows.** M1 and M2 each
@@ -502,11 +510,11 @@ On that pin:
     ceiling;
   - hostile (cadence) p99 ≈ 0.21–0.33 s, with tens of samples over the
     ceiling per short window.
-- **The lone-tail arm's own wire is informational, not a defect.** It reads
-  6.07–6.41× on the smoke arm and 6.22–7.17× in the field. That multiple is
-  the accepted cost of the better tail at that impairment, not a budget to
-  close; the `clean` arm is where M2's budget is asserted (see "What \"done\"
-  means").
+- **The lone-tail arm's own wire is a diagnostic, not a defect.** It reads
+  6.07–6.41× the offered payload on the smoke arm and 6.22–7.17× in the field;
+  that is a measurement the arm line prints, not a bound — the own-wire budget
+  it used to be weighed against is removed (M2 is the offered-load relation
+  now, see "What \"done\" means").
 - **The mechanism** is a compounding repair ladder. Once the lone tail's
   six-datagram cover is exhausted, each further rung waits
   `TAIL_PROBED_MIN_RTO` (`300 ms`) compounded onto the current RTO, so one
@@ -528,22 +536,22 @@ On that pin:
   interactive fresh-tail cover on a pipelined tail; measured on the dual-lane
   arms it cost p99 **29.6 → 83.0 ms** at 6 % iid and **231.8 → 478.1 ms**
   under Gilbert-Elliot burst with the bulk lane loaded, with samples over
-  250 ms rising 12 → 46. Own wire is back at its pre-regression level; the
-  constitution arm's `both` case is what `rtp_mux/GATE.md` records as ~3.6×.
+  250 ms rising 12 → 46. The constitution arm's `both` case is what
+  `rtp_mux/GATE.md` records as a ~26 ms p99 (and a ~3.6× wire diagnostic).
   (The `clean` smoke arm reads ~2.2× on the same pin — a different cadence
   and load, so the two are not interchangeable.)
 
 The M1-vs-M2 trade under jitter is **decided**, not open: the deployed
 configuration stands. On the jittered arm a 2-shard design measured p99
-≈ 108 ms at 5.5–5.9× own-wire, against the deployed build's ≈ 37 ms at
-≈ 6.8×. The lower-wire alternative was measured and **not taken** — the tail
-is worth the wire — and those two numbers are recorded here once, as a closed
-matter. It is not a candidate, and the wire multiple it would have saved is
-not a defect to close. **M1 is the standing priority** where the mandates
-conflict; that priority is settled and is not re-decided per regime.
+≈ 108 ms, against the deployed build's ≈ 37 ms; the lower-latency design was
+measured and taken, and the two numbers are recorded here once, as a closed
+matter, because **M1 is the standing priority** where the mandates
+conflict and M2 no longer bounds the wire that bought it. The measured wire
+multiple remains a printed diagnostic, not a target.
 
 The open item is the field tail itself (see "Where the path stands today").
-It is cut by either **armouring the repair**, which spends M2 own-wire, or
+It is cut by either **armouring the repair**, which spends wire the mandate no
+longer bounds, or
 **shortening the `300 ms` rung and/or the tail-probe budget**, which tightens
 a recovery parameter. The RFC 8985 §7.2/§7.3-aligned unit tests are sometimes
 read as a blocker here; under the rule above they are **not** one — they are
@@ -554,11 +562,14 @@ re-writable with a measurement and a vacuity check.
 Done means: **every smoke-set arm meets M1's mandate bound** — p99 ≤ 250 ms
 and **zero** samples over 250 ms — with `delivery == 1.000`. Full stop.
 
-**M2's 6× own-wire budget** is asserted where it is meaningful, on the
-`clean` arm, which carries the real budget assertion. In the impaired regimes
-the measured wire multiple is **informational**: it says what the better tail
-costs there, and it is not a target and not a defect to close. The hostile and
-lone-tail arms' guards (900 ms / 3200 ms / 8000 ms / 8 % / 10× / 14×) are the
+**M2's offered-load relation** is asserted on the
+`clean` arm, which carries the mandate: the lane is offered its known
+throughput, it delivers it, and its latency stays at the floor under it. In
+the impaired regimes the latency is above the floor by the loss realisation
+itself, so the honest reading there is the delivery floor and the M1
+tripwire, not a latency bound. The hostile and
+lone-tail arms' guards (900 ms / 3200 ms / 8000 ms / 8 % / `0.995` delivery)
+are the
 **intended permanent shape** on those arms — a regression tripwire that fires
 if an impaired arm gets worse — not a placeholder waiting to be tightened to
 the mandate bound. The M1 breach those arms keep visible stays the open
@@ -567,8 +578,8 @@ do not change shape when it is fixed.
 
 **M1 is the standing priority** where the mandates conflict. That is settled,
 and there is nothing here to decide or sign off: in the jitter regime the
-deployed configuration buys p99 ≈ 37 ms at ≈ 6.8×, where the lower-wire
-alternative measures p99 ≈ 108 ms at ≈ 5.5–5.9×, and the product takes the
+deployed configuration buys p99 ≈ 37 ms, where the lower-wire
+alternative measures p99 ≈ 108 ms, and the product takes the
 tail.
 
 ## Half 2 — the infrastructure
@@ -604,13 +615,14 @@ sends — all on the production dual-lane topology:
 | `hostile` | GE `gilbert_elliott_loss(5, 8)`, 25 ms one-way, 100 ms jitter | 256 B cadence | 2 MiB / 3 s |
 | `lone_tail` | same GE + jitter | request/response, depth 1 | none |
 
-`clean` asserts the mandate bounds — M1's ceiling and M2's 6× budget — so it
-is the arm that carries the real budget assertion. `hostile` and `lone_tail`
+`clean` asserts the mandate bounds — M1's ceiling and M2's offered-load
+relation (the known offer, delivery, and the non-degrading p99) — so it
+is the arm that carries the real mandate assertion. `hostile` and `lone_tail`
 assert derived regression guards, which are the **intended permanent shape**
 on those arms: a tripwire that fires when an impaired arm gets worse, not a
 bound waiting to be tightened, and not the place M2 is enforced. On those arms
-the ceiling does not hold today (the open M1 field-tail defect) and the wire
-multiple is informational. The panels draw the real mandate bounds regardless,
+the ceiling does not hold today (the open M1 field-tail defect). The panels
+draw the real mandate bounds regardless,
 so a breach stays visible even where the assertion is only a guard: **the
 assertion is a tripwire, the panel is the evidence.** The guard values and the
 arms asserting them live in `rtp_mux` (`rtp_mux/GATE.md`,
@@ -821,8 +833,8 @@ the reader:
   refused by name — the delivery panels failed that at `0.5 %`, i.e. half a
   pixel. A pinned `y_extent` that reintroduces the failure is refused the same
   way, and so is a pinned `y_extent` that leaves a *named* guard outside the
-  range (the `M2-wire` panel announced `hostile_wire_guard=10` and
-  `lone_wire_guard=14` on an axis topping out at 6.6, so the region it was
+  range (a panel that announced a per-arm guard on an axis topping out below
+  it, so the region it was
   explaining was off the frame) or leaves no room for a bar over the highest
   value it names (`M4-shares` was drawn over `0..0.25` — the fair share itself
   — so a flow over the share could not be drawn at all).
@@ -847,8 +859,9 @@ the reader:
   state its own governance with `bounds[i].series` (a declared series) and/or
   `bounds[i].x` (a category, a list, or `{"min", "max"}`, which must be
   categories the panel draws — the line is then drawn only over that window).
-  A run that supplies neither is refused for such a panel, because as drawn the
-  M2 wire budget line made a budget breach of a crossing the verdict tolerates.
+  A run that supplies neither is refused for such a panel, because as drawn a
+  budget line across arms with different tolerances made a breach of a crossing
+  the verdict tolerates.
   A crossing nothing in the run asserts a looser guard against — a per-flow
   delivery floor — stands as the breach it draws, so a failing run still
   renders its evidence. A crossing a named guard *does* tolerate is measured

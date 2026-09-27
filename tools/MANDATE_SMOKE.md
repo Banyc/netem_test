@@ -70,7 +70,8 @@ A change to any of the three crates on the interactive path must run this
 command, and the assertion is only half of it. The `MANDATE` line is a
 tripwire: it says a bound was crossed, not what moved or by how much. The
 rendered panels are the evidence — latency over time and its CDF for M1,
-delivery and wire for M2, per-seed goodput against the floor for M3 — and a
+delivery and the latency under the known offer for M2, per-seed goodput
+against the floor for M3 — and a
 run whose verdict block is read without its plots has not been read at all.
 A green verdict with an unread panel is how a change that halves bulk goodput
 while passing every other gate gets retained.
@@ -132,7 +133,7 @@ only.
 
    ```
    MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0
-   MANDATE M2 FAIL delivery=0.998 amp=7.2 budget=6.0
+   MANDATE M2 FAIL offer_msgs=120 offer_floor=2352 delivery=0.784 p99=18223.9 nondergrading_p99_ms=100.0
    ```
 
    A line that starts with `MANDATE ` but does not match the grammar above is
@@ -142,7 +143,7 @@ only.
    changed one, and a verdict that measures nothing cannot be checked.
 
    A measurement whose key ends in `_guard` is read as that arm's own
-   regression guard for the quantity the key names (`hostile_wire_guard=10.0`),
+   regression guard for the quantity the key names (`hostile_p99_guard=900.0`),
    and the plotter names it on the bound the arm's bars cross, so a crossing
    the verdict tolerates cannot be read as a budget breach. A producer that
    asserts a looser guard on an arm therefore owes the key: the run's
@@ -350,7 +351,7 @@ than only in total:
   "origin": "smoke-child-start",
   "tests": [
     {"producer": "rtp_mux", "target": "mandate_smoke",
-     "name": "m2_interactive_delivery_and_wire",
+     "name": "m2_offered_load_latency",
      "state": "ok", "started_at_seconds": 0.0,
      "finished_at_seconds": 24.698, "duration_seconds": 24.698}
   ],
