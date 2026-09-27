@@ -519,3 +519,49 @@ probe-forwarding@load=request-response = the probes drive the runner directly, s
 attribution@baseline-family=default = netem_scenarios::netem_reorder_with_rate_jumps_ahead is two declared dimensions (impairment, rate) from the conformance reference, and no arm varies one of them alone; a conformance arm one axis away from it is what closes this.
 attribution@baseline-family=lane = lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot is two declared dimensions (lane, metric) from the lane family's reference; the thin-link regime is another regime, not a second axis of the jittery one, so a lane_regime_coverage arm one axis away closes this.
 ```
+
+## The env-scaled opt-in surfaces: `gate-env-tier`
+
+Three of the harness's surfaces are not `#[ignore]`d scenarios at all — they are
+scaled by environment variables the sources read at run time — so no other
+block in any manifest can see them, and they are declared in the
+`gate-env-tier` block below.
+
+**This file is their manifest, and no second one is needed.** The checker
+resolves one manifest per invocation, and this is the one every `netem_test`
+invocation reads: harness mode's layout is `tests/GATE.md` (`check-gate.py`,
+`harness_layout`), and both documented parameterized forms below name it
+explicitly. The other half of the check is anchored differently — the variable
+set is detected from the whole crate root's Rust sources
+(`_rust_env_read_names(root)`) — so the `netem-test` member's own library and
+example sources are read through this manifest, beside the `tests` package's
+scenarios. Giving the `netem-test` package a manifest of its own would add a
+second authority for the same names, and the package has no scenario
+directory to hang one on (`netem-test/tests/` holds only a golden file, not a
+test target). The member's `--lib` target is already resolved here through the
+`gate-lib-package` block above, which is what lets this manifest name the
+harness's own lib probes at all.
+
+All three rows are runner-less (`-`): the knobs are read in-process by whoever
+invokes the probe or the arms, and no script of this crate sets any of them.
+The `NETEM_PERF_*` names that `tools/perf_loop.py` does set belong to
+`rtp_mux`'s surface — no source of this crate reads one — so they correctly do
+not appear here.
+
+```gate-env-tier
+dynamic-contested-rep = DYN_RUN_SECS | - | the rep length, in seconds, each of the twelve `dynamic_contested` arms in the `rtp_mux` crate runs its scenario for (default 15), read through the harness kit's `dyn_run_secs()`: it sizes those arms' interactive-tail and bulk-goodput measurements, and the arms themselves, their `DYN_REPS` repetition count and their floors are declared in `rtp_mux/GATE.md`, whose own row names this knob as the factor it cannot state; the two declarations are each other's missing factor, because an arm's cost is the rep length times the rep count and one factor lives in each crate | dyn-size-window@knob=DYN_RUN_SECS+unit=second, dyn-size-latency@rep-window=DYN_RUN_SECS+metric=small-and-burst-p50-p99, dyn-size-bulk@rep-window=DYN_RUN_SECS+metric=goodput-fraction, dyn-size-migration@rep-window=DYN_RUN_SECS+arm-set=migrating-variants | DYN_RUN_SECS=15,total=DYN_RUN_SECS,wall=16.18s
+saturating-fifo-probe = PROBE_SECONDS,PROBE_LATENCY_MS,PROBE_MSS,PROBE_YIELD_EVERY,PROBE_ACK_EVERY | - | the harness's own CPU cost per forwarded datagram at saturation, read by owning-symbol attribution (`tools/samply_hotspots.py`) rather than asserted by a wall clock: a bulk client-to-server flood of `PROBE_MSS`-byte datagrams against a sink that returns a 22-byte reply every `PROBE_ACK_EVERY` received datagrams, for `PROBE_SECONDS`, with the sender yielding every `PROBE_YIELD_EVERY` sends and `PROBE_LATENCY_MS` selecting the runner path (0 the direct no-clock no-queue path, anything non-zero the FIFO-scheduled path, which is the only one installing a per-receive socket timeout); the probe's summary prints the per-direction forwarded counts, the metric's denominator, and the load below is the documented shape at the values it was measured with | probe-saturation@shape=bulk-flood+metric=cpu-per-forwarded-datagram, probe-path@knob=PROBE_LATENCY_MS+path=direct-or-fifo-scheduled, probe-denominator@metric=per-direction-forwarded-datagram-count, probe-payload@knob=PROBE_MSS+unit=byte, probe-yield@knob=PROBE_YIELD_EVERY+unit=send, probe-reply@knob=PROBE_ACK_EVERY+unit=received-datagram | PROBE_SECONDS=25,PROBE_LATENCY_MS=1,PROBE_MSS=8192,PROBE_YIELD_EVERY=16,PROBE_ACK_EVERY=13,total=PROBE_SECONDS,wall=25.0s
+report-evidence-sink = NETEM_REPORT_DIR,NETEM_DIST_DIR | - | the CSV evidence sink rather than a measurement: `report_dir()` prefers `NETEM_REPORT_DIR`, falls back to `NETEM_DIST_DIR`, and otherwise writes under `target/netem-report`, and `dump_csv()` writes one `<slug>.csv` of `series,value` rows per arm set into that directory (`dump_csv_to()` names its directory as an argument instead); the pair decides where a run's evidence lands, and no count, window or cadence derives from either name, so this row's load is refused rather than invented | report-evidence@artifact=csv+knob=NETEM_REPORT_DIR-over-NETEM_DIST_DIR, report-default@knob=unset+sink=target/netem-report
+```
+
+The one load that is **derived** rather than measured here is the rep length's:
+its `wall=16.18s` is `rtp_mux/GATE.md`'s recorded 582.34 s for the twelve arms
+at `DYN_REPS=3`, divided by those 36 reps — the harness never runs those arms,
+so the per-rep clock is read back from the crate that does. The probe's load is
+this crate's own measurement of the documented shape: 25.005 s wall with
+`PROBE_LATENCY_MS=1 PROBE_SECONDS=25`, which is why the row's `wall` there is
+the shape's own `PROBE_SECONDS` plus the fixed startup.
+
+A surface that sizes nothing gets no load rather than an invented one: the
+evidence sink names a directory, and a path is not a count, so its row carries
+four fields and the refusal in its `measures` text.
