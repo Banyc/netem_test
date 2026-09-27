@@ -605,6 +605,108 @@ loudly rather than reporting success on absent evidence** — it fails when it
 cannot produce the evidence as well as when a mandate fails. The contract,
 what it writes and its exit codes are in `tools/MANDATE_SMOKE.md`.
 
+### The perf-history M1 band — measured, not a fixed percentage
+
+After the battery, `tools/mandate-check` runs the `perf-history` bin
+(`netem-test/src/bin/perf-history.rs`, built with `--features cli`) over the run:
+it archives the run's artifacts, compares it to the previous archived one, and —
+because M1 is the standing priority — **exits 6 when an interactive arm's tail
+regressed**, so the wrapper's status arms the quick-revert runbook.
+
+That rejection used to be decided by a **fixed relative band** (10 % on clean
+percentiles, 40 % on impaired ones, 50 % on `max`). A fixed band cannot bound a
+quantity whose own run-to-run spread exceeds it, and the archive proves the cost:
+over the eleven runs on record `lone_tail p90` spans **37.1–57.8 ms**, so the pair
+`37.1 -> 55.0` (+48 %) is *inside* the arm's own spread while the 40 % band
+rejects it. The battery came back **PASS 4/4** while the wrapper exited **6** — a
+good build rejected, which is precisely the noise-triggered revert the mechanism
+exists to avoid.
+
+The band is now drawn from the archive, the way
+`mandate_smoke::m1_interactive_tail_latency` draws its deployed baseline:
+
+```text
+measured = mean + 4 sample standard deviations   over the archived runs
+settled  = previous x (1 + settled_band(arm, metric))
+bound    = max(settled, measured)                the wider of the two binds
+```
+
+and a rise rejects only when it clears **all** of the bound, the previous run's
+value, and the absolute floor **5 ms** (2 % of the 250 ms ceiling) — a relative
+test near zero is meaningless in the units the product promises, which is what
+`hostile p50` is: it moves `0.6 -> 16.9` ms, a 28x ratio on a median that is not
+the promise. `p50`, `p90` and `p99` reject; `p999` and `max` are **reported, not
+enforced**, because a single order statistic of a heavy-tailed quantity rejects
+healthy runs at random (`lone_tail max` spans 574.5–3912.3 ms, 6.8x).
+
+**Sample requirement.** The measured half is trusted only from **8** archived
+readings of that arm and metric, **excluding the candidate**. Below it the bound
+is the settled band alone and the report prints the shortfall
+(`insufficient: n of 8 archived runs`) beside it — a rule that silently falls back
+to a fixed 10 % is how this defect happened, so the fallback is named, never
+substituted. 8 is above the six reps `mandate_smoke` recorded as having flaked,
+and it is the smallest count at which the sample standard deviation's own
+relative standard error `1/sqrt(2(n-1))` is below 27 %.
+
+**Degenerate quantities, decided from the distribution.** The population is the
+whole archive series, not the candidate's revision: across the eleven runs the
+transport revision changes every one or two runs (six distinct revisions), so a
+revision-scoped series holds at most three readings — below the requirement — and
+would fall back to the settled band on every run, reintroducing the defect. What
+is shared is the arm's own declaration (impairment, latency, jitter, seed,
+window, cadence, lane shape, scale), which is frozen by the test source. The
+residual is printed rather than hidden: each band's line in `vs-prev.md` carries
+`n`, `mean`, `sd`, the range, and the number of revisions pooled, and the
+`## bands` table carries both halves of every bound.
+
+**The firing history, with the spread as the judge.** Seven archived runs fired
+the fixed-band rule, across **twenty-three** arm-metric pairs (the enforcement
+set was narrowed twice while these runs were being recorded — first `p999`, then
+`max` — so some rows below were rejected by the rule of that day rather than by
+today's). Every one was **false**:
+
+| run | arm / metric | old firing | archived range | `mean+4sd` | judge |
+| --- | --- | --- | --- | --- | --- |
+| `…T175651` | `hostile p50` | 0.6 -> 3.7 (+517 %) | 0.6–16.9 | 25.9 | false |
+| `…T182142` | `hostile p50` | 3.7 -> 16.9 (+357 %) | 0.6–16.9 | 25.9 | false |
+| `…T182142` | `hostile p90` | 87.5 -> 121.9 (+39 %) | 81.2–121.9 | 139.3 | false |
+| `…T182142` | `hostile p99` | 123.9 -> 221.8 (+79 %) | 122.5–221.8 | 314.8 | false |
+| `…T182142` | `hostile p999` | 153.7 -> 252.9 (+65 %) | 150.2–314.5 | 401.4 | false |
+| `…T182142` | `hostile max` | 166.9 -> 267.8 (+60 %) | 165.0–329.4 | 417.4 | false |
+| `…T182353` | `lone_tail p90` | 38.6 -> 49.3 (+28 %) | 37.1–57.8 | 73.3 | false |
+| `…T182353` | `lone_tail p999` | 234.6 -> 418.6 (+78 %) | 234.6–633.4 | 912.4 | false |
+| `…T182353` | `lone_tail max` | 583.1 -> 1523.3 (+161 %) | 574.5–3912.3 | 5960.3 | false |
+| `…T183005` | `clean p999` | 30.1 -> 73.0 (+143 %) | 28.6–76.3 | 126.8 | false |
+| `…T183005` | `clean max` | 32.2 -> 88.0 (+173 %) | 30.5–94.7 | 157.2 | false |
+| `…T183005` | `hostile p50` | 0.7 -> 11.9 (+1600 %) | 0.6–16.9 | 25.9 | false |
+| `…T183005` | `hostile p90` | 88.7 -> 99.6 (+12 %) | 81.2–121.9 | 139.3 | false |
+| `…T183005` | `hostile p99` | 150.8 -> 221.1 (+47 %) | 122.5–221.8 | 314.8 | false |
+| `…T183005` | `hostile p999` | 192.8 -> 314.5 (+63 %) | 150.2–314.5 | 401.4 | false |
+| `…T183005` | `hostile max` | 207.8 -> 329.4 (+59 %) | 165.0–329.4 | 417.4 | false |
+| `…T183005` | `lone_tail p90` | 49.3 -> 57.8 (+17 %) | 37.1–57.8 | 73.3 | false |
+| `…T183005` | `lone_tail p999` | 418.6 -> 633.4 (+51 %) | 234.6–633.4 | 912.4 | false |
+| `…T183005` | `lone_tail max` | 1523.3 -> 3912.3 (+157 %) | 574.5–3912.3 | 5960.3 | false |
+| `…T184325` | `lone_tail p90` | 44.8 -> 52.3 (+17 %) | 37.1–57.8 | 73.3 | false |
+| `…T184325` | `lone_tail p999` | 240.4 -> 390.3 (+62 %) | 234.6–633.4 | 912.4 | false |
+| `…T212734` | `hostile p50` | 0.6 -> 6.6 (+1000 %) | 0.6–16.9 | 25.9 | false |
+| `…T214110` | `lone_tail p90` | 37.1 -> 55.0 (+48 %) | 37.1–57.8 | 73.3 | false |
+
+Every firing was a healthy run: **the mechanism, as it stood, caught no true
+degradation at all** — the same conclusion the `p999` exclusion reached earlier,
+now measured across the whole firing history rather than one metric. That is why
+the archive is the population and the settled band is only its floor: the
+archive's own spread is the discriminator, and a rise that stays inside it is
+noise no matter how large its percentage. Re-running all seven of those runs
+with the measured band exits **0** on every one; the rule has not simply been
+loosened, it has been pointed at a quantity it can bound.
+
+What still rejects: an asserted percentile past the measured bound (a +300 ms
+one-way fault reads 1891.4 ms on `hostile p99`, past its 314.8 ms bound, exit 6),
+plus the `>250 ms` **share** guards and the coarse `p999` guards in
+`mandate_smoke` — the arms' own tripwires, which the band rule does not replace.
+The readings and their derivation are in the run's own `vs-prev.md`
+(`## bands`) and `summary.md`, both printed by `perf-history`.
+
 ### The smoke set
 
 `rtp_mux/tests/mandate_smoke.rs`, run over three arms in the shape the field
