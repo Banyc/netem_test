@@ -69,8 +69,9 @@ tri-mandate smoke set this command was built for; ``netem_test`` is this
 workspace's own perf-tier probes. ``--producer <id>`` selects one or more, and
 with none named **every** declared producer runs, so one run produces per-arm
 records for both. ``--producer-path <id>=<path>`` points one producer at
-another checkout, and ``--rtp-mux <path>`` is the documented shorthand for the
-``rtp_mux`` one.
+another checkout via ``--producer-path <id>=<path>``, which is the only form:
+no flag names a crate, because which crates exist is the registry's business
+(`tools/mandate-producers.json`) and not the harness's.
 
 The report records each producer's own invocation, revision, tree, log, exit
 status and arm count under ``producers``, and each arm carries the ``producer``
@@ -313,7 +314,7 @@ WORKSPACE_ROOT = MODULE_DIR.parent
 # tests' fallback: every producer declares its own sections, and a verdict id
 # is only accepted when the producer that printed it declares it.
 MANDATE_IDS = ("M1", "M2", "M3", "M4")
-# The producer ``--rtp-mux`` and ``default_crate_path`` name, and the one whose
+# The producer the registry marks primary, and the one whose
 # record the report keeps under the ``rtp_mux``/``smoke`` keys a
 # ``mandate-check/4`` reader reads.
 PRIMARY_PRODUCER = "rtp_mux"
@@ -1036,16 +1037,6 @@ def producer_checkout(producer):
     if declared.is_absolute():
         return declared.resolve()
     return (WORKSPACE_ROOT / declared).resolve()
-
-
-def default_crate_path():
-    """The primary producer's default checkout: the sibling ``../rtp_mux``.
-
-    The registry's ``rtp_mux`` entry declares the same ``../rtp_mux``
-    ``default_path``; ``test_mandate_check`` pins the two to each other so this
-    helper cannot drift into a second authority.
-    """
-    return (WORKSPACE_ROOT.parent / PRIMARY_PRODUCER).resolve()
 
 
 def load_producer_declaration(path, problems):
@@ -2519,16 +2510,6 @@ def parse_args(argv):
         ),
     )
     parser.add_argument(
-        "--rtp-mux",
-        type=Path,
-        default=None,
-        help=(
-            "the rtp_mux checkout holding the smoke set; the documented "
-            "shorthand for --producer-path rtp_mux=<path> "
-            f"(default: the sibling ../{PRIMARY_PRODUCER} of this workspace)"
-        ),
-    )
-    parser.add_argument(
         "--dir",
         type=Path,
         default=None,
@@ -2592,9 +2573,12 @@ def parse_args(argv):
 def producer_overrides(args):
     """``(overrides, problems)``: the per-producer checkout paths the CLI names.
 
-    ``--producer-path <id>=<path>`` is the general form and ``--rtp-mux
-    <path>`` the documented shorthand for the primary producer; an explicit
-    ``--producer-path`` for that producer wins over the shorthand.
+    ``--producer-path <id>=<path>`` is the only form. There is deliberately no
+    per-crate shorthand: the harness is the impairment instrument and its
+    tooling, and a flag named after one crate under test would be the harness
+    knowing about that crate. Which crates exist, what each producer's package
+    and target are, and where its default checkout lives are all *declared* in
+    ``tools/mandate-producers.json``; the runner names none of them.
     """
     overrides = {}
     problems = []
@@ -2604,8 +2588,6 @@ def producer_overrides(args):
             problems.append(f"--producer-path {token!r} is not <id>=<path>")
             continue
         overrides[producer] = Path(path)
-    if args.rtp_mux is not None:
-        overrides.setdefault(PRIMARY_PRODUCER, args.rtp_mux)
     return overrides, problems
 
 

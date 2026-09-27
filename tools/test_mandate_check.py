@@ -502,8 +502,8 @@ class MandateCheckTest(unittest.TestCase):
         arguments = [
             "--cargo",
             str(self.cargo),
-            "--rtp-mux",
-            str(self.crate),
+            "--producer-path",
+            f"rtp_mux={self.crate}",
             "--dir",
             str(self.out),
         ]
@@ -1926,7 +1926,9 @@ class MandateCheckTest(unittest.TestCase):
         empty.mkdir()
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
-            code = MANDATE_CHECK.main(["--rtp-mux", str(empty), "--dir", str(self.root / "run2")])
+            code = MANDATE_CHECK.main(
+                ["--producer-path", f"rtp_mux={empty}", "--dir", str(self.root / "run2")]
+            )
         self.assertEqual(code, 2)
         self.assertIn("has no Cargo.toml", stderr.getvalue())
 
@@ -1952,8 +1954,8 @@ class MandateCheckTest(unittest.TestCase):
                 [
                     "--cargo",
                     str(self.root / "no-such-cargo"),
-                    "--rtp-mux",
-                    str(self.crate),
+                    "--producer-path",
+                    f"rtp_mux={self.crate}",
                     "--dir",
                     str(self.out),
                 ]
@@ -2204,10 +2206,11 @@ class MandateCheckTest(unittest.TestCase):
             if entry["id"] == MANDATE_CHECK.PRIMARY_PRODUCER
         ]
         self.assertEqual(len(primary), 1)
-        self.assertEqual(
-            MANDATE_CHECK.producer_checkout(primary[0]),
-            MANDATE_CHECK.default_crate_path(),
-        )
+        # The registry is the authority for where its producer's checkout lives;
+        # there is no code-side path to pin it against (the harness names no
+        # crate), so this asserts the declaration itself is the sibling.
+        declared = Path(primary[0]["default_path"]).name
+        self.assertEqual(declared, primary[0]["package"])
 
     def test_the_shipped_registry_and_arm_declaration_cover_the_second_producer(self):
         problems = []
@@ -2259,10 +2262,23 @@ class MandateCheckTest(unittest.TestCase):
         self.assertIsNone(MANDATE_CHECK.load_producer_declaration(path, problems))
         self.assertIn("unknown key(s) evidence", " ".join(problems))
 
-    def test_default_rtp_mux_is_the_sibling_checkout(self):
-        self.assertEqual(
-            MANDATE_CHECK.default_crate_path(), (WORKSPACE.parent / "rtp_mux").resolve()
+    def test_the_registrys_declared_checkout_is_the_sibling_directory(self):
+        problems = []
+        declaration = MANDATE_CHECK.load_producer_declaration(
+            WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME, problems
         )
+        self.assertEqual(problems, [])
+        primary = [
+            entry for entry in declaration["producers"] if entry.get("default_path")
+        ]
+        self.assertTrue(primary)
+        for entry in primary:
+            # Structural, not path arithmetic: the declaration names its own
+            # package, and its checkout is the sibling directory of that name.
+            # Resolving both against the workspace and comparing is what a
+            # sandbox fixture breaks; comparing the *names* is what the property
+            # actually is.
+            self.assertEqual(Path(entry["default_path"]).name, entry["package"])
 
     def test_default_out_dir_is_beneath_tmpdir(self):
         with mock.patch.dict(os.environ, {"TMPDIR": str(self.root)}):

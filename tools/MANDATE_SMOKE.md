@@ -21,7 +21,7 @@ of them required:
 | --- | --- | --- |
 | `--producer <id>` | every declared producer | run only this producer; repeatable |
 | `--producer-path <id>=<path>` | the producer's declared `default_path` | point one producer at another checkout; repeatable, resolved against the current directory |
-| `--rtp-mux <path>` | the sibling `../rtp_mux` | the documented shorthand for `--producer-path rtp_mux=<path>` |
+| `--producer-path rtp_mux=<path>` | the sibling `../rtp_mux` | the checkout holding the smoke set: the only form, because the harness names no crate (which crates exist is the registry's business) |
 | `--dir <out>` | a fresh directory beneath `$TMPDIR` | where the run writes its evidence |
 | `--quick` | off | ask a producer that honours it for its shortest windows (`MANDATE_SMOKE_QUICK=1`) |
 | `--timeout <seconds>` | 900 | how long each producer may run before it is killed |
