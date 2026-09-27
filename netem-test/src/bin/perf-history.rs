@@ -103,6 +103,14 @@ const M1_ARM_KEYS: &[&str] = &["clean", "hostile", "lone_tail", "lone tail"];
 /// rejection nobody can act on. A clean-arm percentile is tight (cv 0.067), so it
 /// keeps the narrow band; a per-arm band is the price of a rejection that means
 /// something.
+/// The smallest latency change that counts as a regression, in milliseconds. A
+/// percentage alone is meaningless near zero: the hostile arm's median is ~2 ms
+/// (most of its samples are fast, its tail is not), so a 1.3 ms wobble printed as
+/// "+54.2%" and rejected a run that was, in the units the product promises, fine.
+/// A change must clear **both** the relative band and this floor, which is 2 % of
+/// the 250 ms ceiling the product promises.
+const MINIMUM_DELTA_MS: f64 = 5.0;
+
 fn noise_band(metric: &str, arm: &str) -> f64 {
     let impaired = arm.contains("hostile") || arm.contains("lone");
     match metric {
@@ -504,10 +512,18 @@ fn metric_rows(
             } else {
                 0.0
             };
-            let worse = if worse_when_lower(metric) {
-                new < old && percent.abs() > band * 100.0
+            // A latency metric must clear the floor *and* the band: the band
+            // catches a real move on a large value, the floor stops a meaningless
+            // ratio on a tiny one.
+            let floor_ms = if LATENCY_METRICS.contains(metric) {
+                MINIMUM_DELTA_MS
             } else {
-                new > old && percent > band * 100.0
+                0.0
+            };
+            let worse = if worse_when_lower(metric) {
+                new < old && percent.abs() > band * 100.0 && (old - new) > floor_ms
+            } else {
+                new > old && percent > band * 100.0 && (new - old) > floor_ms
             };
             rows.push(Row {
                 arm: arm.clone(),
