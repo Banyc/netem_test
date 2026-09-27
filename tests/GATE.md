@@ -522,9 +522,9 @@ attribution@baseline-family=lane = lane_regime_coverage::high_rtt_low_rate_lane_
 
 ## The env-scaled opt-in surfaces: `gate-env-tier`
 
-Three of the harness's surfaces are not `#[ignore]`d scenarios at all — they are
-scaled by environment variables the sources read at run time — so no other
-block in any manifest can see them, and they are declared in the
+Some of the harness's surfaces are not `#[ignore]`d scenarios at all — they are
+selected or scaled by environment variables the sources read at run time — so no
+other block in any manifest can see them, and they are declared in the
 `gate-env-tier` block below.
 
 **This file is their manifest, and no second one is needed.** The checker
@@ -542,8 +542,11 @@ test target). The member's `--lib` target is already resolved here through the
 `gate-lib-package` block above, which is what lets this manifest name the
 harness's own lib probes at all.
 
-All four rows are runner-less (`-`): the knobs are read in-process by whoever
-invokes the probe or the arms, and no script of this crate sets any of them.
+Most rows below are runner-less (`-`): those names are read in-process by
+whoever invokes the probe or the arms, and no script of this crate sets them.
+The browser row is the exception, and it says so: its `NETEM_RENDER_BROWSER` is
+the name `tools/render_graph.py` itself sets and reads, so that script is the
+runner the row names.
 The `NETEM_PERF_*` names that `tools/perf_loop.py` does set belong to
 `rtp_mux`'s surface — no source of this crate reads one — so they correctly do
 not appear here.
@@ -552,6 +555,7 @@ not appear here.
 dynamic-contested-rep = DYN_RUN_SECS | - | the rep length, in seconds, each of the twelve `dynamic_contested` arms in the `rtp_mux` crate runs its scenario for (default 15), read through the harness kit's `dyn_run_secs()`: it sizes those arms' interactive-tail and bulk-goodput measurements, and the arms themselves, their `DYN_REPS` repetition count and their floors are declared in `rtp_mux/GATE.md`, whose own row names this knob as the factor it cannot state; the two declarations are each other's missing factor, because an arm's cost is the rep length times the rep count and one factor lives in each crate | dyn-size-window@knob=DYN_RUN_SECS+unit=second, dyn-size-latency@rep-window=DYN_RUN_SECS+metric=small-and-burst-p50-p99, dyn-size-bulk@rep-window=DYN_RUN_SECS+metric=goodput-fraction, dyn-size-migration@rep-window=DYN_RUN_SECS+arm-set=migrating-variants | DYN_RUN_SECS=15,total=DYN_RUN_SECS,wall=16.18s
 saturating-fifo-probe = PROBE_SECONDS,PROBE_LATENCY_MS,PROBE_MSS,PROBE_YIELD_EVERY,PROBE_ACK_EVERY | - | the harness's own CPU cost per forwarded datagram at saturation, read by owning-symbol attribution (`tools/samply_hotspots.py`) rather than asserted by a wall clock: a bulk client-to-server flood of `PROBE_MSS`-byte datagrams against a sink that returns a 22-byte reply every `PROBE_ACK_EVERY` received datagrams, for `PROBE_SECONDS`, with the sender yielding every `PROBE_YIELD_EVERY` sends and `PROBE_LATENCY_MS` selecting the runner path (0 the direct no-clock no-queue path, anything non-zero the FIFO-scheduled path, which is the only one installing a per-receive socket timeout); the probe's summary prints the per-direction forwarded counts, the metric's denominator, and the load below is the documented shape at the values it was measured with | probe-saturation@shape=bulk-flood+metric=cpu-per-forwarded-datagram, probe-path@knob=PROBE_LATENCY_MS+path=direct-or-fifo-scheduled, probe-denominator@metric=per-direction-forwarded-datagram-count, probe-payload@knob=PROBE_MSS+unit=byte, probe-yield@knob=PROBE_YIELD_EVERY+unit=send, probe-reply@knob=PROBE_ACK_EVERY+unit=received-datagram | PROBE_SECONDS=25,PROBE_LATENCY_MS=1,PROBE_MSS=8192,PROBE_YIELD_EVERY=16,PROBE_ACK_EVERY=13,total=PROBE_SECONDS,wall=25.0s
 report-evidence-sink = NETEM_REPORT_DIR,NETEM_DIST_DIR | - | the CSV evidence sink rather than a measurement: `report_dir()` prefers `NETEM_REPORT_DIR`, falls back to `NETEM_DIST_DIR`, and otherwise writes under `target/netem-report`, and `dump_csv()` writes one `<slug>.csv` of `series,value` rows per arm set into that directory (`dump_csv_to()` names its directory as an argument instead); the pair decides where a run's evidence lands, and no count, window or cadence derives from either name, so this row's load is refused rather than invented | report-evidence@artifact=csv+knob=NETEM_REPORT_DIR-over-NETEM_DIST_DIR, report-default@knob=unset+sink=target/netem-report
+browser-selection = NETEM_RENDER_BROWSER,PATH | tools/render_graph.py | the program the ported panel rasterizer runs and the directory search used to resolve a bare browser name: `netem-tools mandate-plot` (the Rust port of `tools/mandate_plot.py`, which is what renders the battery's panels) resolves a headless browser from `--browser`, then `NETEM_RENDER_BROWSER`, then the well-known macOS Chrome/Chromium app paths, then the first of `google-chrome`/`chromium`/`chromium-browser`/`chrome` found on `PATH`, and the PNG step is an error rather than a silently skipped artifact when none resolves; neither name sizes a count, a window or a cadence -- one chooses a program and the other the directories that name is looked up in -- so this row's load is refused rather than invented | browser-resolution@knob=NETEM_RENDER_BROWSER-over-PATH, rasterize-default@knob=unset+artifact=headless-browser-png
 perf-history-archive = PERF_ARCHIVE_DIR,PERF_BASELINE_DIR | - | where a run's evidence is kept and what it is compared against, rather than a measurement: the `perf-history` bin (which `tools/mandate-check` runs after every battery) copies each run's report, logs, CSVs and rendered panels to a durable root -- `PERF_ARCHIVE_DIR`, else `.net-perf-history` in the working directory, which the tool creates self-ignoring (a `*` `.gitignore`, the idiom `local/` uses) so an archive inside a repo stays out of the working copy -- compares the run to the previous archived entry and writes `vs-prev.md` beside it and into the archive; `PERF_BASELINE_DIR` names a chosen baseline instead of the previous run, which is how a run is compared against what is deployed when the previous run is itself suspect. Neither name scales a count, window or cadence -- the archive is a sink and the baseline selects a file -- so this row's load is refused rather than invented. The bin owes three artifacts per run: the rendered panels, a run-level `summary.md` and `vs-prev.md`; it writes both text artifacts, prints both to stdout, names every panel in `summary.md` by an absolute canonical path checked to resolve (the archived copy carries the archive's own paths, so summary and panels stay together), and exits `7` rather than passing a run that produced no panel. | archive-sink@artifact=run-artifacts-and-panels+knob=PERF_ARCHIVE_DIR, archive-default@knob=unset+sink=./.net-perf-history, compare-baseline@knob=PERF_BASELINE_DIR-over-previous-run
 ```
 

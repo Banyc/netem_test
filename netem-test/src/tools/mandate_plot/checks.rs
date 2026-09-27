@@ -1,0 +1,4047 @@
+//! The panel checks, each of them a measurement of the artifact that was
+//! written rather than a trust in the code that wrote it.
+//!
+//! `AGENTS.md` makes a panel that cannot show the failure it is drawn for a
+//! defect of the same family as an assertion that cannot fail, and these are
+//! the refusals that enforce it: the axis and headroom tests (a bound the axis
+//! cannot resolve is refused), the sliver statement (a sub-pixel bound the run's
+//! data has clearly departed from is stated on the panel's face instead), the
+//! clip statement (an outlier may not set a line panel's axis silently), the
+//! summary test (a panel owes a machine-readable statement of what it drew,
+//! measured back out of the drawn points and lines), the governance tests (a
+//! bound drawn across arms the run bounds differently names what governs each),
+//! the label-fit/overlap tests, the bar-separation test, the legend test, the
+//! tick-resolution test, the gap test (no segment drawn across a hole in the
+//! sampling) and the stated-reading/stated-number tests.
+//!
+//! Every reader here parses the markup the renderer wrote, so a check cannot
+//! pass on a panel whose text never reached the SVG.
+
+// `!(x > y)` is deliberate throughout this module: it is Python's own
+// `not (x > y)`, and unlike `x <= y` it is true for a NaN. The values here come
+// from a CSV whose finiteness was checked on the way in, but the port keeps the
+// Python spelling rather than trading its semantics for a clearer `partial_cmp`.
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+
+use super::draw;
+use super::draw::*;
+use super::*;
+
+// -- reading the artifact back -------------------------------------------------
+
+/// The reading lines a panel actually draws, joined into one sentence each.
+pub fn drawn_readings(markup: &str) -> Vec<String> {
+    let Some(group) = readings_group_re().search(markup) else {
+        return Vec::new();
+    };
+    let body = group.group(1).unwrap_or_default();
+    text_element_re()
+        .find_all(&body)
+        .iter()
+        .map(|groups| {
+            pyjson::unescape(
+                &bound_label_title_re().replace_all(
+                    groups
+                        .get(1)
+                        .and_then(|value| value.clone())
+                        .as_deref()
+                        .unwrap_or(""),
+                    "",
+                ),
+            )
+        })
+        .collect()
+}
+
+/// How many series segments a panel draws per stroke colour.
+pub fn drawn_polylines(markup: &str) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for groups in polyline_element_re().find_all(markup) {
+        let attributes = groups[0].clone().unwrap_or_default();
+        let values: Vec<(String, String)> = text_attribute_re()
+            .find_all(&attributes)
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].clone().unwrap_or_default(),
+                    pair[1].clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let lookup = |key: &str| {
+            values
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        if lookup("fill").as_deref() != Some("none") {
+            continue;
+        }
+        if let Some(stroke) = lookup("stroke") {
+            *counts.entry(stroke).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// The notes a panel draws on its own face, in draw order.
+pub fn drawn_notes(markup: &str) -> Vec<String> {
+    panel_note_re()
+        .find_all(markup)
+        .iter()
+        .map(|groups| {
+            let content = groups[2].clone().unwrap_or_default();
+            pyjson::unescape(&bound_label_title_re().replace_all(&content, ""))
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Each drawn note line as `(text, (x0, y0, x1, y1))`.
+pub fn note_boxes(markup: &str) -> Vec<(String, (f64, f64, f64, f64))> {
+    let mut boxes = Vec::new();
+    for groups in panel_note_re().find_all(markup) {
+        let x = groups[0].clone().unwrap_or_default();
+        let y = groups[1].clone().unwrap_or_default();
+        let content = groups[2].clone().unwrap_or_default();
+        let text = pyjson::unescape(&bound_label_title_re().replace_all(&content, ""))
+            .trim()
+            .to_string();
+        let left: f64 = x.parse().unwrap_or(0.0);
+        let baseline: f64 = y.parse().unwrap_or(0.0);
+        boxes.push((
+            text.clone(),
+            (
+                left,
+                baseline - draw::LABEL_ASCENT_PX,
+                left + draw::label_text_width(&text),
+                baseline + draw::LABEL_DESCENT_PX,
+            ),
+        ));
+    }
+    boxes
+}
+
+/// The y tick labels a panel draws, in draw order.
+pub fn axis_tick_labels(markup: &str) -> Vec<String> {
+    axis_tick_re()
+        .find_all(markup)
+        .iter()
+        .map(|groups| groups[0].clone().unwrap_or_default())
+        .collect()
+}
+
+/// The y each drawn bound line sits at, in document order.
+pub fn drawn_bound_lines(markup: &str) -> Vec<f64> {
+    drawn_bound_re()
+        .find_all(markup)
+        .iter()
+        .map(|groups| groups[0].clone().unwrap_or_default().parse().unwrap_or(0.0))
+        .collect()
+}
+
+/// The data value each drawn bound line sits at, on the panel's own frame.
+pub fn drawn_bound_values(markup: &str, extent: (f64, f64)) -> Vec<f64> {
+    let Some(rect) = plot_bg_re().search(markup) else {
+        return Vec::new();
+    };
+    let rect = pyre_groups(&rect, 4);
+    let top: f64 = rect[1].parse().unwrap_or(0.0);
+    let height: f64 = rect[3].parse().unwrap_or(0.0);
+    if height <= 0.0 {
+        return Vec::new();
+    }
+    let (low, high) = extent;
+    drawn_bound_lines(markup)
+        .iter()
+        .map(|y| high - (y - top) / height * (high - low))
+        .collect()
+}
+
+fn pyre_groups(found: &crate::tools::pyre::Match, count: usize) -> Vec<String> {
+    (1..=count)
+        .map(|index| found.group(index).unwrap_or_default())
+        .collect()
+}
+
+/// The `(left, top, right, bottom)` rectangle a panel's data is drawn in.
+pub fn panel_plot_rect(panel_id: &str, markup: &str) -> PlotResult<(f64, f64, f64, f64)> {
+    let Some(rect) = plot_bg_re().search(markup) else {
+        return fail(format!(
+            "panel {} was drawn without a plot area, so there is no rectangle its \
+             bound labels could be checked against",
+            pyjson::repr_str(panel_id)
+        ));
+    };
+    let groups = pyre_groups(&rect, 4);
+    let left: f64 = groups[0].parse().unwrap_or(0.0);
+    let top: f64 = groups[1].parse().unwrap_or(0.0);
+    let width: f64 = groups[2].parse().unwrap_or(0.0);
+    let height: f64 = groups[3].parse().unwrap_or(0.0);
+    Ok((left, top, left + width, top + height))
+}
+
+/// One drawn bound label: the sentence it declares, the line it draws, and the
+/// box it occupies.
+pub type BoundLabelBox = (String, String, (f64, f64, f64, f64));
+
+/// Each drawn bound label as `(declared, line, (x0, y0, x1, y1))`.
+pub fn label_boxes(markup: &str) -> Vec<BoundLabelBox> {
+    let mut boxes = Vec::new();
+    for groups in bound_label_re().find_all(markup) {
+        let attributes = groups[0].clone().unwrap_or_default();
+        let content = groups[1].clone().unwrap_or_default();
+        let values: Vec<(String, String)> = text_attribute_re()
+            .find_all(&attributes)
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].clone().unwrap_or_default(),
+                    pair[1].clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let lookup = |key: &str| {
+            values
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let titles = bound_label_title_re().find_all_whole(&content);
+        let declared = pyjson::unescape(&match titles.first() {
+            Some(title) => title_tag_re().replace_all(title, ""),
+            None => content.clone(),
+        });
+        let line = pyjson::unescape(&bound_label_title_re().replace_all(&content, ""));
+        let anchor: f64 = lookup("x").unwrap_or_default().parse().unwrap_or(0.0);
+        let baseline: f64 = lookup("y").unwrap_or_default().parse().unwrap_or(0.0);
+        let width = draw::label_text_width(&line);
+        let left = match lookup("text-anchor").as_deref() {
+            Some("end") => anchor - width,
+            Some("middle") => anchor - width / 2.0,
+            _ => anchor,
+        };
+        boxes.push((
+            declared,
+            line,
+            (
+                left,
+                baseline - draw::LABEL_ASCENT_PX,
+                left + width,
+                baseline + draw::LABEL_DESCENT_PX,
+            ),
+        ));
+    }
+    boxes
+}
+
+/// Each drawn bar as `(x0, y0, x1, y1)`, in document order.
+pub fn bar_boxes(markup: &str) -> Vec<(f64, f64, f64, f64)> {
+    bar_rect_re()
+        .find_all(markup)
+        .iter()
+        .map(|groups| {
+            let x: f64 = groups[0].clone().unwrap_or_default().parse().unwrap_or(0.0);
+            let y: f64 = groups[1].clone().unwrap_or_default().parse().unwrap_or(0.0);
+            let width: f64 = groups[2].clone().unwrap_or_default().parse().unwrap_or(0.0);
+            let height: f64 = groups[3].clone().unwrap_or_default().parse().unwrap_or(0.0);
+            (x, y, x + width, y + height)
+        })
+        .collect()
+}
+
+/// Each drawn `<text>` as `(text, (x0, y0, x1, y1))`.
+pub fn drawn_text_boxes(markup: &str) -> Vec<(String, (f64, f64, f64, f64))> {
+    let mut boxes = Vec::new();
+    for groups in text_element_re().find_all(markup) {
+        let attributes = groups[0].clone().unwrap_or_default();
+        let content = groups[1].clone().unwrap_or_default();
+        let values: Vec<(String, String)> = text_attribute_re()
+            .find_all(&attributes)
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].clone().unwrap_or_default(),
+                    pair[1].clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let lookup = |key: &str| {
+            values
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let text = pyjson::unescape(&bound_label_title_re().replace_all(&content, ""))
+            .trim()
+            .to_string();
+        let width = draw::label_text_width(&text);
+        let x: f64 = lookup("x").unwrap_or_default().parse().unwrap_or(0.0);
+        let y: f64 = lookup("y").unwrap_or_default().parse().unwrap_or(0.0);
+        let transform = lookup("transform").unwrap_or_default();
+        if let Some(rotation) = rotate_re().search(&transform) {
+            let groups = pyre_groups(&rotation, 2);
+            let centre_x: f64 = groups[0].parse().unwrap_or(0.0);
+            let centre_y: f64 = groups[1].parse().unwrap_or(0.0);
+            boxes.push((
+                text,
+                (
+                    centre_x - draw::LABEL_ASCENT_PX,
+                    centre_y - width / 2.0,
+                    centre_x + draw::LABEL_DESCENT_PX,
+                    centre_y + width / 2.0,
+                ),
+            ));
+            continue;
+        }
+        let left = match lookup("text-anchor").as_deref() {
+            Some("middle") => x - width / 2.0,
+            Some("end") => x - width,
+            _ => x,
+        };
+        boxes.push((
+            text,
+            (
+                left,
+                y - draw::LABEL_ASCENT_PX,
+                left + width,
+                y + draw::LABEL_DESCENT_PX,
+            ),
+        ));
+    }
+    boxes
+}
+
+/// The label each legend entry draws, in document order.
+pub fn legend_text(markup: &str) -> Vec<String> {
+    let Some(group) = legend_group_re().search(markup) else {
+        return Vec::new();
+    };
+    let body = group.group(1).unwrap_or_default();
+    text_element_re()
+        .find_all(&body)
+        .iter()
+        .map(|groups| {
+            let content = groups[1].clone().unwrap_or_default();
+            pyjson::unescape(&bound_label_title_re().replace_all(&content, ""))
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The series labels a panel's legend draws, in draw order.
+pub fn legend_series_labels(markup: &str) -> Vec<String> {
+    let Some(group) = legend_group_re().search(markup) else {
+        return Vec::new();
+    };
+    let body = group.group(1).unwrap_or_default();
+    legend_text_re()
+        .find_all(&body)
+        .iter()
+        .map(|groups| pyjson::unescape(&groups[0].clone().unwrap_or_default()))
+        .collect()
+}
+
+/// The names the drawn bound labels state as governed or their own-bounded.
+pub fn governed_names(markup: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (declared, _, _) in label_boxes(markup) {
+        for clause in governance_clause_re().find_iter(&declared) {
+            let body = clause.named("body").unwrap_or_default();
+            for name in governance_name_re().find_all_whole(&body) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+// -- the gap in the sampling, and the readings a panel states ----------------
+
+/// The drawn series segments of one panel, grouped by the stroke that draws
+/// them: the gap check's own attribution, and how it tells two series apart.
+type StrokeGroups = BTreeMap<String, Vec<(String, Vec<(f64, f64)>)>>;
+
+/// Problems that let a hole in the sampling read as a climb.
+pub fn check_gap_honesty(panel_id: &str, series: &Series, markup: &str) -> Vec<String> {
+    let drawn: Series = series
+        .iter()
+        .filter(|(_, points)| !points.is_empty())
+        .map(|(name, points)| (name.clone(), draw::decimate(points)))
+        .collect();
+    let mut problems = Vec::new();
+    let expected_markers: usize = drawn.iter().map(|(_, points)| points.len()).sum();
+    let markers = sample_marker_re().find_all(markup).len();
+    if markers != expected_markers {
+        problems.push(format!(
+            "panel {}: it draws {markers} sample marker(s) for {expected_markers} \
+             drawn sample(s); without a dot at every sample the series' own \
+             discreteness is not on the panel, so a hole in the sampling is drawn \
+             as the line's own steepness",
+            pyjson::repr_str(panel_id)
+        ));
+    }
+    let counts = drawn_polylines(markup);
+    let mut strokes: StrokeGroups = BTreeMap::new();
+    for (index, (name, points)) in drawn.iter().enumerate() {
+        strokes
+            .entry(draw::COLORS[index % draw::COLORS.len()].to_string())
+            .or_default()
+            .push((name.clone(), points.clone()));
+    }
+    for (colour, entries) in strokes {
+        if entries.len() > 1 {
+            let mut sorted: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+            sorted.sort();
+            let sorted_py = pyjson::py_list(&sorted);
+            problems.push(format!(
+                "panel {}: series {sorted_py} are drawn in the same stroke {colour}, \
+                 so this panel's segments cannot be attributed to the series they \
+                 belong to and its holes cannot be checked",
+                pyjson::repr_str(panel_id)
+            ));
+            continue;
+        }
+        let (name, points) = &entries[0];
+        let holes = draw::series_walls(points);
+        let runs: Vec<Vec<(f64, f64)>> = draw::split_at_walls(points, &holes)
+            .into_iter()
+            .filter(|run| run.len() >= 2)
+            .collect();
+        let drawn_count = counts.get(&colour).copied().unwrap_or(0);
+        if drawn_count == runs.len() {
+            continue;
+        }
+        let where_ = if holes.is_empty() {
+            "no hole".to_string()
+        } else {
+            let largest =
+                holes.iter().cloned().fold(
+                    holes[0],
+                    |best, hole| if hole.3 > best.3 { hole } else { best },
+                );
+            let biggest = holes.iter().map(|hole| hole.3).fold(0.0, f64::max);
+            format!(
+                "the {} s hole between {} s and {} s",
+                f2(biggest),
+                f2(largest.1),
+                f2(largest.2)
+            )
+        };
+        problems.push(format!(
+            "panel {}: series {} is drawn as {drawn_count} polyline segment(s) \
+             where its {} hole(s) require {} ({where_}); a segment is drawn across a \
+             hole in the sampling, so a period nobody observed is painted as a \
+             near-vertical climb the run never measured",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(name),
+            holes.len(),
+            runs.len()
+        ));
+    }
+    problems
+}
+
+/// Problems that leave a run's own reading off the panel it is about.
+pub fn check_readings_stated(
+    panel_id: &str,
+    series: &Series,
+    readings: &[(String, String)],
+    markup: &str,
+) -> Vec<String> {
+    let names: Vec<String> = series.iter().map(|(name, _)| name.clone()).collect();
+    let names_py = pyjson::py_list(&names);
+    let stated = drawn_readings(markup).join(" ");
+    let mut problems = Vec::new();
+    for (arm, text) in readings {
+        if !names.contains(arm) {
+            problems.push(format!(
+                "panel {}: the run's reading for arm {} is about no series this \
+                 panel draws (its series are {names_py}); a verdict no panel carries \
+                 is evidence no reader sees",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(arm)
+            ));
+        } else if !stated.contains(text.as_str()) {
+            problems.push(format!(
+                "panel {}: the run read arm {} and the panel does not state it. As \
+                 drawn, a hole in the sampling, a peak that returned and a climb cut \
+                 off by the window's end are the same shape, so the reader cannot \
+                 draw the opposite conclusion from the pixels. Missing: {}",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(arm),
+                pyjson::repr_str(text)
+            ));
+        }
+    }
+    problems
+}
+
+/// The slice of a joined reading band each arm's own sentence occupies.
+pub fn stated_spans(text: &str, arms: &[String]) -> BTreeMap<String, String> {
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for arm in arms {
+        for marker in [format!("{arm}: "), format!("{arm} - ")] {
+            if let Some(index) = text.find(&marker) {
+                found.push((arm.clone(), index));
+                break;
+            }
+        }
+    }
+    found.sort_by_key(|(_, index)| *index);
+    let mut spans = BTreeMap::new();
+    for (position, (arm, start)) in found.iter().enumerate() {
+        let end = found
+            .get(position + 1)
+            .map(|(_, index)| *index)
+            .unwrap_or(text.len());
+        // `start` indexes bytes from `str::find`; the slice is safe because the
+        // markers are ASCII and the text is UTF-8.
+        spans.insert(arm.clone(), text[*start..end].to_string());
+    }
+    spans
+}
+
+/// Half a unit in the last place a written number carries, plus rounding slack.
+pub fn stated_tolerance(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    // The Python pattern is unanchored and its groups are optional, so a value
+    // like `12abc` would still answer `12`: the port keeps that behaviour by
+    // taking the match from the pattern rather than parsing strictly.
+    let found = stated_number_re().find_iter(trimmed).into_iter().next()?;
+    let decimals = found.group(3).map(|text| text.len()).unwrap_or(0);
+    let exponent: i64 = found
+        .group(4)
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0);
+    Some(10.0_f64.powi((exponent - decimals as i64) as i32) * 0.5 * 1.001 + 1e-9)
+}
+
+/// A problem when a written number is not the value the series measures.
+pub fn stated_problem(
+    panel_id: &str,
+    arm: &str,
+    what: &str,
+    written: &str,
+    measured: f64,
+) -> Option<String> {
+    let Some(tolerance) = stated_tolerance(written) else {
+        return Some(format!(
+            "panel {}: the reading drawn for arm {} states {what} as {}, which is \
+             not a number; the band exists so the reader does not have to interpret \
+             the pixels, so a value the reader cannot read is not a reading",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(arm),
+            pyjson::repr_str(written)
+        ));
+    };
+    let value: f64 = written.trim().parse().unwrap_or(f64::NAN);
+    if (value - measured).abs() <= tolerance {
+        return None;
+    }
+    Some(format!(
+        "panel {}: the reading drawn for arm {} states {what} {written}, which the \
+         series it is drawn from does not measure: that point is {}. A caption whose \
+         numbers come from anywhere but its own series is worse than no caption, \
+         because the band is what the reader trusts instead of the pixels",
+        pyjson::repr_str(panel_id),
+        pyjson::repr_str(arm),
+        f6g(measured)
+    ))
+}
+
+/// Every number a drawn reading states, measured against the drawn series.
+pub fn stated_reading_problems(
+    panel_id: &str,
+    arm: &str,
+    points: &[(f64, f64)],
+    text: &str,
+) -> Vec<String> {
+    let xs: Vec<f64> = points.iter().map(|(x, _)| *x).collect();
+    let ys: Vec<f64> = points.iter().map(|(_, y)| *y).collect();
+    let peak = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let peak_index = ys
+        .iter()
+        .rposition(|value| *value == peak)
+        .unwrap_or(ys.len() - 1);
+    let after = points.len() - 1 - peak_index;
+    let wall = draw::gap_wall_seconds(points);
+    let holes = draw::series_walls(points);
+    let mut problems: Vec<String> = Vec::new();
+
+    let note = |what: &str, written: &str, measured: f64, problems: &mut Vec<String>| {
+        if let Some(problem) = stated_problem(panel_id, arm, what, written, measured) {
+            problems.push(problem);
+        }
+    };
+
+    match stated_peak_re().search(text) {
+        None => problems.push(format!(
+            "panel {}: the reading drawn for arm {} states no maximum, so the band's \
+             own claim cannot be read back against the series it is drawn from; a \
+             caption whose numbers cannot be checked is the same defect as no \
+             caption at all",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(arm)
+        )),
+        Some(found) => {
+            note(
+                "its maximum as",
+                &found.group(1).unwrap_or_default(),
+                peak,
+                &mut problems,
+            );
+            note(
+                "where its maximum is as",
+                &found.group(2).unwrap_or_default(),
+                xs[peak_index],
+                &mut problems,
+            );
+        }
+    }
+    match stated_after_re().search(text) {
+        None => {
+            if stated_end_re().search(text).is_none() {
+                problems.push(format!(
+                    "panel {}: the reading drawn for arm {} states neither what \
+                     follows its maximum nor that nothing does, so the one clause \
+                     that tells a peak which returned from a climb the window cut \
+                     off cannot be read back against the series",
+                    pyjson::repr_str(panel_id),
+                    pyjson::repr_str(arm)
+                ));
+            } else if after > 0 {
+                problems.push(format!(
+                    "panel {}: the reading drawn for arm {} states that nothing \
+                     follows its maximum, and the series it is drawn from has {after} \
+                     sample(s) after it; the whole point of the clause is to tell a \
+                     peak that returned from a climb the window cut off",
+                    pyjson::repr_str(panel_id),
+                    pyjson::repr_str(arm)
+                ));
+            }
+        }
+        Some(found) => {
+            let stated_after: i64 = found.group(1).unwrap_or_default().parse().unwrap_or(-1);
+            if stated_after != after as i64 {
+                problems.push(format!(
+                    "panel {}: the reading drawn for arm {} states {stated_after} \
+                     sample(s) after its maximum, and the series it is drawn from has \
+                     {after}: a reader told how long a peak lasted is told a number \
+                     about a different series",
+                    pyjson::repr_str(panel_id),
+                    pyjson::repr_str(arm)
+                ));
+            }
+            if after > 0 {
+                note(
+                    "the sample after its maximum as",
+                    &found.group(2).unwrap_or_default(),
+                    ys[peak_index + 1],
+                    &mut problems,
+                );
+                note(
+                    "that sample's time as",
+                    &found.group(3).unwrap_or_default(),
+                    xs[peak_index + 1],
+                    &mut problems,
+                );
+            }
+            note(
+                "its last sample as",
+                &found.group(4).unwrap_or_default(),
+                ys[ys.len() - 1],
+                &mut problems,
+            );
+            note(
+                "its last sample's time as",
+                &found.group(5).unwrap_or_default(),
+                xs[xs.len() - 1],
+                &mut problems,
+            );
+        }
+    }
+    let holes_match = stated_holes_re().search(text);
+    if holes_match.is_none()
+        && stated_gap_wall_re().search(text).is_none()
+        && stated_no_gap_re().search(text).is_none()
+    {
+        problems.push(format!(
+            "panel {}: the reading drawn for arm {} states nothing about the holes \
+             in its own sampling, so whether the line is drawn across a period \
+             nobody observed cannot be checked from the caption; the holes are the \
+             one thing about the shape the pixels cannot carry",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(arm)
+        ));
+    }
+    if let Some(found) = holes_match {
+        let stated_holes: i64 = found.group(1).unwrap_or_default().parse().unwrap_or(-1);
+        if stated_holes != holes.len() as i64 {
+            problems.push(format!(
+                "panel {}: the reading drawn for arm {} states {stated_holes} sample \
+                 gap(s), and the series it is drawn from has {}: a hole the reader is \
+                 not told about is a hole read as the end of the line",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(arm),
+                holes.len()
+            ));
+        }
+        if let Some(wall) = wall {
+            note(
+                "the least step it would call a gap as",
+                &found.group(2).unwrap_or_default(),
+                wall,
+                &mut problems,
+            );
+        }
+        if !holes.is_empty() {
+            let largest =
+                holes.iter().cloned().fold(
+                    holes[0],
+                    |best, hole| if hole.3 > best.3 { hole } else { best },
+                );
+            note(
+                "its largest gap as",
+                &found.group(3).unwrap_or_default(),
+                largest.3,
+                &mut problems,
+            );
+            note(
+                "where that gap starts as",
+                &found.group(4).unwrap_or_default(),
+                largest.1,
+                &mut problems,
+            );
+            note(
+                "where that gap ends as",
+                &found.group(5).unwrap_or_default(),
+                largest.2,
+                &mut problems,
+            );
+        }
+    } else if let Some(found) = stated_gap_wall_re().search(text)
+        && let Some(wall) = wall
+    {
+        note(
+            "the least step it would call a gap as",
+            &found.group(1).unwrap_or_default(),
+            wall,
+            &mut problems,
+        );
+    }
+    problems
+}
+
+/// Problems that let a drawn caption state numbers its own series did not measure.
+pub fn check_reading_numbers(panel_id: &str, series: &Series, markup: &str) -> Vec<String> {
+    let joined = drawn_readings(markup).join(" ");
+    if joined.is_empty() {
+        return Vec::new();
+    }
+    let arms: Vec<String> = series.iter().map(|(name, _)| name.clone()).collect();
+    let spans = stated_spans(&joined, &arms);
+    let mut problems = Vec::new();
+    for (name, points) in series {
+        let Some(text) = spans.get(name) else {
+            continue;
+        };
+        let drawn = draw::decimate(points);
+        if drawn.is_empty() {
+            continue;
+        }
+        problems.extend(stated_reading_problems(panel_id, name, &drawn, text));
+    }
+    problems
+}
+
+/// Problems that make an axis unreadable: its ticks repeat a value.
+pub fn check_tick_labels_distinct(panel_id: &str, markup: &str) -> Vec<String> {
+    let ticks = axis_tick_labels(markup);
+    let mut repeated: Vec<String> = ticks
+        .iter()
+        .filter(|tick| ticks.iter().filter(|other| *other == *tick).count() > 1)
+        .cloned()
+        .collect();
+    repeated.sort();
+    repeated.dedup();
+    if repeated.is_empty() {
+        return Vec::new();
+    }
+    let ticks_py = pyjson::py_list(&ticks);
+    let repeated_py = pyjson::py_list(&repeated);
+    vec![format!(
+        "panel {}: its y axis draws {} tick(s) as {ticks_py}, so {} of them repeat \
+         ({repeated_py}); a tick the reader cannot tell from its neighbour cannot \
+         carry the quantity the panel is drawn to be read against",
+        pyjson::repr_str(panel_id),
+        ticks.len(),
+        repeated.len()
+    )]
+}
+
+/// Problems that make the reading band eat the shape it explains.
+pub fn check_reading_band(panel_id: &str, plot_height: f64) -> Vec<String> {
+    if plot_height >= ARM_READING_MIN_PLOT_PIXELS {
+        return Vec::new();
+    }
+    vec![format!(
+        "panel {}: the per-arm reading band leaves the plot {} px of the {} px \
+         canvas, under the {} px a latency panel needs to show the shape its \
+         readings are about; state fewer or shorter readings",
+        pyjson::repr_str(panel_id),
+        f0(plot_height),
+        draw::HEIGHT,
+        f0(ARM_READING_MIN_PLOT_PIXELS)
+    )]
+}
+
+/// Every arm the run read must be a series some line panel actually draws.
+pub fn check_censoring_drawn(
+    panels: &[Panel],
+    points: &Points,
+    censoring: Option<&J>,
+) -> Vec<String> {
+    let mut line_series: Vec<String> = Vec::new();
+    for panel in panels {
+        if panel.chart != Chart::Line {
+            continue;
+        }
+        for entry in &panel.series {
+            if points.contains_key(&(panel.id.clone(), entry.name.clone()))
+                && !line_series.contains(&entry.name)
+            {
+                line_series.push(entry.name.clone());
+            }
+        }
+    }
+    let Some(censoring) = censoring.and_then(J::as_obj) else {
+        return Vec::new();
+    };
+    let mut arms: Vec<&String> = censoring.iter().map(|(arm, _)| arm).collect();
+    arms.sort();
+    let mut sorted_line = line_series.clone();
+    sorted_line.sort();
+    let sorted_line_py = pyjson::py_list(&sorted_line);
+    arms.iter()
+        .filter(|arm| !line_series.contains(arm))
+        .map(|arm| {
+            format!(
+                "the run's per-arm reading for {} is about no series any line panel \
+                 of this mandate draws ({sorted_line_py}), so no panel can state it: a \
+                 machine verdict no panel carries is evidence a reader never sees",
+                pyjson::repr_str(arm)
+            )
+        })
+        .collect()
+}
+
+// -- the line panel's clipped axis -------------------------------------------
+
+/// The value a line panel's axis must be clipped at, or `None`.
+pub fn line_clip_owed(series: &Series, bounds: &[Bound]) -> Option<f64> {
+    if bounds.is_empty() {
+        return None;
+    }
+    let values = bound_values(series);
+    if values.is_empty() {
+        return None;
+    }
+    let anchor = bounds
+        .iter()
+        .map(|bound| bound.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !(anchor > 0.0) {
+        return None;
+    }
+    if values.iter().cloned().fold(f64::NEG_INFINITY, f64::max) < Y_CLIP_FACTOR * anchor {
+        return None;
+    }
+    let above: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|value| *value > anchor)
+        .collect();
+    if above.is_empty() || above.len() as f64 > Y_CLIP_SHARE * values.len() as f64 {
+        return None;
+    }
+    Some(anchor)
+}
+
+/// The value a line panel's drawn axis clips at, or `None`.
+pub fn line_axis_clip(
+    series: &Series,
+    bounds: &[Bound],
+    pinned: Option<(f64, f64)>,
+) -> Option<f64> {
+    if pinned.is_some() {
+        return None;
+    }
+    line_clip_owed(series, bounds)
+}
+
+/// The clip a line axis with this clip value carries, as the summary states it.
+pub fn y_clip_document_for(series: &Series, clip: Option<f64>) -> Option<J> {
+    let clip = clip?;
+    let values = bound_values(series);
+    let above: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|value| *value > clip)
+        .collect();
+    if above.is_empty() {
+        return None;
+    }
+    Some(J::Obj(vec![
+        ("value".to_string(), J::Float(clip)),
+        ("clipped".to_string(), J::Int(above.len() as i64)),
+        (
+            "max".to_string(),
+            J::Float(above.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
+        ),
+    ]))
+}
+
+/// The clip the *drawn* line axis applies, or `None`.
+pub fn y_clip_document(series: &Series, bounds: &[Bound], extent: (f64, f64)) -> Option<J> {
+    let values = bound_values(series);
+    if values.is_empty() || extent.1 >= values.iter().cloned().fold(f64::NEG_INFINITY, f64::max) {
+        return None;
+    }
+    let clip = line_clip_owed(series, bounds);
+    y_clip_document_for(series, clip)
+}
+
+/// The sentence a clipped axis owes its reader, or `""`.
+pub fn y_clip_statement(series: &Series, clip: Option<f64>) -> String {
+    let Some(document) = y_clip_document_for(series, clip) else {
+        return String::new();
+    };
+    let value = document.get("value").and_then(J::as_f64).unwrap_or(0.0);
+    let clipped = document.get("clipped").and_then(J::as_i64).unwrap_or(0);
+    let max = document.get("max").and_then(J::as_f64).unwrap_or(0.0);
+    format!(
+        "y axis clipped at {}: {clipped} of {} value(s) up to {} drawn at the top edge",
+        sliver_number(value),
+        bound_values(series).len(),
+        sliver_number(max)
+    )
+}
+
+/// Problems that let one outlier set a line panel's axis, or hide the clip.
+pub fn check_line_axis_clip_stated(
+    panel_id: &str,
+    chart: Chart,
+    series: &Series,
+    bounds: &[Bound],
+    extent: (f64, f64),
+    markup: &str,
+    pinned: Option<(f64, f64)>,
+) -> Vec<String> {
+    if chart != Chart::Line {
+        return Vec::new();
+    }
+    let Some(owed) = line_clip_owed(series, bounds) else {
+        return Vec::new();
+    };
+    if pinned.is_some() {
+        return Vec::new();
+    }
+    let values = bound_values(series);
+    let peak = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if extent.1 >= peak {
+        let above = values.iter().filter(|value| **value > owed).count();
+        return vec![format!(
+            "panel {}: its axis tops out at {}, which reaches the {} the run drew, \
+             while {above} of {} value(s) lie above the {} the panel is read against: \
+             one outlier set the axis, so every body is drawn to its scale and a \
+             change in either is sub-pixel. Draw the axis to the read-at value and \
+             state where it clips",
+            pyjson::repr_str(panel_id),
+            f4g(extent.1),
+            fg(peak),
+            values.len(),
+            fg(owed)
+        )];
+    }
+    let mut problems = Vec::new();
+    if !y_clip_line_re().is_match(markup) {
+        problems.push(format!(
+            "panel {}: its axis is clipped at {} and draws no class=\"y-clip\" mark \
+             at the frame top, so the clipped samples are drawn at a pixel the panel \
+             does not explain",
+            pyjson::repr_str(panel_id),
+            fg(owed)
+        ));
+    }
+    let statement = y_clip_statement(series, Some(owed));
+    if !statement.is_empty() && !drawn_notes(markup).join(" ").contains(&statement) {
+        problems.push(format!(
+            "panel {}: its axis is clipped at {} and the panel does not state it, so \
+             a sample drawn at the frame's top edge reads as a value at the axis' own \
+             top rather than as an excursion past it. Missing from the panel's face: {}",
+            pyjson::repr_str(panel_id),
+            fg(owed),
+            pyjson::repr_str(&statement)
+        ));
+    }
+    problems
+}
+
+/// The y extent of a line or CDF panel, as the report's own chart lays it out.
+pub fn line_axis_extent(
+    series: &Series,
+    bounds: &[Bound],
+    pinned: Option<(f64, f64)>,
+    plot_height: Option<f64>,
+) -> (f64, f64) {
+    if let Some(pinned) = pinned {
+        return pinned;
+    }
+    let labelled: Vec<(f64, String)> = bounds
+        .iter()
+        .map(|bound| (bound.y, String::new()))
+        .collect();
+    let extent = draw::extent_including_bounds(draw::finite_extent(series), &labelled);
+    let clip = line_axis_clip(series, bounds, None);
+    let Some(clip) = clip else {
+        return extent;
+    };
+    if !(clip > extent.0) {
+        return extent;
+    }
+    let plot_height =
+        plot_height.unwrap_or((draw::HEIGHT - draw::PAD_TOP - draw::PAD_BOTTOM) as f64);
+    axis_with_headroom(extent.0, clip, clip, plot_height, None)
+}
+
+/// The axis a panel is drawn on, so the checks measure the drawn axis.
+pub fn panel_axis_extent(
+    panel: &Panel,
+    series: &Series,
+    bounds: &[Bound],
+    run_values: Option<&J>,
+    plot_height: f64,
+) -> PlotResult<(f64, f64)> {
+    match panel.chart {
+        Chart::Cdf => Ok((0.0, 100.0)),
+        Chart::Bar => {
+            if let Some(pinned) = &panel.y_extent {
+                return Ok(*pinned);
+            }
+            Ok(draw::bar_axis_extent(
+                series,
+                bounds,
+                run_values,
+                Some(plot_height as i64),
+            ))
+        }
+        Chart::Line => Ok(line_axis_extent(
+            series,
+            bounds,
+            panel.y_extent,
+            Some(plot_height),
+        )),
+    }
+}
+
+/// The x extent a panel draws, in its own units, as `(low, high)`.
+pub fn panel_x_axis_extent(chart: Chart, series: &Series) -> (f64, f64) {
+    if chart == Chart::Bar {
+        let mut categories: Vec<f64> = series
+            .iter()
+            .flat_map(|(_, points)| points.iter().map(|(x, _)| *x))
+            .collect();
+        categories.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        categories.dedup();
+        if categories.is_empty() {
+            return (0.0, 1.0);
+        }
+        return draw::bar_x_extent(&categories);
+    }
+    let xs: Vec<f64> = series
+        .iter()
+        .flat_map(|(_, points)| {
+            draw::decimate(points)
+                .into_iter()
+                .map(|(x, _)| x)
+                .collect::<Vec<f64>>()
+        })
+        .collect();
+    if xs.is_empty() {
+        return (0.0, 1.0);
+    }
+    let low = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut high = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if low == high {
+        high = low + 1.0;
+    }
+    (low, high)
+}
+
+// -- the axis test, and the statement that answers it -------------------------
+
+/// The band the axis test measures for one bound, and the pixels it has.
+pub fn bound_band_pixels(
+    series: &Series,
+    bounds: &[Bound],
+    bound: &Bound,
+    extent: (f64, f64),
+    plot_height: f64,
+    run_values: Option<&J>,
+) -> (f64, f64) {
+    let values = bound_values(series);
+    let ys: Vec<f64> = bounds.iter().map(|item| item.y).collect();
+    let unit = unit_span(&values, &ys);
+    let tolerances: Vec<f64> = run_guards(run_values, Some(series), &bound.label)
+        .iter()
+        .map(|(_, value)| *value)
+        .collect();
+    let band = bound_band(&values, bound.y, unit, &tolerances);
+    let span = extent.1 - extent.0;
+    (band, band / span * plot_height)
+}
+
+/// One number as the sliver statement writes it and the check reads it back.
+pub fn sliver_number(value: f64) -> String {
+    fg(value)
+}
+
+/// `(pixels, value)`: the most legible departure the bars draw from a bound.
+pub fn sliver_departure(
+    values: &[f64],
+    bound: &Bound,
+    extent: (f64, f64),
+    plot_height: f64,
+) -> (f64, Option<f64>) {
+    let y = bound.y;
+    let band_arm = bound.band_arm.is_some() || two_sided_bound(bound);
+    let side = if band_arm {
+        None
+    } else {
+        bound_side(values, y)
+    };
+    let candidates: Vec<f64> = match side {
+        Some("cap") => values.iter().copied().filter(|value| *value > y).collect(),
+        Some("floor") => values.iter().copied().filter(|value| *value < y).collect(),
+        _ => values.to_vec(),
+    };
+    if candidates.is_empty() {
+        return (0.0, None);
+    }
+    let furthest = candidates
+        .iter()
+        .cloned()
+        .fold(candidates[0], |best, value| {
+            if (value - y).abs() > (best - y).abs() {
+                value
+            } else {
+                best
+            }
+        });
+    let span = extent.1 - extent.0;
+    ((furthest - y).abs() / span * plot_height, Some(furthest))
+}
+
+/// The sentence that states a sub-pixel bound's position, or `""`.
+pub fn bound_sliver_statement(
+    bound: &Bound,
+    values: &[f64],
+    band: f64,
+    extent: (f64, f64),
+    plot_height: f64,
+) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    let (low, high) = extent;
+    let span = high - low;
+    let y = bound.y;
+    if band / span * plot_height >= MIN_BOUND_PIXELS {
+        return String::new();
+    }
+    let (departure_px, departure) = sliver_departure(values, bound, extent, plot_height);
+    let Some(departure) = departure else {
+        return String::new();
+    };
+    if departure_px < MIN_BOUND_PIXELS {
+        return String::new();
+    }
+    let nearest = values.iter().cloned().fold(values[0], |best, value| {
+        if (value - y).abs() < (best - y).abs() {
+            value
+        } else {
+            best
+        }
+    });
+    format!(
+        "bound \"{}\" at {} on axis {}..{}: band {} = {} px; nearest bar {}, {} \
+         away; furthest {}, {} px from the bound",
+        bound.label,
+        sliver_number(y),
+        sliver_number(low),
+        sliver_number(high),
+        sliver_number(band),
+        f1(band / span * plot_height),
+        sliver_number(nearest),
+        sliver_number((nearest - y).abs()),
+        sliver_number(departure),
+        f1(departure_px)
+    )
+}
+
+/// `(bound, sentence)` for every bound whose sliver the panel owes stated.
+// The loop walks indices because it names one bound while mutating another in
+// the same slice (`unlabelled`); an iterator would borrow the slice twice.
+#[allow(clippy::needless_range_loop)]
+pub fn sliver_bound_statements(
+    series: &Series,
+    bounds: &mut [Bound],
+    extent: (f64, f64),
+    plot_height: f64,
+    run_values: Option<&J>,
+) -> Vec<(usize, String)> {
+    let values = bound_values(series);
+    let span = extent.1 - extent.0;
+    let mut statements = Vec::new();
+    for index in 0..bounds.len() {
+        let y = bounds[index].y;
+        if bound_side(&values, y).is_none() && crossing_values(&values, y).is_empty() {
+            continue;
+        }
+        let band = bound_band_pixels(
+            series,
+            bounds,
+            &bounds[index],
+            extent,
+            plot_height,
+            run_values,
+        )
+        .0;
+        let mut sentence =
+            bound_sliver_statement(&bounds[index], &values, band, extent, plot_height);
+        if sentence.is_empty() {
+            continue;
+        }
+        for other in 0..bounds.len() {
+            if other == index || bounds[other].band_arm.is_none() {
+                continue;
+            }
+            let gap = (bounds[other].y - y).abs() / span * plot_height;
+            if gap >= draw::LABEL_LINE_HEIGHT_PX {
+                continue;
+            }
+            bounds[other].unlabelled = true;
+            sentence += &format!(
+                "; its arm at {} ({} px away) is drawn unlabelled",
+                sliver_number(bounds[other].y),
+                f1(gap)
+            );
+        }
+        statements.push((index, sentence));
+    }
+    statements
+}
+
+/// Problems that make a drawn sliver statement's numbers not the run's.
+pub fn sliver_statement_problems(
+    panel_id: &str,
+    bound: &Bound,
+    matches: &[crate::tools::pyre::Match],
+    values: &[f64],
+    band: f64,
+    extent: (f64, f64),
+    plot_height: f64,
+) -> Vec<String> {
+    let (low, high) = extent;
+    let span = high - low;
+    let y = bound.y;
+    let nearest = values.iter().cloned().fold(values[0], |best, value| {
+        if (value - y).abs() < (best - y).abs() {
+            value
+        } else {
+            best
+        }
+    });
+    let (departure_px, departure) = sliver_departure(values, bound, extent, plot_height);
+    let measured: Vec<(&str, f64)> = vec![
+        ("value", y),
+        ("low", low),
+        ("high", high),
+        ("band", band),
+        ("band_px", band / span * plot_height),
+        ("near", nearest),
+        ("near_dist", (nearest - y).abs()),
+        ("far", departure.unwrap_or(0.0)),
+        ("far_px", departure_px),
+    ];
+    let mut problems = Vec::new();
+    for found in matches {
+        for (field, expected) in &measured {
+            let Some(printed) = found.named(field).and_then(|text| text.parse::<f64>().ok()) else {
+                continue;
+            };
+            let slack = if field.ends_with("_px") {
+                0.05
+            } else {
+                (1e-4 * expected.abs()).max(1e-9)
+            };
+            if (printed - expected).abs() <= slack {
+                continue;
+            }
+            problems.push(format!(
+                "panel {}: the statement for the bound {} prints {field}={}, where \
+                 the drawn points and the drawn axis {}..{} measure {}; a stated \
+                 distance that is not the run's is a claim the reader has no way to \
+                 check",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&bound.label),
+                fg(printed),
+                f4g(low),
+                f4g(high),
+                fg(*expected)
+            ));
+        }
+    }
+    problems
+}
+
+/// Problems that leave a sub-pixel bound's own position unstated.
+pub fn check_sliver_bound_stated(
+    panel_id: &str,
+    series: &Series,
+    bounds: &[Bound],
+    extent: (f64, f64),
+    markup: &str,
+    plot_height: Option<f64>,
+    run_values: Option<&J>,
+) -> Vec<String> {
+    let values = bound_values(series);
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let (low, high) = extent;
+    let span = high - low;
+    if !(span > 0.0) {
+        let low_py = frepr(low);
+        let high_py = frepr(high);
+        return vec![format!(
+            "panel {}: the axis {low_py}..{high_py} has no span",
+            pyjson::repr_str(panel_id)
+        )];
+    }
+    let plot_height =
+        plot_height.unwrap_or((draw::HEIGHT - draw::PAD_TOP - draw::PAD_BOTTOM) as f64);
+    let notes = drawn_notes(markup).join(" ");
+    let mut stated: BTreeMap<String, Vec<crate::tools::pyre::Match>> = BTreeMap::new();
+    for found in sliver_statement_re().find_iter(&notes) {
+        stated
+            .entry(found.named("label").unwrap_or_default())
+            .or_default()
+            .push(found);
+    }
+    let drawn_labels: Vec<String> = label_boxes(markup)
+        .into_iter()
+        .map(|(declared, _, _)| declared)
+        .collect();
+    let mut problems = Vec::new();
+    for bound in bounds {
+        let y = bound.y;
+        if bound_side(&values, y).is_none() && crossing_values(&values, y).is_empty() {
+            continue;
+        }
+        let (band, pixels) =
+            bound_band_pixels(series, bounds, bound, extent, plot_height, run_values);
+        if pixels >= MIN_BOUND_PIXELS {
+            continue;
+        }
+        let matches = stated.get(&bound.label).cloned().unwrap_or_default();
+        if matches.is_empty() {
+            problems.push(format!(
+                "panel {}: the bound {} (y={}) has a band of {} ({} px of {} on the \
+                 axis {}..{}), under the {} px it needs to show the departure it \
+                 exists to catch, and the panel states nothing about where the bound \
+                 sits: a reader can see a departure and cannot read it against the \
+                 bound, which is the same panel as one drawn silently",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&bound.label),
+                fg(y),
+                f4g(band),
+                f1(pixels),
+                f0(plot_height),
+                f4g(low),
+                f4g(high),
+                f0(MIN_BOUND_PIXELS)
+            ));
+            continue;
+        }
+        problems.extend(sliver_statement_problems(
+            panel_id,
+            bound,
+            &matches,
+            &values,
+            band,
+            extent,
+            plot_height,
+        ));
+        for other in bounds {
+            if std::ptr::eq(other, bound) || other.band_arm.is_none() {
+                continue;
+            }
+            let gap = (other.y - y).abs() / (high - low) * plot_height;
+            if gap >= draw::LABEL_LINE_HEIGHT_PX {
+                continue;
+            }
+            if drawn_labels.contains(&other.label) {
+                continue;
+            }
+            let satisfied = matches.iter().any(|found| {
+                found
+                    .named("arm")
+                    .and_then(|text| text.parse::<f64>().ok())
+                    .is_some_and(|arm| (arm - other.y).abs() <= 1e-9)
+                    && found
+                        .named("arm_px")
+                        .and_then(|text| text.parse::<f64>().ok())
+                        .is_some_and(|pixels| (pixels - gap).abs() <= 0.05)
+            });
+            if satisfied {
+                continue;
+            }
+            problems.push(format!(
+                "panel {}: the band arm at {} is drawn {} px from the stated arm, too \
+                 close for a label of its own, and the panel draws no label for it and \
+                 states nothing about where it is: an arm neither labelled nor stated \
+                 is a line the reader cannot read a bar against",
+                pyjson::repr_str(panel_id),
+                fg(other.y),
+                f1(gap)
+            ));
+        }
+    }
+    problems
+}
+
+/// Problems that make an axis unable to show a bound drawn on it.
+pub fn check_panel_axis(
+    panel_id: &str,
+    series: &Series,
+    bounds: &[Bound],
+    extent: (f64, f64),
+    plot_height: Option<f64>,
+    run_values: Option<&J>,
+    stated: &str,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let (low, high) = extent;
+    let span = high - low;
+    if !(span > 0.0) {
+        let low_py = frepr(low);
+        let high_py = frepr(high);
+        return vec![format!(
+            "panel {}: the axis {low_py}..{high_py} has no span",
+            pyjson::repr_str(panel_id)
+        )];
+    }
+    let plot_height =
+        plot_height.unwrap_or((draw::HEIGHT - draw::PAD_TOP - draw::PAD_BOTTOM) as f64);
+    let values = bound_values(series);
+    for bound in bounds {
+        let y = bound.y;
+        if bound_side(&values, y).is_none() && crossing_values(&values, y).is_empty() {
+            continue;
+        }
+        let (band, pixels) =
+            bound_band_pixels(series, bounds, bound, extent, plot_height, run_values);
+        if pixels >= MIN_BOUND_PIXELS {
+            continue;
+        }
+        if !stated.is_empty() && stated.contains(&bound.label) {
+            continue;
+        }
+        let nearest = values
+            .iter()
+            .map(|value| (value - y).abs())
+            .fold(f64::INFINITY, f64::min);
+        let nearest = if values.is_empty() { 0.0 } else { nearest };
+        problems.push(format!(
+            "panel {}: the axis {}..{} leaves the bound {} (y={}) a band of {} ({} of \
+             its height, {} px of {}), under the {} px a bound needs to show the \
+             departure it exists to catch, so that departure would be sub-pixel. The \
+             panel may draw the bound and state its position with the measured \
+             distance instead (this run's nearest bar is {} from it, {} px of this \
+             axis); it states nothing, so the panel is refused rather than drawn",
+            pyjson::repr_str(panel_id),
+            f4g(low),
+            f4g(high),
+            pyjson::repr_str(&bound.label),
+            fg(y),
+            f4g(band),
+            pct1(band / span),
+            f1(pixels),
+            f0(plot_height),
+            f0(MIN_BOUND_PIXELS),
+            f4g(nearest),
+            f1(nearest / span * plot_height)
+        ));
+    }
+    problems
+}
+
+// -- the panel summary --------------------------------------------------------
+
+/// The summary a panel carries: what it drew, with the drawn coordinates.
+#[allow(clippy::too_many_arguments)]
+pub fn panel_summary_document(
+    panel_id: &str,
+    chart: Chart,
+    x_label: &str,
+    y_label: &str,
+    series: &Series,
+    bounds: &[Bound],
+    extent: (f64, f64),
+    markup: &str,
+    stated_labels: &str,
+    plot_height: f64,
+    run_values: Option<&J>,
+    fault: Option<&str>,
+) -> J {
+    let drawn_pixels = drawn_bound_re()
+        .find_all(markup)
+        .iter()
+        .map(|groups| {
+            groups[0]
+                .clone()
+                .unwrap_or_default()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        })
+        .collect::<Vec<f64>>();
+    let drawn_labels: Vec<String> = label_boxes(markup)
+        .into_iter()
+        .map(|(declared, _, _)| declared)
+        .collect();
+    let mut entries = Vec::new();
+    for (index, bound) in bounds.iter().enumerate() {
+        let label = bound.label.clone();
+        let has_label = drawn_labels
+            .iter()
+            .any(|declared| declared.starts_with(&label));
+        let state = if stated_labels.contains(&label) {
+            BOUND_DRAWN_STATED_SLIVER
+        } else if bound.unlabelled || !has_label {
+            BOUND_DRAWN_UNLABELLED
+        } else {
+            BOUND_DRAWN_LABELLED
+        };
+        let band_pixels = if chart == Chart::Bar {
+            Some(bound_band_pixels(series, bounds, bound, extent, plot_height, run_values).1)
+        } else {
+            None
+        };
+        entries.push(J::Obj(vec![
+            ("label".to_string(), J::Str(label)),
+            ("value".to_string(), J::Float(bound.y)),
+            (
+                "px".to_string(),
+                match drawn_pixels.get(index) {
+                    Some(value) => J::Float(*value),
+                    None => J::Null,
+                },
+            ),
+            (
+                "band_px".to_string(),
+                match band_pixels {
+                    Some(value) => J::Float(value),
+                    None => J::Null,
+                },
+            ),
+            (
+                "reason".to_string(),
+                J::Str(bound_reason(bound).to_string()),
+            ),
+            ("drawn".to_string(), J::Str(state.to_string())),
+        ]));
+    }
+    let (x_low, x_high) = panel_x_axis_extent(chart, series);
+    let series_entries: Vec<J> = series
+        .iter()
+        .map(|(name, points)| {
+            let scores: Vec<f64> = points.iter().map(|(_, value)| *value).collect();
+            J::Obj(vec![
+                ("name".to_string(), J::Str(drawn_series_name(chart, name))),
+                ("points".to_string(), J::Int(points.len() as i64)),
+                (
+                    "min".to_string(),
+                    match scores.iter().cloned().fold(None::<f64>, |best, value| {
+                        Some(match best {
+                            Some(best) => best.min(value),
+                            None => value,
+                        })
+                    }) {
+                        Some(value) => J::Float(value),
+                        None => J::Null,
+                    },
+                ),
+                (
+                    "max".to_string(),
+                    match scores.iter().cloned().fold(None::<f64>, |best, value| {
+                        Some(match best {
+                            Some(best) => best.max(value),
+                            None => value,
+                        })
+                    }) {
+                        Some(value) => J::Float(value),
+                        None => J::Null,
+                    },
+                ),
+            ])
+        })
+        .collect();
+    J::Obj(vec![
+        ("panel".to_string(), J::Str(panel_id.to_string())),
+        ("chart".to_string(), J::Str(chart.name().to_string())),
+        (
+            "axis".to_string(),
+            J::Arr(vec![J::Float(extent.0), J::Float(extent.1)]),
+        ),
+        (
+            "x_axis".to_string(),
+            J::Arr(vec![J::Float(x_low), J::Float(x_high)]),
+        ),
+        (
+            "y_clip".to_string(),
+            y_clip_document(series, bounds, extent).unwrap_or(J::Null),
+        ),
+        ("x_label".to_string(), J::Str(x_label.to_string())),
+        ("y_label".to_string(), J::Str(y_label.to_string())),
+        ("series".to_string(), J::Arr(series_entries)),
+        ("bounds".to_string(), J::Arr(entries)),
+        (
+            "reading".to_string(),
+            J::Str(panel_reading(chart, series, bounds, extent, plot_height)),
+        ),
+        (
+            "fault".to_string(),
+            match fault {
+                Some(value) => J::Str(value.to_string()),
+                None => J::Null,
+            },
+        ),
+    ])
+}
+
+/// The summary as the compact human-readable block every reader sees.
+pub fn panel_summary_block(document: &J) -> String {
+    let axis = document.get("axis").and_then(J::as_arr).unwrap_or(&[]);
+    let x_axis = document.get("x_axis").and_then(J::as_arr);
+    let mut line = format!(
+        "panel {}  chart={}  axis={}..{}  ",
+        document.get("panel").and_then(J::as_str).unwrap_or(""),
+        document.get("chart").and_then(J::as_str).unwrap_or(""),
+        sliver_number(axis.first().and_then(J::as_f64).unwrap_or(0.0)),
+        sliver_number(axis.get(1).and_then(J::as_f64).unwrap_or(0.0))
+    );
+    if let Some(x_axis) = x_axis
+        && x_axis.len() >= 2
+    {
+        line.push_str(&format!(
+            "x_axis={}..{}  ",
+            sliver_number(x_axis[0].as_f64().unwrap_or(0.0)),
+            sliver_number(x_axis[1].as_f64().unwrap_or(0.0))
+        ));
+    }
+    line.push_str(&format!(
+        "x={}  y={}",
+        document.get("x_label").and_then(J::as_str).unwrap_or(""),
+        document.get("y_label").and_then(J::as_str).unwrap_or("")
+    ));
+    let mut lines = vec![line];
+    if let Some(clip) = document.get("y_clip")
+        && clip.truthy()
+    {
+        lines.push(format!(
+            "  y_clip: clipped at {} \u{2014} {} drawn value(s) up to {} are drawn \
+                 at the frame's top edge",
+            sliver_number(clip.get("value").and_then(J::as_f64).unwrap_or(0.0)),
+            clip.get("clipped").and_then(J::as_i64).unwrap_or(0),
+            sliver_number(clip.get("max").and_then(J::as_f64).unwrap_or(0.0))
+        ));
+    }
+    let series = document.get("series").and_then(J::as_arr).unwrap_or(&[]);
+    if !series.is_empty() {
+        let listed: Vec<String> = series
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} {} pts {}..{}",
+                    entry.get("name").and_then(J::as_str).unwrap_or(""),
+                    entry.get("points").and_then(J::as_i64).unwrap_or(0),
+                    sliver_number(entry.get("min").and_then(J::as_f64).unwrap_or(0.0)),
+                    sliver_number(entry.get("max").and_then(J::as_f64).unwrap_or(0.0))
+                )
+            })
+            .collect();
+        lines.push(format!("  series: {}", listed.join("; ")));
+    }
+    let bounds = document.get("bounds").and_then(J::as_arr).unwrap_or(&[]);
+    if bounds.is_empty() {
+        lines.push("  bound: none by design".to_string());
+    } else {
+        for entry in bounds {
+            let pixel = match entry.get("px") {
+                Some(J::Float(value)) => f1(*value),
+                _ => "unplaced".to_string(),
+            };
+            let band = match entry.get("band_px").and_then(J::as_f64) {
+                Some(value) => format!("{}px", f1(value)),
+                None => "n/a".to_string(),
+            };
+            lines.push(format!(
+                "  bound: {} y={} px={pixel} band={band} reason={} drawn={}",
+                pyjson::repr_str(entry.get("label").and_then(J::as_str).unwrap_or("")),
+                sliver_number(entry.get("value").and_then(J::as_f64).unwrap_or(0.0)),
+                entry.get("reason").and_then(J::as_str).unwrap_or(""),
+                entry.get("drawn").and_then(J::as_str).unwrap_or("")
+            ));
+        }
+    }
+    lines.push(format!(
+        "  reading: {}",
+        document.get("reading").and_then(J::as_str).unwrap_or("")
+    ));
+    if let Some(fault) = document.get("fault").and_then(J::as_str) {
+        lines.push(format!(
+            "  fault: {fault} \u{2014} a deliberate input fault on this mandate's arm; \
+             the arm it perturbs failed as intended, so this is a fault render and not \
+             a refused panel"
+        ));
+        let slivers: Vec<&J> = bounds
+            .iter()
+            .filter(|entry| {
+                entry.get("drawn").and_then(J::as_str) == Some(BOUND_DRAWN_STATED_SLIVER)
+                    && entry
+                        .get("band_px")
+                        .map(|value| value.as_f64().is_some())
+                        .unwrap_or(false)
+            })
+            .collect();
+        if !slivers.is_empty() {
+            let listed: Vec<String> = slivers
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{} is {} px of this axis and stated at px={}",
+                        pyjson::repr_str(entry.get("label").and_then(J::as_str).unwrap_or("")),
+                        f1(entry.get("band_px").and_then(J::as_f64).unwrap_or(0.0)),
+                        f1(entry.get("px").and_then(J::as_f64).unwrap_or(0.0))
+                    )
+                })
+                .collect();
+            lines.push(format!("  fault scale: {}", listed.join("; ")));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Insert a panel's summary as a machine-readable `<desc>` in its SVG.
+pub fn introduce_panel_summary(markup: &str, document: &J) -> String {
+    let body = pyjson::escape(&pyjson::dumps(document, true, None));
+    let desc = format!("<desc class=\"panel-summary\">{body}</desc>");
+    let Some(found) = svg_opening_re().search(markup) else {
+        return markup.to_string();
+    };
+    let chars: Vec<char> = markup.chars().collect();
+    let mut out: String = chars[..found.end].iter().collect();
+    out.push_str(&desc);
+    out.extend(chars[found.end..].iter());
+    out
+}
+
+/// The summary a written panel carries, or `None` when it carries none.
+pub fn read_panel_summary(markup: &str) -> Option<J> {
+    let found = panel_summary_re().search(markup)?;
+    let body = pyjson::unescape(&found.named("body").unwrap_or_default());
+    let document = pyjson::parse(&body).ok()?;
+    document.as_obj()?;
+    Some(document)
+}
+
+/// One x tick label, formatted the way the chart that draws it formats it.
+pub fn x_axis_tick_text(chart: Chart, scale: &str, low: f64, high: f64, fraction: f64) -> String {
+    if chart != Chart::Bar && scale == "log" && low > 0.0 && high > low {
+        let low_log = low.log10();
+        let span = high.log10() - low_log;
+        return f4g(10.0_f64.powf(low_log + span * fraction));
+    }
+    let value = low + (high - low) * fraction;
+    if chart == Chart::Bar {
+        return f2(value);
+    }
+    f1(value)
+}
+
+/// Problems that leave a panel's stated x extent different from the drawn one.
+pub fn check_x_axis_extent_stated(
+    panel_id: &str,
+    chart: Chart,
+    x_axis: (f64, f64),
+    markup: &str,
+) -> Vec<String> {
+    let drawn = x_axis_tick_re()
+        .find_all(markup)
+        .iter()
+        .map(|groups| groups[0].clone().unwrap_or_default())
+        .collect::<Vec<String>>();
+    if drawn.len() < 2 {
+        return vec![format!(
+            "panel {}: its x axis draws {} tick label(s), so the x extent its summary \
+             states cannot be measured back against the axis the panel drew",
+            pyjson::repr_str(panel_id),
+            drawn.len()
+        )];
+    }
+    let (low, high) = x_axis;
+    let scale = drawn_x_scale(markup);
+    let expected: Vec<String> = (0..drawn.len())
+        .map(|index| {
+            x_axis_tick_text(
+                chart,
+                scale,
+                low,
+                high,
+                index as f64 / (drawn.len() - 1) as f64,
+            )
+        })
+        .collect();
+    if expected == drawn {
+        return Vec::new();
+    }
+    let expected_py = pyjson::py_list(&expected);
+    let drawn_py = pyjson::py_list(&drawn);
+    vec![format!(
+        "panel {}: its summary states the x axis {}..{}, which draws the tick labels \
+         {expected_py}, where the SVG's own x axis draws {drawn_py}; the summary has to \
+         be the drawn geometry",
+        pyjson::repr_str(panel_id),
+        fg(low),
+        fg(high)
+    )]
+}
+
+/// Problems that leave a panel without a true statement of what it drew.
+#[allow(clippy::too_many_arguments)]
+pub fn check_panel_summary_stated(
+    panel_id: &str,
+    chart: Chart,
+    x_label: &str,
+    y_label: &str,
+    series: &Series,
+    bounds: &[Bound],
+    extent: (f64, f64),
+    markup: &str,
+    plot_height: f64,
+    stated_labels: &str,
+    run_values: Option<&J>,
+    fault: Option<&str>,
+) -> Vec<String> {
+    let expected = panel_summary_document(
+        panel_id,
+        chart,
+        x_label,
+        y_label,
+        series,
+        bounds,
+        extent,
+        markup,
+        stated_labels,
+        plot_height,
+        run_values,
+        fault,
+    );
+    let Some(found) = panel_summary_re().search(markup) else {
+        return vec![format!(
+            "panel {}: it carries no panel summary, so the only thing that says what \
+             it drew is the render and the reader has to infer the producer's answer \
+             from it. Every panel owes a <desc class=\"panel-summary\"> stating its \
+             axis, its series, every bound line with its pixel position and why it is \
+             drawn, and its reading; a plot step that cannot produce one is refused",
+            pyjson::repr_str(panel_id)
+        )];
+    };
+    let body = pyjson::unescape(&found.named("body").unwrap_or_default());
+    let stated = match pyjson::parse(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return vec![format!(
+                "panel {}: its panel summary is not readable JSON ({error}), so \
+                 nothing can be measured against it",
+                pyjson::repr_str(panel_id)
+            )];
+        }
+    };
+    let mut problems = Vec::new();
+    if stated.as_obj().is_none() {
+        return vec![format!(
+            "panel {}: its panel summary is a {}, not an object of the panel's own \
+             fields",
+            pyjson::repr_str(panel_id),
+            stated.type_name()
+        )];
+    }
+    let expected_members = expected.as_obj().unwrap_or_default().to_vec();
+    for (key, value) in &expected_members {
+        let matches_ = json_equal(stated.get(key), Some(value));
+        if matches_ {
+            continue;
+        }
+        problems.push(format!(
+            "panel {}: its summary's {} is {} where the drawn panel measures {}; a \
+             summary that is not the drawn panel's is worse than none, because the \
+             reader trusts it instead of the pixels",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(key),
+            stated
+                .get(key)
+                .map(J::repr)
+                .unwrap_or_else(|| "None".to_string()),
+            value.repr()
+        ));
+    }
+    let mut extra: Vec<String> = stated
+        .as_obj()
+        .unwrap_or_default()
+        .iter()
+        .map(|(key, _)| key.clone())
+        .filter(|key| !expected_members.iter().any(|(name, _)| name == key))
+        .collect();
+    extra.sort();
+    let extra_py = pyjson::py_list(&extra);
+    if !extra.is_empty() {
+        problems.push(format!(
+            "panel {}: its summary carries field(s) {extra_py} the drawn panel does not \
+             define, so at least one number is about something other than this render",
+            pyjson::repr_str(panel_id)
+        ));
+    }
+    let drawn_lines = drawn_bound_lines(markup);
+    if drawn_lines.len() != bounds.len() {
+        problems.push(format!(
+            "panel {}: it draws {} bound line(s) and its summary states {}, so a \
+             drawn bound is unaccounted for or a stated one is not drawn",
+            pyjson::repr_str(panel_id),
+            drawn_lines.len(),
+            bounds.len()
+        ));
+    } else {
+        let expected_bounds = expected.get("bounds").and_then(J::as_arr).unwrap_or(&[]);
+        for (entry, drawn_y) in expected_bounds.iter().zip(drawn_lines.iter()) {
+            let Some(pixel) = entry.get("px").and_then(J::as_f64) else {
+                continue;
+            };
+            if (pixel - drawn_y).abs() <= SUMMARY_PIXEL_SLACK {
+                continue;
+            }
+            problems.push(format!(
+                "panel {}: its summary states the bound {} at px={pixel}, where the \
+                 SVG draws that line at y1={drawn_y}; the summary has to be the drawn \
+                 geometry",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(entry.get("label").and_then(J::as_str).unwrap_or(""))
+            ));
+        }
+    }
+    let legend = legend_series_labels(markup);
+    let expected_names: Vec<String> = expected
+        .get("series")
+        .and_then(J::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .map(|entry| {
+            entry
+                .get("name")
+                .and_then(J::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    if !legend.is_empty() && legend != expected_names {
+        let expected_names_py = pyjson::py_list(&expected_names);
+        let legend_py = pyjson::py_list(&legend);
+        problems.push(format!(
+            "panel {}: its summary names the series {expected_names_py}, where the \
+             drawn legend names {legend_py}; a summary of series the panel does not \
+             draw is a claim about another panel",
+            pyjson::repr_str(panel_id)
+        ));
+    }
+    if stated.get("x_axis").is_some() {
+        let x_axis = expected.get("x_axis").and_then(J::as_arr).unwrap_or(&[]);
+        problems.extend(check_x_axis_extent_stated(
+            panel_id,
+            chart,
+            (
+                x_axis.first().and_then(J::as_f64).unwrap_or(0.0),
+                x_axis.get(1).and_then(J::as_f64).unwrap_or(0.0),
+            ),
+            markup,
+        ));
+    }
+    problems
+}
+
+/// The tags a summary names, for the reader who wants the reason vocabulary.
+pub const BOUND_DRAWN_LABELLED: &str = "labelled";
+/// A bound line the panel draws without a label of its own.
+pub const BOUND_DRAWN_UNLABELLED: &str = "unlabelled";
+/// A bound line whose sliver the panel states in prose instead of a label.
+pub const BOUND_DRAWN_STATED_SLIVER: &str = "stated-as-sliver";
+
+/// The pixel slack a stated bound position is allowed against the drawn line.
+pub const SUMMARY_PIXEL_SLACK: f64 = 0.05;
+
+/// Python's `==` for two parsed JSON values, where an object's key order is
+/// not part of the value.
+pub fn json_equal(first: Option<&J>, second: Option<&J>) -> bool {
+    match (first, second) {
+        (Some(J::Obj(a)), Some(J::Obj(b))) => {
+            a.len() == b.len()
+                && a.iter().all(|(key, value)| {
+                    b.iter()
+                        .find(|(name, _)| name == key)
+                        .is_some_and(|(_, other)| json_equal(Some(value), Some(other)))
+                })
+        }
+        (Some(J::Arr(a)), Some(J::Arr(b))) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| json_equal(Some(x), Some(y)))
+        }
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+// -- values a panel names must be on the axis it draws ------------------------
+
+/// The run's own guards the panel's drawn labels will name on its own axis.
+pub fn named_guard_values(
+    series: &Series,
+    bounds: &[Bound],
+    run_values: Option<&J>,
+    crossing: bool,
+) -> Vec<f64> {
+    if !crossing || run_values.is_none() {
+        return Vec::new();
+    }
+    let mut guards: Vec<f64> = Vec::new();
+    for bound in bounds {
+        for (_, value) in run_guards(run_values, Some(series), &bound.label) {
+            if !guards.contains(&value) {
+                guards.push(value);
+            }
+        }
+    }
+    guards.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    guards
+}
+
+/// Problems that make a named value unreadable: the axis does not resolve it.
+pub fn check_named_values_in_axis(
+    panel_id: &str,
+    bounds: &[Bound],
+    guards: &[f64],
+    extent: (f64, f64),
+    plot_height: Option<f64>,
+) -> Vec<String> {
+    let (low, high) = extent;
+    let span = high - low;
+    if !(span > 0.0) {
+        let low_py = frepr(low);
+        let high_py = frepr(high);
+        return vec![format!(
+            "panel {}: the axis {low_py}..{high_py} has no span",
+            pyjson::repr_str(panel_id)
+        )];
+    }
+    let plot_height =
+        plot_height.unwrap_or((draw::HEIGHT - draw::PAD_TOP - draw::PAD_BOTTOM) as f64);
+    let mut named: Vec<(f64, String)> = bounds
+        .iter()
+        .map(|bound| (bound.y, format!("bound {}", pyjson::repr_str(&bound.label))))
+        .collect();
+    named.extend(
+        guards
+            .iter()
+            .map(|value| (*value, format!("named guard {}", fg(*value)))),
+    );
+    let mut problems = Vec::new();
+    for (value, what) in named {
+        let where_ = if low <= value && value <= high {
+            let clear = (value - low).min(high - value) * plot_height / span;
+            if clear >= MIN_AXIS_INSET_PIXELS {
+                continue;
+            }
+            format!("only {} px from the nearest edge of it", f1(clear))
+        } else if value > high {
+            format!("{} px above it", f1((value - high) * plot_height / span))
+        } else {
+            format!("{} px below it", f1((low - value) * plot_height / span))
+        };
+        problems.push(format!(
+            "panel {}: the axis {}..{} does not resolve the {what} (y={}) that the \
+             panel names: it is {where_}, and a named value the axis does not show is \
+             a claim the reader has no way to check",
+            pyjson::repr_str(panel_id),
+            f4g(low),
+            f4g(high),
+            fg(value)
+        ));
+    }
+    problems
+}
+
+/// Problems that make a guard the panel *names* unreadable: no line at it.
+pub fn check_named_guards_drawn(
+    panel_id: &str,
+    guards: &[f64],
+    extent: (f64, f64),
+    markup: &str,
+    plot_height: Option<f64>,
+) -> Vec<String> {
+    if guards.is_empty() {
+        return Vec::new();
+    }
+    let (low, high) = extent;
+    let span = high - low;
+    if !(span > 0.0) {
+        let low_py = frepr(low);
+        let high_py = frepr(high);
+        return vec![format!(
+            "panel {}: the axis {low_py}..{high_py} has no span",
+            pyjson::repr_str(panel_id)
+        )];
+    }
+    let plot_height =
+        plot_height.unwrap_or((draw::HEIGHT - draw::PAD_TOP - draw::PAD_BOTTOM) as f64);
+    let drawn = drawn_bound_values(markup, extent);
+    let slack = 0.5 / plot_height * span;
+    let mut problems = Vec::new();
+    for value in guards {
+        if drawn.iter().any(|line| (value - line).abs() <= slack) {
+            continue;
+        }
+        let rounded: Vec<f64> = drawn
+            .iter()
+            .map(|line| fdec(*line, 4).parse().unwrap_or(0.0))
+            .collect();
+        let rounded_py = pyjson::py_float_list(&rounded);
+        problems.push(format!(
+            "panel {}: its label names the guard {}, but the artifact draws {} bound \
+             line(s) at {rounded_py} and none of them is that guard: a tolerance the \
+             panel names and does not draw is a claim the reader has to take on trust, \
+             and a bar between that guard and the bound it is read against has no \
+             second line to sit inside",
+            pyjson::repr_str(panel_id),
+            fg(*value),
+            drawn.len()
+        ));
+    }
+    problems
+}
+
+/// Problems that make an over-bound bar undrawable: the axis is too short.
+pub fn check_bound_headroom(
+    panel_id: &str,
+    bounds: &[Bound],
+    guards: &[f64],
+    extent: (f64, f64),
+    plot_height: Option<f64>,
+    series: Option<&Series>,
+) -> Vec<String> {
+    if bounds.is_empty() && guards.is_empty() {
+        return Vec::new();
+    }
+    let (low, high) = extent;
+    let span = high - low;
+    if !(span > 0.0) {
+        let low_py = frepr(low);
+        let high_py = frepr(high);
+        return vec![format!(
+            "panel {}: the axis {low_py}..{high_py} has no span",
+            pyjson::repr_str(panel_id)
+        )];
+    }
+    let plot_height =
+        plot_height.unwrap_or((draw::HEIGHT - draw::PAD_TOP - draw::PAD_BOTTOM) as f64);
+    let mut problems = Vec::new();
+    let top = bounds
+        .iter()
+        .map(|bound| bound.y)
+        .chain(guards.iter().cloned())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let headroom = (high - top) / span * plot_height;
+    if headroom < MIN_HEADROOM_PIXELS {
+        problems.push(format!(
+            "panel {}: the axis {}..{} keeps {} px above the highest value it names \
+             (y={}), under the {} px an over-bound bar needs: a breach and a value \
+             exactly at that bound would be drawn as the same picture, so the panel \
+             could not show the failure it exists for",
+            pyjson::repr_str(panel_id),
+            f4g(low),
+            f4g(high),
+            f1(headroom),
+            fg(top),
+            f0(MIN_HEADROOM_PIXELS)
+        ));
+    }
+    let Some(series) = series else {
+        return problems;
+    };
+    let values = bound_values(series);
+    for bound in bounds {
+        if bound.band_arm.as_deref() != Some("lower") && failure_side(&values, bound.y) >= 0.0 {
+            continue;
+        }
+        let y = bound.y;
+        let below = (y - low) / span * plot_height;
+        if below >= MIN_HEADROOM_PIXELS {
+            continue;
+        }
+        problems.push(format!(
+            "panel {}: the axis {}..{} keeps {} px below the bound {} (y={}), under \
+             the {} px an under-bound bar needs: a bar that crosses that bound \
+             downwards would be drawn flush with the frame, where it reads as the \
+             frame's border and not as a crossing",
+            pyjson::repr_str(panel_id),
+            f4g(low),
+            f4g(high),
+            f1(below),
+            pyjson::repr_str(&bound.label),
+            fg(y),
+            f0(MIN_HEADROOM_PIXELS)
+        ));
+    }
+    problems
+}
+
+/// Problems that make half of a declared two-sided bound missing.
+pub fn check_two_sided_bound_drawn(
+    panel_id: &str,
+    bounds: &[Bound],
+    extent: (f64, f64),
+    markup: &str,
+    plot_height: Option<f64>,
+) -> Vec<String> {
+    let (low, high) = extent;
+    let span = high - low;
+    if !(span > 0.0) {
+        let low_py = frepr(low);
+        let high_py = frepr(high);
+        return vec![format!(
+            "panel {}: the axis {low_py}..{high_py} has no span",
+            pyjson::repr_str(panel_id)
+        )];
+    }
+    if !bounds
+        .iter()
+        .any(|bound| bound_band_half_width(bound).is_some())
+    {
+        return Vec::new();
+    }
+    let plot_height =
+        plot_height.unwrap_or((draw::HEIGHT - draw::PAD_TOP - draw::PAD_BOTTOM) as f64);
+    let drawn = drawn_bound_values(markup, extent);
+    let slack = 0.5 / plot_height * span;
+    let mut problems = Vec::new();
+    for bound in bounds {
+        let Some(half) = bound_band_half_width(bound) else {
+            continue;
+        };
+        let y = bound.y;
+        if !two_sided_bound(bound) {
+            problems.push(format!(
+                "panel {}: the bound {} declares a symmetric band of {}, while the \
+                 value it declares is {}; the declaration does not say where the band \
+                 is centred, so the arm on the other side is unknowable and a \
+                 departure there would be drawn with no line to cross",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&bound.label),
+                fg(half),
+                fg(y)
+            ));
+            continue;
+        }
+        let missing: Vec<f64> = [y, -y]
+            .into_iter()
+            .filter(|arm| !drawn.iter().any(|sample| (sample - arm).abs() <= slack))
+            .collect();
+        if !missing.is_empty() {
+            let arms = missing
+                .iter()
+                .map(|arm| format!("{}{}", sign_char(*arm), f4g(arm.abs())))
+                .collect::<Vec<String>>()
+                .join(", ");
+            let drawn_arms = drawn
+                .iter()
+                .map(|value| f4g(*value))
+                .collect::<Vec<String>>()
+                .join(", ");
+            problems.push(format!(
+                "panel {}: the bound {} names a two-sided band (+/-{}), but the panel \
+                 draws no line at {arms}; its drawn arms are [{drawn_arms}]: a breach \
+                 on the side with no line is a bar crossing nothing, which is the \
+                 failure the panel is drawn for",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&bound.label),
+                fg(half)
+            ));
+        }
+        for (arm, side, room) in [(y, "above", high - y), (-y, "below", -y - low)] {
+            let pixels = room / span * plot_height;
+            if pixels >= MIN_HEADROOM_PIXELS {
+                continue;
+            }
+            let where_ = if pixels < 0.0 {
+                format!("{} px outside the axis {side} it", f1(-pixels))
+            } else {
+                format!("only {} px inside the axis {side} it", f1(pixels))
+            };
+            let arm_text = format!("{}{}", sign_char(arm), f4g(arm.abs()));
+            problems.push(format!(
+                "panel {}: the band arm at {arm_text} is {where_} ({}..{}), so a bar \
+                 crossing it has less than the {} px it needs: the breach and the arm \
+                 would be drawn as the same picture",
+                pyjson::repr_str(panel_id),
+                f4g(low),
+                f4g(high),
+                f0(MIN_HEADROOM_PIXELS)
+            ));
+        }
+    }
+    problems
+}
+
+fn sign_char(value: f64) -> char {
+    if value.is_sign_negative() { '-' } else { '+' }
+}
+
+// -- governance ---------------------------------------------------------------
+
+/// Problems that make a crossed bound unreadable: nothing says what governs it.
+pub fn check_bound_governance(
+    panel_id: &str,
+    series: &Series,
+    bounds: &[Bound],
+    run_values: Option<&J>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let values = bound_values(series);
+    for bound in bounds {
+        let crossing = crossing_values(&values, bound.y);
+        if crossing.is_empty() {
+            continue;
+        }
+        if bound.series.is_some() || bound.x.is_some() {
+            continue;
+        }
+        if run_values.is_some() {
+            continue;
+        }
+        problems.push(format!(
+            "panel {} draws the bound {} (y={}) with {} of {} bar(s) beyond it, and \
+             the run's own measurements were not supplied, so the panel cannot say \
+             whether that crossing is a breach or an arm's tolerated guard; pass the \
+             run's MANDATE values (tools/mandate-check does) or declare which series \
+             the bound governs with bounds[].series / bounds[].x",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(&bound.label),
+            fg(bound.y),
+            crossing.len(),
+            values.len()
+        ));
+    }
+    problems
+}
+
+/// Problems that leave a bound drawn across arms with different floors unnamed.
+pub fn check_bound_arm_governance(
+    panel_id: &str,
+    panel: &Panel,
+    series: &Series,
+    bounds: &[Bound],
+    run_values: Option<&J>,
+    markup: &str,
+) -> Vec<String> {
+    let planned = bar_bound_plan(panel, series, bounds, run_values);
+    let drawn: Vec<String> = label_boxes(markup)
+        .into_iter()
+        .map(|(declared, _, _)| declared)
+        .collect();
+    let drawn_py = pyjson::py_list(&drawn);
+    let mut problems = Vec::new();
+    if panel.chart != Chart::Bar {
+        let clause = arm_guard_clause(series, run_values);
+        if clause.is_empty() {
+            return Vec::new();
+        }
+        for bound in bounds {
+            let label = governed_label(bound, series, run_values, false);
+            if drawn.contains(&label) {
+                continue;
+            }
+            problems.push(format!(
+                "panel {}: the run states the guards {} for the arms this bound \
+                 crosses, so one line across every series would be the bound of none \
+                 of them; the panel has to name which arm it governs and what the \
+                 other arms are read against. Missing: {} (drawn: {drawn_py})",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&clause),
+                pyjson::repr_str(&label)
+            ));
+        }
+        return problems;
+    }
+    if planned.len() <= bounds.len() {
+        return Vec::new();
+    }
+    for bound in &planned {
+        let label = governed_label(bound, series, run_values, true);
+        if drawn.contains(&label) {
+            continue;
+        }
+        problems.push(format!(
+            "panel {}: the run states the bound {} for some arms and {} for others, so \
+             one line across every bar would be the floor of neither; the panel has to \
+             draw each arm's own bound and name the arms it governs. Missing: {} \
+             (drawn: {drawn_py})",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(&planned[0].label),
+            pyjson::repr_str(&planned[planned.len() - 1].label),
+            pyjson::repr_str(&label)
+        ));
+    }
+    problems
+}
+
+/// The drawn points beyond a bound that the panel reads as a departure.
+pub fn crossing_points(series: &Series, y: f64) -> Vec<(String, f64, f64)> {
+    let values = bound_values(series);
+    if clustered_around(&values, y) {
+        return Vec::new();
+    }
+    let mut below: Vec<(String, f64, f64)> = Vec::new();
+    let mut above: Vec<(String, f64, f64)> = Vec::new();
+    for (name, points) in series {
+        for (x, value) in points {
+            if *value < y {
+                below.push((name.clone(), *x, *value));
+            } else if *value > y {
+                above.push((name.clone(), *x, *value));
+            }
+        }
+    }
+    let total = below.len() + above.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    if (above.len() as f64) <= CROSSING_BULK_SHARE * total as f64 {
+        return above;
+    }
+    if (below.len() as f64) <= CROSSING_BULK_SHARE * total as f64 {
+        return below;
+    }
+    Vec::new()
+}
+
+/// The drawn series -- or arms -- the run states a bound of their own for.
+pub fn own_bound_names(chart: Chart, series: &Series, run_values: Option<&J>) -> Vec<String> {
+    if run_values.is_none() {
+        return Vec::new();
+    }
+    if chart != Chart::Bar {
+        return arm_guard_tokens(series, run_values)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+    }
+    let mut own: Vec<String> = Vec::new();
+    for (name, _) in series {
+        for suffix in [PER_ARM_BOUND_SUFFIXES.0, PER_ARM_BOUND_SUFFIXES.1] {
+            let key = format!("{name}{suffix}");
+            let present = run_values
+                .and_then(J::as_obj)
+                .and_then(|members| members.iter().find(|(key_, _)| *key_ == key))
+                .map(|(_, value)| numeric(value))
+                .unwrap_or(false);
+            if present && !own.contains(name) {
+                own.push(name.clone());
+            }
+        }
+    }
+    if series.len() == 1 {
+        let quantity = series[0].0.as_str();
+        let arms = run_arm_names(series, run_values);
+        let mut categories: Vec<f64> = series[0].1.iter().map(|(x, _)| *x).collect();
+        categories.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        categories.dedup();
+        if !arms.is_empty() && arms.len() == categories.len() {
+            for arm in &arms {
+                if arm_bound_source(arm, quantity, run_values).is_some() && !own.contains(arm) {
+                    own.push(arm.clone());
+                }
+            }
+        }
+    }
+    own
+}
+
+/// The spellings a drawn label may use for one series or arm.
+pub fn series_tokens(name: &str) -> Vec<String> {
+    vec![name.to_string(), series_label(name)]
+}
+
+/// Problems that leave a bound's crossing attributed to no bound at all.
+#[allow(clippy::too_many_arguments)]
+pub fn check_crossing_series_governed(
+    panel_id: &str,
+    chart: Chart,
+    series: &Series,
+    bounds: &[Bound],
+    run_values: Option<&J>,
+    markup: &str,
+) -> Vec<String> {
+    let own = own_bound_names(chart, series, run_values);
+    if own.is_empty() {
+        return Vec::new();
+    }
+    let stated = governed_names(markup);
+    let arms = if series.len() == 1 {
+        run_arm_names(series, run_values)
+    } else {
+        Vec::new()
+    };
+    let mut categories: Vec<f64> = series
+        .iter()
+        .flat_map(|(_, points)| points.iter().map(|(x, _)| *x))
+        .collect();
+    categories.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    categories.dedup();
+    let by_category = !arms.is_empty() && arms.len() == categories.len();
+    let mut problems = Vec::new();
+    for bound in bounds {
+        let window = bound_governed_x(bound);
+        let points = crossing_points(series, bound.y);
+        if points.is_empty() {
+            continue;
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for (name, x, _value) in &points {
+            if let Some(window) = window
+                && window.0 <= *x
+                && *x <= window.1
+            {
+                continue;
+            }
+            if bound.series.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            let mut tokens = series_tokens(name);
+            if by_category && let Some(index) = categories.iter().position(|value| value == x) {
+                tokens.extend(series_tokens(&arms[index]));
+            }
+            if !tokens.iter().any(|token| own.contains(token)) {
+                continue;
+            }
+            if tokens.iter().any(|token| stated.contains(token)) {
+                continue;
+            }
+            let target = if own.contains(name) {
+                name.clone()
+            } else if by_category {
+                categories
+                    .iter()
+                    .position(|value| value == x)
+                    .map(|index| arms[index].clone())
+                    .unwrap_or_else(|| name.clone())
+            } else {
+                name.clone()
+            };
+            if !missing.contains(&target) {
+                missing.push(target);
+            }
+        }
+        if missing.is_empty() {
+            continue;
+        }
+        missing.sort();
+        let missing_py = pyjson::py_list(&missing);
+        problems.push(format!(
+            "panel {}: the bound {} (y={}) is crossed by the drawn value(s) of \
+             {missing_py}, which the run measures against a bound of their own, and no \
+             drawn bound line says so: as drawn, a pass under that series' own guard \
+             and a breach of this bound are the same picture. Name the series on the \
+             bound's own label (the arm-guard clause), or draw the bound that governs \
+             it beside it and label that line with `governs series <name>`",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(&bound.label),
+            fg(bound.y)
+        ));
+    }
+    problems
+}
+
+// -- a label's fit, and a note's ---------------------------------------------
+
+/// Problems that make a drawn bound label leave the panel's plot area.
+pub fn check_label_fit(panel_id: &str, markup: &str) -> PlotResult<Vec<String>> {
+    let (left, top, right, bottom) = panel_plot_rect(panel_id, markup)?;
+    let mut problems = Vec::new();
+    for (declared, line, (x0, y0, x1, y1)) in label_boxes(markup) {
+        let mut outside = Vec::new();
+        if x0 < left {
+            outside.push(format!("{} px past its left edge", f1(left - x0)));
+        }
+        if x1 > right {
+            outside.push(format!("{} px past its right edge", f1(x1 - right)));
+        }
+        if y0 < top {
+            outside.push(format!("{} px above it", f1(top - y0)));
+        }
+        if y1 > bottom {
+            outside.push(format!("{} px below it", f1(y1 - bottom)));
+        }
+        if outside.is_empty() {
+            continue;
+        }
+        let detail = if line == declared {
+            String::new()
+        } else {
+            format!(" (on the drawn line {})", pyjson::repr_str(&line))
+        };
+        problems.push(format!(
+            "panel {}: the bound label {} does not fit the plot area{detail} -- its \
+             drawn box {},{:.1}..{},{:.1} is {}, and the plot area is \
+             {:.1},{:.1}..{:.1},{:.1}. The label is the part of the panel that says \
+             what its bound governs, so it has to be inside the panel; shorten the \
+             label or its guard list, or give the panel an axis with room for it",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(&declared),
+            f1(x0),
+            y0,
+            f1(x1),
+            y1,
+            outside.join(", "),
+            left,
+            top,
+            right,
+            bottom
+        ));
+    }
+    Ok(problems)
+}
+
+/// Problems that make a bound label unreadable: it shares pixels with another.
+pub fn check_label_overlap(panel_id: &str, markup: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let boxes = label_boxes(markup);
+    for (index, (declared, line, box_)) in boxes.iter().enumerate() {
+        for (other_declared, other_line, other) in boxes[index + 1..].iter() {
+            let area = draw::box_overlap(*box_, *other);
+            if area <= LABEL_OVERLAP_PX2 {
+                continue;
+            }
+            let same_anchor = declared == other_declared
+                && (box_.1 - other.1).abs() < draw::LABEL_LINE_HEIGHT_PX - 0.5;
+            let what = if same_anchor {
+                format!(
+                    "the bound label {} is drawn twice on the same anchor",
+                    pyjson::repr_str(declared)
+                )
+            } else {
+                format!(
+                    "the bound labels {} and {} overlap",
+                    pyjson::repr_str(declared),
+                    pyjson::repr_str(other_declared)
+                )
+            };
+            let smaller = ((box_.2 - box_.0) * (box_.3 - box_.1))
+                .min((other.2 - other.0) * (other.3 - other.1));
+            let mut problem = format!(
+                "panel {}: {what} -- their boxes share {} of {} px, so both names are \
+                 drawn where neither can be read",
+                pyjson::repr_str(panel_id),
+                f0(area),
+                f0(smaller)
+            );
+            if line != declared || other_line != other_declared {
+                problem.push_str(&format!(
+                    " (on the drawn lines {} and {})",
+                    pyjson::repr_str(line),
+                    pyjson::repr_str(other_line)
+                ));
+            }
+            problems.push(problem);
+        }
+    }
+    problems
+}
+
+/// Problems that let bars read as one ribbon instead of as values.
+pub fn check_bar_separation(panel_id: &str, markup: &str) -> Vec<String> {
+    let mut bars = bar_boxes(markup);
+    bars.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut problems = Vec::new();
+    for (index, first) in bars.iter().enumerate() {
+        for second in bars[index + 1..].iter() {
+            let gap = (second.0 - first.2).max(first.0 - second.2);
+            if gap >= MIN_BAR_GAP_PIXELS {
+                continue;
+            }
+            let stated = if gap < 0.0 {
+                format!("overlap by {} px", f1(-gap))
+            } else {
+                format!("are {} px apart", f2(gap))
+            };
+            problems.push(format!(
+                "panel {}: two drawn bars {stated}, under the {} px a reader needs to \
+                 tell one value from the next; drawn flush they read as one constantly \
+                 growing quantity rather than as separate values",
+                pyjson::repr_str(panel_id),
+                f0(MIN_BAR_GAP_PIXELS)
+            ));
+        }
+    }
+    problems
+}
+
+/// Problems that make a series unnamed to a human reader.
+pub fn check_series_labels(panel_id: &str, markup: &str, series: &Series) -> Vec<String> {
+    let drawn = legend_text(markup);
+    let expected: Vec<String> = series.iter().map(|(name, _)| series_label(name)).collect();
+    let mut problems = Vec::new();
+    if drawn != expected {
+        let drawn_py = pyjson::py_list(&drawn);
+        let expected_py = pyjson::py_list(&expected);
+        problems.push(format!(
+            "panel {}: the legend draws {drawn_py}, not the labels its series have \
+             {expected_py}; every series needs a human name",
+            pyjson::repr_str(panel_id)
+        ));
+    }
+    for text in &drawn {
+        if raw_column_name_re().match_at(text).is_some() {
+            problems.push(format!(
+                "panel {}: the legend draws the raw column name {}, a reader is told \
+                 the producer's spelling instead of the quantity's name",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(text)
+            ));
+        }
+    }
+    problems
+}
+
+/// Problems that make a drawn text unreadable or uninformative.
+pub fn check_canvas_text_fit(panel_id: &str, markup: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (text, (x0, y0, x1, y1)) in drawn_text_boxes(markup) {
+        if let Some(placeholder) = placeholder_text_re().search(&text) {
+            problems.push(format!(
+                "panel {}: the drawn text {} carries the empty placeholder {}; a panel \
+                 must draw the measurement, not the template its absent evidence left \
+                 behind",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&text),
+                pyjson::repr_str(&placeholder.group(0).unwrap_or_default())
+            ));
+        }
+        if x0 < 0.0 || y0 < 0.0 || x1 > draw::WIDTH as f64 || y1 > draw::HEIGHT as f64 {
+            let mut outside = Vec::new();
+            if x0 < 0.0 {
+                outside.push(format!("{} px past the left edge", f1(-x0)));
+            }
+            if x1 > draw::WIDTH as f64 {
+                outside.push(format!(
+                    "{} px past the right edge",
+                    f1(x1 - draw::WIDTH as f64)
+                ));
+            }
+            if y0 < 0.0 {
+                outside.push(format!("{} px above it", f1(-y0)));
+            }
+            if y1 > draw::HEIGHT as f64 {
+                outside.push(format!("{} px below it", f1(y1 - draw::HEIGHT as f64)));
+            }
+            problems.push(format!(
+                "panel {}: the drawn text {} is {}, so the {}x{} canvas draws it \
+                 clipped; a label the reader cannot finish is not a label",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&text),
+                outside.join(", "),
+                draw::WIDTH,
+                draw::HEIGHT
+            ));
+        }
+    }
+    problems
+}
+
+/// Problems that make a panel's own note unreadable where it is drawn.
+pub fn check_note_fit(panel_id: &str, markup: &str) -> PlotResult<Vec<String>> {
+    let boxes = note_boxes(markup);
+    if boxes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (left, top, right, bottom) = panel_plot_rect(panel_id, markup)?;
+    let mut problems = Vec::new();
+    for (text, (x0, y0, x1, y1)) in &boxes {
+        if *x0 < left || *y0 < top || *x1 > right || *y1 > bottom {
+            problems.push(format!(
+                "panel {}: its note {} is drawn at {:.1},{:.1}..{:.1},{:.1}, outside \
+                 the plot area {:.1},{:.1}..{:.1},{:.1}; a note about what this frame \
+                 cannot show has to be inside the frame",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(text),
+                x0,
+                y0,
+                x1,
+                y1,
+                left,
+                top,
+                right,
+                bottom
+            ));
+        }
+    }
+    let mut others: Vec<(String, (f64, f64, f64, f64))> = label_boxes(markup)
+        .into_iter()
+        .map(|(declared, _, box_)| (declared, box_))
+        .collect();
+    others.extend(boxes.iter().cloned());
+    for (index, (declared, box_)) in others.iter().enumerate() {
+        for (other_text, other) in others[index + 1..].iter() {
+            let area = draw::box_overlap(*box_, *other);
+            if area <= LABEL_OVERLAP_PX2 {
+                continue;
+            }
+            problems.push(format!(
+                "panel {}: the drawn text {} shares {} px with {}, so neither is \
+                 readable; a note is what the reader is told instead of the pixels, so \
+                 it may not be drawn under another label",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(declared),
+                f0(area),
+                pyjson::repr_str(other_text)
+            ));
+        }
+    }
+    Ok(problems)
+}
+
+// -- the composition panels ---------------------------------------------------
+
+/// The bounds a bar panel's own bars straddle, which none of them can fail.
+pub fn target_bounds(panel: &Panel, series: &Series) -> Vec<Bound> {
+    let values = bound_values(series);
+    bound_specs(panel)
+        .into_iter()
+        .filter(|bound| {
+            bound_side(&values, bound.y).is_none() && crossing_values(&values, bound.y).is_empty()
+        })
+        .collect()
+}
+
+/// One drawn point of a panel, keyed the way the two panels' points are matched.
+type PointKey = (String, f64);
+
+fn points_of(panel: &Panel, points: &Points) -> Vec<(PointKey, f64)> {
+    let mut keyed: Vec<(PointKey, f64)> = panel_series(panel, points)
+        .into_iter()
+        .flat_map(|(name, series)| {
+            series
+                .into_iter()
+                .map(move |(x, value)| ((name.clone(), x), value))
+        })
+        .collect();
+    keyed.sort_by(|a, b| {
+        a.0.0.cmp(&b.0.0).then(
+            a.0.1
+                .partial_cmp(&b.0.1)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    keyed
+}
+
+/// The mandate panel that draws `(value - y) / y` for this panel's points.
+pub fn relative_departure_panel(
+    panel: &Panel,
+    panels: &[Panel],
+    points: &Points,
+    y: f64,
+) -> Option<(usize, Vec<(PointKey, f64)>)> {
+    let mine = points_of(panel, points);
+    if mine.is_empty() || y == 0.0 {
+        return None;
+    }
+    for (index, other) in panels.iter().enumerate() {
+        if other.id == panel.id || other.chart != Chart::Bar {
+            continue;
+        }
+        let theirs = points_of(other, points);
+        if theirs.len() != mine.len() || theirs.iter().zip(mine.iter()).any(|(a, b)| a.0 != b.0) {
+            continue;
+        }
+        if mine
+            .iter()
+            .enumerate()
+            .all(|(position, (_, value))| (theirs[position].1 - (value - y) / y).abs() <= 1e-5)
+        {
+            return Some((index, theirs));
+        }
+    }
+    None
+}
+
+/// The note a share panel owes: what it is, and where its failure is drawn.
+pub fn departure_view_note(panel: &Panel, panels: &[Panel], points: &Points) -> String {
+    if panel.chart != Chart::Bar {
+        return String::new();
+    }
+    let series = panel_series(panel, points);
+    for bound in target_bounds(panel, &series) {
+        let Some((index, values)) = relative_departure_panel(panel, panels, points, bound.y) else {
+            continue;
+        };
+        let companion = &panels[index];
+        let bounds = bound_specs(companion);
+        if bounds.is_empty() {
+            continue;
+        }
+        let departure_bound = bounds
+            .iter()
+            .map(|bound| bound.y)
+            .fold(f64::INFINITY, f64::min);
+        let mut worst: Vec<(String, f64)> = Vec::new();
+        for entry in &companion.series {
+            let scores: Vec<f64> = values
+                .iter()
+                .filter(|((name, _), _)| *name == entry.name)
+                .map(|(_, value)| value.abs())
+                .collect();
+            if !scores.is_empty() {
+                worst.push((
+                    entry.name.clone(),
+                    scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                ));
+            }
+        }
+        let listed: Vec<String> = worst
+            .iter()
+            .map(|(name, value)| format!("{name} {}", pct2(*value)))
+            .collect();
+        return format!(
+            "composition view - the departure is drawn on panel '{}' (bound {}): worst \
+             {}",
+            companion.id,
+            pct1(departure_bound),
+            listed.join(", ")
+        );
+    }
+    String::new()
+}
+
+/// The note a panel with no bound of its own owes: where the bound is drawn.
+pub fn bound_reference_note(
+    panel: &Panel,
+    panels: &[Panel],
+    points: &Points,
+    x_label: &str,
+    y_label: &str,
+    run_values: Option<&J>,
+) -> String {
+    if !panel.bounds.is_empty() {
+        return String::new();
+    }
+    if !derived_x_bounds(panel, panels, points, x_label, y_label, run_values).is_empty() {
+        return String::new();
+    }
+    for other in panels {
+        if other.id == panel.id {
+            continue;
+        }
+        if other.bounds.is_empty() {
+            continue;
+        }
+        return format!(
+            "composition view - this panel draws the quantity; the mandate's bound \
+             '{}' is drawn on panel '{}'",
+            other.bounds[0].label, other.id
+        );
+    }
+    String::new()
+}
+
+/// The note a panel owes for the failure its own frame cannot carry.
+pub fn composition_note(
+    panel: &Panel,
+    panels: &[Panel],
+    points: &Points,
+    x_label: &str,
+    y_label: &str,
+    run_values: Option<&J>,
+) -> String {
+    let departure = departure_view_note(panel, panels, points);
+    if !departure.is_empty() {
+        return departure;
+    }
+    bound_reference_note(panel, panels, points, x_label, y_label, run_values)
+}
+
+/// Problems that leave a composition panel silent about the failure it cannot show.
+#[allow(clippy::too_many_arguments)]
+pub fn check_departure_view_stated(
+    panel_id: &str,
+    panel: &Panel,
+    panels: &[Panel],
+    points: &Points,
+    markup: &str,
+    x_label: &str,
+    y_label: &str,
+    run_values: Option<&J>,
+) -> Vec<String> {
+    let expected = composition_note(panel, panels, points, x_label, y_label, run_values);
+    if expected.is_empty() {
+        return Vec::new();
+    }
+    let drawn = drawn_notes(markup).join(" ");
+    if drawn.contains(&expected) {
+        return Vec::new();
+    }
+    vec![format!(
+        "panel {}: its own frame cannot carry the failure its mandate is read for -- \
+         either its bound is a value its bars straddle, or it draws no bound at all -- \
+         and the panel says neither where that failure is drawn nor what it measures. \
+         Expected on the panel: {}; drawn: {}. A panel drawn silently is read as \
+         evidence that there is no failure to draw",
+        pyjson::repr_str(panel_id),
+        pyjson::repr_str(&expected),
+        pyjson::repr_str(&drawn)
+    )]
+}
+
+/// Every x a bound declares it governs must be a category the panel draws.
+pub fn check_bound_x_categories(panel_id: &str, series: &Series, bounds: &[Bound]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut categories: Vec<f64> = series
+        .iter()
+        .flat_map(|(_, points)| points.iter().map(|(x, _)| *x))
+        .collect();
+    categories.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    categories.dedup();
+    let categories_py = pyjson::py_float_list(&categories);
+    let names: Vec<String> = series.iter().map(|(name, _)| name.clone()).collect();
+    for bound in bounds {
+        if let Some((low, high)) = bound_governed_x(bound) {
+            let governed: Vec<f64> = categories
+                .iter()
+                .copied()
+                .filter(|x| low <= *x && *x <= high)
+                .collect();
+            if governed.is_empty() {
+                problems.push(format!(
+                    "panel {}: the bound {} declares it governs x={}..{}, and the panel \
+                     draws no category there (its categories are {categories_py})",
+                    pyjson::repr_str(panel_id),
+                    pyjson::repr_str(&bound.label),
+                    fg(low),
+                    fg(high)
+                ));
+            } else if governed.len() < categories.len()
+                && (low != governed.iter().cloned().fold(f64::INFINITY, f64::min)
+                    || high != governed.iter().cloned().fold(f64::NEG_INFINITY, f64::max))
+            {
+                problems.push(format!(
+                    "panel {}: the bound {} declares it governs x={}..{}, which is not \
+                     a boundary between the panel's categories {categories_py}",
+                    pyjson::repr_str(panel_id),
+                    pyjson::repr_str(&bound.label),
+                    fg(low),
+                    fg(high)
+                ));
+            }
+        }
+        if let Some(series_name) = &bound.series
+            && !names.contains(series_name)
+        {
+            let mut sorted = names.clone();
+            sorted.sort();
+            let sorted_py = pyjson::py_list(&sorted);
+            problems.push(format!(
+                "panel {}: the bound {} declares it governs series {}, which the \
+                     panel does not declare (its series are {sorted_py})",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&bound.label),
+                pyjson::repr_str(series_name)
+            ));
+        }
+    }
+    problems
+}
+
+// -- axis labels --------------------------------------------------------------
+
+/// Problems that let an axis label contradict the run's own vocabulary.
+pub fn check_x_axis_label(
+    panel_id: &str,
+    x_label: &str,
+    categories: &[f64],
+    run_values: Option<&J>,
+) -> Vec<String> {
+    let Some(reps) = repeated_category_index(categories, run_values) else {
+        return Vec::new();
+    };
+    let expected = format!("rep (1..{reps})");
+    if x_label == expected {
+        return Vec::new();
+    }
+    vec![format!(
+        "panel {}: the run measured reps={reps} and this panel draws a bar at each of \
+         1..{reps}, but its x axis is labelled {}: those categories are the run's \
+         repetitions, and a reader told they are {} is told something the run never \
+         measured",
+        pyjson::repr_str(panel_id),
+        pyjson::repr_str(x_label),
+        pyjson::repr_str(x_label)
+    )]
+}
+
+/// Problems that label a panel's axis with a sibling panel's quantity.
+pub fn check_axis_label(
+    panel_id: &str,
+    y_label: &str,
+    series: &Series,
+    declared: Option<&str>,
+    _carried: &str,
+) -> Vec<String> {
+    if declared.is_some() || series.len() != 1 {
+        return Vec::new();
+    }
+    let expected = series_label(&series[0].0);
+    if y_label == expected {
+        return Vec::new();
+    }
+    vec![format!(
+        "panel {}: its y axis is labelled {} \u{2014} the mandate's shared y_label, \
+         carried over from a sibling panel \u{2014} while its only series is {}: a \
+         single-series panel names its own quantity, and a reader told the axis is {} \
+         is told a unit the run never measured",
+        pyjson::repr_str(panel_id),
+        pyjson::repr_str(y_label),
+        pyjson::repr_str(&expected),
+        pyjson::repr_str(y_label)
+    )]
+}
+
+// -- a cdf panel's x axis -----------------------------------------------------
+
+/// Where `value` sits on an axis, as a share of that axis' span.
+pub fn x_axis_share(x_min: f64, x_max: f64, scale: &str, value: f64) -> f64 {
+    if scale == "log" {
+        let low = x_min.log10();
+        let high = x_max.log10();
+        return (value.log10() - low) / (high - low);
+    }
+    (value - x_min) / (x_max - x_min)
+}
+
+/// The largest relative departure of `values` from a straight line.
+fn straight_line_residual(values: &[f64], fractions: &[f64]) -> f64 {
+    let low = values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let high = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let span = high - low;
+    if span <= 0.0 {
+        return f64::INFINITY;
+    }
+    let count = values.len() as f64;
+    let mean_x = fractions.iter().sum::<f64>() / count;
+    let mean_y = values.iter().sum::<f64>() / count;
+    let denominator: f64 = fractions.iter().map(|x| (x - mean_x).powi(2)).sum();
+    if denominator <= 0.0 {
+        return f64::INFINITY;
+    }
+    let slope = fractions
+        .iter()
+        .zip(values.iter())
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>()
+        / denominator;
+    let intercept = mean_y - slope * mean_x;
+    fractions
+        .iter()
+        .zip(values.iter())
+        .map(|(x, y)| (y - (intercept + slope * x)).abs())
+        .fold(f64::NEG_INFINITY, f64::max)
+        / span
+}
+
+/// `log` or `linear`: the scale the panel's own ticks put its axis on.
+pub fn drawn_x_scale(markup: &str) -> &'static str {
+    let mut values = Vec::new();
+    for (index, _) in x_axis_tick_re().find_iter(markup).iter().enumerate() {
+        let _ = index;
+    }
+    for groups in x_axis_tick_re().find_all(markup) {
+        let text = groups[0].clone().unwrap_or_default();
+        match text.parse::<f64>() {
+            Ok(value) => values.push(value),
+            Err(_) => return "linear",
+        }
+    }
+    if values.len() < 4 || values.iter().any(|value| *value <= 0.0) {
+        return "linear";
+    }
+    let fractions: Vec<f64> = (0..values.len())
+        .map(|index| index as f64 / (values.len() - 1) as f64)
+        .collect();
+    let logarithmic = straight_line_residual(
+        &values
+            .iter()
+            .map(|value| value.log10())
+            .collect::<Vec<f64>>(),
+        &fractions,
+    );
+    let arithmetic = straight_line_residual(&values, &fractions);
+    if logarithmic < arithmetic {
+        "log"
+    } else {
+        "linear"
+    }
+}
+
+/// The panel's arm names the run asserts no guard of its own for.
+pub fn reference_arm_names(series: &Series, run_values: Option<&J>) -> Vec<String> {
+    let guarded: Vec<String> = arm_guard_tokens(series, run_values)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    if guarded.is_empty() || guarded.len() == series.len() {
+        return Vec::new();
+    }
+    series
+        .iter()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !guarded.contains(name))
+        .collect()
+}
+
+/// The samples the reference arms contribute, and the axis they sit on.
+pub fn reference_reach(series: &Series, reference: &[String]) -> (Vec<f64>, (f64, f64)) {
+    let values: Vec<f64> = series
+        .iter()
+        .flat_map(|(_, points)| points.iter().map(|(x, _)| *x))
+        .collect();
+    let reach: Vec<f64> = series
+        .iter()
+        .filter(|(name, _)| reference.contains(name))
+        .flat_map(|(_, points)| points.iter().map(|(x, _)| *x))
+        .collect();
+    if values.is_empty() || reach.is_empty() {
+        return (Vec::new(), (0.0, 0.0));
+    }
+    (
+        reach,
+        (
+            values.iter().cloned().fold(f64::INFINITY, f64::min),
+            values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        ),
+    )
+}
+
+/// `(share, low, high, largest)` for the reference arms, or `None`.
+pub fn reference_reach_share(
+    series: &Series,
+    reference: &[String],
+    scale: &str,
+) -> Option<(f64, f64, f64, f64)> {
+    let (reach, (low, high)) = reference_reach(series, reference);
+    if reach.is_empty() || !(high > low) || (scale == "log" && low <= 0.0) {
+        return None;
+    }
+    let largest = reach.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if scale == "log" && largest <= 0.0 {
+        return None;
+    }
+    Some((x_axis_share(low, high, scale, largest), low, high, largest))
+}
+
+/// The x scale a cdf panel is drawn on, from its own dynamic range.
+pub fn cdf_x_scale(series: &Series, reference: &[String]) -> &'static str {
+    let (reach, (low, high)) = reference_reach(series, reference);
+    if reach.is_empty() || !(high > low) || low <= 0.0 {
+        return "linear";
+    }
+    if reference_reach_share(series, reference, "linear")
+        .map(|(share, _, _, _)| share)
+        .unwrap_or(0.0)
+        >= MIN_REFERENCE_REACH_SHARE
+    {
+        return "linear";
+    }
+    "log"
+}
+
+/// The sentence a cdf panel owes when its drawn axis still squeezes.
+pub fn cdf_scale_note(series: &Series, reference: &[String], scale: &str) -> String {
+    let Some((share, low, high, largest)) = reference_reach_share(series, reference, scale) else {
+        return String::new();
+    };
+    if share >= MIN_REFERENCE_REACH_SHARE {
+        return String::new();
+    }
+    let kind = if scale == "log" {
+        "logarithmic (base 10)"
+    } else {
+        "linear"
+    };
+    format!(
+        "x axis {kind}: the reference arm {} reaches {} on {}..{}, {} of the width, \
+         so the region that carries the failure is compressed at the left edge",
+        reference.join(" "),
+        f4g(largest),
+        f4g(low),
+        f4g(high),
+        pct0(share)
+    )
+}
+
+/// Whether the panel's own text states that its reference arm is squeezed.
+pub fn reference_reach_stated(markup: &str, reference: &[String], share: f64) -> bool {
+    let text = drawn_notes(markup).join(" ");
+    !text.is_empty()
+        && text.contains(&pct0(share))
+        && reference.iter().any(|name| text.contains(name))
+}
+
+/// Problems that squeeze a cdf panel's reference arm to a sliver.
+pub fn check_cdf_reference_reach(
+    panel_id: &str,
+    panel: &Panel,
+    series: &Series,
+    reference: &[String],
+    markup: &str,
+) -> Vec<String> {
+    if panel.chart != Chart::Cdf || reference.is_empty() {
+        return Vec::new();
+    }
+    let scale = drawn_x_scale(markup);
+    let Some((share, low, high, largest)) = reference_reach_share(series, reference, scale) else {
+        return Vec::new();
+    };
+    if share >= MIN_REFERENCE_REACH_SHARE {
+        return Vec::new();
+    }
+    if reference_reach_stated(markup, reference, share) {
+        return Vec::new();
+    }
+    vec![format!(
+        "panel {}: the reference arm(s) {} reach {} on an x axis {}..{}, {} of the \
+         width -- under the {} a distribution panel needs to show the shape of the arm \
+         it is read for, so the region that carries the failure is a sliver; draw the \
+         axis on the scale that keeps it legible, or state the squeeze on the panel",
+        pyjson::repr_str(panel_id),
+        reference.join(" "),
+        f4g(largest),
+        f4g(low),
+        f4g(high),
+        pct1(share),
+        pct0(MIN_REFERENCE_REACH_SHARE)
+    )]
+}
+
+// -- a bound the sibling panel states on this panel's x axis ------------------
+
+/// The bounds a sibling panel draws on the quantity this panel's x axis carries.
+pub fn derived_x_bounds(
+    panel: &Panel,
+    panels: &[Panel],
+    points: &Points,
+    mandate_x_label: &str,
+    mandate_y_label: &str,
+    run_values: Option<&J>,
+) -> Vec<(f64, String, String)> {
+    if panel.chart != Chart::Line && panel.chart != Chart::Cdf {
+        return Vec::new();
+    }
+    let mine = panel_series(panel, points);
+    let our_x = panel_x_label_for(
+        panel,
+        mandate_x_label,
+        &mine
+            .iter()
+            .flat_map(|(_, series)| series.iter().map(|(x, _)| *x))
+            .collect::<Vec<f64>>(),
+        run_values,
+    );
+    let mut derived = Vec::new();
+    for other in panels {
+        if other.id == panel.id {
+            continue;
+        }
+        let their_y = panel_y_label_for(other, mandate_y_label, &panel_series(other, points));
+        if their_y != our_x {
+            continue;
+        }
+        for bound in &other.bounds {
+            derived.push((bound.y, bound.label.clone(), other.id.clone()));
+        }
+    }
+    derived
+}
+
+/// A bound carried to the x axis, with the value every series reads there.
+pub fn x_bound_label(
+    bound: &(f64, String, String),
+    series: &Series,
+    x_unit: &str,
+    y_unit: &str,
+    drawn_range: Option<(f64, f64)>,
+) -> String {
+    let x = bound.0;
+    let mut readings = Vec::new();
+    for (name, points) in series {
+        let Some(value) = value_at(points, x) else {
+            continue;
+        };
+        readings.push(format!("{name} {}{y_unit}", f4g(value)));
+    }
+    let outside = drawn_range.is_some_and(|range| !(range.0 <= x && x <= range.1));
+    let unit = if x_unit.is_empty() {
+        String::new()
+    } else {
+        format!(" {x_unit}")
+    };
+    let mut text = format!("{} [at {}{unit}: {}]", bound.1, fg(x), readings.join(", "));
+    if outside {
+        text.push_str(" (x beyond this panel's drawn range)");
+    }
+    text
+}
+
+/// Problems that leave a mandate bound off a panel that can carry it in-frame.
+#[allow(clippy::too_many_arguments)]
+pub fn check_x_bound_drawn(
+    panel_id: &str,
+    panel: &Panel,
+    panels: &[Panel],
+    points: &Points,
+    mandate_x_label: &str,
+    mandate_y_label: &str,
+    run_values: Option<&J>,
+    markup: &str,
+) -> PlotResult<Vec<String>> {
+    let derived = derived_x_bounds(
+        panel,
+        panels,
+        points,
+        mandate_x_label,
+        mandate_y_label,
+        run_values,
+    );
+    if derived.is_empty() {
+        return Ok(Vec::new());
+    }
+    let series = panel_series(panel, points);
+    let drawn: Series = series
+        .iter()
+        .map(|(name, points)| (name.clone(), draw::decimate(points)))
+        .collect();
+    let x_unit = panel_unit(&panel_x_label_for(
+        panel,
+        mandate_x_label,
+        &series
+            .iter()
+            .flat_map(|(_, points)| points.iter().map(|(x, _)| *x))
+            .collect::<Vec<f64>>(),
+        run_values,
+    ));
+    let y_unit = panel_unit(&panel_y_label_for(panel, mandate_y_label, &series));
+    let xs: Vec<f64> = drawn
+        .iter()
+        .flat_map(|(_, points)| points.iter().map(|(x, _)| *x))
+        .collect();
+    let drawn_range = if xs.is_empty() {
+        None
+    } else {
+        Some((
+            xs.iter().cloned().fold(f64::INFINITY, f64::min),
+            xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        ))
+    };
+    let drawn_xs: Vec<f64> = x_bound_mark_re()
+        .find_all(markup)
+        .iter()
+        .map(|groups| groups[0].clone().unwrap_or_default().parse().unwrap_or(0.0))
+        .collect();
+    let drawn_xs_py = pyjson::py_float_list(&drawn_xs);
+    let labels: Vec<String> = label_boxes(markup)
+        .into_iter()
+        .map(|(declared, _, _)| declared)
+        .collect();
+    let labels_py = pyjson::py_list(&labels);
+    let (left, _, right, _) = panel_plot_rect(panel_id, markup)?;
+    let mut problems = Vec::new();
+    for bound in &derived {
+        let reading = format!("at {}", fg(bound.0));
+        let stated = labels.iter().find(|label| {
+            label.starts_with(&bound.1) && **label != bound.1 && label.contains(&reading)
+        });
+        let Some(stated) = stated else {
+            problems.push(format!(
+                "panel {}: the mandate's bound {} is stated on panel {} on this \
+                 panel's own x quantity, so this panel can draw the failure and has to \
+                 say what the bound reads there. Expected on the panel: {}; drawn: \
+                 {labels_py}",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&bound.1),
+                pyjson::repr_str(&bound.2),
+                pyjson::repr_str(&x_bound_label(bound, &drawn, &x_unit, &y_unit, drawn_range))
+            ));
+            continue;
+        };
+        for (name, points) in &drawn {
+            let Some(value) = value_at(points, bound.0) else {
+                continue;
+            };
+            let pattern = regex(&format!(
+                r"{}\s+([-+0-9.eE]+){}",
+                regex_escape(name),
+                regex_escape(&y_unit)
+            ));
+            let Some(written) = pattern.search(stated) else {
+                problems.push(format!(
+                    "panel {}: the bound {} is drawn without a value for series {}, \
+                     which the panel plots; the series reads {}{y_unit} at {} and a \
+                     reader told nothing is told the pointer the value replaced \
+                     (drawn: {})",
+                    pyjson::repr_str(panel_id),
+                    pyjson::repr_str(&bound.1),
+                    pyjson::repr_str(name),
+                    f6g(value),
+                    fg(bound.0),
+                    pyjson::repr_str(stated)
+                ));
+                continue;
+            };
+            if let Some(problem) = stated_problem(
+                panel_id,
+                name,
+                &format!("its value at {} as", fg(bound.0)),
+                &written.group(1).unwrap_or_default(),
+                value,
+            ) {
+                problems.push(problem);
+            }
+        }
+        let outside = drawn_range.is_none_or(|range| !(range.0 <= bound.0 && bound.0 <= range.1));
+        if outside {
+            if !stated.contains("beyond this panel's drawn range") {
+                problems.push(format!(
+                    "panel {}: the bound {} at {} is outside this panel's drawn x range \
+                     and the panel's sentence does not say so, so the value it states \
+                     reads as a measurement (drawn: {})",
+                    pyjson::repr_str(panel_id),
+                    pyjson::repr_str(&bound.1),
+                    fg(bound.0),
+                    pyjson::repr_str(stated)
+                ));
+            }
+            continue;
+        }
+        if drawn_xs.is_empty() {
+            let range = drawn_range.unwrap();
+            problems.push(format!(
+                "panel {}: the bound {} at {} lies inside this panel's drawn x range \
+                 {}..{}, so the artifact needs a vertical mark at it -- a bound the \
+                 panel states but does not draw is a claim with no mark to read it \
+                 against",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&bound.1),
+                fg(bound.0),
+                fg(range.0),
+                fg(range.1)
+            ));
+            continue;
+        }
+        let range = drawn_range.unwrap();
+        let scale = if range.0 > 0.0 && bound.0 > 0.0 {
+            drawn_x_scale(markup)
+        } else {
+            "linear"
+        };
+        let want = left + x_axis_share(range.0, range.1, scale, bound.0) * (right - left);
+        if drawn_xs.iter().any(|value| (value - want).abs() <= 1.5) {
+            continue;
+        }
+        problems.push(format!(
+            "panel {}: its drawn x marks are at {drawn_xs_py} px and the bound {} at {} \
+             is {:.1} px; a mark somewhere else on the axis is not the bound the \
+             sentence states",
+            pyjson::repr_str(panel_id),
+            pyjson::repr_str(&bound.1),
+            fg(bound.0),
+            want
+        ));
+    }
+    Ok(problems)
+}
+
+/// The pattern-level escape of a literal, as Python's `re.escape`.
+pub fn regex_escape(text: &str) -> String {
+    // Python escapes every character that is not an ASCII letter, digit or
+    // underscore in 3.7+; escaping a superset is harmless for the literals this
+    // port feeds it (a series name and a unit).
+    let mut out = String::new();
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            out.push(character);
+        } else {
+            out.push('\\');
+            out.push(character);
+        }
+    }
+    out
+}
+
+// -- the drawn reading, and what a panel's data says --------------------------
+
+/// The sentence one line panel states for one arm, from the arm's series.
+pub fn arm_reading(arm: &str, points: &[(f64, f64)], detector: Option<&J>) -> String {
+    let xs: Vec<f64> = points.iter().map(|(x, _)| *x).collect();
+    let ys: Vec<f64> = points.iter().map(|(_, y)| *y).collect();
+    let peak = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let peak_index = ys
+        .iter()
+        .rposition(|value| *value == peak)
+        .unwrap_or(ys.len() - 1);
+    let after = points.len() - 1 - peak_index;
+    let verdict = detector
+        .and_then(|value| value.get("verdict"))
+        .and_then(J::as_str);
+    let mut parts = vec![match verdict {
+        Some(verdict) if !verdict.trim().is_empty() => format!("{arm}: {verdict}"),
+        _ => arm.to_string(),
+    }];
+    parts.push(format!("peak {} ms at {} s", f4g(peak), f2(xs[peak_index])));
+    if after > 0 {
+        parts.push(format!(
+            "{after} sample(s) after it (next {} ms at {} s, last {} ms at {} s)",
+            f4g(ys[peak_index + 1]),
+            f2(xs[peak_index + 1]),
+            f4g(ys[ys.len() - 1]),
+            f2(xs[xs.len() - 1])
+        ));
+    } else {
+        parts.push("nothing after it, so the series ends on its own maximum".to_string());
+    }
+    let wall = draw::gap_wall_seconds(points);
+    let holes = draw::series_walls(points);
+    if !holes.is_empty() {
+        let largest =
+            holes.iter().cloned().fold(
+                holes[0],
+                |best, hole| if hole.3 > best.3 { hole } else { best },
+            );
+        // No spaces around the hyphen: the pattern that reads this clause back
+        // out (`STATED_HOLES_RE`) is Python's, and Python's writer has none.
+        parts.push(format!(
+            "{} sample gap(s) over {} s, largest {} s ({}-{} s), drawn as breaks, \
+             not climbs",
+            holes.len(),
+            f2(wall.unwrap_or(0.0)),
+            f2(largest.3),
+            f2(largest.1),
+            f2(largest.2)
+        ));
+    } else if let Some(wall) = wall {
+        parts.push(format!("no sample gap over {} s", f2(wall)));
+    } else {
+        parts.push("no sample gap".to_string());
+    }
+    if let Some(detector) = detector {
+        let mut measured = Vec::new();
+        if let Some(value) = detector.get("rungs_at_edge")
+            && numeric(value)
+        {
+            measured.push(format!("rungs_at_edge {}", json_g(value)));
+        }
+        if let Some(value) = detector.get("room")
+            && numeric(value)
+        {
+            measured.push(format!("room {} ms", json_g(value)));
+        }
+        if !measured.is_empty() {
+            parts.push(format!("detector {}", measured.join(" ")));
+        }
+    }
+    parts.join(" - ")
+}
+
+/// The `(arm, sentence)` readings a line panel states, in series order.
+pub fn panel_readings(series: &Series, censoring: Option<&J>) -> Vec<(String, String)> {
+    let Some(censoring) = censoring.filter(|value| value.truthy()) else {
+        return Vec::new();
+    };
+    series
+        .iter()
+        .map(|(name, points)| {
+            let detector = censoring.get(name);
+            (
+                name.clone(),
+                arm_reading(name, &draw::decimate(points), detector),
+            )
+        })
+        .collect()
+}
+
+/// The series name a panel's own legend draws for this chart.
+pub fn drawn_series_name(chart: Chart, name: &str) -> String {
+    let _ = chart;
+    series_label(name)
+}
+
+/// What a panel's data says, in the quantity's own units, as one sentence.
+pub fn panel_reading(
+    chart: Chart,
+    series: &Series,
+    bounds: &[Bound],
+    extent: (f64, f64),
+    plot_height: f64,
+) -> String {
+    let _ = chart;
+    let values = bound_values(series);
+    let span = extent.1 - extent.0;
+    let mut parts = Vec::new();
+    for (name, points) in series {
+        let scores: Vec<f64> = points.iter().map(|(_, value)| *value).collect();
+        if scores.is_empty() {
+            continue;
+        }
+        parts.push(format!(
+            "{} {}..{} ({} pts)",
+            drawn_series_name(Chart::Line, name),
+            sliver_number(scores.iter().cloned().fold(f64::INFINITY, f64::min)),
+            sliver_number(scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
+            scores.len()
+        ));
+    }
+    for bound in bounds {
+        let crossed = crossing_values(&values, bound.y);
+        if crossed.is_empty() {
+            continue;
+        }
+        let y = bound.y;
+        let furthest = crossed.iter().cloned().fold(crossed[0], |best, value| {
+            if (value - y).abs() > (best - y).abs() {
+                value
+            } else {
+                best
+            }
+        });
+        let drawn = furthest.max(extent.0).min(extent.1);
+        let pixels = (drawn - y).abs() / span * plot_height;
+        if pixels < MIN_BOUND_PIXELS {
+            continue;
+        }
+        let side = if furthest > y { "beyond" } else { "under" };
+        parts.push(format!(
+            "{} of {} values {side} {} by up to {} ({} px)",
+            crossed.len(),
+            values.len(),
+            pyjson::repr_str(&bound.label),
+            sliver_number((furthest - y).abs()),
+            f1(pixels)
+        ));
+    }
+    parts.join("; ")
+}
+
+/// The clause naming what a drawn bound governs.
+pub fn governed_label(
+    bound: &Bound,
+    series: &Series,
+    run_values: Option<&J>,
+    crossing: bool,
+) -> String {
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(arms) = bound.arms.as_ref()
+        && !arms.is_empty()
+    {
+        clauses.push(format!("governs {}", arms.join(" ")));
+    }
+    if bound.governs_none {
+        clauses.push(
+            "governs no arm of this run: every arm states a guard of its own, drawn on \
+             its own band"
+                .to_string(),
+        );
+    }
+    if let Some(series_name) = &bound.series {
+        clauses.push(format!("governs series {series_name}"));
+    }
+    if let Some((low, high)) = bound_governed_x(bound) {
+        clauses.push(if low == high {
+            format!("governs x={}", fg(low))
+        } else {
+            format!("governs x={}..{}", fg(low), fg(high))
+        });
+    }
+    if crossing {
+        let values = bound_values(series);
+        let mut crossing_clauses: Vec<String> = Vec::new();
+        let crossed = crossing_values(&values, bound.y);
+        if !crossed.is_empty() {
+            let side = if crossed[0] > bound.y {
+                "beyond"
+            } else {
+                "under"
+            };
+            crossing_clauses.push(format!(
+                "{} of {} bars {side} it",
+                crossed.len(),
+                values.len()
+            ));
+        }
+        let guards = if bound.guard_key.is_some() || bound.guards_drawn {
+            Vec::new()
+        } else {
+            run_guards(run_values, Some(series), &bound.label)
+        };
+        if !guards.is_empty() {
+            let listed: Vec<String> = guards
+                .iter()
+                .map(|(key, value)| format!("{key}={}", fg(*value)))
+                .collect();
+            crossing_clauses.push(format!("run guards {}", listed.join(" ")));
+        }
+        if !crossing_clauses.is_empty() {
+            clauses.push(crossing_clauses.join("; "));
+        }
+    } else {
+        let clause = arm_guard_clause(series, run_values);
+        if !clause.is_empty() {
+            clauses.push(clause);
+        }
+    }
+    if clauses.is_empty() {
+        return bound.label.clone();
+    }
+    format!("{} [{}]", bound.label, clauses.join("; "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn series_of(name: &str, points: Vec<(f64, f64)>) -> Series {
+        vec![(name.to_string(), points)]
+    }
+
+    #[test]
+    fn a_bound_whose_band_the_axis_cannot_resolve_is_refused_and_a_statement_answers_it() {
+        // The delivery-floor shape: seven bars at 1.000 and one at 0.994
+        // against a 0.995 floor. On an axis the bars' own extent sets, the
+        // floor's band is a sliver and the refusal is owed.
+        let series = series_of(
+            "delivery",
+            vec![
+                (1.0, 1.0),
+                (2.0, 1.0),
+                (3.0, 1.0),
+                (4.0, 1.0),
+                (5.0, 1.0),
+                (6.0, 1.0),
+                (7.0, 1.0),
+                (8.0, 0.994),
+            ],
+        );
+        let bounds = vec![Bound::new(0.995, "delivery floor 0.995".to_string())];
+        // The band view the policy picks puts the floor's 1 % band across most
+        // of the plot, so a bar through it is legible: green.
+        let extent = draw::bar_axis_extent(&series, &bounds, None, None);
+        let problems =
+            check_panel_axis("delivery", &series, &bounds, extent, Some(228.0), None, "");
+        assert!(problems.is_empty(), "{problems:?}");
+        // A pinned zero-based axis is the measured defect: over `0..2` the
+        // floor's band is about a pixel, and the panel states nothing about it.
+        let pinned = (0.0, 2.0);
+        let sub = check_panel_axis("delivery", &series, &bounds, pinned, Some(228.0), None, "");
+        assert_eq!(sub.len(), 1, "{sub:?}");
+        assert!(
+            sub[0].contains("under the 6 px a bound needs"),
+            "{}",
+            sub[0]
+        );
+        let (band, pixels) = bound_band_pixels(&series, &bounds, &bounds[0], pinned, 228.0, None);
+        assert!(pixels < MIN_BOUND_PIXELS, "{pixels}");
+        // Nothing here departs from the floor by a legible distance, so a
+        // statement would have nothing to say and the refusal stands.
+        let statement =
+            bound_sliver_statement(&bounds[0], &bound_values(&series), band, pinned, 228.0);
+        assert!(statement.is_empty(), "{statement}");
+        // A starved bar on the axis a fault sets does depart legibly, and there
+        // the same panel may draw the bound and state where it sits.
+        let starved = series_of(
+            "delivery",
+            vec![(1.0, 1.0), (2.0, 1.0), (3.0, 1.0), (4.0, 0.0)],
+        );
+        // An axis the fault's own body set: the band is sub-pixel there while a
+        // starved bar is a long way below the floor.
+        let fault_axis = (0.0, 5.0);
+        let statement =
+            bound_sliver_statement(&bounds[0], &bound_values(&starved), 0.01, fault_axis, 228.0);
+        assert!(
+            !statement.is_empty(),
+            "a departure is drawn, so a statement is owed"
+        );
+        assert!(
+            statement.contains("bound \"delivery floor 0.995\""),
+            "{statement}"
+        );
+        assert!(
+            check_panel_axis(
+                "delivery",
+                &starved,
+                &bounds,
+                fault_axis,
+                Some(228.0),
+                None,
+                "delivery floor 0.995"
+            )
+            .is_empty(),
+            "the statement is what the refusal is answered with"
+        );
+    }
+
+    #[test]
+    fn a_hole_drawn_as_a_climb_is_refused() {
+        let mut points: Vec<(f64, f64)> = (0..10).map(|index| (index as f64, 1.0)).collect();
+        for point in points.iter_mut().skip(5) {
+            point.0 += 30.0;
+        }
+        let series = series_of("lone_tail", points.clone());
+        // A single polyline with no sample markers: the hole is a wall.
+        let bad = "<svg><polyline points=\"1,1 2,1 3,1\" fill=\"none\" stroke=\"#2563eb\"/>\
+                   <polyline points=\"4,1 5,1 6,1\" fill=\"none\" stroke=\"#dc2626\"/></svg>";
+        let problems = check_gap_honesty("latency", &series, bad);
+        assert!(!problems.is_empty());
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("sample marker")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("polyline segment")),
+            "{problems:?}"
+        );
+        // Rebuilt honestly -- a marker per sample and one polyline per run --
+        // the same points pass, so the refusal above measures the geometry.
+        let mut good = String::from("<svg>");
+        for (x, _) in draw::decimate(&points) {
+            good.push_str(&format!("<circle class=\"sample\" cx=\"{x}\" cy=\"1\"/>"));
+        }
+        good.push_str("<polyline points=\"1,1 2,1\" fill=\"none\" stroke=\"#2563eb\"/>");
+        good.push_str("<polyline points=\"3,1 4,1\" fill=\"none\" stroke=\"#2563eb\"/>");
+        good.push_str("</svg>");
+        assert!(check_gap_honesty("latency", &series, &good).is_empty());
+    }
+
+    #[test]
+    fn a_summary_is_measured_back_out_of_the_drawn_lines() {
+        let series = series_of("clean", vec![(1.0, 20.0), (2.0, 30.0)]);
+        let bounds = vec![Bound::new(250.0, "M1 ceiling 250 ms".to_string())];
+        let extent = (10.0, 260.0);
+        // A markup whose drawn bound sits at a pixel the summary will state.
+        let markup = "<svg><rect x=\"72\" y=\"24\" width=\"864\" height=\"228\" class=\"plot-bg\"/>\
+                      <line class=\"bound\" x1=\"72\" y1=\"30.0\" x2=\"936\" y2=\"30.0\"/>\
+                      <text x=\"72.0\" y=\"276\" text-anchor=\"middle\">1.0</text>\
+                      <text x=\"936.0\" y=\"276\" text-anchor=\"middle\">2.0</text>\
+                      <g class=\"legend\"><text>clean</text></g></svg>";
+        let mut document = panel_summary_document(
+            "latency",
+            Chart::Line,
+            "elapsed time (s)",
+            "latency (ms)",
+            &series,
+            &bounds,
+            extent,
+            markup,
+            "",
+            228.0,
+            None,
+            None,
+        );
+        let with_summary = introduce_panel_summary(markup, &document);
+        let problems = check_panel_summary_stated(
+            "latency",
+            Chart::Line,
+            "elapsed time (s)",
+            "latency (ms)",
+            &series,
+            &bounds,
+            extent,
+            &with_summary,
+            228.0,
+            "",
+            None,
+            None,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        // Vacuity: the same document with a *different* stated pixel is
+        // refused, so the check measures the drawn geometry.
+        if let J::Obj(members) = &mut document
+            && let Some((_, J::Arr(bounds))) = members.iter_mut().find(|(key, _)| key == "bounds")
+            && let J::Obj(entry) = &mut bounds[0]
+            && let Some((_, value)) = entry.iter_mut().find(|(key, _)| key == "px")
+        {
+            *value = J::Float(99.0);
+        }
+        let tampered = introduce_panel_summary(markup, &document);
+        let problems = check_panel_summary_stated(
+            "latency",
+            Chart::Line,
+            "elapsed time (s)",
+            "latency (ms)",
+            &series,
+            &bounds,
+            extent,
+            &tampered,
+            228.0,
+            "",
+            None,
+            None,
+        );
+        assert!(!problems.is_empty());
+        assert!(
+            problems.iter().any(|problem| problem.contains("99.0")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_legend_drawing_a_column_name_is_refused() {
+        let series = series_of("shaper_forwarded", vec![(1.0, 1.0)]);
+        let bad = "<svg><g class=\"legend\"><line/><text x=\"1\" y=\"1\">shaper_forwarded</text></g></svg>";
+        let problems = check_series_labels("goodput", bad, &series);
+        assert!(!problems.is_empty(), "{problems:?}");
+        let good = "<svg><g class=\"legend\"><line/><text x=\"1\" y=\"1\">shaper forwarded</text></g></svg>";
+        assert!(check_series_labels("goodput", good, &series).is_empty());
+    }
+}

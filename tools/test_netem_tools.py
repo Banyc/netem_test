@@ -1198,5 +1198,194 @@ def _field(output, label):
     raise AssertionError(f"{label!r} not reported:\n{output}")
 
 
+class MandatePlotTest(unittest.TestCase):
+    """Exercise `netem-tools mandate-plot`'s render, its summary and its refusals.
+
+    The plotter was `tools/mandate_plot.py`, which `tools/mandate-check` imported
+    in-process; this is the command-line contract of the port, so every case runs
+    the *binary*. Each refusal that makes a panel's own statement forced has a
+    case, and the pair of a refusal with its rendering sibling is stated rather
+    than implied: a bound the axis cannot resolve is refused, and the same bound
+    on the axis the policy picks is drawn -- so the refusal measures the axis and
+    not a check that never fires.
+
+    Every case is `--no-rasterize`: the PNG step needs a browser, and a suite
+    that silently accepted a missing browser would be checking nothing.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/tmp"))
+        self.root = Path(self._tmp.name)
+        self.out = self.root / "plots"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def declare(self, declaration, rows, name="M1", args=()):
+        """Write one mandate's declaration and CSV, and render it."""
+        path = self.root / f"{name}.json"
+        path.write_text(json.dumps(declaration), encoding="utf-8")
+        (self.root / f"{name}.csv").write_text(
+            "panel,series,x,y\n" + "".join(f"{row}\n" for row in rows), encoding="utf-8"
+        )
+        return subprocess.run(
+            [str(BINARY), "mandate-plot", str(path), "--out", str(self.out),
+             "--no-rasterize", *args],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def accept(self, declaration, rows, name="M1", args=()):
+        completed = self.declare(declaration, rows, name=name, args=args)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return completed
+
+    def reject(self, declaration, rows, fragment, name="M1", args=()):
+        completed = self.declare(declaration, rows, name=name, args=args)
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertIn(fragment, completed.stdout + completed.stderr)
+        return completed
+
+    @staticmethod
+    def line_declaration():
+        return {
+            "mandate": "M1",
+            "title": "the port's own mandate",
+            "x_label": "elapsed time (s)",
+            "y_label": "latency (ms)",
+            "panels": [
+                {
+                    "id": "latency",
+                    "chart": "line",
+                    "series": [{"name": "clean"}],
+                    "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+                }
+            ],
+        }
+
+    @staticmethod
+    def line_rows():
+        return [f"latency,clean,{index},20.{index}" for index in range(1, 21)]
+
+    @staticmethod
+    def floor_declaration(pinned=None):
+        panel = {
+            "id": "delivery",
+            "chart": "bar",
+            "series": [{"name": "delivery"}],
+            # The declaration names the series the bound governs, so the run's
+            # own per-arm measurements are not needed for the crossing: what is
+            # under test here is the axis test.
+            "bounds": [
+                {
+                    "y": 0.995,
+                    "label": "M4 per-flow delivery floor 0.995",
+                    "series": "delivery",
+                }
+            ],
+        }
+        if pinned is not None:
+            panel["y_extent"] = pinned
+        return {
+            "mandate": "M4",
+            "title": "the port's own floor mandate",
+            "x_label": "flow (1..4)",
+            "y_label": "delivery (received / offered)",
+            "panels": [panel],
+        }
+
+    @staticmethod
+    def floor_rows():
+        return [
+            "delivery,delivery,1,1.0",
+            "delivery,delivery,2,1.0",
+            "delivery,delivery,3,1.0",
+            "delivery,delivery,4,0.994",
+        ]
+
+    def test_a_declared_panel_is_rendered_with_its_summary_beside_it(self):
+        completed = self.accept(self.line_declaration(), self.line_rows())
+        svg = self.out / "M1-latency.svg"
+        self.assertTrue(svg.is_file())
+        written = svg.read_text(encoding="utf-8")
+        self.assertIn('<desc class="panel-summary">', written)
+        self.assertIn('class="bound"', written)
+        self.assertIn('class="sample"', written)
+        sidecar = self.out / "M1-latency.summary.txt"
+        self.assertTrue(sidecar.is_file())
+        block = sidecar.read_text(encoding="utf-8")
+        self.assertIn("panel latency  chart=line", block)
+        self.assertIn("M1 ceiling 250 ms", block)
+        # The run's own output carries every panel's reading, so a reader need
+        # not open an SVG to learn what it shows.
+        self.assertIn("panels: 1", completed.stdout)
+        self.assertIn("mandate: M1", completed.stdout)
+        self.assertIn(str(svg), completed.stdout)
+        self.assertIn(block.strip(), completed.stdout)
+
+    def test_the_json_face_prints_the_summary_it_wrote(self):
+        completed = self.accept(self.line_declaration(), self.line_rows(), args=("--json",))
+        document = json.loads(completed.stdout)
+        self.assertEqual(document["mandate"], "M1")
+        self.assertEqual(document["panels"], 1)
+        self.assertEqual(document["summaries"][0]["panel"], "latency")
+        self.assertTrue(document["summaries"][0]["block"])
+        self.assertEqual(len(document["svg"]), 1)
+        self.assertFalse(document["rasterized"])
+
+    def test_a_bound_its_axis_cannot_resolve_is_refused(self):
+        # The measured defect: a delivery floor's band over a zero-based `0..2`
+        # axis is about a pixel, so the departure it exists to catch is
+        # sub-pixel and the panel says nothing about it.
+        completed = self.reject(
+            self.floor_declaration(pinned=[0.0, 2.0]),
+            self.floor_rows(),
+            "under the 6 px a bound needs",
+            name="M4",
+        )
+        self.assertIn("0.5% of its height", completed.stderr)
+        self.assertFalse((self.out / "M4-delivery.svg").is_file())
+
+    def test_the_vacuity_pair_the_same_bound_is_drawn_on_the_axis_the_policy_picks(self):
+        # Without the pin the band view is chosen and the same bound, the same
+        # bars and the same floor render -- so the refusal above measures the
+        # axis and not a check that never fires.
+        self.accept(self.floor_declaration(), self.floor_rows(), name="M4")
+        block = (self.out / "M4-delivery.summary.txt").read_text(encoding="utf-8")
+        self.assertIn("M4 per-flow delivery floor 0.995", block)
+        self.assertIn("band view", (self.out / "M4-delivery.svg").read_text(encoding="utf-8"))
+
+    def test_a_csv_row_for_a_series_the_declaration_does_not_declare_is_refused(self):
+        self.reject(
+            self.line_declaration(),
+            self.line_rows() + ["latency,nobody,1,1.0"],
+            "which the declaration does not declare",
+        )
+
+    def test_a_missing_csv_is_refused_by_path(self):
+        declaration = self.line_declaration()
+        path = self.root / "M1.json"
+        path.write_text(json.dumps(declaration), encoding="utf-8")
+        completed = subprocess.run(
+            [str(BINARY), "mandate-plot", str(path), "--out", str(self.out), "--no-rasterize"],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertIn("mandate data CSV not found", completed.stderr)
+        self.assertIn(str(self.root / "M1.csv"), completed.stderr)
+
+    def test_a_reading_for_an_arm_no_line_panel_draws_is_refused(self):
+        # A machine verdict no panel carries is evidence a reader never sees,
+        # so the run's own reading has to have a panel to be stated on.
+        readings = self.root / "censoring.json"
+        readings.write_text(json.dumps({"nobody": {"verdict": "Clear"}}), encoding="utf-8")
+        self.reject(
+            self.line_declaration(),
+            self.line_rows(),
+            "is about no series any line panel of this mandate draws",
+            args=("--run-censoring", str(readings)),
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,9 +7,10 @@
 //!
 //! ```text
 //! netem-tools mandate-compare [report] [--baseline <path>] [--json-out <path>]
+//! netem-tools mandate-plot <declaration.json> --out <dir> [--no-rasterize]
 //! ```
 //!
-//! Run `netem-tools mandate-compare --help` for the flags. The command line is
+//! Run `netem-tools <subcommand> --help` for the flags. The command line is
 //! parsed with clap's `derive` API: a subcommand dispatcher, and each
 //! subcommand's flags a struct. The crate's `cli` feature carries clap, and both
 //! binaries require that feature, so a plain library build — and every sibling
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use netem_test::tools::mandate_compare::{self, Args};
+use netem_test::tools::mandate_plot::{self, Args as PlotArgs};
 use netem_test::tools::pyformat;
 
 #[derive(Debug, Parser)]
@@ -40,6 +42,8 @@ enum Tool {
     MandateCompare(MandateCompare),
     /// apply a Python `format()` spec to a value (the port's prerequisite)
     PyFormat(PyFormat),
+    /// render and verify a mandate's declared performance panels
+    MandatePlot(MandatePlot),
 }
 
 // `py-format` has two faces: a single call (`--value`/`--spec`) for a human,
@@ -131,6 +135,54 @@ impl From<MandateCompare> for Args {
     }
 }
 
+// The flags of `mandate-plot`, converted into the plotter's own `Args`. The
+// defaults are named here rather than restated: `--rasterize` is on unless
+// `--no-rasterize` is given, which is the Python tool's own pair of flags and
+// its own default, because a run that silently skipped the PNG step would be an
+// evidence failure rather than a saving.
+#[derive(Debug, clap::Args)]
+struct MandatePlot {
+    /// the mandate's .json panel declaration; its sibling .csv carries the data
+    #[arg(value_name = "declaration")]
+    declaration: PathBuf,
+    /// directory the panel SVGs (and PNGs) are written into
+    #[arg(long, value_name = "dir")]
+    out: PathBuf,
+    /// verify and write SVGs only; do not attempt the external PNG step
+    #[arg(long)]
+    no_rasterize: bool,
+    /// headless browser executable or name (default: $NETEM_RENDER_BROWSER)
+    #[arg(long, value_name = "path")]
+    browser: Option<String>,
+    /// this run's MANDATE measurements (a JSON object or a file of one)
+    #[arg(long, value_name = "JSON|PATH", allow_hyphen_values = true)]
+    run_values: Option<String>,
+    /// this run's per-arm censoring readings (a JSON object or a file of one)
+    #[arg(long, value_name = "JSON|PATH", allow_hyphen_values = true)]
+    run_censoring: Option<String>,
+    /// this run's MANDATE_SMOKE_FAULT selector, when the run took one
+    #[arg(long, value_name = "NAME")]
+    fault: Option<String>,
+    /// print a JSON summary of the produced panels instead of the text one
+    #[arg(long)]
+    json: bool,
+}
+
+impl From<MandatePlot> for PlotArgs {
+    fn from(cli: MandatePlot) -> PlotArgs {
+        PlotArgs {
+            declaration: cli.declaration,
+            out: cli.out,
+            rasterize: !cli.no_rasterize,
+            browser: cli.browser,
+            run_values: cli.run_values,
+            run_censoring: cli.run_censoring,
+            fault: cli.fault,
+            json: cli.json,
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let status = match cli.command {
@@ -140,6 +192,19 @@ fn main() {
             kind: args.kind,
             spec: Some(args.spec),
         }),
+        Tool::MandatePlot(args) => {
+            let json = args.json;
+            match mandate_plot::render_mandate(&args.into()) {
+                Ok(summary) => {
+                    mandate_plot::print_summary(&summary, json);
+                    0
+                }
+                Err(error) => {
+                    eprintln!("mandate_plot: error: {error}");
+                    1
+                }
+            }
+        }
     };
     std::process::exit(status);
 }
