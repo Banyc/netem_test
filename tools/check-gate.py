@@ -4307,10 +4307,27 @@ def main() -> int:
     # note stays advisory and is never fatal.
     actual_lib = ignored_scenarios(LIB_TARGET)
 
+    # Every failing block names *itself* in the closing diagnostic. A single
+    # `bad` flag can only say "the gate failed", and the one line it used to
+    # print blamed the manifest for whatever failed -- so an env-tier-only
+    # failure sent the reader to a file that had not changed. The symptoms are
+    # collected here, one per failing block, and printed on stderr at the end.
     bad = False
+    symptoms: list[str] = []
+
+    def failed(symptom: str) -> None:
+        nonlocal bad
+        bad = True
+        if symptom not in symptoms:
+            symptoms.append(symptom)
+
     for problem in dir_problems:
         print(problem)
-        bad = True
+        failed(
+            "the SCENARIO DIRECTORY line(s) above name a directory that is not "
+            f"the one {layout().package}'s test targets live in; pass it with "
+            "--crate <ROOT> <PACKAGE> <DIR> <GATE_MD>"
+        )
     missing = sorted(actual - manifest.keys())
     stale = sorted(manifest.keys() - actual - actual_lib)
     if missing or stale:
@@ -4318,7 +4335,10 @@ def main() -> int:
             print(f"UNCLASSIFIED ignored scenario: {name}")
         for name in stale:
             print(f"STALE manifest entry (no longer ignored): {name}")
-        bad = True
+        failed(
+            f"manifest has {len(manifest)} entries, binaries report "
+            f"{len(actual)} ignored scenarios; update {layout().manifest}"
+        )
 
     undeclared_lib = sorted(
         actual_lib
@@ -4345,7 +4365,10 @@ def main() -> int:
         target, _, name = entry.partition("::")
         if not target or not name:
             print(f"MALFORMED gate-default-required entry: {entry}")
-            bad = True
+            failed(
+                "a gate-default-required entry is malformed; it names a scenario "
+                f"as `<target>::<test>` -- update {layout().manifest}"
+            )
             continue
         default = listed_scenarios(target, ignored=False) - ignored_scenarios(target)
         if entry not in default:
@@ -4353,7 +4376,10 @@ def main() -> int:
                 f"REQUIRED default scenario is not in the default tier "
                 f"(re-ignored or removed?): {entry}"
             )
-            bad = True
+            failed(
+                "a scenario the gate marks as required no longer runs in the "
+                f"default tier; re-tier it or update {layout().manifest}"
+            )
 
     # The report-only/asserting split: a scenario asserts a gate iff it is in
     # the default tier, or it is `#[ignore]`d under an asserting opt-in tier
@@ -4365,17 +4391,26 @@ def main() -> int:
     recorded_asserting = asserting_entries()
     if len(recorded_asserting) != len(set(recorded_asserting)):
         print("DUPLICATE entry in gate-asserting")
-        bad = True
+        failed(
+            "the ```gate-asserting block lists a scenario twice; update "
+            f"{layout().manifest}"
+        )
     recorded_set = set(recorded_asserting)
     for name in sorted(expected_asserting - recorded_set):
         print(f"ASSERTING scenario missing from gate-asserting: {name}")
-        bad = True
+        failed(
+            "a scenario that asserts a gate is missing from the ```gate-asserting "
+            f"block; update {layout().manifest}"
+        )
     for name in sorted(recorded_set - expected_asserting):
         print(
             f"gate-asserting entry is not an asserting scenario "
             f"(perf-tier or unknown): {name}"
         )
-        bad = True
+        failed(
+            "the ```gate-asserting block lists a scenario that asserts nothing "
+            f"(perf-tier or unknown); update {layout().manifest}"
+        )
 
     # A `perf` scenario must be report-only: an assertion in its own body is an
     # asserting check filed under the tier that never runs, so it is an error.
@@ -4391,7 +4426,10 @@ def main() -> int:
                 f"[file {target_source_label(target)}, token(s): "
                 f"{', '.join(sorted(set(found_tokens(bodies.get(lib_bare_name(target, test))))))}]"
             )
-            bad = True
+            failed(
+                "a scenario filed under the report-only `perf` tier asserts in its "
+                f"own body; make it report-only or re-tier it in {layout().manifest}"
+            )
 
     # The direct-body scan only sees assertions in a `perf` scenario's own
     # body. Close the one-call-away hole: the crate-local call graph closure of
@@ -4403,7 +4441,10 @@ def main() -> int:
         print(
             f"PERF scenario body not found in source (macro-generated or moved?): {name}"
         )
-        bad = True
+        failed(
+            "a `perf` scenario in the manifest has no body in the source it "
+            f"names; update {layout().manifest}"
+        )
     recorded_helpers = recorded_perf_guard_helpers()
     for ident in sorted(set(derived_helpers) - set(recorded_helpers)):
         print(
@@ -4411,20 +4452,29 @@ def main() -> int:
             f"{ident} ({derived_helpers[ident]} assertion token(s): "
             f"{', '.join(helper_tokens[ident])})"
         )
-        bad = True
+        failed(
+            "a helper reachable from a `perf` scenario asserts without being "
+            f"recorded as a report-only guard; update {layout().manifest}"
+        )
     for ident in sorted(set(recorded_helpers) - set(derived_helpers)):
         print(
             f"recorded perf guard helper is not reachable from any perf scenario "
             f"(stale entry?): {ident}"
         )
-        bad = True
+        failed(
+            "a helper recorded as a report-only perf guard is no longer "
+            f"reachable from any `perf` scenario; update {layout().manifest}"
+        )
     for ident in sorted(set(derived_helpers) & set(recorded_helpers)):
         if derived_helpers[ident] != recorded_helpers[ident]:
             print(
                 f"perf guard helper assertion count changed for {ident}: "
                 f"recorded {recorded_helpers[ident]}, found {derived_helpers[ident]}"
             )
-            bad = True
+            failed(
+                f"the assertion count of the report-only perf guard {ident} "
+                f"changed; update {layout().manifest}"
+            )
 
     # The perf-loop lane roles: a lane is either a verdict instrument or
     # diagnostic-only. The documented roles must match
@@ -4435,7 +4485,11 @@ def main() -> int:
         lane_roles, lane_errors = check_lane_roles()
         for error in lane_errors:
             print(error)
-            bad = True
+            failed(
+                "the ```gate-lane-roles block does not match "
+                "perf_loop.lane_classification; update it in "
+                f"{layout().manifest}"
+            )
     else:
         lane_roles = {}
 
@@ -4451,7 +4505,12 @@ def main() -> int:
         print(note)
     for problem in perf_problems:
         print(f"PERF DECLARATION: {problem}")
-    bad = bad or bool(perf_problems)
+    if perf_problems:
+        failed(
+            "the PERF DECLARATION line(s) above do not match the gate manifest "
+            "or the measured timings; the perf tests and their declarations are "
+            f"checked against {layout().manifest}"
+        )
 
     # The env-scaled opt-in surface: a tier that is not `#[ignore]`d at all but
     # scaled by environment variables, which every other block is blind to.
@@ -4461,7 +4520,12 @@ def main() -> int:
         print(note)
     for problem in env_problems:
         print(f"ENV TIER: {problem}")
-    bad = bad or bool(env_problems)
+    if env_problems:
+        failed(
+            "the ENV TIER line(s) above name an env-scaled opt-in surface that "
+            "does not match the source; the surface is declared in the "
+            f"```gate-env-tier block of {layout().manifest}"
+        )
 
     # The documented counts: a number in prose that a command already
     # determines is verified against the source that determines it, or has left
@@ -4472,16 +4536,22 @@ def main() -> int:
         doc_problems, doc_summary = check_doc_counts(layout().root)
         for problem in doc_problems:
             print(problem)
-        bad = bad or bool(doc_problems)
+        if doc_problems:
+            failed(
+                "the DOC COUNT line(s) above name a documented count that no "
+                "longer matches the command that determines it; update the "
+                "document that states it"
+            )
     else:
         doc_summary = []
 
     if bad:
-        print(
-            f"\nmanifest has {len(manifest)} entries, binaries report "
-            f"{len(actual)} ignored scenarios; update {layout().manifest}",
-            file=sys.stderr,
-        )
+        # One diagnostic per failing block, naming the artifact that block is
+        # checked against. A failure in one block must not be announced as a
+        # failure in another: the reader is sent to exactly the file to fix.
+        print("", file=sys.stderr)
+        for symptom in symptoms:
+            print(symptom, file=sys.stderr)
         return 1
 
     by_tier: dict[str, int] = {}

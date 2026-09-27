@@ -1303,7 +1303,13 @@ class EnvTierFixture(unittest.TestCase):
     def declare(self, body):
         append_block(self.root / "tests" / "GATE.md", "gate-env-tier", body + "\n")
 
-    def check(self):
+    def check_split(self):
+        """``(code, stdout, stderr)``: the closing diagnostic goes to **stderr**.
+
+        The detail of a failure is on stdout, one line per problem; the single
+        closing diagnostic is on stderr, and which artifact it names is the
+        thing under test, so the two streams must not be concatenated.
+        """
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
         env["FAKE_CARGO_PLAN"] = str(self.plan_path)
@@ -1322,13 +1328,87 @@ class EnvTierFixture(unittest.TestCase):
             env=env,
             cwd=str(self.root),
         )
-        return proc.returncode, proc.stdout + proc.stderr
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def check(self):
+        code, stdout, stderr = self.check_split()
+        return code, stdout + stderr
 
     def rejects(self, fragment):
         code, output = self.check()
         self.assertNotEqual(code, 0, f"expected a non-zero exit; output={output}")
         self.assertIn(fragment, output)
         return output
+
+
+class CheckGateFailureDiagnosticTest(EnvTierFixture):
+    """The closing stderr diagnostic names the failure that actually fired.
+
+    The checker used to end every failure with one sentence about the manifest,
+    whatever had failed: an env-tier-only run -- where the manifest held exactly
+    the ignored scenarios the binaries reported, so nothing was wrong with it --
+    printed `manifest has 1 entries, binaries report 1 ignored scenarios; update
+    .../tests/GATE.md` and sent the reader to the one file that had not changed.
+
+    The pair below is the check and its vacuity: the first case fails if a
+    diagnostic names a symptom that did not fire, and the second fails if the
+    manifest symptom is named when it did -- so the first cannot be satisfied by
+    never printing it.
+    """
+
+    def test_an_env_tier_only_failure_names_the_env_tier_and_not_the_manifest(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS,FIXTURE_GHOST "
+            "| local/run_env.py | per-dial loss rate | fixture-liveness@shape=churn"
+        )
+        code, stdout, stderr = self.check_split()
+        self.assertNotEqual(code, 0, stdout + stderr)
+        self.assertIn(
+            "ENV TIER: gate-env-tier surface fixture-churn: FIXTURE_GHOST is "
+            "passed to no env-reading function",
+            stdout,
+        )
+        # The manifest is not the failing block: it holds exactly the ignored
+        # scenarios the binaries report, so a diagnostic naming it sends the
+        # reader to a file nothing is wrong with.
+        self.assertNotIn(
+            "manifest has",
+            stderr,
+            "the manifest did not fail, so its count line must not fire",
+        )
+        self.assertIn("ENV TIER", stderr)
+        self.assertIn(str(self.root / "tests" / "GATE.md"), stderr)
+
+    def test_a_manifest_failure_gives_the_manifest_diagnostic(self):
+        # The vacuity: the manifest symptom still fires when the manifest is the
+        # failing block, so the case above is about the *attribution* rather
+        # than about a count line dropped from the checker.
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+            "| per-dial loss rate | fixture-liveness@shape=churn"
+        )
+        self.plan_path.write_text(
+            json.dumps(
+                {
+                    "lists": {
+                        "tests|alpha": {
+                            "default": ["t_ok"],
+                            "ignored": ["t_ig", "t_ig2"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, stdout, stderr = self.check_split()
+        self.assertNotEqual(code, 0, stdout + stderr)
+        self.assertIn("UNCLASSIFIED ignored scenario: alpha::t_ig2", stdout)
+        self.assertIn("manifest has 1 entries, binaries report 2", stderr)
+        self.assertNotIn(
+            "ENV TIER",
+            stderr,
+            "the env surface is declared here, so its symptom must not fire",
+        )
 
 
 class CheckGateEnvTierTest(EnvTierFixture):
