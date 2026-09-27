@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use netem_test::tools::mandate_compare::{self, Args};
+use netem_test::tools::pyformat;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,6 +38,29 @@ struct Cli {
 enum Tool {
     /// diff a mandate-check run against the committed baseline
     MandateCompare(MandateCompare),
+    /// apply a Python `format()` spec to a value (the port's prerequisite)
+    PyFormat(PyFormat),
+}
+
+// `py-format` has two faces: a single call (`--value`/`--spec`) for a human,
+// and a streaming `kind TAB value TAB spec` stdin face for the corpus
+// differential, so one process formats hundreds of thousands of pairs.
+#[derive(Debug, clap::Args)]
+struct PyFormat {
+    /// format this value instead of reading stdin (a Python `repr()`)
+    #[arg(long, value_name = "repr", allow_hyphen_values = true)]
+    value: Option<String>,
+    /// the value's kind: f (float), i (int), s (str)
+    #[arg(long, value_name = "kind", default_value = "f")]
+    kind: String,
+    /// the format spec (the part after the `:`), e.g. `.4g`
+    #[arg(
+        long,
+        value_name = "spec",
+        default_value = "",
+        allow_hyphen_values = true
+    )]
+    spec: String,
 }
 
 // The flags of `mandate-compare`, converted into the comparison's own `Args`.
@@ -111,6 +135,11 @@ fn main() {
     let cli = Cli::parse();
     let status = match cli.command {
         Tool::MandateCompare(args) => mandate_compare::main(args.into()),
+        Tool::PyFormat(args) => pyformat::main(pyformat::Args {
+            value: args.value,
+            kind: args.kind,
+            spec: Some(args.spec),
+        }),
     };
     std::process::exit(status);
 }
@@ -125,9 +154,19 @@ mod tests {
         Cli::try_parse_from(full).expect("the arguments parse")
     }
 
+    /// `netem-tools mandate-compare ...`'s flags, for the tests below. The
+    /// `Tool` enum gained a second variant when `py-format` landed, so the
+    /// binding is a `match` rather than a single-variant `let`.
+    fn mandate_compare(argv: &[&str]) -> MandateCompare {
+        match parse(argv).command {
+            Tool::MandateCompare(args) => args,
+            other => panic!("expected mandate-compare, got {other:?}"),
+        }
+    }
+
     #[test]
     fn mandate_compare_binds_every_flag_to_the_comparison_options() {
-        let cli = parse(&[
+        let args = mandate_compare(&[
             "mandate-compare",
             "candidate.json",
             "--baseline",
@@ -144,7 +183,6 @@ mod tests {
             "--json-out",
             "diff.json",
         ]);
-        let Tool::MandateCompare(args) = cli.command;
         let args: Args = args.into();
         assert_eq!(args.report, Some(PathBuf::from("candidate.json")));
         assert_eq!(args.baseline, Some(PathBuf::from("baseline.json")));
@@ -158,8 +196,7 @@ mod tests {
 
     #[test]
     fn an_omitted_flag_takes_the_comparison_default() {
-        let cli = parse(&["mandate-compare"]);
-        let Tool::MandateCompare(args) = cli.command;
+        let args = mandate_compare(&["mandate-compare"]);
         let args: Args = args.into();
         let defaults = Args::default();
         assert_eq!(args.report, None);
@@ -178,10 +215,25 @@ mod tests {
         // the parser must bind `-1` as a value rather than reject it as an
         // unknown flag: the hand-rolled parser passed it through, and the
         // black-box suite asserts the refusal.
-        let cli = parse(&["mandate-compare", "--count-tolerance", "-1"]);
-        let Tool::MandateCompare(args) = cli.command;
-        let args: Args = args.into();
+        let parsed = mandate_compare(&["mandate-compare", "--count-tolerance", "-1"]);
+        let args: Args = parsed.into();
         assert_eq!(args.count_tolerance, -1.0);
+    }
+
+    #[test]
+    fn py_format_binds_the_value_kind_and_spec() {
+        let cli = parse(&["py-format", "--value", "12345.6789", "--spec", ".4g"]);
+        let Tool::PyFormat(args) = cli.command else {
+            panic!("expected the py-format subcommand");
+        };
+        let args = netem_test::tools::pyformat::Args {
+            value: args.value,
+            kind: args.kind,
+            spec: Some(args.spec),
+        };
+        assert_eq!(args.value.as_deref(), Some("12345.6789"));
+        assert_eq!(args.kind, "f");
+        assert_eq!(args.spec.as_deref(), Some(".4g"));
     }
 
     #[test]
