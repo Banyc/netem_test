@@ -2262,23 +2262,34 @@ class MandateCheckTest(unittest.TestCase):
         self.assertIsNone(MANDATE_CHECK.load_producer_declaration(path, problems))
         self.assertIn("unknown key(s) evidence", " ".join(problems))
 
-    def test_the_registrys_declared_checkout_is_the_sibling_directory(self):
+    def test_declared_checkouts_resolve_to_real_directories(self):
+        """A declared `default_path` must resolve to a directory that exists.
+
+        Not "the directory name equals the package": the harness member's own
+        producer declares `"."` and lives in `netem-test/` while its package is
+        `netem_test`, so that property is false. What is true, and what the
+        runner depends on, is that each declared checkout resolves -- inside the
+        workspace or beside it -- to a directory that is there.
+        """
         problems = []
         declaration = MANDATE_CHECK.load_producer_declaration(
             WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME, problems
         )
         self.assertEqual(problems, [])
-        primary = [
+        declared = [
             entry for entry in declaration["producers"] if entry.get("default_path")
         ]
-        self.assertTrue(primary)
-        for entry in primary:
-            # The property is that a declared checkout *resolves to* the
-            # producer's own package directory. Comparing the raw name fails on
-            # the second producer, which declares `"."` -- itself -- so resolve
-            # against the workspace first.
+        self.assertTrue(declared)
+        for entry in declared:
             resolved = (MANDATE_CHECK.WORKSPACE_ROOT / entry["default_path"]).resolve()
-            self.assertEqual(resolved.name, entry["package"])
+            self.assertTrue(
+                resolved.is_dir(), f"{entry['id']}: {resolved} is not a directory"
+            )
+            self.assertIn(
+                MANDATE_CHECK.WORKSPACE_ROOT.parent,
+                (resolved, *resolved.parents),
+                f"{entry['id']}: {resolved} is neither the workspace nor beside it",
+            )
 
     def test_default_out_dir_is_beneath_tmpdir(self):
         with mock.patch.dict(os.environ, {"TMPDIR": str(self.root)}):
