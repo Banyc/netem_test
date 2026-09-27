@@ -169,9 +169,18 @@ silenced by softening a declaration:
   the arms the panel exists to compare. The run's own keys enumerate the arms
   (`<arm>_<quantity>`) and name the arms that are not its reference (`*_guard`),
   so the declared bound is drawn over the reference arms and the run's own over
-  the rest, each segment naming the arms it governs. A run that restates
-  nothing, a panel whose arms the run does not enumerate, and a quantity whose
-  bound the run never restates are all left with their single declared line.
+  the rest, each segment naming the arms it governs. The run's per-arm *guard*
+  is the same fact (`arm_bound_source`): a guard the panel names is a bound the
+  panel owes the reader, so `M2-wire`'s `hostile_wire_guard=10` and
+  `lone_wire_guard=14` are drawn each over the arm it governs, and a guard that
+  names a whole drawn series (`hostile_p99_guard` on a panel drawing that
+  statistic) spans the plot labelled with its series. Where *every* arm states a
+  guard of its own, the declared bound is drawn across the panel saying it
+  governs no arm rather than passing as one arm's floor. `check_named_guards_drawn`
+  measures both against the artifact: every guard a drawn label names has to
+  have a line at its value. A run that states no bound of its own, a panel whose
+  arms the run does not enumerate, and a quantity the run never restates are
+  left with their single declared line.
   A **line** panel cannot split its one line per arm — its arms share the time
   axis — so it owes the same division in words: the bound names the arm it
   governs and, for every other arm it crosses, the run's own key and value for
@@ -179,6 +188,18 @@ silenced by softening a declaration:
   against a panel whose only mark was the 250 ms mandate ceiling, which is not
   what that arm is asserted against (its own p99 guard is 3200 ms): the reader
   saw a 6.3×-over-ceiling peak and no way to learn it was a pass.
+- **the reference-reach test** — `check_cdf_reference_reach` refuses a cdf
+  panel whose own subject is a sliver. A latency CDF is read for where its
+  reference arm's body and tail sit, and a linear axis out to the worst arm's
+  tail decides the whole picture: measured on the `M1-cdf` artifact of a
+  recorded run, axis `0.045..1017.77` ms linear, the `clean` curve ended at
+  `112.55` ms — 11.1 % of the 864 px plot, its p99 at 9.2 % — while the lone
+  tail was drawn in full. The axis is therefore put on base-10 logarithms when
+  a linear one would leave that arm below `MIN_REFERENCE_REACH_SHARE` of the
+  width, and the share is measured back off the panel's own tick labels
+  (`drawn_x_scale`), so a quiet return to a linear axis is refused rather than
+  believed. A panel that cannot reach the share even on a log axis owes a
+  sentence saying so, and the sentence is accepted in the scale's place.
 - **the x-bound test** — `check_x_bound_drawn` refuses a panel that leaves a
   mandate bound off a frame that can carry it. `bounds` are horizontal, so a
   ceiling expressed on the plot's *x* axis — an M1 latency ceiling read against
