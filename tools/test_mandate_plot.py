@@ -133,6 +133,106 @@ DELIVERY_ROWS = [
     ["delivery", "hostile", 4.0, 1.0],
 ]
 
+# The `MANDATE_SMOKE_FAULT=M4_drop` render (99 % loss): the four clean flows
+# were starved to a share of 0.000, which is an imbalance of -1.000 against a
+# 0.25 ideal, while the hostile arm stayed inside its band. The axis is
+# therefore the *data's* scale (-1..0.0605) and the declared `±1 %` band is
+# 0.009884 of it -- 2.1 px of 228 -- which the axis test refused, deleting the
+# panel whose whole point is that the fault's guard fired.
+DROP_IMBALANCE_DECLARATION = {
+    "mandate": "M4",
+    "title": "M4 interactive lane fairness: 4 flows on one interactive lane",
+    "x_label": "flow (1..4)",
+    "y_label": "departure from the fair share",
+    "panels": [
+        {
+            "id": "imbalance",
+            "chart": "bar",
+            "y_label": "departure from the fair share",
+            "x_label": "flow (1..4)",
+            "series": [{"name": "clean"}, {"name": "hostile"}],
+            "bounds": [{"y": 0.01, "label": "fair-share bound \u00b11.0%"}],
+        }
+    ],
+}
+
+DROP_IMBALANCE_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["imbalance", "clean", 1.0, -1.0],
+    ["imbalance", "clean", 2.0, -1.0],
+    ["imbalance", "clean", 3.0, -1.0],
+    ["imbalance", "clean", 4.0, -1.0],
+    ["imbalance", "hostile", 1.0, 0.000116],
+    ["imbalance", "hostile", 2.0, 0.000116],
+    ["imbalance", "hostile", 3.0, -0.000347],
+    ["imbalance", "hostile", 4.0, 0.000116],
+]
+
+DROP_IMBALANCE_SERIES = [
+    ("clean", [(float(x), -1.0) for x in (1, 2, 3, 4)]),
+    (
+        "hostile",
+        [
+            (1.0, 0.000116),
+            (2.0, 0.000116),
+            (3.0, -0.000347),
+            (4.0, 0.000116),
+        ],
+    ),
+]
+
+# The `MANDATE_SMOKE_FAULT=M4_late` render (every flow's last stretch held past
+# the cutoff, with the early body repaired late): the clean arm's p50 and p99
+# are 3.9-4.3 s against a 250 ms ceiling, so the ceiling is 1.6 px of a
+# 0..4565.34 axis -- the same refusal, on the latency panel, of a render whose
+# verdict is PASS and whose panel is the evidence the fault showed.
+LATE_LATENCY_DECLARATION = {
+    "mandate": "M4",
+    "title": "M4 interactive lane fairness: 4 flows on one interactive lane",
+    "x_label": "flow (1..4)",
+    "y_label": "latency (ms)",
+    "panels": [
+        {
+            "id": "latency",
+            "chart": "bar",
+            "y_label": "latency (ms)",
+            "x_label": "flow (1..4)",
+            "series": [
+                {"name": "clean_p50"},
+                {"name": "clean_p99"},
+                {"name": "hostile_p50"},
+                {"name": "hostile_p99"},
+            ],
+            "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+        }
+    ],
+}
+
+LATE_LATENCY_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["latency", "clean_p50", 1.0, 3886.742],
+    ["latency", "clean_p50", 2.0, 3882.2],
+    ["latency", "clean_p50", 3.0, 3835.351],
+    ["latency", "clean_p50", 4.0, 3467.733],
+    ["latency", "clean_p99", 1.0, 4345.298],
+    ["latency", "clean_p99", 2.0, 4347.945],
+    ["latency", "clean_p99", 3.0, 4346.328],
+    ["latency", "clean_p99", 4.0, 4312.403],
+    ["latency", "hostile_p50", 1.0, 81.0],
+    ["latency", "hostile_p50", 2.0, 72.365],
+    ["latency", "hostile_p50", 3.0, 72.431],
+    ["latency", "hostile_p50", 4.0, 85.271],
+    ["latency", "hostile_p99", 1.0, 282.427],
+    ["latency", "hostile_p99", 2.0, 308.469],
+    ["latency", "hostile_p99", 3.0, 313.148],
+    ["latency", "hostile_p99", 4.0, 294.569],
+]
+
+# The run's own `MANDATE M4` keys the panel's labels name: the ceiling is the
+# declaration's, and `hostile_p99_guard` is the arm's own tolerance, so the
+# panel draws both lines and the axis test measures the ceiling against it.
+LATE_LATENCY_RUN_VALUES = {"ceiling": 250.0, "hostile_p99_guard": 900.0}
+
 WIRE_DECLARATION = {
     "mandate": "M2",
     "title": "M2 interactive delivery and own-wire multiple",
@@ -2085,6 +2185,152 @@ class MandatePlotTest(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("sub-pixel", stderr)
         self.assertIn("M2 wire budget 6x", stderr)
+
+    # -- the sliver-bound test: a fault panel states where its bound sits -----
+
+    def render_sliver(self, declaration, rows, name, run_values=None):
+        """Render one fault-geometry declaration and return its imbalance SVG."""
+        arguments = [] if run_values is None else [
+            "--run-values",
+            json.dumps(run_values),
+        ]
+        code, stderr, out = self.render_mandate(declaration, rows, name, *arguments)
+        self.assertEqual(code, 0, stderr)
+        panel = declaration["panels"][0]["id"]
+        return (out / f"{declaration['mandate']}-{panel}.svg").read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_starved_flows_sliver_bound_is_stated_not_refused(self):
+        document = self.render_sliver(
+            DROP_IMBALANCE_DECLARATION, DROP_IMBALANCE_ROWS, "M4drop"
+        )
+        # Both arms are drawn -- the fault panel is evidence, not an error --
+        # and the panel says where the bound sits and how far the bars are.
+        self.assertEqual(document.count('class="bound"'), 2)
+        notes = " ".join(MANDATE.drawn_notes(document))
+        self.assertIn(
+            'bound "fair-share bound \u00b11.0%" at 0.01 on axis -1..0.0605: '
+            "band 0.009884 = 2.1 px; nearest bar 0.000116, 0.009884 away; "
+            "furthest -1, 217.1 px from the bound",
+            notes,
+        )
+        # The mirrored arm is 4.3 px from the stated one -- closer than a line
+        # of text -- so it is drawn unlabelled and its own position is stated.
+        self.assertEqual(document.count("<title>fair-share bound"), 1)
+        self.assertIn("its arm at -0.01 (4.3 px away) is drawn unlabelled", notes)
+
+    def test_the_starved_flows_sliver_is_still_refused_without_the_statement(self):
+        # The pre-fix behaviour, and the check's own vacuity: the same geometry
+        # with no statement is refused by the axis test naming the band, and the
+        # statement check refuses a panel that draws the sliver silently.
+        series = DROP_IMBALANCE_SERIES
+        bounds = [{"y": 0.01, "label": "fair-share bound \u00b11.0%"}]
+        drawn = MANDATE.mirrored_bounds(bounds)
+        axis = MANDATE.bar_axis_extent(series, drawn, None)
+        problems = MANDATE.check_panel_axis("imbalance", series, drawn, axis)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("sub-pixel", problems[0])
+        self.assertIn("fair-share bound \u00b11.0%", problems[0])
+        # red: the panel that draws the sliver and states nothing
+        markup = MANDATE.svg_bar_chart(
+            "M4 [imbalance]",
+            "flow (1..4)",
+            "departure from the fair share",
+            series,
+            drawn,
+            axis,
+            None,
+        )
+        silent = MANDATE.check_sliver_bound_stated(
+            "imbalance", series, drawn, axis, markup
+        )
+        self.assertEqual(len(silent), 1, silent)
+        self.assertIn("fair-share bound \u00b11.0%", silent[0])
+        self.assertIn("states nothing", silent[0])
+        self.assertIn("2.1 px", silent[0])
+        # green: the same artifact with the statement's own numbers on it
+        document = self.render_sliver(
+            DROP_IMBALANCE_DECLARATION, DROP_IMBALANCE_ROWS, "M4drop2"
+        )
+        self.assertEqual(
+            MANDATE.check_sliver_bound_stated(
+                "imbalance", series, drawn, axis, document
+            ),
+            [],
+        )
+
+    def test_the_late_arms_sliver_ceiling_is_stated_not_refused(self):
+        document = self.render_sliver(
+            LATE_LATENCY_DECLARATION,
+            LATE_LATENCY_ROWS,
+            "M4late",
+            LATE_LATENCY_RUN_VALUES,
+        )
+        # The ceiling is 1.6 px of a 4565.34 ms axis and the fault's own body is
+        # 204.7 px past it, so the panel states both rather than refusing.
+        notes = " ".join(MANDATE.drawn_notes(document))
+        self.assertIn(
+            'bound "M1 ceiling 250 ms" at 250 on axis 0..4565.34: band 32.427 '
+            "= 1.6 px; nearest bar 282.427, 32.427 away; furthest 4347.94, "
+            "204.7 px from the bound",
+            notes,
+        )
+        # The axis test still measures the band it always did, and the run's own
+        # guard is still drawn beside the ceiling.
+        self.assertEqual(document.count('class="bound"'), 2)
+
+    def test_a_stated_sliver_whose_numbers_are_not_the_runs_is_refused(self):
+        # The statement is what the reader is told instead of the pixels, so a
+        # sentence carrying a number nothing measured is worse than silence.
+        document = self.render_sliver(
+            DROP_IMBALANCE_DECLARATION, DROP_IMBALANCE_ROWS, "M4drop3"
+        )
+        series = DROP_IMBALANCE_SERIES
+        bounds = [{"y": 0.01, "label": "fair-share bound \u00b11.0%"}]
+        drawn = MANDATE.mirrored_bounds(bounds)
+        axis = MANDATE.bar_axis_extent(series, drawn, None)
+        tampered = document.replace("217.1 px from the bound", "1.0 px from the bound")
+        self.assertNotEqual(tampered, document)
+        problems = MANDATE.check_sliver_bound_stated(
+            "imbalance", series, drawn, axis, tampered
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("far_px=1", problems[0])
+
+    def test_the_sliver_statement_is_not_owed_where_no_departure_is_drawn(self):
+        # The other half of the rule: the statement is only the honest reading
+        # where the panel *shows* a departure. The wire budget's furthest bar is
+        # the lowest one and is a pass, so that panel keeps the refusal.
+        series = [("wire_x", [(1.0, 2.12), (2.0, 4.91), (3.0, 5.91)])]
+        bounds = [{"y": 6.0, "label": "M2 wire budget 6x"}]
+        axis = MANDATE.bar_axis_extent(series, bounds, None)
+        self.assertEqual(
+            MANDATE.sliver_bound_statements(series, bounds, axis, MANDATE.bar_plot_height(1)),
+            [],
+        )
+
+    def test_a_departure_smaller_than_the_band_is_not_a_statement(self):
+        # The threshold the statement stands on: a departure has to be at least
+        # as legible as the six pixels the band is measured against, or the
+        # panel has nothing to state but the sliver itself and the refusal is
+        # the right answer. On a `0..5` axis, `0.02` is 0.9 px and `0.2` is
+        # 9.1 px.
+        bound = {"y": 0.0, "label": "synthetic bound"}
+        self.assertEqual(
+            MANDATE.bound_sliver_statement(
+                bound,
+                [-0.02, 0.02],
+                0.005,
+                (0.0, 5.0),
+                MANDATE.bar_plot_height(1),
+            ),
+            "",
+        )
+        statement = MANDATE.bound_sliver_statement(
+            bound, [-0.2, 0.2], 0.005, (0.0, 5.0), MANDATE.bar_plot_height(1)
+        )
+        self.assertIn("furthest -0.2, 9.1 px from the bound", statement)
 
     def test_a_panel_labelled_with_a_sibling_s_unit_is_refused(self):
         series = [("fraction", [(1.0, 0.958217), (2.0, 0.958271)])]

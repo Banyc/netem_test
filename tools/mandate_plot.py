@@ -49,6 +49,26 @@ silenced by softening a declaration:
   the bound exists to catch must not be sub-pixel. The delivery floors failed
   it: over `0..2` for a `0..1` quantity, the M4 floor's 0.5 % band was 1.1
   pixels. A panel that fails is an error naming the axis and the bound.
+- **the sliver-bound test** — `check_sliver_bound_stated` refuses a panel that
+  draws a bound its own axis cannot resolve *and* says nothing about where the
+  bound sits. The axis test above measures the band a bound needs; when a run's
+  data lies far enough beyond the bound that the axis is the data's scale rather
+  than the bound's, that band is a sliver. Measured on the fault renders the
+  battery never takes, `MANDATE_SMOKE_FAULT=M4_drop` left `M4-imbalance`'s
+  `±1 %` band `2.1 px` of a `-1..0.0605` axis whose span the starved flows'
+  `-1.000` departures had set, and `MANDATE_SMOKE_FAULT=M4_late` left
+  `M4-latency`'s 250 ms ceiling `1.6 px` of a `0..4565` axis the fault's
+  3886-4348 ms body had set -- and both panels were refused rather than drawn,
+  so the fault's visual evidence that its guard fires was missing. The failure
+  those panels exist for was *visible* in both cases (a `217 px` departure on
+  the first, `205 px` on the second), so a panel may draw such a bound -- and
+  `check_panel_axis` accepts it -- once the panel states on its own face where
+  the bound sits, how wide its band is in pixels, and how far the nearest and
+  furthest bars lie from it. The statement is owed only when a departure at
+  least `MIN_BOUND_PIXELS` legible is drawn, so the ordinary case (data at the
+  bound, no visible departure) keeps the refusal. Both halves are refused by
+  name: a sliver-bound panel that states nothing, and a stated one whose
+  numbers are not the drawn points' and the drawn axis' own.
 - **the governance test** — a bound drawn across a bar panel whose bars split
   around it (an outlier split: at most a third of them beyond it, the rest not)
   is a departure whose meaning lives in *the run*: an arm's own guard may
@@ -319,6 +339,15 @@ ROTATE_RE = re.compile(r"rotate\(\s*[-0-9.]+\s+([-0-9.]+)\s+([-0-9.]+)\s*\)")
 BAR_RECT_RE = re.compile(
     r'<rect x="([-0-9.]+)" y="([-0-9.]+)" width="([-0-9.]+)" '
     r'height="([-0-9.]+)" fill="(#[0-9A-Fa-f]{6})"'
+)
+SLIVER_STATEMENT_RE = re.compile(
+    r'bound "(?P<label>[^"]*)" at (?P<value>[-+0-9.eE]+) on axis '
+    r'(?P<low>[-+0-9.eE]+)\.\.(?P<high>[-+0-9.eE]+): band (?P<band>[-+0-9.eE]+) = '
+    r'(?P<band_px>[0-9.]+) px; nearest bar (?P<near>[-+0-9.eE]+), '
+    r'(?P<near_dist>[-+0-9.eE]+) away; furthest (?P<far>[-+0-9.eE]+), '
+    r'(?P<far_px>[0-9.]+) px from the bound'
+    r'(?:; its arm at (?P<arm>[-+0-9.eE]+) \((?P<arm_px>[0-9.]+) px away\) '
+    r'is drawn unlabelled)?'
 )
 LEGEND_GROUP_RE = re.compile(r'<g class="legend">(.*?)</g>', re.S)
 LABEL_OVERLAP_PX2 = 1.0
@@ -2202,7 +2231,9 @@ def panel_axis_extent(panel, series, bounds, run_values, plot_height):
     return line_axis_extent(series, bounds, pinned)
 
 
-def check_panel_axis(panel_id, series, bounds, extent, plot_height=None, run_values=None):
+def check_panel_axis(
+    panel_id, series, bounds, extent, plot_height=None, run_values=None, *, stated=None
+):
     """Problems that make an axis unable to show a bound drawn on it.
 
     This is `AGENTS.md`'s first panel test — "would a regression be visible at
@@ -2215,6 +2246,15 @@ def check_panel_axis(panel_id, series, bounds, extent, plot_height=None, run_val
     The band is measured with the run's own guards, because they are part of the
     question: a crossing a named guard tolerates is not a departure, and what the
     reader then has to be able to see is the tolerance (`bound_band`).
+
+    ``stated`` names the bounds whose sliver the panel states instead
+    (`sliver_bound_statements`): a bound whose band the axis cannot resolve is
+    refused *unless* the panel draws it and says, with the measured distance,
+    where it sits. That alternative exists because a refusal deletes the panel,
+    and for a fault render the panel is the evidence that the guard fired. It is
+    owed only where the panel draws a departure at least as legible as the band
+    it cannot resolve, so a run whose data sits at the bound still gets the
+    refusal — there the alternative would state nothing but the sliver itself.
     """
     problems = []
     low, high = extent
@@ -2224,24 +2264,309 @@ def check_panel_axis(panel_id, series, bounds, extent, plot_height=None, run_val
     if plot_height is None:
         plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
     values = _bound_values(series)
-    unit = unit_span(values, [bound["y"] for bound in bounds])
     for bound in bounds:
-        y = bound["y"]
+        y = float(bound["y"])
         if bound_side(values, y) is None and not crossing_values(values, y):
             continue
-        tolerances = [
-            value for _, value in run_guards(run_values, series, bound["label"])
-        ]
-        band = bound_band(values, y, unit, tolerances)
-        pixels = band / span * plot_height
-        if pixels < MIN_BOUND_PIXELS:
+        band, pixels = bound_band_pixels(
+            series, bounds, bound, extent, plot_height, run_values
+        )
+        if pixels >= MIN_BOUND_PIXELS:
+            continue
+        if stated and str(bound["label"]) in stated:
+            continue
+        nearest = min((abs(value - y) for value in values), default=0.0)
+        problems.append(
+            f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} leaves the "
+            f"bound {bound['label']!r} (y={y:g}) a band of {band:.4g} "
+            f"({band / span:.1%} of its height, {pixels:.1f} px of "
+            f"{plot_height:.0f}), under the {MIN_BOUND_PIXELS:.0f} px a bound "
+            "needs to show the departure it exists to catch, so that "
+            "departure would be sub-pixel. The panel may draw the bound and "
+            "state its position with the measured distance instead (this run's "
+            f"nearest bar is {nearest:.4g} from it, "
+            f"{nearest / span * plot_height:.1f} px of this axis); it states "
+            "nothing, so the panel is refused rather than drawn"
+        )
+    return problems
+
+
+def bound_band_pixels(series, bounds, bound, extent, plot_height, run_values=None):
+    """The band the axis test measures for one bound, and the pixels it has.
+
+    One function for the refusal and for the statement a panel makes in its
+    place, so the band a panel is refused for and the band it states are the same
+    measurement: `check_panel_axis`, `sliver_bound_statements` and
+    `check_sliver_bound_stated` all read it here. The band is the proxy
+    `bound_band` derives — the nearest value on the bound's own side, the
+    tolerance the run's own guards open, or a fraction panel's resolution floor —
+    measured against the run's guards where the bound's label names one.
+    """
+    values = _bound_values(series)
+    unit = unit_span(values, [item["y"] for item in bounds])
+    tolerances = [
+        value for _, value in run_guards(run_values, series, bound["label"])
+    ]
+    band = bound_band(values, float(bound["y"]), unit, tolerances)
+    span = extent[1] - extent[0]
+    return band, band / span * plot_height
+
+
+def sliver_number(value):
+    """One number as the sliver statement writes it and the check reads it back."""
+    return f"{value:g}"
+
+
+def sliver_departure(values, bound, extent, plot_height):
+    """``(pixels, value)``: the most legible departure the bars draw from a bound.
+
+    The side is the one the bound can fail towards, and a bar on the other side
+    is a pass rather than a failure: a **cap**'s bars sit under it, a **floor**'s
+    over it, and a bound a run's bars straddle — or one arm of a declared `±`
+    band, whose mirror carries `band_arm` — fails on either side. The side
+    matters and the *distance* alone cannot stand in for it: measured on the
+    `M2 wire budget 6x` panel with no guard supplied, the furthest bar is the
+    *lowest* one (`2.12`, 140 px below a 6x budget it is well inside), which is
+    the bar's length and not a breach. The refusal there is right, so the
+    statement is reserved for a panel that draws the departure.
+    """
+    y = float(bound["y"])
+    band_arm = bound.get("band_arm") is not None or two_sided_bound(bound)
+    side = None if band_arm else bound_side(values, y)
+    if side == "cap":
+        candidates = [value for value in values if value > y]
+    elif side == "floor":
+        candidates = [value for value in values if value < y]
+    else:
+        candidates = list(values)
+    if not candidates:
+        return 0.0, None
+    furthest = max(candidates, key=lambda value: abs(value - y))
+    span = extent[1] - extent[0]
+    return abs(furthest - y) / span * plot_height, furthest
+
+
+def bound_sliver_statement(bound, values, band, extent, plot_height):
+    """The sentence that states a sub-pixel bound's position, or ``""``.
+
+    `check_panel_axis` refuses a bound whose band the axis cannot resolve,
+    because a departure of the bound's own size would be sub-pixel. That refusal
+    is right while the panel's data sits *at* the bound: the band is then the
+    only place the failure could show, and the delivery floor drawn over `0..2`
+    is the measured case. It is the wrong answer once the run's own data lies far
+    enough beyond the bound that the axis is the data's scale and not the
+    bound's: the fault renders are exactly that, and refusing them deleted the
+    visual evidence that the guard fires.
+
+    What makes the panel honest there is the statement, not a widened axis — the
+    bound is drawn, its position is stated, and the distance from it to the bars
+    the run drew is stated with it, so the reader has the number the sliver took
+    away. A statement is owed only when the panel *shows* a departure at least as
+    legible as the band it cannot resolve (`MIN_BOUND_PIXELS`, on the side the
+    bound can fail towards — `sliver_departure`), which is why the ordinary case
+    keeps the refusal: there the only thing to state is the sliver itself. The
+    numbers are the drawn points' and the drawn axis' own, so
+    `check_sliver_bound_stated` measures them back out of the artifact.
+    """
+    if not values:
+        return ""
+    low, high = extent
+    span = high - low
+    y = float(bound["y"])
+    if band / span * plot_height >= MIN_BOUND_PIXELS:
+        return ""
+    departure_px, departure = sliver_departure(values, bound, extent, plot_height)
+    if departure is None or departure_px < MIN_BOUND_PIXELS:
+        return ""
+    nearest = min(values, key=lambda value: abs(value - y))
+    return (
+        f'bound "{bound["label"]}" at {sliver_number(y)} on axis '
+        f"{sliver_number(low)}..{sliver_number(high)}: band "
+        f"{sliver_number(band)} = {band / span * plot_height:.1f} px; nearest "
+        f"bar {sliver_number(nearest)}, {sliver_number(abs(nearest - y))} away; "
+        f"furthest {sliver_number(departure)}, "
+        f"{departure_px:.1f} px from the bound"
+    )
+
+
+def sliver_bound_statements(series, bounds, extent, plot_height, run_values=None):
+    """``[(bound, sentence)]`` for every bound whose sliver the panel owes stated.
+
+    The bounds are the ones `check_panel_axis` measures — a bound a bar can
+    fail, or one a minority of them cross — whose band is sub-pixel and whose run
+    draws a departure legible enough to make the statement the honest reading.
+    A bound the axis test does not measure owes no statement: it is a reference
+    the bars straddle, not a line a bar crosses.
+
+    A mirrored arm whose line is within a label height of the one being stated
+    cannot carry a label of its own — two labels that close are the text of
+    neither, and `check_label_overlap` refuses them — so it is drawn unlabelled
+    and its own position goes into this sentence: the declaration's label
+    already says the bound is a band, and the statement says where each arm is.
+    Measured on the `M4_drop` fault render, the `±1 %` arms sat `4.3 px` apart on
+    a `-1..0.0605` axis, which is closer than one line of label text.
+    """
+    values = _bound_values(series)
+    span = extent[1] - extent[0]
+    statements = []
+    for bound in bounds:
+        y = float(bound["y"])
+        if bound_side(values, y) is None and not crossing_values(values, y):
+            continue
+        band, _ = bound_band_pixels(
+            series, bounds, bound, extent, plot_height, run_values
+        )
+        sentence = bound_sliver_statement(bound, values, band, extent, plot_height)
+        if not sentence:
+            continue
+        for other in bounds:
+            if other is bound or other.get("band_arm") is None:
+                continue
+            gap = abs(float(other["y"]) - y) / span * plot_height
+            if gap >= REPORT.LABEL_LINE_HEIGHT_PX:
+                continue
+            other["unlabelled"] = True
+            sentence += (
+                f'; its arm at {sliver_number(float(other["y"]))} '
+                f"({gap:.1f} px away) is drawn unlabelled"
+            )
+        statements.append((bound, sentence))
+    return statements
+
+
+def sliver_statement_problems(panel_id, bound, matches, values, band, extent, plot_height):
+    """Problems that make a drawn sliver statement's numbers not the run's.
+
+    Every number the statement carries is measured against the drawn points and
+    the drawn axis: the bound's own position, the axis' ends, the band and its
+    pixels, and the nearest and furthest bars with their distances. A statement
+    is the part of a sliver-bound panel a reader trusts *instead of* the pixels,
+    so a number that came from anywhere but the artifact would be authoritative
+    and wrong — the same defect `check_reading_numbers` exists for on the
+    latency band.
+    """
+    low, high = extent
+    span = high - low
+    y = float(bound["y"])
+    nearest = min(values, key=lambda value: abs(value - y))
+    departure_px, departure = sliver_departure(values, bound, extent, plot_height)
+    measured = {
+        "value": y,
+        "low": low,
+        "high": high,
+        "band": band,
+        "band_px": band / span * plot_height,
+        "near": nearest,
+        "near_dist": abs(nearest - y),
+        "far": departure,
+        "far_px": departure_px,
+    }
+    problems = []
+    for match in matches:
+        for field, expected in measured.items():
+            printed = float(match.group(field))
+            if field.endswith("_px"):
+                slack = 0.05
+            else:
+                slack = max(1e-4 * abs(expected), 1e-9)
+            if abs(printed - expected) <= slack:
+                continue
             problems.append(
-                f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} leaves the "
-                f"bound {bound['label']!r} (y={y:g}) a band of {band:.4g} "
-                f"({band / span:.1%} of its height, {pixels:.1f} px of "
-                f"{plot_height:.0f}), under the {MIN_BOUND_PIXELS:.0f} px a bound "
-                "needs to show the departure it exists to catch, so that "
-                "departure would be sub-pixel"
+                f"panel {panel_id!r}: the statement for the bound "
+                f"{bound['label']!r} prints {field}={printed:g}, where the drawn "
+                f"points and the drawn axis {low:.4g}..{high:.4g} measure "
+                f"{expected:g}; a stated distance that is not the run's is a "
+                "claim the reader has no way to check"
+            )
+    return problems
+
+
+def check_sliver_bound_stated(
+    panel_id, series, bounds, extent, markup, plot_height=None, run_values=None
+):
+    """Problems that leave a sub-pixel bound's own position unstated.
+
+    The axis test's refusal (`check_panel_axis`) is answered by a statement, and
+    this is the check on that answer: a panel that draws a bound whose band its
+    axis cannot resolve owes, on its own face, where the bound sits, how wide its
+    band is in pixels, and how far the nearest and furthest bars lie from it.
+    Two ways to fail it. A panel that draws the sliver and says nothing leaves the
+    reader able to see a departure and unable to read it against the bound, which
+    is the same panel as one drawn silently; and a panel whose stated numbers are
+    not the drawn points' own is worse than silent, because the reader is told a
+    distance the run did not measure.
+
+    This reads both sides off the artifact: the bounds and bands are the ones
+    `bound_band_pixels` measures from the CSV, the drawn points and the axis the
+    renderer used, and the statements are parsed back out of the SVG's own note
+    elements (`drawn_notes`), the way every other check here measures the panel
+    that was written rather than the plan it was written from.
+    """
+    values = _bound_values(series)
+    if not values:
+        return []
+    low, high = extent
+    span = high - low
+    if not span > 0:
+        return [f"panel {panel_id!r}: the axis {low!r}..{high!r} has no span"]
+    if plot_height is None:
+        plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    stated = {}
+    for match in SLIVER_STATEMENT_RE.finditer(" ".join(drawn_notes(markup))):
+        stated.setdefault(match.group("label"), []).append(match)
+    drawn_labels = {declared for declared, _, _ in label_boxes(markup)}
+    problems = []
+    for bound in bounds:
+        y = float(bound["y"])
+        if bound_side(values, y) is None and not crossing_values(values, y):
+            continue
+        band, pixels = bound_band_pixels(
+            series, bounds, bound, extent, plot_height, run_values
+        )
+        if pixels >= MIN_BOUND_PIXELS:
+            continue
+        matches = stated.get(str(bound["label"]))
+        if not matches:
+            problems.append(
+                f"panel {panel_id!r}: the bound {bound['label']!r} (y={y:g}) has a "
+                f"band of {band:.4g} ({pixels:.1f} px of "
+                f"{plot_height:.0f} on the axis {low:.4g}..{high:.4g}), under the "
+                f"{MIN_BOUND_PIXELS:.0f} px it needs to show the departure it "
+                "exists to catch, and the panel states nothing about where the "
+                "bound sits: a reader can see a departure and cannot read it "
+                "against the bound, which is the same panel as one drawn silently"
+            )
+            continue
+        problems.extend(
+            sliver_statement_problems(
+                panel_id, bound, matches, values, band, extent, plot_height
+            )
+        )
+        # A mirrored arm drawn unlabelled owes its own position in the sentence:
+        # the arm's label is the number a bar falling to that side is read
+        # against, so a panel that drops the label and states nothing about the
+        # arm is the panel drawn silently one level down.
+        for other in bounds:
+            if other is bound or other.get("band_arm") is None:
+                continue
+            gap = abs(float(other["y"]) - y) / (high - low) * plot_height
+            if gap >= REPORT.LABEL_LINE_HEIGHT_PX:
+                continue
+            if str(other["label"]) in drawn_labels:
+                continue
+            if any(
+                match.group("arm") is not None
+                and abs(float(match.group("arm")) - float(other["y"])) <= 1e-9
+                and abs(float(match.group("arm_px")) - gap) <= 0.05
+                for match in matches
+            ):
+                continue
+            problems.append(
+                f"panel {panel_id!r}: the band arm at {float(other['y']):g} is "
+                f"drawn {gap:.1f} px from the stated arm, too close for a label of "
+                "its own, and the panel draws no label for it and states nothing "
+                "about where it is: an arm neither labelled nor stated is a line "
+                f"the reader cannot read a bar against"
             )
     return problems
 
@@ -3925,6 +4250,15 @@ def svg_bar_chart(
             left, right = min(left, right), max(left, right)
         label = governed_label(bound, series, run_values)
         parts.append(f"<line class=\"bound\" x1=\"{left:.1f}\" y1=\"{y:.1f}\" x2=\"{right:.1f}\" y2=\"{y:.1f}\" stroke=\"{REPORT.BOUND_STROKE}\" stroke-width=\"1.4\" stroke-dasharray=\"6 4\"/>")
+        # An arm whose line is within a label height of the one being stated is
+        # drawn without a label of its own: two labels that close are the text of
+        # neither, and `check_label_overlap` refuses both. The band's declaration
+        # keeps its label -- the sentence that says the bound is a band -- and the
+        # arm's own position goes into the sliver statement
+        # (`sliver_bound_statements`), which `check_sliver_bound_stated` reads
+        # back out of this markup.
+        if bound.get("unlabelled"):
+            continue
         markup, layout = REPORT.bound_label_markup(
             label,
             right,
@@ -4084,6 +4418,18 @@ def panel_markup(
         else bar_plot_height(len(series))
     )
     axis = panel_axis_extent(panel, series, drawn_bounds, run_values, plot_height)
+    # A bound whose band this axis cannot resolve owes a statement on the panel's
+    # own face, and the statement is what `check_panel_axis` accepts in the
+    # refusal's place: the two are read from `sliver_bound_statements` here, so
+    # the panel cannot be allowed by one reading and refused by the other.
+    sliver_statements = (
+        sliver_bound_statements(series, drawn_bounds, axis, plot_height, run_values)
+        if chart == "bar"
+        else []
+    )
+    if sliver_statements:
+        stated_slivers = "; ".join(sentence for _, sentence in sliver_statements)
+        note = f"{note}; {stated_slivers}" if note else stated_slivers
     guards = named_guard_values(
         series, drawn_bounds, run_values, crossing=chart == "bar"
     )
@@ -4112,7 +4458,13 @@ def panel_markup(
         # crossing of a ceiling is the line poking above it, so it owes the
         # axis-range and headroom checks (which it gets) rather than a band.
         problems += check_panel_axis(
-            panel["id"], series, drawn_bounds, axis, plot_height, run_values
+            panel["id"],
+            series,
+            drawn_bounds,
+            axis,
+            plot_height,
+            run_values,
+            stated=[str(bound["label"]) for bound, _ in sliver_statements],
         )
     problems += check_named_values_in_axis(
         panel["id"], drawn_bounds, guards, axis, plot_height
@@ -4219,6 +4571,9 @@ def panel_markup(
                 panel["id"], panel, series, bounds, run_values, markup
             )
             + check_bar_separation(panel["id"], markup)
+            + check_sliver_bound_stated(
+                panel["id"], series, drawn_bounds, axis, markup, plot_height, run_values
+            )
             if chart == "bar"
             else check_departure_view_stated(
                 panel["id"],
