@@ -198,6 +198,9 @@ ENV_READ_RE = re.compile(r"env::var(?:_os)?\s*\(")
 ENV_LITERAL_RE = re.compile(r'env::var(?:_os)?\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 # `env::var(NAME)`/`env::var_os(NAME)` where the argument is a bare identifier.
 ENV_IDENT_RE = re.compile(r"env::var(?:_os)?\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+# A Rust binding, as a forwarder's parameter may be named: the name a caller's
+# argument can be, when the forwarder hands it to `env::var`.
+RUST_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # The header of a closure bound by `let`: `let NAME = |…|`, `let NAME: T = move |…|`.
 # A closure is a second crate-local forwarder, and one the `fn`-only scan cannot
 # see: its parameter receives the literal at the call site exactly as a `fn`'s
@@ -3334,7 +3337,17 @@ def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
     receives the literal at the call site exactly as a `fn`'s does, so a
     `fn`-only scan leaves every name it forwards invisible -- and a name the
     scan cannot see cannot be declared, because the stale-declaration half then
-    refuses the true record. Finally a name may be spelled once as a
+    refuses the true record. A literal handed to a forwarder counts only when it
+    lands in a **key position** of that forwarder -- the parameter the
+    forwarder's own body hands to `env::var` (`fn env_parse(name, d) { std::env::var(name) … }`
+    has key position 0) or forwards to another reader's key position
+    (`fn hops(name, d) { env_parse(name, d) }`). A reader whose body reads a
+    *fixed* literal and uses its parameter as something else
+    (`fn fault(mandate: &str) -> Option<String> { std::env::var("MANDATE_SMOKE_FAULT").ok()?.contains(mandate).then(…) }`)
+    has **no** key position, so a name-shaped argument handed to it is an
+    argument, not an env name: without the distinction the propagation turns
+    every caller of every reader into a surface and demands a declaration for a
+    string that is not a variable. Finally a name may be spelled once as a
     `const`/`static` string alias and handed to `env::var` by that alias
     (`const ENV: &str = "RTP_RTX_DUP"; … std::env::var(ENV)`), which is a read
     with no literal at the call and no call site to read one from.
@@ -3358,7 +3371,8 @@ def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
     of the literal in `code`, because that is where the name lives.
     """
     sources: list[tuple[Path, str, str]] = []
-    forwarders: list[tuple[str, str, str, Path]] = []
+    # (forwarder, parameter names, body with literals, body blanked, file).
+    forwarders: list[tuple[str, tuple[str, ...], str, str, Path]] = []
     for path in sorted(root.rglob("*.rs")):
         if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
@@ -3373,27 +3387,35 @@ def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
             if start == -1:
                 continue
             end = _brace_end(quiet, start)
+            params = _parameter_names(_call_arguments(quiet, match.end() - 1))
             forwarders.append(
-                (match.group(1), code[start:end], quiet[start:end], path)
+                (match.group(1), params, code[start:end], quiet[start:end], path)
             )
         for match in CLOSURE_RE.finditer(quiet):
-            body = _closure_body(code, quiet, match.end())
+            close = quiet.find("|", match.end())
+            if close == -1:
+                continue
+            body = _closure_body(code, quiet, close + 1)
             if body is not None:
-                forwarders.append((match.group(1), body[0], body[1], path))
+                params = _parameter_names(quiet[match.end() : close])
+                forwarders.append(
+                    (match.group(1), params, body[0], body[1], path)
+                )
     readers = {
         name
-        for name, _, calls_body, _ in forwarders
+        for name, _, _, calls_body, _ in forwarders
         if ENV_READ_RE.search(calls_body)
     }
     changed = True
     while changed:
         changed = False
-        for name, _, calls_body, _ in forwarders:
+        for name, _, _, calls_body, _ in forwarders:
             if name in readers:
                 continue
             if any(call in readers for call in CALL_RE.findall(calls_body)):
                 readers.add(name)
                 changed = True
+    keys = _forwarder_key_positions(forwarders, readers)
     found: dict[str, set[str]] = {}
     for path, code, quiet in sources:
         # The direct read: group 1 of the literal call is the name, so no
@@ -3420,18 +3442,178 @@ def _rust_env_read_names(root: Path) -> dict[str, set[str]]:
             literal = aliases.get(match.group(1))
             if literal is not None:
                 _remember_env_read(found, literal, path, root)
-    for _, code_body, calls_body, path in forwarders:
-        # The forwarded read: the literal sits in the arguments of a call to a
-        # crate-local forwarder that reads the env. The call is found in the
-        # blanked view and its arguments taken from the other, since both are
-        # the same length and the name is inside the literal.
+    for _, _, code_body, calls_body, path in forwarders:
+        # The forwarded read: the literal sits in a **key position** of a call
+        # to a crate-local forwarder that reads the env -- the parameter that
+        # forwarder hands to `env::var`, not any argument of any reader. The
+        # call and its argument spans are found in the blanked view and the
+        # literal taken from the other, since both are the same length.
         for match in CALL_RE.finditer(calls_body):
-            if match.group(1) not in readers:
+            callee = match.group(1)
+            if callee not in readers:
                 continue
-            arguments = _call_arguments(code_body, match.end() - 1)
-            for literal in STRING_LITERAL_RE.findall(arguments):
-                _remember_env_read(found, literal, path, root)
+            positions = keys.positions(callee, path)
+            if not positions:
+                continue
+            spans = _argument_spans(calls_body, match.end() - 1)
+            for index in positions:
+                if index >= len(spans):
+                    continue
+                start, end = spans[index]
+                for literal in STRING_LITERAL_RE.findall(code_body[start:end]):
+                    _remember_env_read(found, literal, path, root)
     return found
+
+
+def _forwarder_key_positions(
+    forwarders: list[tuple[str, tuple[str, ...], str, str, Path]],
+    readers: set[str],
+):
+    """The key positions of every crate-local forwarder.
+
+    A parameter is a key position when the forwarder's own body hands it to
+    `env::var`/`var_os` (`std::env::var(key)`), or passes it to another
+    reader's key position (`env_parse(name, default)`). The second rule is a
+    transitive closure because a wrapper can be several hops from the read
+    (`hops` -> `env_parse` -> `env::var`), and it stops at a reader with no key
+    position: a forwarder that reads a *fixed* literal and treats its argument
+    as a suffix or a comparison target forwards no name to the environment.
+
+    The positions are resolved per file first, because a bare call resolves in
+    the caller's own scope; a callee defined elsewhere (a `pub(crate)` helper
+    called from a sibling module) falls back to the union over every definition
+    of that name, which is the same bare-name over-approximation the reader set
+    already carries. The union can only *add* a key position, so the stale half
+    never fails open on it.
+    """
+    by_file: dict[tuple[Path, str], set[int]] = {}
+    for name, params, _, calls_body, path in forwarders:
+        slot = by_file.setdefault((path, name), set())
+        for read in ENV_READ_RE.finditer(calls_body):
+            position = _parameter_position(
+                _call_arguments(calls_body, read.end() - 1), params
+            )
+            if position is not None:
+                slot.add(position)
+    by_name: dict[str, set[int]] = {}
+    changed = True
+    while changed:
+        changed = False
+        by_name = {}
+        for (_, name), positions in by_file.items():
+            by_name.setdefault(name, set()).update(positions)
+        for name, params, _, calls_body, path in forwarders:
+            slot = by_file[(path, name)]
+            for match in CALL_RE.finditer(calls_body):
+                callee = match.group(1)
+                if callee not in readers:
+                    continue
+                callee_positions = by_file.get((path, callee))
+                if callee_positions is None:
+                    callee_positions = by_name.get(callee, frozenset())
+                if not callee_positions:
+                    continue
+                spans = _argument_spans(calls_body, match.end() - 1)
+                for index in callee_positions:
+                    if index >= len(spans):
+                        continue
+                    start, end = spans[index]
+                    position = _parameter_position(calls_body[start:end], params)
+                    if position is not None and position not in slot:
+                        slot.add(position)
+                        changed = True
+
+    class _Keys:
+        """The key positions of a callee, resolved in the caller's own file."""
+
+        def positions(self, callee: str, path: Path) -> set[int]:
+            local = by_file.get((path, callee))
+            if local is not None:
+                return local
+            return by_name.get(callee, set())
+
+    return _Keys()
+
+
+def _parameter_names(text: str) -> tuple[str, ...]:
+    """A forwarder's parameter names, positionally.
+
+    A parameter that is not a plain binding -- `_`, or a destructuring pattern
+    such as `(a, b): (u8, u8)` -- has no name a caller can hand to `env::var`,
+    so its slot is empty and can never be a key position.
+    """
+    names: list[str] = []
+    for item in _split_top_level(text):
+        head = item.split(":", 1)[0].strip()
+        if head.startswith("mut "):
+            head = head[len("mut ") :].strip()
+        if head == "_" or not RUST_IDENT_RE.fullmatch(head):
+            names.append("")
+        else:
+            names.append(head)
+    return tuple(names)
+
+
+def _parameter_position(argument: str, params: tuple[str, ...]) -> int | None:
+    """The index of the parameter ``argument`` names, or None.
+
+    The argument must *be* the parameter, optionally borrowed, so a parameter
+    handed to `env::var` through any other expression is not a key: the key of
+    `env::var(&format!("{prefix}_{suffix}"))` is a concatenation, not either
+    parameter.
+    """
+    name = argument.strip()
+    while name.startswith("&"):
+        name = name[1:].lstrip()
+    for index, param in enumerate(params):
+        if param and param == name:
+            return index
+    return None
+
+
+def _argument_spans(text: str, open_index: int) -> list[tuple[int, int]]:
+    """The `(start, end)` of each top-level argument of the call at ``open_index``.
+
+    The commas are read from a literal-blanked view, so a comma inside a string
+    constant cannot split an argument, and the spans index the un-blanked view
+    at the same offsets.
+    """
+    depth = 0
+    spans: list[tuple[int, int]] = []
+    start = open_index + 1
+    index = open_index
+    while index < len(text):
+        char = text[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                if index > start:
+                    spans.append((start, index))
+                break
+        elif char == "," and depth == 1:
+            spans.append((start, index))
+            start = index + 1
+        index += 1
+    return spans
+
+
+def _split_top_level(text: str) -> list[str]:
+    """The comma-separated pieces of ``text`` at bracket depth 0."""
+    pieces: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            pieces.append(text[start:index])
+            start = index + 1
+    pieces.append(text[start:])
+    return [piece for piece in pieces if piece.strip()]
 
 
 def _closure_body(

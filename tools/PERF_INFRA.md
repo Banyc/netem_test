@@ -120,14 +120,21 @@ using the same grammar the coverage cells use:
 The checker reads the surface from two artifacts rather than from a
 convention: a name counts when this crate's Rust sources read it from the
 process environment **and** a script in the crate names it. A source reads one
-in either of two ways, so the reader half is two scans. A literal handed
+in one of four ways, so the reader half is four scans. A literal handed
 straight to `env::var`/`var_os` is a read wherever it stands, including a
 module-scope initializer no function body encloses. A literal handed to a
-crate-local *wrapper* — `env_parse("SOAK_DIALERS", 16)` — is forwarded to
-`env::var` by the wrapper, so it is read through the wrapper's caller and only
-if the wrapper is itself a reader: that set is the transitive closure over
-crate-local calls, because a one-hop scan reports no surface at all for the
-wrapper form and would be vacuously silent. Both scans read comment- and
+crate-local *wrapper* — `env_parse("SOAK_DIALERS", 16)`, a `fn` or a
+`let`-bound closure — is forwarded to `env::var` by the wrapper, so it is read
+through the wrapper's caller and only if the wrapper is itself a reader: that
+set is the transitive closure over crate-local calls, because a one-hop scan
+reports no surface at all for the wrapper form and would be vacuously silent.
+A forwarded literal counts only in a **key position** of the wrapper — the
+parameter it hands to `env::var`, directly or through another reader — because
+a reader that reads a *fixed* literal and uses its argument as a suffix, a
+comparison target or any other expression forwards no name to the environment,
+and counting one of those would demand a declaration for a string that is not a
+variable. A name may also be spelled once as a `const`/`static` string alias
+and handed to `env::var` as that alias. All four scans read comment- and
 literal-stripped text, so an `env::var("NAME")` written in a doc comment or
 inside a string constant is a mention rather than a read — otherwise a
 declaration could be satisfied by prose, which is the stale-declaration rule

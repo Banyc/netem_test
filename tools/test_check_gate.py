@@ -1876,6 +1876,133 @@ class CheckGateEnvTierForwarderTest(EnvTierFixture):
         )
 
 
+# A crate whose readers do and do not hand their parameter to `env::var`. The
+# propagation from "this function reads the env" to "its arguments are env
+# names" is only sound for a parameter that reaches `env::var` as the key:
+# `fault` reads a *fixed* literal and uses its argument as a suffix of the
+# value, so an argument handed to it is an argument, and the second parameter
+# of `flagged` is a label the body only prints. `hops` is the two-hop wrapper
+# that *is* a key position, and `flagged`'s first position is one too.
+KEYED_ARG_RS = '''fn env_parse(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn hops(name: &str, default: u64) -> u64 {
+    env_parse(name, default)
+}
+
+pub fn two_hop() -> u64 {
+    hops("FIXTURE_TWO_HOP", 8)
+}
+
+/// The body reads a fixed literal; `mandate` is a suffix of the value, not a key.
+pub fn fault(mandate: &str) -> Option<String> {
+    let value = std::env::var("FIXTURE_FAULT_KEY").ok()?;
+    value.contains(mandate).then_some(mandate.to_owned())
+}
+
+pub fn faulted() -> Option<String> {
+    fault("FIXTURE_NOT_A_KEY")
+}
+
+/// Two parameters, one key: `note` is printed, never handed to `env::var`.
+fn flagged(key: &str, note: &str) -> u64 {
+    eprintln!("{note}");
+    env_parse(key, 3)
+}
+
+pub fn flagged_call() -> u64 {
+    flagged("FIXTURE_KEYED", "FIXTURE_NOTE_ONLY")
+}
+'''
+
+
+class CheckGateEnvTierKeyPositionTest(EnvTierFixture):
+    """A name-shaped argument is a read only when it reaches `env::var` as a key.
+
+    A reader that reads a *fixed* literal and uses its parameter as a suffix
+    (`fault(mandate)`) forwards no name to the environment, so an argument
+    handed to it is an argument: demanding a declaration for it demands a row
+    for a string that is not a variable, and a row naming it is then refused as
+    stale -- the grammar contradicting itself in both directions. The same rule
+    read the other way is that a literal in a key position is still a read: a
+    direct literal, a two-hop wrapper's forwarded parameter, and the first of
+    two parameters must all be recorded.
+    """
+
+    EXTRA_SOURCES = {"src/keyed_arg.rs": KEYED_ARG_RS}
+
+    CHURN = (
+        "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/run_env.py "
+        "| per-dial loss rate under a sized load | fixture-liveness@shape=churn"
+    )
+
+    READ = (
+        "fixture-keyed = FIXTURE_FAULT_KEY,FIXTURE_KEYED,FIXTURE_TWO_HOP | - "
+        "| the names the read-forwarders hand to env::var as their key "
+        "| fixture-liveness@shape=keyed"
+    )
+
+    def test_the_key_positions_of_the_fixture_are_the_reads(self):
+        self.declare(self.CHURN + "\n" + self.READ)
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("gate-env-tier: 2 env-scaled surface(s), 5 variable(s)", output)
+        self.assertNotIn("FIXTURE_NOT_A_KEY", output)
+        self.assertNotIn("FIXTURE_NOTE_ONLY", output)
+
+    def test_a_name_shaped_argument_to_a_suffix_reader_is_not_demanded(self):
+        """`fault("FIXTURE_NOT_A_KEY")` is an argument, not a variable."""
+        self.declare(self.CHURN + "\n" + self.READ)
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("no declared surface names it", output)
+
+    def test_a_name_shaped_argument_to_a_suffix_reader_is_not_a_read(self):
+        self.declare(self.CHURN)
+        self.rejects(
+            "FIXTURE_FAULT_KEY is read by src/keyed_arg.rs and set by no script"
+        )
+
+    def test_a_non_key_argument_declared_is_refused_as_stale(self):
+        self.declare(
+            self.CHURN
+            + "\n"
+            + self.READ
+            + "\nfixture-suffix = FIXTURE_NOTE_ONLY,FIXTURE_NOT_A_KEY | - "
+            "| a suffix and a printed label | fixture-liveness@shape=suffix"
+        )
+        self.rejects(
+            "surface fixture-suffix: FIXTURE_NOTE_ONLY, FIXTURE_NOT_A_KEY is "
+            "passed to no env-reading function of this crate"
+        )
+
+    def test_a_two_hop_key_position_is_still_a_read(self):
+        """`hops` -> `env_parse` -> `env::var` carries the literal, so it is one."""
+        self.declare(
+            self.CHURN
+            + "\nfixture-partial = FIXTURE_FAULT_KEY,FIXTURE_KEYED | - "
+            "| the keyed fixture without the two-hop wrapper "
+            "| fixture-liveness@shape=partial"
+        )
+        self.rejects(
+            "FIXTURE_TWO_HOP is read by src/keyed_arg.rs and set by no script"
+        )
+
+    def test_the_first_of_two_parameters_is_the_key(self):
+        """A literal at the key index is a read; the label index is not."""
+        self.declare(
+            self.CHURN
+            + "\nfixture-partial = FIXTURE_FAULT_KEY,FIXTURE_TWO_HOP | - "
+            "| the keyed fixture without the first-parameter key "
+            "| fixture-liveness@shape=partial"
+        )
+        self.rejects("FIXTURE_KEYED is read by src/keyed_arg.rs and set by no script")
+
+
 class CheckGateScenarioDirectoryTest(CheckGatePerfFixture):
     """`--crate`'s scenario directory is reconciled with the package's targets.
 
