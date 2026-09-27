@@ -1389,6 +1389,23 @@ class CheckGateEnvTierTest(EnvTierFixture):
         (self.root / "tools" / "other.py").write_text("print('nothing')\n")
         self.rejects("runner 'tools/other.py' names none of the declared variables")
 
+    def test_a_row_with_no_runner_field_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | "
+            "| per-dial loss rate under a sized load | fixture-liveness@shape=churn"
+        )
+        self.rejects(
+            "no runner field; state the script that runs the surface, or '-' "
+            "for a surface no script runs"
+        )
+
+    def test_a_row_with_three_fields_fails(self):
+        self.declare(
+            "fixture-churn = FIXTURE_ITERATIONS | local/run_env.py "
+            "| per-dial loss rate under a sized load"
+        )
+        self.rejects("got 3 field(s)")
+
     def test_a_runner_that_is_not_a_file_fails(self):
         self.declare(
             "fixture-churn = FIXTURE_ITERATIONS,FIXTURE_ROUNDS | local/absent.py "
