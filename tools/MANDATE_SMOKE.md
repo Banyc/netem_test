@@ -394,7 +394,7 @@ verdict block names both runs' producers, so a variant that dropped a whole
 producer's arms is not a green diff but a coverage regression.
 
 ```sh
-cargo run -p netem-test --bin netem-tools -- mandate-compare <run>/mandate-check.json
+cargo run -p netem-test --features cli --bin netem-tools -- mandate-compare <run>/mandate-check.json
 ```
 
 A **coverage regression** (exit `4`) is a movement that means the arm no longer

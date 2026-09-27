@@ -108,7 +108,7 @@ def binary():
             return candidate
     raise AssertionError(
         "netem-tools is not built; build it with "
-        "`cargo build -p netem-test --bin netem-tools` before running this suite"
+        "`cargo build -p netem-test --features cli --bin netem-tools` before running this suite"
     )
 
 

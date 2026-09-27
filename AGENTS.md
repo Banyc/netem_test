@@ -27,8 +27,9 @@ instrument whose probe and lanes are hosted by the crates they measure.
   `--component-revision rtp_mux=<commit>` selects the probe that runs.
 
 The harness is a leaf: `netem-test` depends only on `dfsql`, `serde`,
-`parking_lot`, and optionally `tokio`, and the `tests` package only on
-`netem-test` and `tokio`.
+`parking_lot`, and optionally `tokio` (the `test-kit` feature) and `clap` (the
+`cli` feature, which the two binaries alone require), and the `tests` package
+only on `netem-test` and `tokio`.
 
 ## Performance quick path
 
@@ -58,8 +59,8 @@ workspace's own perf-tier probes — renders the smoke set's panels and writes
 `mandate-check.json`; run it and read the plots for any change to `rtp`, `mux`
 or `rtp_mux` (see `tools/MANDATE_SMOKE.md`). The per-arm records it writes are
 what the `mandate-compare` subcommand of the `netem-tools` binary
-(`cargo run -p netem-test --bin netem-tools -- mandate-compare`) diffs against
-`tools/mandate-baseline.json`, so a
+(`cargo run -p netem-test --features cli --bin netem-tools -- mandate-compare`)
+diffs against `tools/mandate-baseline.json`, so a
 shortening of any recorded arm can be shown coverage-neutral. The intention
 behind the constitution, and the inventory of the tools and gates that measure
 it, are in `tools/PERF_INFRA.md`.

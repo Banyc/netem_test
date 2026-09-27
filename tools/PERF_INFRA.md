@@ -699,7 +699,7 @@ declared cell each fail the run.
 fresh report with the committed `tools/mandate-baseline.json`:
 
 ```sh
-cargo run -p netem-test --bin netem-tools -- mandate-compare <run>/mandate-check.json
+cargo run -p netem-test --features cli --bin netem-tools -- mandate-compare <run>/mandate-check.json
 ```
 
 A **coverage regression** (exit `4`) is a movement that means the arm no longer

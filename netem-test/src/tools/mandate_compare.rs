@@ -164,10 +164,13 @@ use super::json::{self, Json};
 
 pub const DEFAULT_BASELINE_NAME: &str = "mandate-baseline.json";
 pub const DEFAULT_REPORT_NAME: &str = "mandate-check.json";
-const DEFAULT_COUNT_TOLERANCE: f64 = 0.50;
-const DEFAULT_WINDOW_TOLERANCE: f64 = 0.01;
-const DEFAULT_DELIVERY_TOLERANCE: f64 = 0.005;
-const DEFAULT_VALUE_TOLERANCE: f64 = 0.5;
+// The flags' defaults are public because the `netem-tools` binary's clap
+// definition names them (`default_value_t`), so the CLI and the comparison
+// cannot drift apart on what an omitted flag means.
+pub const DEFAULT_COUNT_TOLERANCE: f64 = 0.50;
+pub const DEFAULT_WINDOW_TOLERANCE: f64 = 0.01;
+pub const DEFAULT_DELIVERY_TOLERANCE: f64 = 0.005;
+pub const DEFAULT_VALUE_TOLERANCE: f64 = 0.5;
 const MINIMUM_SCHEMA: u32 = 3;
 // How many arms and claim gaps the printed block lists before it summarises the
 // rest, so a large run cannot bury its verdict in a wall of lines.
@@ -1372,16 +1375,22 @@ fn producers_of(payload: &Json, arms: &BTreeMap<String, Json>) -> Vec<String> {
     producers
 }
 
+/// The comparison's resolved options.
+///
+/// The flag *surface* is the binary's — `netem-tools`'s `mandate-compare`
+/// subcommand is a clap `derive` struct that converts into this one, so the
+/// library carries no parser and a consumer that never asks for the `cli`
+/// feature never builds one. Every field is public for that conversion.
 #[derive(Debug, Clone)]
-struct Args {
-    report: Option<PathBuf>,
-    baseline: Option<PathBuf>,
-    count_tolerance: f64,
-    window_tolerance: f64,
-    delivery_tolerance: f64,
-    value_tolerance: f64,
-    fail_on_value_drift: bool,
-    json_out: Option<PathBuf>,
+pub struct Args {
+    pub report: Option<PathBuf>,
+    pub baseline: Option<PathBuf>,
+    pub count_tolerance: f64,
+    pub window_tolerance: f64,
+    pub delivery_tolerance: f64,
+    pub value_tolerance: f64,
+    pub fail_on_value_drift: bool,
+    pub json_out: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -2004,20 +2013,15 @@ fn problem_to_json(problem: &Problem) -> Json {
     Json::Object(entry)
 }
 
-/// The `mandate-compare` subcommand: parse its arguments, run the comparison,
-/// print the verdict block and (with `--json-out`) write the diff.
-pub fn main(argv: &[String]) -> i32 {
-    if argv.iter().any(|arg| arg == "-h" || arg == "--help") {
-        println!("{}", usage());
-        return EXIT_OK;
-    }
-    let args = match parse_args(argv) {
-        Ok(args) => args,
-        Err(message) => {
-            eprintln!("mandate-compare: error: {message}");
-            return EXIT_UNCOMPARABLE;
-        }
-    };
+/// The `mandate-compare` subcommand's body: run the comparison for
+/// already-parsed [`Args`], print the verdict block and (with `--json-out`)
+/// write the diff.
+///
+/// The flags are parsed by the `netem-tools` binary with clap; this is the
+/// library entry point that binary calls, so the comparison has one
+/// implementation whether it is reached from the command line or from
+/// [`coverage_verdict`].
+pub fn main(args: Args) -> i32 {
     let stdout = io::stdout();
     let stderr = io::stderr();
     run(args, &mut stdout.lock(), &mut stderr.lock())
@@ -2098,80 +2102,6 @@ pub fn coverage_verdict(candidate_report: &Path, baseline_report: &Path) -> Vec<
         }
         Err(error) => vec![format!("mandate-compare: error: {error}")],
     }
-}
-
-fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
-    let mut args = Args::default();
-    let mut positional: Vec<PathBuf> = Vec::new();
-    let mut index = 0;
-    while index < argv.len() {
-        let arg = argv[index].clone();
-        match arg.as_str() {
-            "--baseline" => {
-                args.baseline = Some(PathBuf::from(take_value(argv, &mut index, "--baseline")?))
-            }
-            "--count-tolerance" => {
-                let value = take_value(argv, &mut index, "--count-tolerance")?;
-                args.count_tolerance = parse_number("--count-tolerance", &value)?;
-            }
-            "--window-tolerance" => {
-                let value = take_value(argv, &mut index, "--window-tolerance")?;
-                args.window_tolerance = parse_number("--window-tolerance", &value)?;
-            }
-            "--delivery-tolerance" => {
-                let value = take_value(argv, &mut index, "--delivery-tolerance")?;
-                args.delivery_tolerance = parse_number("--delivery-tolerance", &value)?;
-            }
-            "--value-tolerance" => {
-                let value = take_value(argv, &mut index, "--value-tolerance")?;
-                args.value_tolerance = parse_number("--value-tolerance", &value)?;
-            }
-            "--fail-on-value-drift" => args.fail_on_value_drift = true,
-            "--json-out" => {
-                args.json_out = Some(PathBuf::from(take_value(argv, &mut index, "--json-out")?))
-            }
-            other if other.starts_with("--") => {
-                return Err(format!("unrecognized argument {other}"));
-            }
-            other => positional.push(PathBuf::from(other)),
-        }
-        index += 1;
-    }
-    if let Some(report) = positional.first() {
-        args.report = Some(report.clone());
-    }
-    Ok(args)
-}
-
-fn take_value(
-    argv: &[String],
-    index: &mut usize,
-    flag: &str,
-) -> std::result::Result<String, String> {
-    *index += 1;
-    argv.get(*index)
-        .cloned()
-        .ok_or_else(|| format!("{flag} needs a value"))
-}
-
-fn parse_number(flag: &str, text: &str) -> std::result::Result<f64, String> {
-    text.parse::<f64>()
-        .map_err(|error| format!("{flag} expects a number, not {text:?}: {error}"))
-}
-
-fn usage() -> String {
-    [
-        "mandate-compare [report] [options]",
-        "",
-        "  --baseline <path>            the committed baseline report",
-        "  --count-tolerance <f>        relative fall in a count that is coverage loss",
-        "  --window-tolerance <f>       relative fall in a measured window",
-        "  --delivery-tolerance <f>     absolute fall in the delivery ratio",
-        "  --value-tolerance <f>        relative statistic movement reported as drift",
-        "  --fail-on-value-drift        exit 5 when a statistic moved past the tolerance",
-        "  --json-out <path>            write the diff as JSON as well as printing it",
-    ]
-    .join("\n")
 }
 
 #[cfg(test)]
@@ -2554,13 +2484,11 @@ mod tests {
             baseline: &Path,
             extra: &[&str],
         ) -> (i32, String, String) {
-            let mut argv: Vec<String> = vec![
-                candidate.display().to_string(),
-                "--baseline".to_string(),
-                baseline.display().to_string(),
-            ];
-            argv.extend(extra.iter().map(|value| value.to_string()));
-            let args = parse_args(&argv).expect("the fixture's arguments parse");
+            let args = Args {
+                report: Some(candidate.to_path_buf()),
+                baseline: Some(baseline.to_path_buf()),
+                ..options_from_extra(extra)
+            };
             let mut out = Vec::new();
             let mut err = Vec::new();
             let code = run(args, &mut out, &mut err);
@@ -2620,6 +2548,36 @@ mod tests {
                 "expected {fragment:?} in {stdout}{stderr}"
             );
         }
+    }
+
+    /// The options a fixture run sets, from the argument tokens the tests name.
+    ///
+    /// This is fixture plumbing, not a command-line parser: the flag surface is
+    /// the `netem-tools` binary's, pinned black-box by
+    /// `tools/test_netem_tools.py` and by the bin's own clap tests. An unknown
+    /// token panics rather than being silently dropped, so a fixture can never
+    /// quietly stop exercising what it names.
+    fn options_from_extra(extra: &[&str]) -> Args {
+        let mut args = Args::default();
+        let mut index = 0;
+        while index < extra.len() {
+            match extra[index] {
+                "--fail-on-value-drift" => args.fail_on_value_drift = true,
+                "--json-out" => {
+                    index += 1;
+                    args.json_out = Some(PathBuf::from(extra[index]));
+                }
+                "--count-tolerance" => {
+                    index += 1;
+                    args.count_tolerance = extra[index]
+                        .parse()
+                        .unwrap_or_else(|_| panic!("not a number: {}", extra[index]));
+                }
+                other => panic!("the fixture names no option {other:?}"),
+            }
+            index += 1;
+        }
+        args
     }
 
     fn jget<'a>(value: &'a Json, path: &[&str]) -> &'a Json {

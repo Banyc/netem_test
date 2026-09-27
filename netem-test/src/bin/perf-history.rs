@@ -31,7 +31,7 @@
 //! -----
 //!
 //! ```text
-//! cargo run -p netem-test --bin perf-history -- <run-dir> [--label L]
+//! cargo run -p netem-test --features cli --bin perf-history -- <run-dir> [--label L]
 //!     [--baseline <run-dir>] [--no-archive] [--only-compare] [--no-ab]
 //! ```
 //!
@@ -40,6 +40,7 @@
 //! chosen run instead of the previous one (that is how a run is compared against
 //! what is deployed, when the previous run is itself suspect).
 
+use clap::Parser;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -901,6 +902,8 @@ fn summary_markdown(
 
 // ─────────────────────────────── the runner ──────────────────────────────────
 
+/// The runner's resolved options. The command line is parsed by [`Cli`] and
+/// converted into this, so the runner itself never sees a flag string.
 struct Args {
     run: PathBuf,
     baseline: Option<PathBuf>,
@@ -910,65 +913,46 @@ struct Args {
     no_ab: bool,
 }
 
-fn parse_args(argv: &[String]) -> Result<Args> {
-    let mut args = Args {
-        run: PathBuf::from("."),
-        baseline: None,
-        label: "mandate-check".to_string(),
-        archive: true,
-        only_compare: false,
-        no_ab: false,
-    };
-    let mut positional = Vec::new();
-    let mut index = 0;
-    while index < argv.len() {
-        let arg = argv[index].as_str();
-        match arg {
-            "--baseline" => {
-                index += 1;
-                let Some(value) = argv.get(index) else {
-                    return fail("--baseline needs a path");
-                };
-                args.baseline = Some(PathBuf::from(value));
-            }
-            "--label" => {
-                index += 1;
-                let Some(value) = argv.get(index) else {
-                    return fail("--label needs a value");
-                };
-                args.label = value.clone();
-            }
-            "--no-archive" => args.archive = false,
-            "--only-compare" => args.only_compare = true,
-            "--no-ab" => args.no_ab = true,
-            "-h" | "--help" => {
-                println!("{}", usage());
-                std::process::exit(0);
-            }
-            other if other.starts_with("--") => return fail(format!("unknown flag {other}")),
-            other => positional.push(PathBuf::from(other)),
-        }
-        index += 1;
-    }
-    if let Some(first) = positional.first() {
-        args.run = first.clone();
-    }
-    Ok(args)
+// The command line, parsed with clap's `derive` API. The rationale for the
+// feature gate is stated in the module doc; only the flags and their help
+// belong in the user-facing help, so no doc comment sits on this struct.
+#[derive(Debug, clap::Parser)]
+#[command(
+    name = "perf-history",
+    about = "archive every perf run forever, and compare each run to the previous one"
+)]
+struct Cli {
+    /// the run directory (or the `mandate-check.json` inside it) to archive and compare
+    #[arg(value_name = "run-dir", default_value = ".")]
+    run: PathBuf,
+    /// compare against this run instead of the previous archived one
+    #[arg(long, value_name = "dir")]
+    baseline: Option<PathBuf>,
+    /// the archive series (default: mandate-check)
+    #[arg(long, value_name = "name", default_value = "mandate-check")]
+    label: String,
+    /// compare without archiving this run
+    #[arg(long)]
+    no_archive: bool,
+    /// exit 0 even on an M1 degradation (report-only)
+    #[arg(long)]
+    only_compare: bool,
+    /// skip the coverage/claim verdict for this run
+    #[arg(long)]
+    no_ab: bool,
 }
 
-fn usage() -> String {
-    [
-        "perf-history <run-dir> [options]",
-        "",
-        "  --baseline <dir>   compare against this run instead of the previous archived one",
-        "  --label <name>     the archive series (default: mandate-check)",
-        "  --no-archive       compare without archiving this run",
-        "  --only-compare     exit 0 even on an M1 degradation (report-only)",
-        "  --no-ab            skip the coverage/claim verdict for this run",
-        "",
-        "$PERF_ARCHIVE_DIR relocates the archive (default ./.net-perf-history); $PERF_BASELINE_DIR chooses a baseline.",
-    ]
-    .join("\n")
+impl From<Cli> for Args {
+    fn from(cli: Cli) -> Args {
+        Args {
+            run: cli.run,
+            baseline: cli.baseline,
+            label: cli.label,
+            archive: !cli.no_archive,
+            only_compare: cli.only_compare,
+            no_ab: cli.no_ab,
+        }
+    }
 }
 
 fn run(args: Args, out: &mut impl Write) -> Result<i32> {
@@ -1104,15 +1088,18 @@ fn run(args: Args, out: &mut impl Write) -> Result<i32> {
 }
 
 fn main() {
-    let argv: Vec<String> = env::args().skip(1).collect();
-    let args = match parse_args(&argv) {
-        Ok(args) => args,
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
         Err(error) => {
-            eprintln!("perf-history: error: {error}");
-            eprintln!("{}", usage());
-            std::process::exit(1);
+            // The hand-rolled exit codes are preserved rather than clap's: a
+            // usage error exits 1 (clap would use 2), and help exits 0 on
+            // stdout (clap's `print` sends help and version to stdout, every
+            // other kind to stderr).
+            let _ = error.print();
+            std::process::exit(if error.use_stderr() { 1 } else { 0 });
         }
     };
+    let args: Args = cli.into();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match run(args, &mut out) {
@@ -1228,5 +1215,48 @@ mod tests {
             code, EXIT_EVIDENCE_FAILURE,
             "a run that rendered no panel must not pass"
         );
+    }
+
+    fn parse(argv: &[&str]) -> Cli {
+        let mut full = vec!["perf-history"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full).expect("the arguments parse")
+    }
+
+    #[test]
+    fn an_omitted_flag_takes_the_hand_rolled_default() {
+        let args: Args = parse(&[]).into();
+        assert_eq!(args.run, PathBuf::from("."));
+        assert_eq!(args.baseline, None);
+        assert_eq!(args.label, "mandate-check");
+        assert!(args.archive);
+        assert!(!args.only_compare);
+        assert!(!args.no_ab);
+    }
+
+    #[test]
+    fn every_flag_binds_to_its_option() {
+        let args: Args = parse(&[
+            "runs/one",
+            "--baseline",
+            "runs/base",
+            "--label",
+            "series",
+            "--no-archive",
+            "--only-compare",
+            "--no-ab",
+        ])
+        .into();
+        assert_eq!(args.run, PathBuf::from("runs/one"));
+        assert_eq!(args.baseline, Some(PathBuf::from("runs/base")));
+        assert_eq!(args.label, "series");
+        assert!(!args.archive);
+        assert!(args.only_compare);
+        assert!(args.no_ab);
+    }
+
+    #[test]
+    fn an_unknown_flag_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["perf-history", "--bogus"]).is_err());
     }
 }

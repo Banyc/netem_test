@@ -72,7 +72,7 @@ def history(run_dir: Path, argv) -> int:
         print(
             "mandate-check: warning: perf-history is not built, so this run was not "
             "archived and not compared to the previous one "
-            "(build it: cargo build --release -p netem-test --bin perf-history)",
+            "(build it: cargo build --release -p netem-test --features cli --bin perf-history)",
             file=sys.stderr,
         )
         return 0
