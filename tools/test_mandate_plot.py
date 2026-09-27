@@ -2475,6 +2475,94 @@ class MandatePlotTest(unittest.TestCase):
         self.assertIn("bound: none by design", block)
         self.assertNotIn("fault:", block)
 
+    # -- the summary states both axis extents it drew ------------------------
+
+    def test_the_summary_states_the_x_extent_the_panel_drew(self):
+        # The x extent is the other half of what a panel drew -- for a CDF it is
+        # the latency range its curves are read against -- and a summary that
+        # omitted it left the reader to guess the one extent only the tick
+        # labels carried.
+        code, stderr, out = self.render_mandate(
+            HEALTHY_DECLARATION, HEALTHY_ROWS, "M1xa"
+        )
+        self.assertEqual(code, 0, stderr)
+        blocks = (out / "M1-latency.summary.txt").read_text(encoding="utf-8")
+        self.assertIn("x_axis=0..2", blocks)
+        latency = MANDATE.read_panel_summary(
+            (out / "M1-latency.svg").read_text(encoding="utf-8")
+        )
+        self.assertEqual(latency["x_axis"], [0.0, 2.0])
+        cdf = MANDATE.read_panel_summary(
+            (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        )
+        self.assertEqual(cdf["x_axis"], [12.5, 88.25])
+        # and the drawn tick labels are the extent the summary states, to the
+        # precision the axis draws them at
+        ticks = MANDATE.X_AXIS_TICK_RE.findall(
+            (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        )
+        self.assertEqual(ticks[0], "12.5")
+        self.assertEqual(ticks[-1], "88.2")
+
+    def test_a_stated_x_extent_that_is_not_the_drawn_axis_is_refused(self):
+        # red, at the check itself: a stated extent its own axis cannot draw.
+        code, stderr, out = self.render_mandate(
+            HEALTHY_DECLARATION, HEALTHY_ROWS, "M1xb"
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        self.assertEqual(
+            MANDATE.check_x_axis_extent_stated(
+                "cdf", "cdf", [12.5, 88.25], svg
+            ),
+            [],
+        )
+        problems = MANDATE.check_x_axis_extent_stated("cdf", "cdf", [0.0, 100.0], svg)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("states the x axis 0..100", problems[0])
+        self.assertIn("12.5", problems[0])
+        self.assertIn("88.2", problems[0])
+
+    def test_a_summary_without_the_x_extent_is_refused(self):
+        # red: the same panel with the field dropped. An absent extent and a
+        # false one are refused alike, the way an absent reading is.
+        code, stderr, out = self.render_mandate(
+            HEALTHY_DECLARATION, HEALTHY_ROWS, "M1xc"
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        parsed = MANDATE.read_panel_summary(svg)
+        del parsed["x_axis"]
+        silent = MANDATE.introduce_panel_summary(
+            MANDATE.PANEL_SUMMARY_RE.sub("", svg), parsed
+        )
+        problems = MANDATE.check_panel_summary_stated(
+            "cdf",
+            "cdf",
+            "latency (ms)",
+            "percentile (%)",
+            [("impaired", [(12.5, 33.3), (31.5, 66.7), (88.25, 100.0)])],
+            [],
+            (0.0, 100.0),
+            silent,
+            MANDATE.bar_plot_height(1),
+            [],
+        )
+        self.assertTrue(any("'x_axis'" in problem for problem in problems), problems)
+
+    def test_a_bar_panel_states_its_padded_category_domain(self):
+        # A bar panel's x axis is the padded category domain, not the categories
+        # themselves: the half-band at each end is what puts the outer bars
+        # inside the plot, and it is what the axis' own ticks draw.
+        code, stderr, out = self.render_mandate(
+            DELIVERY_DECLARATION, DELIVERY_ROWS, "M4xbar"
+        )
+        self.assertEqual(code, 0, stderr)
+        parsed = MANDATE.read_panel_summary(
+            (out / "M4-delivery.svg").read_text(encoding="utf-8")
+        )
+        self.assertEqual(parsed["x_axis"], [0.5, 4.5])
+
     def test_a_panel_labelled_with_a_sibling_s_unit_is_refused(self):
         series = [("fraction", [(1.0, 0.958217), (2.0, 0.958271)])]
         # red: the label the preserved run drew on the fraction panel -- the

@@ -76,7 +76,9 @@ silenced by softening a declaration:
   gets inferred from a render: an `exit=2` read as a plot refusal, a panel count
   read as files, a filtered-out test's silence read as a pass. So a panel states,
   in the machine-readable `<desc class="panel-summary">` it carries, its chart,
-  axis and axis labels, its series with the range and count of the points drawn,
+  **both** axis extents it drew (the y extent as a number, the x extent measured
+  back out of the axis' own tick labels by `check_x_axis_extent_stated`) and its
+  axis labels, its series with the range and count of the points drawn,
   every bound line with its value, pixel position, band pixels and why it is
   drawn, its reading in the quantity's own units, and -- for a run that took a
   `MANDATE_SMOKE_FAULT` selector -- that it is a fault render rather than a
@@ -2160,6 +2162,27 @@ def axis_with_headroom(low, high, top, plot_height, bottom=None):
     return (low, high)
 
 
+def bar_x_extent(categories):
+    """The x extent a categorical bar panel is drawn over, as ``(low, high)``.
+
+    Each category owns a band, and the domain is padded by half a band at both
+    ends so every band lies inside the plot. One function for the drawing and
+    for the summary that states it, so the extent a panel reports is the extent
+    it drew: `svg_bar_chart` calls this for its own `x_min`/`x_max`, and
+    `panel_x_axis_extent` calls it for the summary, which recomputes the
+    x extent from the same categories the panel plots.
+    """
+    slot = min(
+        (
+            after - before
+            for before, after in zip(categories, categories[1:])
+            if after > before
+        ),
+        default=1.0,
+    )
+    return (categories[0] - slot / 2, categories[-1] + slot / 2)
+
+
 def bar_axis_extent(series, bounds, run_values=None, plot_height=None):
     """The y extent for one bar panel, as ``(low, high)``.
 
@@ -2246,6 +2269,31 @@ def panel_axis_extent(panel, series, bounds, run_values, plot_height):
             return pinned
         return bar_axis_extent(series, bounds, run_values, plot_height)
     return line_axis_extent(series, bounds, pinned)
+
+
+def panel_x_axis_extent(chart, series):
+    """The x extent a panel draws, in its own units, as ``(low, high)``.
+
+    The y extent is only half of "what did the panel draw": a CDF's x axis is
+    the latency range its curves are read against, and a bar panel's is the
+    padded category domain its bars sit in. Both are stated in the panel
+    summary, and both are recomputed here the way the chart computes them --
+    from the decimated points a line/CDF panel actually plots, and from the
+    categories a bar panel actually bands -- so the stated x extent is the
+    drawn one rather than a second guess at it.
+    """
+    if chart == "bar":
+        categories = sorted({x for _, points in series for x, _ in points})
+        if not categories:
+            return (0.0, 1.0)
+        return bar_x_extent(categories)
+    xs = [x for _, points in series for x, _ in REPORT.decimate(points)]
+    if not xs:
+        return (0.0, 1.0)
+    low, high = min(xs), max(xs)
+    if low == high:
+        high = low + 1.0
+    return (low, high)
 
 
 def check_panel_axis(
@@ -2779,10 +2827,12 @@ def panel_summary_document(
                 "drawn": state,
             }
         )
+    x_low, x_high = panel_x_axis_extent(chart, series)
     return {
         "panel": panel_id,
         "chart": chart,
         "axis": [float(extent[0]), float(extent[1])],
+        "x_axis": [float(x_low), float(x_high)],
         "x_label": x_label,
         "y_label": y_label,
         "series": [
@@ -2803,10 +2853,16 @@ def panel_summary_document(
 def panel_summary_block(document):
     """The summary as the compact human-readable block every reader sees."""
     axis = document["axis"]
+    x_axis = document.get("x_axis")
     lines = [
         f"panel {document['panel']}  chart={document['chart']}  "
         f"axis={sliver_number(axis[0])}..{sliver_number(axis[1])}  "
-        f"x={document['x_label']}  y={document['y_label']}"
+        + (
+            f"x_axis={sliver_number(x_axis[0])}..{sliver_number(x_axis[1])}  "
+            if x_axis
+            else ""
+        )
+        + f"x={document['x_label']}  y={document['y_label']}"
     ]
     if document["series"]:
         lines.append(
@@ -2877,6 +2933,62 @@ def read_panel_summary(markup):
     except (ValueError, TypeError):
         return None
     return document if isinstance(document, dict) else None
+
+
+def x_axis_tick_text(chart, scale, low, high, fraction):
+    """One x tick label, formatted the way the chart that draws it formats it.
+
+    The two chart families write their x ticks differently (`svg_bar_chart`
+    prints two decimals, `rtp_trace_report.svg_line_chart` one on a linear axis
+    and four significant figures on a log one), so the formatter is chosen by
+    the chart and the scale the panel drew rather than assumed. The arithmetic
+    mirrors the chart's own expression term for term, because the check has to
+    reproduce the *drawn* text, not a value close to it.
+    """
+    if chart != "bar" and scale == "log" and low > 0.0 and high > low:
+        low_log = math.log10(low)
+        span = math.log10(high) - low_log
+        return f"{10.0 ** (low_log + span * fraction):.4g}"
+    value = low + (high - low) * fraction
+    if chart == "bar":
+        return f"{value:.2f}"
+    return f"{value:.1f}"
+
+
+def check_x_axis_extent_stated(panel_id, chart, x_axis, markup):
+    """Problems that leave a panel's stated x extent different from the drawn one.
+
+    A panel summary states both axis extents, and the y extent is checked as a
+    number against the drawn frame. The x extent has no single drawn number: it
+    is drawn *through its tick labels*, so it is measured the way the reader
+    measures it -- by reformatting the labels the axis must carry at its two
+    ends from the stated extent and comparing them with the labels the SVG
+    actually drew. A stated x extent that cannot reproduce its own ticks has
+    stated an axis other than the one it drew, which is the same defect as a
+    stated bound pixel that is not the drawn line's; a summary that omitted the
+    x extent altogether is refused by `check_panel_summary_stated`'s own field
+    comparison, so an absent extent and a false one are refused alike.
+    """
+    drawn = X_AXIS_TICK_RE.findall(markup)
+    if len(drawn) < 2:
+        return [
+            f"panel {panel_id!r}: its x axis draws {len(drawn)} tick label(s), so "
+            "the x extent its summary states cannot be measured back against the "
+            "axis the panel drew"
+        ]
+    low, high = x_axis
+    scale = drawn_x_scale(markup)
+    expected = [
+        x_axis_tick_text(chart, scale, low, high, index / (len(drawn) - 1))
+        for index in range(len(drawn))
+    ]
+    if expected == drawn:
+        return []
+    return [
+        f"panel {panel_id!r}: its summary states the x axis {low:g}..{high:g}, "
+        f"which draws the tick labels {expected}, where the SVG's own x axis "
+        f"draws {drawn}; the summary has to be the drawn geometry"
+    ]
 
 
 def check_panel_summary_stated(
@@ -2982,6 +3094,10 @@ def check_panel_summary_stated(
             f"panel {panel_id!r}: its summary names the series {expected_names}, "
             f"where the drawn legend names {legend}; a summary of series the panel "
             "does not draw is a claim about another panel"
+        )
+    if "x_axis" in stated:
+        problems += check_x_axis_extent_stated(
+            panel_id, chart, expected["x_axis"], markup
         )
     return problems
 
@@ -4573,15 +4689,7 @@ def svg_bar_chart(
     # neighbours, and the overlap painted a rising ribbon instead of three
     # values (`check_bar_separation` now measures the overlap itself).
     categories = sorted(set(xs))
-    slot = min(
-        (
-            after - before
-            for before, after in zip(categories, categories[1:])
-            if after > before
-        ),
-        default=1.0,
-    )
-    x_min, x_max = categories[0] - slot / 2, categories[-1] + slot / 2
+    x_min, x_max = bar_x_extent(categories)
     if extent is None:
         extent = bar_axis_extent(series, bounds)
     y_min, y_max = extent
