@@ -806,8 +806,10 @@ the reader:
   majority, not on every bar. Every other bar panel keeps the zero baseline,
   with the axis extended to cover **every bound the panel draws and every
   per-arm guard its own label names** plus `MIN_HEADROOM_PIXELS` above the
-  highest of them. Every bound the panel draws at its own scale must then
-  resolve at least `MIN_BOUND_PIXELS` of the axis height, or the render is
+  highest of them and `MIN_HEADROOM_PIXELS` below the lowest bound a bar can
+  fail *through* (a floor, or a two-sided band's lower arm — the same rule on
+  the side nobody checked). Every bound the panel draws at its own scale must
+  then resolve at least `MIN_BOUND_PIXELS` of the axis height, or the render is
   refused by name — the delivery panels failed that at `0.5 %`, i.e. half a
   pixel. A pinned `y_extent` that reintroduces the failure is refused the same
   way, and so is a pinned `y_extent` that leaves a *named* guard outside the
@@ -816,6 +818,19 @@ the reader:
   explaining was off the frame) or leaves no room for a bar over the highest
   value it names (`M4-shares` was drawn over `0..0.25` — the fair share itself
   — so a flow over the share could not be drawn at all).
+- **a bound declared two-sided is drawn on both sides.** A bound whose own
+  label declares a symmetric band (`fair-share bound ±1.0%`) is one declaration
+  standing for two lines, and the panel draws both: the declared value keeps the
+  declared label, and the mirrored arm is labelled with its own value
+  (`mirrored_bounds`). `check_two_sided_bound_drawn` reads the arms back out of
+  the SVG, measures them against `+y` and `-y`, requires `MIN_HEADROOM_PIXELS`
+  beyond each, and refuses a `±` label whose number is not the value it is
+  declared at — then the band's centre is unknowable and a mirror would be a
+  bound the declaration never made. Measured on a run's `M4-imbalance` panel,
+  only the `+1 %` line was drawn, over an axis whose *low* was the data's own
+  minimum (`-0.0002`): a starved flow's `-1 %` departure was a `4.9 px` bar
+  flush with the frame bottom, crossing no line at all — a failure the panel
+  was drawn for, arriving as a pass.
 - **a crossed bound must be attributable.** A bound with at most a third of
   the bars beyond it is read as a departure, and whether that departure is a
   breach or an arm's tolerated tripwire is a property of *the run*: the panel

@@ -1612,6 +1612,149 @@ class MandatePlotTest(unittest.TestCase):
             [],
         )
 
+    def test_a_two_sided_bound_is_drawn_on_both_of_its_sides(self):
+        # The defect, measured on the run whose panel read `fair-share bound
+        # ±1.0%` beside a single `+0.01` line: the axis' *low* came from the
+        # data (-0.000353) and not from the bound, so the `-1 %` arm sat 202 px
+        # below the frame and a starved flow's departure was a bar flush with
+        # the frame bottom, crossing nothing. The panel has to draw the band
+        # where its own label says it applies.
+        declaration = SHARES_IMBALANCE_DECLARATION
+        panel = declaration["panels"][1]
+        points = _points(SHARES_IMBALANCE_ROWS)
+        series = MANDATE.panel_series(panel, points)
+        bounds = MANDATE._bound_specs(panel)
+        drawn_bounds = MANDATE.drawable_bounds(panel, series, bounds, None)
+        plot_height = MANDATE.bar_plot_height(len(series))
+        extent = MANDATE.panel_axis_extent(
+            panel, series, drawn_bounds, None, plot_height
+        )
+        code, stderr, out = self.render_mandate(
+            declaration, SHARES_IMBALANCE_ROWS, "M4band"
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-imbalance.svg").read_text(encoding="utf-8")
+        # green: both arms are in the artifact, each at its own value.
+        arms = sorted(MANDATE.drawn_bound_values(document, extent))
+        self.assertEqual(len(arms), 2, arms)
+        self.assertAlmostEqual(arms[0], -0.01, places=4)
+        self.assertAlmostEqual(arms[1], 0.01, places=4)
+        self.assertEqual(
+            MANDATE.check_two_sided_bound_drawn(
+                "imbalance", drawn_bounds, extent, document, plot_height
+            ),
+            [],
+        )
+        # and the labels say which arm each line is: the declared sentence on
+        # the declared value, the mirrored value on the mirrored arm.
+        self.assertEqual(
+            [declared for declared, _, _ in MANDATE.label_boxes(document)],
+            [
+                "fair-share bound ±1.0%",
+                "fair-share bound -1.0%",
+            ],
+        )
+        # A one-sided bound is left exactly as declared: the mirror is for the
+        # declaration that names a band, not for every bound.
+        floor = SHARES_DECLARATION["panels"][0]["bounds"]
+        self.assertEqual(MANDATE.mirrored_bounds(floor), floor)
+        self.assertEqual(
+            MANDATE.check_two_sided_bound_drawn("shares", floor, extent, document),
+            [],
+        )
+        # red: the same panel with its lower arm removed -- the one-sided
+        # artifact the run actually drew. The check has to name the missing arm,
+        # not merely fail to find fault.
+        element = max(
+            MANDATE.re.findall(r'<line class="bound"[^>]*/>', document),
+            key=lambda line: float(
+                MANDATE.re.search(r'y1="([-0-9.]+)"', line).group(1)
+            ),
+        )
+        one_sided = document.replace(element, "", 1)
+        self.assertNotEqual(one_sided, document)
+        problems = MANDATE.check_two_sided_bound_drawn(
+            "imbalance", drawn_bounds, extent, one_sided, plot_height
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("draws no line at -0.01", problems[0])
+        self.assertIn("crossing nothing", problems[0])
+        # The pre-fix axis, from the declared bound alone: this is the existing
+        # axis-range check, which covers the other half of the property as soon
+        # as the arm is a value the panel *names*.
+        old_extent = MANDATE.bar_axis_extent(series, bounds, None, plot_height)
+        self.assertLess(old_extent[0], 0.0)
+        self.assertGreater(old_extent[0], -0.01)
+        stale = MANDATE.check_named_values_in_axis(
+            "imbalance", drawn_bounds, [], old_extent, plot_height
+        )
+        self.assertEqual(len(stale), 1, stale)
+        self.assertIn("-0.01", stale[0])
+        self.assertIn("below it", stale[0])
+
+    def test_the_lower_arm_of_a_band_keeps_room_below_it(self):
+        # The second half of the same defect: an axis whose low *is* the lower
+        # arm gives a bar that crosses it nowhere to go, so the breach and the
+        # arm are drawn as the same picture. `check_bound_headroom` measured
+        # only the side above the highest bound; the downward-failing side is
+        # the same rule.
+        declaration = SHARES_IMBALANCE_DECLARATION
+        panel = declaration["panels"][1]
+        series = MANDATE.panel_series(panel, _points(SHARES_IMBALANCE_ROWS))
+        bounds = MANDATE._bound_specs(panel)
+        drawn_bounds = MANDATE.drawable_bounds(panel, series, bounds, None)
+        plot_height = MANDATE.bar_plot_height(len(series))
+        extent = MANDATE.panel_axis_extent(
+            panel, series, drawn_bounds, None, plot_height
+        )
+        # green: the automatic extent keeps MIN_HEADROOM_PIXELS below the arm...
+        self.assertEqual(
+            MANDATE.check_bound_headroom(
+                "imbalance", drawn_bounds, [], extent, plot_height, series
+            ),
+            [],
+        )
+        below = (-0.01 - extent[0]) / (extent[1] - extent[0]) * plot_height
+        self.assertGreaterEqual(below, MANDATE.MIN_HEADROOM_PIXELS)
+        # ...and above it.
+        above = (extent[1] - 0.01) / (extent[1] - extent[0]) * plot_height
+        self.assertGreaterEqual(above, MANDATE.MIN_HEADROOM_PIXELS)
+        # red: the axis flush with the lower arm is refused, naming the side.
+        flush = (extent[0], extent[1])
+        problems = MANDATE.check_bound_headroom(
+            "imbalance", drawn_bounds, [], (-0.01, flush[1]), plot_height, series
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("below the bound", problems[0])
+        self.assertIn("flush with the frame", problems[0])
+
+    def test_a_two_sided_bound_cannot_be_written_one_sided(self):
+        # End to end: with the mirror disabled the pipeline must not write the
+        # panel at all, rather than writing the half-bound the run drew.
+        declaration = SHARES_IMBALANCE_DECLARATION
+        with mock.patch.object(MANDATE, "mirrored_bounds", lambda bounds: bounds):
+            code, stderr, _ = self.render_mandate(
+                declaration, SHARES_IMBALANCE_ROWS, "M4one"
+            )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("draws no line at -0.01", stderr)
+        # and the arm's missing headroom is stated as what it is, not as a
+        # negative distance: on a one-sided axis the -1 % arm is *outside* it.
+        self.assertIn("outside the axis below it", stderr)
+
+    def test_a_band_label_whose_magnitude_is_not_its_declared_value_is_refused(self):
+        # The mirror is derived from the label's own number, so a `±` label that
+        # does not state the value it is declared at says the band's centre is
+        # somewhere the declaration never named: refused rather than mirrored on
+        # a guess.
+        declaration = json.loads(json.dumps(SHARES_IMBALANCE_DECLARATION))
+        declaration["panels"][1]["bounds"][0]["y"] = 0.02
+        code, stderr, _ = self.render_mandate(
+            declaration, SHARES_IMBALANCE_ROWS, "M4odd"
+        )
+        self.assertNotEqual(code, 0, stderr)
+        self.assertIn("does not say where the band is centred", stderr)
+
     def test_a_bound_label_drawn_twice_at_one_anchor_is_refused(self):
         code, stderr, out = self.render_mandate(SHARES_DECLARATION, SHARES_ROWS, "M4dup")
         self.assertEqual(code, 0, stderr)

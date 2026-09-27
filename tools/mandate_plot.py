@@ -87,13 +87,26 @@ silenced by softening a declaration:
   off the frame with them. An axis that does not resolve a value the panel
   names is an error, and so is a named value drawn on the frame's own edge.
 - **the headroom test** — `check_bound_headroom` requires `MIN_HEADROOM_PIXELS`
-  of axis above the highest value a panel names, so the bar that crosses that
-  value has somewhere to go. An axis topping out *at* the bound draws a breach
-  and a value exactly at the bound as the same picture: `M4-shares` was drawn
-  over `0..0.25` — the fair share itself — so a flow over the share could not
-  be drawn at all. `axis_with_headroom` spends the span's own 5 % and then the
-  pixel floor, because a fair share pinned at 25 % has a data spread of a
+  of axis beyond every value a panel names, on the side a bar can fail towards:
+  above the highest, so the bar that crosses that value has somewhere to go, and
+  below the lowest *downward-failing* one, so a floor or a band's lower arm is
+  not drawn flush with the frame. An axis topping out *at* the bound draws a
+  breach and a value exactly at the bound as the same picture: `M4-shares` was
+  drawn over `0..0.25` — the fair share itself — so a flow over the share could
+  not be drawn at all. `axis_with_headroom` spends the span's own 5 % and then
+  the pixel floor, because a fair share pinned at 25 % has a data spread of a
   ten-thousandth and the span's 5 % of it is a third of a pixel.
+- **the two-sided-bound test** — `check_two_sided_bound_drawn` refuses a panel
+  that draws one arm of a bound its own label declares as a symmetric band
+  (`±`). `M4-imbalance` names `fair-share bound ±1.0%` and drew a single line at
+  `+0.01`, over an axis whose *low* was the data's own minimum (`-0.000234`)
+  rather than the bound: `-1 %` — the departure a starved flow makes, and the
+  failure the M4 mandate exists for — was drawn as a 4.9 px bar flush with the
+  frame bottom, crossing nothing. The arms are read back out of the SVG and
+  measured against `+y` and `-y`, the axis is required to keep
+  `MIN_HEADROOM_PIXELS` beyond each, and a `±` label whose magnitude is not the
+  value it declares (so the band's centre is unknowable) is refused rather than
+  mirrored on a guess.
 - **the label-overlap test** — `check_label_overlap` refuses a label drawn
   twice on one anchor or any two labels sharing ink. The preserved run drew
   `fair share 25.0%fair share 25.0%` at a single anchor, leaving the text of
@@ -277,6 +290,7 @@ PLOT_BG_RE = re.compile(
     r'class="plot-bg"'
 )
 BOUND_LABEL_RE = re.compile(r'<text class="bound-label"([^>]*)>(.*?)</text>', re.S)
+DRAWN_BOUND_RE = re.compile(r'<line class="bound"[^>]*\by1="([-0-9.]+)"')
 BOUND_LABEL_TITLE_RE = re.compile(r"<title>.*?</title>", re.S)
 TEXT_ATTRIBUTE_RE = re.compile(r'([A-Za-z][\w-]*)="([^"]*)"')
 TEXT_ELEMENT_RE = re.compile(r"<text\b([^>]*)>(.*?)</text>", re.S)
@@ -775,6 +789,88 @@ def _bound_specs(panel):
         spec["y"] = float(bound["y"])
         specs.append(spec)
     return specs
+
+
+BOUND_BAND_MARK = "\u00b1"
+"""The mark a bound's label uses to declare a symmetric two-sided band.
+
+`M4`'s imbalance bound names itself `fair-share bound ±1.0%`: the mandate fails
+on a departure from the fair share in *either* direction, so the bound the
+panel has to draw and the reader has to compare against is the band, not one of
+its arms. Drawing only the `+1 %` line leaves a flow starved on the other side
+with no line to cross -- and, because the axis' low was the data's own minimum,
+the breach expanded the frame instead of crossing anything.
+"""
+
+BOUND_BAND_RE = re.compile(
+    re.escape(BOUND_BAND_MARK) + r"\s*([0-9]+(?:\.[0-9]+)?)\s*(%)?"
+)
+
+
+def bound_band_half_width(bound):
+    """The magnitude a bound's label declares as a symmetric band, or ``None``.
+
+    ``None`` is a one-sided bound's ordinary label. A label carrying `±` states
+    that the bound applies on both sides of the quantity's ideal, and the number
+    it states is the half-width; a percentage is taken in the axis' own units.
+    """
+    match = BOUND_BAND_RE.search(str(bound.get("label", "")))
+    if match is None:
+        return None
+    half = float(match.group(1))
+    return half / 100.0 if match.group(2) else half
+
+
+def two_sided_bound(bound):
+    """Whether a bound's own label declares it as a band around zero.
+
+    The declared ``y`` is the band's half-width: the label already states that
+    magnitude, and the declaration's ``y`` is the only value in the artifact
+    that can be it, so the other arm is ``-y``. The equality is what makes that
+    derivable rather than assumed -- a `±` label whose number is *not* the
+    declared ``y`` is saying the half-width is something else, and a mirror
+    computed from ``y`` would then be a bound the declaration never made. Such a
+    declaration is refused by `check_two_sided_bound_drawn` rather than drawn.
+    """
+    half = bound_band_half_width(bound)
+    if half is None:
+        return False
+    return math.isclose(abs(float(bound["y"])), half, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def mirrored_bounds(bounds):
+    """The bound lines a panel draws: every declared bound, plus a band's arms.
+
+    A two-sided bound is one declaration standing for two lines, and the panel
+    draws both: the declared value keeps the declared label -- the sentence that
+    says the bound *is* a band -- and the mirrored arm is labelled with its own
+    value, which is the number a bar falling to that side is read against, and
+    marked `band_arm` so the axis policy knows that arm fails downwards whatever
+    this run's bars happen to have done. A one-sided bound is returned
+    unchanged, so this is a no-op for every panel that declares an ordinary
+    floor or ceiling.
+    """
+    drawn = []
+    for bound in bounds:
+        drawn.append(dict(bound))
+        if not two_sided_bound(bound):
+            continue
+        mirror = dict(bound)
+        mirror["y"] = -float(bound["y"])
+        mirror["label"] = str(bound["label"]).replace(BOUND_BAND_MARK, "-")
+        mirror["band_arm"] = "lower"
+        drawn.append(mirror)
+    return drawn
+
+
+def drawable_bounds(panel, series, bounds, run_values):
+    """The bound lines one bar panel draws: its effective bounds, mirrored.
+
+    The single place both the drawing and the artifact's own verification read
+    the plan from, so a panel and the check on it cannot disagree about how many
+    lines a declaration calls for.
+    """
+    return mirrored_bounds(effective_bounds(panel, series, bounds, run_values))
 
 
 def _bound_values(series):
@@ -1725,6 +1821,9 @@ def check_bound_arm_governance(panel_id, panel, series, bounds, run_values, mark
     the arm's own 3200 ms p99 guard.
     """
     planned = effective_bounds(panel, series, bounds, run_values)
+    # The *run's* per-arm plan, not the declaration's bands: this check is about
+    # one line drawn across arms whose own floors differ, while a band's two arms
+    # are the declaration's own and are measured by `check_two_sided_bound_drawn`.
     drawn = [declared for declared, _, _ in label_boxes(markup)]
     problems = []
     if panel["chart"] != "bar":
@@ -1788,8 +1887,8 @@ def named_guard_values(series, bounds, run_values, *, crossing):
     return sorted(guards)
 
 
-def axis_with_headroom(low, high, top, plot_height):
-    """Widen an axis so a value over its highest named bound is still drawable.
+def axis_with_headroom(low, high, top, plot_height, bottom=None):
+    """Widen an axis so a value past its highest (or lowest) bound is drawable.
 
     Two margins, because they answer different questions. `FRAME_HEADROOM` of
     the span is the frame's own breathing room, so a line or tick at the top of
@@ -1798,15 +1897,34 @@ def axis_with_headroom(low, high, top, plot_height):
     a bar which crosses it is a bar, not a smudge — and on a panel whose data
     spread is tiny against the bound (a fair share pinned at 25 %) the span's
     own 5 % is under a pixel, so the pixel floor is what does the work.
+
+    `bottom` is the same requirement on the other side, for a bound a bar can
+    fail *downwards*: a `±` band's lower arm, or a floor the data can fall
+    through. Without it the axis' low is the data's own minimum — measured on
+    `M4-imbalance`, `-0.0002` against a `-1 %` arm — so the arm is drawn off the
+    frame and a starved flow's departure is a small bar that crosses nothing.
+    The two adjustments are applied in this order and each keeps the other's
+    margin: lowering `low` only widens the span the upper margin is measured in,
+    so a margin already met stays met.
     """
     span = high - low
     if span > 0:
         high = high + FRAME_HEADROOM * span
-    minimum = MIN_HEADROOM_PIXELS / plot_height
+    # The margin the *policy* targets is a hair over the one the checks demand:
+    # the adjustment lands on the constraint's boundary, and a boundary met only
+    # to the last bit of a double reads as `5.999... px` to `check_bound_headroom`
+    # and would refuse the panel the policy just widened. A millionth of a pixel
+    # is far below anything drawable and far above the rounding it answers.
+    minimum = MIN_HEADROOM_PIXELS * (1.0 + 1e-6) / plot_height
     if top > high:
         return (low, high)
     if minimum < 1.0 and high - top < minimum * (high - low):
         high = max(high, (top - minimum * low) / (1.0 - minimum))
+    if bottom is not None and minimum < 1.0:
+        if bottom < low:
+            return (low, high)
+        if bottom - low < minimum * (high - low):
+            low = min(low, (bottom - minimum * high) / (1.0 - minimum))
     return (low, high)
 
 
@@ -1828,7 +1946,10 @@ def bar_axis_extent(series, bounds, run_values=None, plot_height=None):
       announces `lone_wire_guard=14` on an axis topping out at 6.7 is naming a
       value it does not draw — the guard is then off the chart, and so is the
       region between the budget and it, which is where the crossing the panel
-      exists to explain actually lies.
+      exists to explain actually lies. The *failing* side of the lowest such
+      bound is carried too: a two-sided band's lower arm, or a floor the data
+      can fall through, needs `MIN_HEADROOM_PIXELS` below it for the same
+      reason a ceiling needs them above it.
     """
     values = _bound_values(series)
     ys = [bound["y"] for bound in bounds]
@@ -1846,7 +1967,25 @@ def bar_axis_extent(series, bounds, run_values=None, plot_height=None):
     named = [*ys, *guards]
     low = min([0.0, *values, *named])
     high = max([0.0, *values, *named])
-    return axis_with_headroom(low, high, max(named) if named else high, plot_height)
+    # Room is owed below a bound a bar can fail *through*, and only there: a
+    # ceiling (`failure_side` +1) needs it above, a floor (-1) below, and a
+    # bound the bars are read *at* (0, a fair share) is no line any of them
+    # crosses and owes neither. A band's lower arm is downward-failing by
+    # construction, whatever this run's bars happen to do: a flow below `-y`
+    # has starved, and the axis must keep the room that bar needs to be drawn.
+    floors = [
+        float(bound["y"])
+        for bound in bounds
+        if bound.get("band_arm") == "lower"
+        or failure_side(values, float(bound["y"])) < 0.0
+    ]
+    return axis_with_headroom(
+        low,
+        high,
+        max(named) if named else high,
+        plot_height,
+        bottom=min(floors) if floors else None,
+    )
 
 
 def line_axis_extent(series, bounds, pinned=None):
@@ -1961,7 +2100,9 @@ def check_named_values_in_axis(panel_id, bounds, guards, extent, plot_height=Non
     return problems
 
 
-def check_bound_headroom(panel_id, bounds, guards, extent, plot_height=None):
+def check_bound_headroom(
+    panel_id, bounds, guards, extent, plot_height=None, series=None
+):
     """Problems that make an over-bound bar undrawable: the axis is too short.
 
     An axis that tops out at the highest bound it names leaves the bar that
@@ -1971,6 +2112,14 @@ def check_bound_headroom(panel_id, bounds, guards, extent, plot_height=None):
     a panel whose data spread is a ten-thousandth of its bound (a fair share
     pinned at 25 %) it bites on the automatic extent too, which is why the
     policy spends a pixel floor on it as well as the span's own share.
+
+    The same rule holds on the other side, and it was the half nobody checked: a
+    bound a bar can fail *downwards* — a floor, or a `±` band's lower arm —
+    needs `MIN_HEADROOM_PIXELS` **below** it, or a bar under it is drawn flush
+    with the frame and reads as the frame's border rather than as a crossing.
+    `series` tells the two sides apart (`failure_side`): without it the bottom
+    rule cannot be evaluated and only the upper margin is measured, which is why
+    it is optional rather than required.
     """
     if not bounds and not guards:
         return []
@@ -1980,17 +2129,141 @@ def check_bound_headroom(panel_id, bounds, guards, extent, plot_height=None):
         return [f"panel {panel_id!r}: the axis {low!r}..{high!r} has no span"]
     if plot_height is None:
         plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    problems = []
     top = max([bound["y"] for bound in bounds] + list(guards))
     headroom = (high - top) / span * plot_height
-    if headroom >= MIN_HEADROOM_PIXELS:
+    if headroom < MIN_HEADROOM_PIXELS:
+        problems.append(
+            f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} keeps {headroom:.1f} "
+            f"px above the highest value it names (y={top:g}), under the "
+            f"{MIN_HEADROOM_PIXELS:.0f} px an over-bound bar needs: a breach and a "
+            "value exactly at that bound would be drawn as the same picture, so the "
+            "panel could not show the failure it exists for"
+        )
+    if series is None:
+        return problems
+    values = _bound_values(series)
+    for bound in bounds:
+        if (
+            bound.get("band_arm") != "lower"
+            and failure_side(values, bound["y"]) >= 0.0
+        ):
+            continue
+        y = float(bound["y"])
+        below = (y - low) / span * plot_height
+        if below >= MIN_HEADROOM_PIXELS:
+            continue
+        problems.append(
+            f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} keeps {below:.1f} "
+            f"px below the bound {bound['label']!r} (y={y:g}), under the "
+            f"{MIN_HEADROOM_PIXELS:.0f} px an under-bound bar needs: a bar that "
+            "crosses that bound downwards would be drawn flush with the frame, "
+            "where it reads as the frame's border and not as a crossing"
+        )
+    return problems
+
+
+def drawn_bound_lines(markup):
+    """The y each drawn bound line sits at, in document order."""
+    return [float(y) for y in DRAWN_BOUND_RE.findall(markup)]
+
+
+def drawn_bound_values(markup, extent):
+    """The data value each drawn bound line sits at, on the panel's own frame.
+
+    Read out of the artifact rather than from the plan the renderer was handed:
+    a check that measured the plan could not tell a line that was drawn from one
+    the renderer forgot, and the forgotten half is the whole defect.
+    """
+    rect = PLOT_BG_RE.search(markup)
+    if rect is None:
         return []
-    return [
-        f"panel {panel_id!r}: the axis {low:.4g}..{high:.4g} keeps {headroom:.1f} "
-        f"px above the highest value it names (y={top:g}), under the "
-        f"{MIN_HEADROOM_PIXELS:.0f} px an over-bound bar needs: a breach and a "
-        "value exactly at that bound would be drawn as the same picture, so the "
-        "panel could not show the failure it exists for"
-    ]
+    _, top, _, height = (float(group) for group in rect.groups())
+    if height <= 0.0:
+        return []
+    low, high = extent
+    return [high - (y - top) / height * (high - low) for y in drawn_bound_lines(markup)]
+
+
+def check_two_sided_bound_drawn(panel_id, bounds, extent, markup, plot_height=None):
+    """Problems that make half of a declared two-sided bound missing.
+
+    A bound whose label declares a symmetric band (`±`) is one declaration
+    standing for two lines, one either side of the quantity's ideal, and a
+    panel that draws only one of them cannot show a breach on the other side.
+    Measured on the `M4-imbalance` panel of a `tools/mandate-check` run, it
+    drew a single line at `+0.01` for a label reading `fair-share bound ±1.0%`,
+    over an axis whose low was the data's own minimum (`-0.000234`) rather than
+    the bound: a starved flow's `-1 %` departure was therefore drawn as a
+    `4.9 px` bar flush with the frame bottom and no line to cross. The eye
+    caught it; nothing refused it.
+
+    Two things are measured, both on the artifact: the panel draws both arms
+    (the drawn lines are read back out of the SVG and compared with `+y` and
+    `-y` in the axis' own units), and the axis keeps `MIN_HEADROOM_PIXELS`
+    beyond each arm, so a bar past either side has somewhere to be drawn. The
+    `y` a `±` label is mirrored from has to be the magnitude the label itself
+    states, or the band's centre is unknowable and the render is refused rather
+    than drawn with a mirror the declaration never made.
+    """
+    low, high = extent
+    span = high - low
+    if not span > 0:
+        return [f"panel {panel_id!r}: the axis {low!r}..{high!r} has no span"]
+    if not any(bound_band_half_width(bound) is not None for bound in bounds):
+        return []
+    if plot_height is None:
+        plot_height = REPORT.HEIGHT - REPORT.PAD_TOP - REPORT.PAD_BOTTOM
+    drawn = drawn_bound_values(markup, extent)
+    # A drawn y is printed to a tenth of a pixel, so half a pixel of the axis is
+    # the widest a rounding artefact can be; anything further is another arm.
+    slack = 0.5 / plot_height * span
+    problems = []
+    for bound in bounds:
+        half = bound_band_half_width(bound)
+        if half is None:
+            continue
+        y = float(bound["y"])
+        if not two_sided_bound(bound):
+            problems.append(
+                f"panel {panel_id!r}: the bound {bound['label']!r} declares a "
+                f"symmetric band of {half:g}, while the value it declares is "
+                f"{y:g}; the declaration does not say where the band is centred, "
+                "so the arm on the other side is unknowable and a departure "
+                "there would be drawn with no line to cross"
+            )
+            continue
+        missing = [
+            arm
+            for arm in (y, -y)
+            if not any(abs(sample - arm) <= slack for sample in drawn)
+        ]
+        if missing:
+            arms = ", ".join(f"{arm:+.4g}" for arm in missing)
+            drawn_arms = ", ".join(f"{value:.4g}" for value in drawn)
+            problems.append(
+                f"panel {panel_id!r}: the bound {bound['label']!r} names a "
+                f"two-sided band (+/-{half:g}), but the panel draws no line at "
+                f"{arms}; its drawn arms are [{drawn_arms}]: a breach on the "
+                "side with no line is a bar crossing nothing, which is the "
+                "failure the panel is drawn for"
+            )
+        for arm, side, room in ((y, "above", high - y), (-y, "below", -y - low)):
+            pixels = room / span * plot_height
+            if pixels >= MIN_HEADROOM_PIXELS:
+                continue
+            where = (
+                f"{-pixels:.1f} px outside the axis {side} it"
+                if pixels < 0.0
+                else f"only {pixels:.1f} px inside the axis {side} it"
+            )
+            problems.append(
+                f"panel {panel_id!r}: the band arm at {arm:+.4g} is {where} "
+                f"({low:.4g}..{high:.4g}), so a bar crossing it has less than the "
+                f"{MIN_HEADROOM_PIXELS:.0f} px it needs: the breach and the arm "
+                "would be drawn as the same picture"
+            )
+    return problems
 
 
 def check_bound_governance(panel_id, series, bounds, run_values):
@@ -3316,7 +3589,7 @@ def panel_markup(
     # A bound the run restates for some of the panel's arms is drawn as each
     # arm's own bound, so every check below -- the axis, the headroom, the
     # drawn lines -- measures the bounds the panel actually draws.
-    drawn_bounds = effective_bounds(panel, series, bounds, run_values)
+    drawn_bounds = drawable_bounds(panel, series, bounds, run_values)
     pinned = _require_extent(panel.get("y_extent"), f"panels.{panel['id']}.y_extent")
     # A line panel reserves a band above the plot for its per-arm readings, so
     # the plot it draws -- and therefore the axis every check below measures --
@@ -3370,7 +3643,7 @@ def panel_markup(
     problems += check_named_values_in_axis(
         panel["id"], drawn_bounds, guards, axis, plot_height
     ) + check_bound_headroom(
-        panel["id"], drawn_bounds, guards, axis, plot_height
+        panel["id"], drawn_bounds, guards, axis, plot_height, series
     )
     if problems:
         _fail("\n  ".join(problems))
@@ -3449,6 +3722,7 @@ def panel_markup(
         + check_canvas_text_fit(panel["id"], markup)
         + check_tick_labels_distinct(panel["id"], markup)
         + check_note_fit(panel["id"], markup)
+        + check_two_sided_bound_drawn(panel["id"], drawn_bounds, axis, markup)
         + (
             check_departure_view_stated(
                 panel["id"],
@@ -3612,12 +3886,13 @@ def render_mandate(
         bounds = panel.get("bounds") or []
         # A bound the run restates per arm is drawn as each arm's own line, so
         # the count is the plan's -- one line per contiguous run of equal
-        # values -- and each *declared* bound has to appear among the labels
-        # the panel actually drew. The labels are read from their `<title>`
+        # values -- and a bound declared as a two-sided band is drawn as both
+        # its arms. Each *declared* bound has to appear among the labels the
+        # panel actually drew. The labels are read from their `<title>`
         # elements, which carry the undivided sentence, because a wrapped label
         # splits its own text across elements and a raw substring test would
         # fail on a line break rather than on a missing bound.
-        planned = effective_bounds(
+        planned = drawable_bounds(
             panel, panel_series(panel, points), _bound_specs(panel), run_values
         )
         drawn = written.count('class="bound"')
