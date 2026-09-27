@@ -101,7 +101,15 @@ silenced by softening a declaration:
   and/or `bounds[i].x` (which also clips the drawn line to the x-window it
   governs). A crossing the run asserts nothing loosely against — a per-flow
   delivery floor with no guard — stands as the breach it draws and is not
-  refused: the evidence survives a failing run.
+  refused: the evidence survives a failing run. And the *attribution* is itself
+  measured: `check_crossing_series_governed` refuses a bound crossed by a series
+  the run states a bound of its own for (`arm_guard_tokens` for a line panel,
+  a `<series>_guard` key or `arm_bound_source` for a bar panel) unless the drawn
+  labels name that series — the arm-guard clause on the line it crossed, or the
+  `governs series <name>` clause on the guard line beside it. Without it a
+  departure is drawn with nothing saying whether it is a breach or a pass under
+  the arm's own guard, which is how a `lone_tail` peak of 1567.1 ms crossed the
+  250 ms ceiling on a panel saying nothing about the arm's own 3200 ms guard.
 - **the label-fit test** — the bound label is the part of the panel that says
   what its line governs, and `check_label_fit` reads every drawn label back out
   of the SVG and refuses the render when its box leaves the plot area. The
@@ -2088,6 +2096,166 @@ def check_bound_arm_governance(panel_id, panel, series, bounds, run_values, mark
             "across every bar would be the floor of neither; the panel has to "
             "draw each arm's own bound and name the arms it governs. Missing: "
             f"{label!r} (drawn: {drawn!r})"
+        )
+    return problems
+
+
+# -- a bound's crossing must name the bound that governs the series it crossed
+#
+# `AGENTS.md`'s second panel test -- "does each drawn bound apply to every
+# series it crosses?" -- applied to the one thing the drawn labels still left a
+# reader to infer. On `M1-latency` a `lone_tail` peak crosses the 250 ms ceiling
+# that governs the *clean* arm; on `M4-latency` the four `hostile_p99` bars past
+# the ceiling answer to a `hostile_p99_guard` of their own. The run's `MANDATE`
+# line is the only place that says an impaired series is measured against
+# something else, and a panel that draws its departure while naming nowhere
+# which bound governs it leaves a pass under the arm's own guard and a breach of
+# the panel's bound as the same picture.
+GOVERNANCE_CLAUSE_RE = re.compile(r"\[(?P<body>[^\]]*)\]")
+GOVERNANCE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def crossing_points(series, y):
+    """The drawn points beyond a bound that the panel reads as a departure.
+
+    `crossing_values`' own rule -- the minority side, and no crossing at all for
+    a bound the values are clustered around -- applied to the *points* rather
+    than to the bare values, so each crossing is attributed to the series and
+    category that drew it rather than to a number two bars may share.
+    """
+    values = [value for _, points in series for _, value in points]
+    if clustered_around(values, y):
+        return []
+    below = [
+        (name, x, value)
+        for name, points in series
+        for x, value in points
+        if value < y
+    ]
+    above = [
+        (name, x, value)
+        for name, points in series
+        for x, value in points
+        if value > y
+    ]
+    total = len(below) + len(above)
+    if not total:
+        return []
+    if len(above) <= CROSSING_BULK_SHARE * total:
+        return above
+    if len(below) <= CROSSING_BULK_SHARE * total:
+        return below
+    return []
+
+
+def own_bound_names(chart, series, run_values):
+    """The drawn series -- or arms -- the run states a bound of their own for.
+
+    The vocabulary is the panel's shape. A **line** panel's series *are* its
+    arms, so `arm_guard_tokens` attributes each `*_guard` key to the drawn arm
+    whose name prefixes it (`hostile_p99_guard` -> `hostile`). A **bar** panel's
+    series are either statistics with a guard key of their own (`<series>_guard`
+    -- the four `M4-latency` series) or the run's arms, for which
+    `arm_bound_source` resolves the per-arm bound (`hostile_wire_guard` on the
+    `wire_x` panel). A run that states no such bound leaves the panel's own
+    bound as the only one there is, and this check owes it nothing.
+    """
+    if not isinstance(run_values, dict):
+        return set()
+    if chart != "bar":
+        return {name for name, _ in arm_guard_tokens(series, run_values)}
+    own = set()
+    for name, _ in series:
+        for suffix in PER_ARM_BOUND_SUFFIXES:
+            if numeric(run_values.get(f"{name}{suffix}")):
+                own.add(name)
+    if len(series) == 1:
+        quantity = series[0][0]
+        arms = run_arm_names(series, run_values)
+        categories = sorted({x for _, points in series for x, _ in points})
+        if arms and len(arms) == len(categories):
+            for arm in arms:
+                if arm_bound_source(arm, quantity, run_values) is not None:
+                    own.add(arm)
+    return own
+
+
+def series_tokens(name):
+    """The spellings a drawn label may use for one series or arm."""
+    return {str(name), series_label(str(name))}
+
+
+def governed_names(markup):
+    """The names the drawn bound labels state as governed or their own-bounded.
+
+    Every bound label carries its governance in the bracket `governed_label`
+    appends -- `governs clean`, `governs series hostile_p99`, `lone_tail guards
+    lone_p99_guard=3200` -- and the sentence is read back out of the drawn
+    `<title>`, because that is what the reader gets. The names are matched as
+    whole identifiers, so `hostile` never answers for `hostile_p99` and a guard
+    *key* (`hostile_p99_guard`) never answers for the series it bounds.
+    """
+    names = set()
+    for declared, _line, _box in label_boxes(markup):
+        for clause in GOVERNANCE_CLAUSE_RE.finditer(declared):
+            names.update(GOVERNANCE_NAME_RE.findall(clause.group("body")))
+    return names
+
+
+def check_crossing_series_governed(
+    panel_id, chart, series, bounds, run_values, markup
+):
+    """Problems that leave a bound's crossing attributed to no bound at all.
+
+    A crossing is governed when either the bound's own declaration covers it (an
+    `x` window that contains the category, a `series` that names it) or the
+    panel names what governs the series that departed. A series the run states a
+    bound of its own for is *not* governed by the declaration's bound, so the
+    panel owes its name somewhere on a drawn bound line: the arm-guard clause on
+    the line it crossed (`lone_tail guards lone_p99_guard=3200`), or the
+    `governs series` clause on the guard line drawn beside it. A departure with
+    neither is refused -- the shape that let a `lone_tail` peak of 1567.1 ms
+    cross the 250 ms ceiling on a panel saying nothing about the arm's own 3200
+    ms p99 guard.
+    """
+    own = own_bound_names(chart, series, run_values)
+    if not own:
+        return []
+    stated = governed_names(markup)
+    arms = run_arm_names(series, run_values) if len(series) == 1 else []
+    categories = sorted({x for _, points in series for x, _ in points})
+    by_category = len(arms) == len(categories) and bool(arms)
+    problems = []
+    for bound in bounds:
+        window = bound_governed_x(bound)
+        points = crossing_points(series, float(bound["y"]))
+        if not points:
+            continue
+        missing = set()
+        for name, x, _value in points:
+            if window is not None and window[0] <= x <= window[1]:
+                continue
+            if bound.get("series") == name:
+                continue
+            tokens = set(series_tokens(name))
+            if by_category and x in categories:
+                tokens |= series_tokens(arms[categories.index(x)])
+            if not (tokens & own):
+                continue
+            if tokens & stated:
+                continue
+            missing.add(name if name in own else arms[categories.index(x)])
+        if not missing:
+            continue
+        problems.append(
+            f"panel {panel_id!r}: the bound {bound['label']!r} "
+            f"(y={float(bound['y']):g}) is crossed by the drawn value(s) of "
+            f"{sorted(missing)}, which the run measures against a bound of "
+            "their own, and no drawn bound line says so: as drawn, a pass under "
+            "that series' own guard and a breach of this bound are the same "
+            "picture. Name the series on the bound's own label (the arm-guard "
+            "clause), or draw the bound that governs it beside it and label "
+            "that line with `governs series <name>`"
         )
     return problems
 
@@ -5134,6 +5302,9 @@ def panel_markup(
             + check_bound_arm_governance(
                 panel["id"], panel, series, bounds, run_values, markup
             )
+            + check_crossing_series_governed(
+                panel["id"], chart, series, drawn_bounds, run_values, markup
+            )
             + check_bar_separation(panel["id"], markup)
             + check_sliver_bound_stated(
                 panel["id"], series, drawn_bounds, axis, markup, plot_height, run_values
@@ -5151,6 +5322,9 @@ def panel_markup(
             )
             + check_bound_arm_governance(
                 panel["id"], panel, series, bounds, run_values, markup
+            )
+            + check_crossing_series_governed(
+                panel["id"], chart, series, drawn_bounds, run_values, markup
             )
             + check_x_bound_drawn(
                 panel["id"],

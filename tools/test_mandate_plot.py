@@ -168,6 +168,86 @@ DROP_IMBALANCE_ROWS = [
     ["imbalance", "hostile", 4.0, 0.000116],
 ]
 
+# A line panel whose lone tail crosses its ceiling: the 1600 ms sample is the
+# minority beyond 250 ms, and the run states the arm's own 3200 ms p99 guard, so
+# the panel owes the reader which bound governs the arm that departed.
+CROSSING_DECLARATION = {
+    "mandate": "M1",
+    "title": "M1 interactive tail latency (clean vs hostile vs lone tail)",
+    "x_label": "elapsed time (s)",
+    "y_label": "latency (ms)",
+    "panels": [
+        {
+            "id": "latency",
+            "chart": "line",
+            "series": [
+                {"name": "clean"},
+                {"name": "hostile"},
+                {"name": "lone_tail"},
+            ],
+            "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+        }
+    ],
+}
+
+CROSSING_ROWS = (
+    [["panel", "series", "x", "y"]]
+    + [["latency", "clean", float(i), 20.0 + i] for i in range(10)]
+    + [["latency", "hostile", float(i), 100.0 + i] for i in range(10)]
+    + [["latency", "lone_tail", float(i), 100.0 + i] for i in range(9)]
+    + [["latency", "lone_tail", 9.0, 1600.0]]
+)
+
+CROSSING_SERIES = [
+    ("clean", [(float(i), 20.0 + i) for i in range(10)]),
+    ("hostile", [(float(i), 100.0 + i) for i in range(10)]),
+    ("lone_tail", [(float(i), 100.0 + i) for i in range(9)] + [(9.0, 1600.0)]),
+]
+
+CROSSING_GUARDS = {
+    "ceiling": 250.0,
+    "clean_p99": 27.0,
+    "hostile_p99_guard": 900.0,
+    "hostile_over250_guard": 8.0,
+    "lone_p99_guard": 3200.0,
+    "lone_over250_guard": 8.0,
+}
+
+# The `M4-latency` shape: four statistic series, one bar per flow, and a run
+# guard that belongs to a single series (`hostile_p99_guard=900`). The ceiling
+# is crossed by the one `hostile_p99` flow above it.
+SERIES_GUARD_DECLARATION = {
+    "mandate": "M4",
+    "title": "M4 interactive lane fairness: 4 flows on one interactive lane",
+    "x_label": "flow (1..4)",
+    "y_label": "latency (ms)",
+    "panels": [
+        {
+            "id": "latency",
+            "chart": "bar",
+            "y_label": "latency (ms)",
+            "series": [
+                {"name": "clean_p50"},
+                {"name": "clean_p99"},
+                {"name": "hostile_p50"},
+                {"name": "hostile_p99"},
+            ],
+            "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+        }
+    ],
+}
+
+SERIES_GUARD_ROWS = (
+    [["panel", "series", "x", "y"]]
+    + [["latency", "clean_p50", float(i), 22.0] for i in (1, 2, 3, 4)]
+    + [["latency", "clean_p99", float(i), 180.0] for i in (1, 2, 3, 4)]
+    + [["latency", "hostile_p50", float(i), 70.0] for i in (1, 2, 3, 4)]
+    + [["latency", "hostile_p99", 1.0, 1000.0]]
+    + [["latency", "hostile_p99", float(i), 340.0] for i in (2, 3, 4)]
+)
+
+SERIES_GUARD_VALUES = {"ceiling": 250.0, "hostile_p99_guard": 900.0, "flows": 4}
+
 DROP_IMBALANCE_SERIES = [
     ("clean", [(float(x), -1.0) for x in (1, 2, 3, 4)]),
     (
@@ -2562,6 +2642,106 @@ class MandatePlotTest(unittest.TestCase):
             (out / "M4-delivery.svg").read_text(encoding="utf-8")
         )
         self.assertEqual(parsed["x_axis"], [0.5, 4.5])
+
+    # -- a crossing must name the bound that governs the series it crossed --
+
+    def test_a_crossing_arm_guarded_by_the_run_is_named_on_the_ceiling(self):
+        # green: the lone tail's 1600 ms sample crosses the 250 ms ceiling, and
+        # the run states that arm's own guard, so the drawn label names it.
+        code, stderr, out = self.render_mandate(
+            CROSSING_DECLARATION,
+            CROSSING_ROWS,
+            "M1cg",
+            "--run-values",
+            json.dumps(CROSSING_GUARDS),
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        labels = [declared for declared, _, _ in MANDATE.label_boxes(svg)]
+        self.assertTrue(any("lone_tail" in label for label in labels), labels)
+        self.assertEqual(
+            MANDATE.check_crossing_series_governed(
+                "latency",
+                "line",
+                CROSSING_SERIES,
+                [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+                CROSSING_GUARDS,
+                svg,
+            ),
+            [],
+        )
+
+    def test_a_crossing_whose_arm_is_named_nowhere_is_refused(self):
+        # red, at the check: the same drawn panel with the governance clause
+        # stripped from every bound label. The run still states `lone_tail`'s own
+        # guard, so the departure has to be attributed and is not.
+        code, stderr, out = self.render_mandate(
+            CROSSING_DECLARATION,
+            CROSSING_ROWS,
+            "M1cg2",
+            "--run-values",
+            json.dumps(CROSSING_GUARDS),
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M1-latency.svg").read_text(encoding="utf-8")
+        stripped = MANDATE.GOVERNANCE_CLAUSE_RE.sub("", svg)
+        self.assertNotEqual(stripped, svg)
+        problems = MANDATE.check_crossing_series_governed(
+            "latency",
+            "line",
+            CROSSING_SERIES,
+            [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+            CROSSING_GUARDS,
+            stripped,
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'lone_tail'", problems[0])
+        self.assertIn("M1 ceiling 250 ms", problems[0])
+
+    def test_a_guard_key_named_without_its_series_is_refused(self):
+        # red, at the render: a panel whose run guard is named on the ceiling as
+        # a *key* (`hostile_p99_guard=900`) while the ceiling sits at that key's
+        # own value, so no guard line is drawn beside it. The panel then names
+        # the key and never the series it bounds -- exactly the hole that let a
+        # hostile bar cross the ceiling with nothing saying which bound governs
+        # it.
+        declaration = {
+            **SERIES_GUARD_DECLARATION,
+            "panels": [
+                {
+                    **SERIES_GUARD_DECLARATION["panels"][0],
+                    "bounds": [{"y": 900.0, "label": "M1 ceiling 900 ms"}],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(
+            declaration,
+            SERIES_GUARD_ROWS,
+            "M4cg",
+            "--run-values",
+            json.dumps(SERIES_GUARD_VALUES),
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("'hostile_p99'", stderr)
+        self.assertIn("M1 ceiling 900 ms", stderr)
+
+    def test_a_series_guard_is_drawn_and_named_beside_the_ceiling(self):
+        # green: the same panel with the ceiling at the mandate's own value. The
+        # run's guard is drawn as its own line and labelled with the series it
+        # governs, so the departure is attributed and the render is kept.
+        code, stderr, out = self.render_mandate(
+            SERIES_GUARD_DECLARATION,
+            SERIES_GUARD_ROWS,
+            "M4cg2",
+            "--run-values",
+            json.dumps(SERIES_GUARD_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M4-latency.svg").read_text(encoding="utf-8")
+        labels = [declared for declared, _, _ in MANDATE.label_boxes(svg)]
+        self.assertTrue(
+            any("governs series hostile_p99" in label for label in labels), labels
+        )
 
     def test_a_panel_labelled_with_a_sibling_s_unit_is_refused(self):
         series = [("fraction", [(1.0, 0.958217), (2.0, 0.958271)])]
