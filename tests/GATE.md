@@ -506,7 +506,7 @@ the gap.
 
 ```gate-coverage-gaps
 M1@lane=dual-lane+metric=p99 = owned by rtp_mux's mandate_smoke; the harness supplies the impairment instrument and asserts none of the product's mandate bounds. Declaration pending (tools/PERF_INFRA.md, "Where the migration stands").
-M2@lane=dual-lane+metric=own-wire = owned by rtp_mux's mandate_smoke, as above: the harness has no lane of its own to assert a wire budget on.
+M2@lane=dual-lane+metric=offer-and-latency = owned by rtp_mux's mandate_smoke, as above: the harness has no lane of its own to assert an offered-load latency on.
 M3@lane=dual-lane+metric=goodput-fraction = owned by rtp_mux's dual_lane_mandates, as above.
 M4@lane=dual-lane+metric=per-flow-share = owned by rtp_mux's mandate_smoke M4 arm, as above.
 conformance-delay@impairment=correlated-delay = no conformance test asserts the delay-correlation draw distribution; the correlated knobs surface only through the four-state loss test's aggregate counters.

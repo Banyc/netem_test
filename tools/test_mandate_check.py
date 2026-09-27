@@ -143,33 +143,40 @@ M1_ROWS = [
 
 M2_DECLARATION = {
     "mandate": "M2",
-    "title": "M2 interactive delivery and wire",
-    "x_label": "seed",
+    "title": "M2 interactive delivery and latency under a known offer "
+    "(1=clean 2=hostile 3=lone_tail)",
+    "x_label": "arm (1=clean 2=hostile 3=lone_tail)",
     "y_label": "value",
     "panels": [
         {
             "id": "delivery",
-            "chart": "line",
-            "series": [{"name": "interactive"}],
+            "chart": "bar",
+            "series": [{"name": "delivery"}],
             "bounds": [{"y": 1.0, "label": "M2 delivery floor 1.000"}],
         },
         {
-            "id": "wire",
+            "id": "latency",
             "chart": "bar",
-            "series": [{"name": "interactive"}],
-            "bounds": [{"y": 6.0, "label": "M2 wire budget 6x"}],
+            "series": [{"name": "p99_ms"}],
+            "bounds": [
+                {
+                    "y": 100.0,
+                    "label": "M2 non-degrading p99 bound (ms)",
+                    "x": [1],
+                }
+            ],
         },
     ],
 }
 
 M2_ROWS = [
     ["panel", "series", "x", "y"],
-    ["delivery", "interactive", 11.0, 1.0],
-    ["delivery", "interactive", 21.0, 1.0],
-    ["delivery", "interactive", 31.0, 1.0],
-    ["wire", "interactive", 11.0, 3.4],
-    ["wire", "interactive", 21.0, 3.61],
-    ["wire", "interactive", 31.0, 3.8],
+    ["delivery", "delivery", 1.0, 1.0],
+    ["latency", "p99_ms", 1.0, 26.251],
+    ["delivery", "delivery", 2.0, 1.0],
+    ["latency", "p99_ms", 2.0, 134.232],
+    ["delivery", "delivery", 3.0, 1.0],
+    ["latency", "p99_ms", 3.0, 185.8015],
 ]
 
 M3_DECLARATION = {
@@ -277,13 +284,13 @@ PASS_LINES = [
     # that arm's mandate's MANDATE line — the ordering the runner attributes by.
     "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   25.3 "
     "p90=   43.0 p99=   89.0 p999=   97.9 max=   102.5 over250=   0 wire=     42300B "
-    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
     "[mandate-smoke hostile  ] sent=  800 recv=  800 delivery=1.000 p50=   39.5 "
     "p90=  150.6 p99=  245.1 p999=  283.6 max=   289.9 over250=  21 wire=     42300B "
-    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
     "[mandate-smoke lone_tail] sent=  240 recv=  240 delivery=1.000 p50=    0.3 "
     "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
-    "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
+    "bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
     # The producer's own censoring reading for the M1 series, which is what the
     # latency panel states per arm: the verdict no pixel carries.
     "[m1-censoring] arm=impaired samples=3 last=88.2 rungs_at_edge=-0.50 "
@@ -294,15 +301,19 @@ PASS_LINES = [
     "test m1_interactive_tail_latency ... ok <86.163s>",
     "[mandate-smoke clean    ] sent=  800 recv=  800 delivery=1.000 p50=   25.3 "
     "p90=   43.0 p99=   89.0 p999=   97.9 max=   102.5 over250=   0 wire=     42300B "
-    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
     "[mandate-smoke hostile  ] sent=  800 recv=  800 delivery=1.000 p50=   39.5 "
     "p90=  150.6 p99=  245.1 p999=  283.6 max=   289.9 over250=  21 wire=     42300B "
-    "x=2.16 bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
+    "bulk_sink=   8123456B bulk_wire=   9123456B wall=12.3s window=12s",
     "[mandate-smoke lone_tail] sent=  240 recv=  240 delivery=1.000 p50=    0.3 "
     "p90=   69.6 p99=  174.7 p999=  681.9 max=  2693.3 over250=   4 wire=    120000B "
-    "x=5.40 bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
-    "MANDATE M2 PASS delivery=1.000 amp=3.61 budget=6.0 delivery_floor=0.995",
-    "test m2_interactive_delivery_and_wire ... ok <86.162s>",
+    "bulk_sink=         0B bulk_wire=         0B wall=15.3s window=15s",
+    "MANDATE M2 PASS clean_offer_msgs=2398 clean_offer_floor=2352 "
+    "clean_offered_bps=51200 clean_delivery=1.000 clean_p99=26.3 "
+    "hostile_offer_msgs=2400 hostile_offer_floor=2352 hostile_delivery=1.000 "
+    "lone_delivery=1.000 offer_bps=51200 offer_tolerance=0.02 "
+    "nondergrading_p99_ms=100.0 delivery_floor=0.995",
+    "test m2_offered_load_latency ... ok <86.162s>",
     "[mandate-smoke m3/rep1] delivered 0.963 MiB/s over 2.0004s, shaper forwarded "
     "0.972 MiB/s, capacity 1.000 MiB/s, fraction 0.963 (820148 / 992240 bytes)",
     "[mandate-smoke m3/rep2] delivered 0.971 MiB/s over 2.0011s, shaper forwarded "
@@ -552,7 +563,7 @@ class MandateCheckTest(unittest.TestCase):
         for mandate in ("M1", "M2", "M3", "M4"):
             self.assertIn(f"{mandate} PASS", stdout)
         self.assertIn("p99=31.5 ceiling=250.0 over250=0", stdout)
-        self.assertIn("delivery=1.0 amp=3.61 budget=6.0", stdout)
+        self.assertIn("clean_delivery=1.0 clean_p99=26.3", stdout)
         self.assertIn("flows=4 clean_delivery_min=1.0", stdout)
         report = self.report()
         self.assertTrue(report["ok"], report["problems"])
@@ -622,7 +633,7 @@ class MandateCheckTest(unittest.TestCase):
         m3 = report["mandates"]["M3"]
         self.assertEqual(m3["values"], {"goodput": 0.52, "floor": 0.35, "link_mib_s": 8.0})
         self.assertEqual(len(m3["plots"]), 1)
-        self.assertEqual(report["mandates"]["M2"]["values"]["delivery"], 1.0)
+        self.assertEqual(report["mandates"]["M2"]["values"]["clean_delivery"], 1.0)
         m4 = report["mandates"]["M4"]
         self.assertEqual(m4["verdict"], "PASS")
         self.assertEqual(m4["values"]["flows"], 4)
@@ -693,7 +704,7 @@ class MandateCheckTest(unittest.TestCase):
             ("M1", "latency"),
             ("M1", "cdf"),
             ("M2", "delivery"),
-            ("M2", "wire"),
+            ("M2", "latency"),
             ("M3", "goodput"),
             ("M4", "shares"),
             ("M4", "imbalance"),
@@ -721,7 +732,7 @@ class MandateCheckTest(unittest.TestCase):
             [entry["name"] for entry in timings["tests"]],
             [
                 "m1_interactive_tail_latency",
-                "m2_interactive_delivery_and_wire",
+                "m2_offered_load_latency",
                 "m3_bulk_goodput_fraction",
                 "m4_interactive_lane_fairness",
             ],
@@ -845,7 +856,7 @@ class MandateCheckTest(unittest.TestCase):
             {"seconds": 51.216, "line": "MANDATE M2 PASS delivery=1.000"},
             {
                 "seconds": 51.216,
-                "line": "test m2_interactive_delivery_and_wire ... ok <49.945s>",
+                "line": "test m2_offered_load_latency ... ok <49.945s>",
             },
             {"seconds": 51.218, "line": "MANDATE M1 PASS p99=90.8"},
             {
@@ -1450,7 +1461,6 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(clean["counters"]["wire_bytes"], 42300)
         self.assertEqual(clean["counters"]["bulk_wire_bytes"], 9123456)
         self.assertEqual(clean["windows"]["window_seconds"], 12)
-        self.assertEqual(clean["values"]["x"], 2.16)
         self.assertEqual(
             clean["cells"],
             [
@@ -1790,23 +1800,29 @@ class MandateCheckTest(unittest.TestCase):
         # FAIL being a verdict rather than an evidence failure.
         plan = self.healthy_plan(
             stdout=[
-                line.replace(
-                    "MANDATE M2 PASS delivery=1.000",
-                    "MANDATE M2 FAIL delivery=0.998",
+                (
+                    "MANDATE M2 FAIL clean_offer_msgs=120 clean_offer_floor=2352 "
+                    "clean_offered_bps=51200 clean_delivery=0.784 clean_p99=18223.9 "
+                    "hostile_offer_msgs=2400 hostile_offer_floor=2352 "
+                    "hostile_delivery=1.000 lone_delivery=1.000 offer_bps=51200 "
+                    "offer_tolerance=0.02 nondergrading_p99_ms=100.0 "
+                    "delivery_floor=0.995"
                 )
+                if line.startswith("MANDATE M2 ")
+                else line
                 for line in PASS_LINES
             ]
         )
         code, stdout, stderr = self.run_tool(plan)
         self.assertEqual(code, 3, stderr)
-        self.assertIn("M2 FAIL  delivery=0.998 amp=3.61 budget=6.0", stdout)
+        self.assertIn("M2 FAIL  clean_offer_msgs=120", stdout)
         self.assertIn("exit=3", stdout)
         report = self.report()
         self.assertFalse(report["ok"])
         self.assertEqual(report["exit_code"], 3)
         self.assertEqual(report["problems"], [])
         self.assertEqual(report["mandates"]["M2"]["verdict"], "FAIL")
-        self.assertEqual(report["mandates"]["M2"]["values"]["amp"], 3.61)
+        self.assertEqual(report["mandates"]["M2"]["values"]["clean_p99"], 18223.9)
         self.assertEqual(len(report["mandates"]["M2"]["plots"]), 2)
 
     # -- every rejection: non-zero, and naming the problem -----------------

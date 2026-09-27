@@ -510,11 +510,11 @@ On that pin:
     ceiling;
   - hostile (cadence) p99 ≈ 0.21–0.33 s, with tens of samples over the
     ceiling per short window.
-- **The lone-tail arm's own wire is a diagnostic, not a defect.** It reads
-  6.07–6.41× the offered payload on the smoke arm and 6.22–7.17× in the field;
-  that is a measurement the arm line prints, not a bound — the own-wire budget
-  it used to be weighed against is removed (M2 is the offered-load relation
-  now, see "What \"done\" means").
+- **The lone-tail arm's own wire is a diagnostic, not a defect.** The arm line
+  prints its forwarded bytes (`wire=`, `bulk_wire=`) and the payload it was
+  offered (`offered=`); both are measurements it records, not bounds. No
+  mandate weighs them any more (M2 is the offered-load relation now, see
+  "What \"done\" means"), so they are read as diagnosis only.
 - **The mechanism** is a compounding repair ladder. Once the lone tail's
   six-datagram cover is exhausted, each further rung waits
   `TAIL_PROBED_MIN_RTO` (`300 ms`) compounded onto the current RTO, so one
@@ -529,7 +529,8 @@ On that pin:
   spikes criterion", but no README in `rtp_mux`, `rtp` or `mux` states it —
   the phrase is in `netem_test/tests/README.md`. Both are corrections for the
   next agent in that crate, which was held by another agent at this writing.
-- **Clean-arm own wire is back at ~3.63×** after reverting the **fresh-tail
+- **Clean-arm own wire rose back** to its pre-split level after reverting the
+  **fresh-tail
   cover split** — `rtp` change `tnlxylvslomrkyzyozlroqmkrovowomt` (commit
   `f0b22e2e5301`), reverted by `xnzwoywuszqrylnpxsllsspluusporpr` (commit
   `7f68486688dd`), which is `rtp v0.0.94`. The split stopped paying the
@@ -537,17 +538,17 @@ On that pin:
   arms it cost p99 **29.6 → 83.0 ms** at 6 % iid and **231.8 → 478.1 ms**
   under Gilbert-Elliot burst with the bulk lane loaded, with samples over
   250 ms rising 12 → 46. The constitution arm's `both` case is what
-  `rtp_mux/GATE.md` records as a ~26 ms p99 (and a ~3.6× wire diagnostic).
-  (The `clean` smoke arm reads ~2.2× on the same pin — a different cadence
-  and load, so the two are not interchangeable.)
+  `rtp_mux/GATE.md` records as a ~26 ms p99, with its forwarded bytes printed
+  as a diagnostic. (The `clean` smoke arm reads differently on the same pin — a
+  different cadence and load, so the two are not interchangeable.)
 
 The M1-vs-M2 trade under jitter is **decided**, not open: the deployed
 configuration stands. On the jittered arm a 2-shard design measured p99
 ≈ 108 ms, against the deployed build's ≈ 37 ms; the lower-latency design was
 measured and taken, and the two numbers are recorded here once, as a closed
 matter, because **M1 is the standing priority** where the mandates
-conflict and M2 no longer bounds the wire that bought it. The measured wire
-multiple remains a printed diagnostic, not a target.
+conflict and M2 no longer bounds the wire that bought it. The wire bytes the
+arm line prints remain a diagnostic, not a target.
 
 The open item is the field tail itself (see "Where the path stands today").
 It is cut by either **armouring the repair**, which spends wire the mandate no
@@ -866,7 +867,7 @@ the reader:
   delivery floor — stands as the breach it draws, so a failing run still
   renders its evidence. A crossing a named guard *does* tolerate is measured
   against the tolerance (the region between the reference and the point where a
-  departure begins) rather than against its own tenth of a multiple, which is
+  departure begins) rather than against the data's own nearest value, which is
   sub-pixel once the axis has to carry the guard as well; the margin rule is
   unchanged for every bound with no such guard. A bound the values *cluster*
   around in the middle of a unit (a fair share, a symmetric departure band) has
@@ -922,8 +923,8 @@ the reader:
   empty template (`[]`, `()`, `None`), which draws the absence of the evidence
   its own label claims rather than the measurement.
 - **a legend must name the quantity, not the column.** `check_series_labels`
-  refuses a legend drawing a producer's column name (`wire_x`,
-  `shaper_forwarded`); `series_label` maps the names whose prettified form is
+  refuses a legend drawing a producer's column name (`shaper_forwarded`,
+  `min_share`); `series_label` maps the names whose prettified form is
   still cryptic and prettifies the rest.
 - **an axis whose ticks repeat a value cannot carry its own reading.**
   `check_tick_labels_distinct` reads the y tick labels back out of the artifact

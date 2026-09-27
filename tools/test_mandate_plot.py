@@ -359,46 +359,57 @@ LATE_LATENCY_ROWS = [
 # panel draws both lines and the axis test measures the ceiling against it.
 LATE_LATENCY_RUN_VALUES = {"ceiling": 250.0, "hostile_p99_guard": 900.0}
 
-WIRE_DECLARATION = {
+# The live `M2-latency` panel: the interactive arms' p99 against the
+# non-degrading bound under the known offer. `M2_LATENCY_RUN_VALUES` is a run
+# that states a guard of its own for the two impaired arms, which is what makes
+# the crossing on the lone-tail bar attributable.
+M2_LATENCY_DECLARATION = {
     "mandate": "M2",
-    "title": "M2 interactive delivery and own-wire multiple",
+    "title": "M2 interactive delivery and latency under a known offer "
+    "(1=clean 2=hostile 3=lone_tail)",
     "x_label": "arm (1=clean 2=hostile 3=lone_tail)",
     "y_label": "value",
     "panels": [
         {
-            "id": "wire",
+            "id": "latency",
             "chart": "bar",
-            "series": [{"name": "wire_x"}],
-            "bounds": [{"y": 6, "label": "M2 wire budget 6x"}],
+            "series": [{"name": "p99_ms"}],
+            "bounds": [
+                {
+                    "y": 100.0,
+                    "label": "M2 non-degrading p99 bound (ms)",
+                    "x": [1],
+                }
+            ],
         }
     ],
 }
 
-WIRE_ROWS = [
+M2_LATENCY_ROWS = [
     ["panel", "series", "x", "y"],
-    ["wire", "wire_x", 1.0, 2.151595],
-    ["wire", "wire_x", 2.0, 5.000262],
-    ["wire", "wire_x", 3.0, 6.633134],
+    ["latency", "p99_ms", 1.0, 26.251],
+    ["latency", "p99_ms", 2.0, 61.5],
+    ["latency", "p99_ms", 3.0, 185.8015],
 ]
 
-# The run's own verdict measurements for M2, whose per-arm guards are what the
-# wire panel's label names instead of reading as a breach the verdict tolerates.
-WIRE_RUN_VALUES = {
-    "budget": 6.0,
-    "clean_wire_x": 2.15,
-    "hostile_wire_guard": 10.0,
-    "hostile_wire_x": 5.0,
-    "lone_wire_guard": 14.0,
-    "lone_wire_x": 6.63,
+# The run's own measurements for the latency panel: the per-arm p99 the panel
+# plots and the two impaired arms' guards, which are the bounds the crossing
+# lone bar is read against instead of the clean arm's non-degrading bound.
+M2_LATENCY_RUN_VALUES = {
+    "clean_p99_ms": 26.251,
+    "hostile_p99_ms": 61.5,
+    "lone_p99_ms": 185.8015,
+    "hostile_p99_guard": 200.0,
+    "lone_p99_guard": 400.0,
 }
 
-# The run's per-arm guards for a four-arm wire panel, which is the shape that
+# The run's per-arm guards for a four-arm latency panel, which is the shape that
 # makes the attribution label long enough to wrap.
-WIRE_FOUR_ARM_RUN_VALUES = {
-    "clean_wire_guard": 3.0,
-    "hostile_wire_guard": 10.0,
-    "lone_wire_guard": 14.0,
-    "burst_wire_guard": 21.0,
+M2_LATENCY_FOUR_ARM_RUN_VALUES = {
+    "clean_p99_guard": 300.0,
+    "hostile_p99_guard": 200.0,
+    "lone_p99_guard": 400.0,
+    "burst_p99_guard": 600.0,
 }
 
 # Widths of the labels that run drew, measured on its own standalone panels by
@@ -408,9 +419,9 @@ WIRE_FOUR_ARM_RUN_VALUES = {
 # check that fails when it starts underestimating the drawn text.
 RENDERED_LABEL_WIDTHS = (
     (
-        "M2 wire budget 6x [1 of 3 bars beyond it; run guards "
-        "hostile_wire_guard=10 lone_wire_guard=14]",
-        436.73,
+        "M2 non-degrading p99 bound (ms) [1 of 3 bars beyond it; run guards "
+        "hostile_p99_guard=200 lone_p99_guard=400]",
+        512.22,
     ),
     (
         "M1 ceiling 250 ms [4 of 16 bars beyond it; run guards "
@@ -457,14 +468,11 @@ SHARES_DECLARATION = {
 # `0.995` -- the two floors the delivery panel has to draw per arm.
 M2_RUN_VALUES = {
     "clean_delivery": 1.0,
-    "clean_wire_x": 2.11,
     "hostile_delivery": 1.0,
-    "hostile_wire_x": 5.14,
     "lone_delivery": 1.0,
-    "lone_wire_x": 6.41,
-    "budget": 6.0,
-    "hostile_wire_guard": 10.0,
-    "lone_wire_guard": 14.0,
+    # The impaired arms' own delivery floors mark them as not the reference arm.
+    "hostile_delivery_guard": 0.995,
+    "lone_delivery_guard": 0.995,
     "delivery_floor": 0.995,
 }
 
@@ -556,7 +564,7 @@ FRACTION_DECLARATION = {
 # above it -- the placement the audit measured four pixels above the plot.
 M2_DELIVERY_DECLARATION = {
     "mandate": "M2",
-    "title": "M2 interactive delivery and own-wire multiple",
+    "title": "M2 interactive delivery and p99 ms",
     "x_label": "arm (1=clean 2=hostile 3=lone_tail)",
     "y_label": "delivery (received / offered)",
     "panels": [
@@ -912,30 +920,41 @@ class MandatePlotTest(unittest.TestCase):
 
     def test_a_bound_the_bars_split_around_is_a_target_not_a_crossing(self):
         # M4-shares' fair share: the bars straddle it, so it is the value they are
-        # read against and owes no attribution. M2-wire's lone bar past the
-        # budget is the crossing the panel has to explain.
+        # read against and owes no attribution. A lone-tail bar past M2's
+        # non-degrading bound is the crossing the panel has to explain.
         shares = [0.250059, 0.250059, 0.249941, 0.249941, 0.250173, 0.249365,
                   0.250289, 0.250173]
         self.assertEqual(MANDATE.crossing_values(shares, 0.25), [])
-        wire = [2.151595, 5.000262, 6.633134]
-        self.assertEqual(MANDATE.crossing_values(wire, 6.0), [6.633134])
+        latency = [26.251, 61.5, 185.8015]
+        self.assertEqual(MANDATE.crossing_values(latency, 100.0), [185.8015])
 
     # -- the governance test: a crossed bound must say what it governs -------
 
     def test_a_crossed_bound_without_the_run_is_refused(self):
-        # The vacuity half: the M2 wire panel's own numbers, with the run's
-        # measurements not supplied, is the panel the audit found misleading — a
-        # crossing the panel cannot attribute. It is refused, not drawn.
-        code, stderr, _ = self.render_mandate(WIRE_DECLARATION, WIRE_ROWS, "M2bare")
+        # The vacuity half: the M2 latency panel with the bound's own x-window
+        # removed and the run's measurements not supplied is a panel a crossing
+        # cannot be attributed on. It is refused, not drawn.
+        declaration = {
+            **M2_LATENCY_DECLARATION,
+            "panels": [
+                {
+                    **M2_LATENCY_DECLARATION["panels"][0],
+                    "bounds": [
+                        {"y": 100.0, "label": "M2 non-degrading p99 bound (ms)"}
+                    ],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(declaration, M2_LATENCY_ROWS, "M2bare")
         self.assertNotEqual(code, 0)
-        self.assertIn("M2 wire budget 6x", stderr)
+        self.assertIn("M2 non-degrading p99 bound (ms)", stderr)
         self.assertIn("run's own measurements were not supplied", stderr)
         self.assertIn("tolerated guard", stderr)
 
-    def test_the_run_s_own_guards_attribute_the_crossed_wire_bound(self):
+    def test_the_run_s_own_guards_attribute_the_crossed_latency_bound(self):
         out = self.root / "out-M2"
         declaration_path = self.write_mandate(
-            WIRE_DECLARATION, WIRE_ROWS, name="M2run"
+            M2_LATENCY_DECLARATION, M2_LATENCY_ROWS, name="M2run"
         )
         code, _, stderr = self.run_main(
             str(declaration_path),
@@ -943,45 +962,118 @@ class MandatePlotTest(unittest.TestCase):
             "--out",
             str(out),
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         self.assertEqual(code, 0, stderr)
-        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+        document = (out / "M2-latency.svg").read_text(encoding="utf-8")
         # Every drawn bound now says who is beyond it and by which guard, so the
-        # crossing lone bar can no longer be read as a budget breach.
+        # crossing lone bar can no longer be read as a bound breach.
         self.assertIn("1 of 3 bars beyond it", document)
-        self.assertIn("hostile_wire_guard=10", document)
-        self.assertIn("lone_wire_guard=14", document)
+        self.assertIn("hostile_p99_guard=200", document)
+        self.assertIn("lone_p99_guard=400", document)
         # Named *and* drawn: three lines, each labelled with the arm it governs,
         # so the crossing bar is inside its own arm's guard rather than above a
-        # budget no line of it was placed under.
+        # bound no line of it was placed under.
         self.assertEqual(document.count('class="bound"'), 3)
         for label in (
-            "M2 wire budget 6x [governs clean; 1 of 3 bars beyond it]",
-            "run hostile_wire_guard=10 [governs hostile]",
-            "run lone_wire_guard=14 [governs lone]",
+            "M2 non-degrading p99 bound (ms) [governs clean; 1 of 3 bars beyond it]",
+            "run hostile_p99_guard=200 [governs hostile]",
+            "run lone_p99_guard=400 [governs lone]",
         ):
             self.assertIn(label, document)
         # the data itself is untouched: the same three bars, at the same heights
         rects = MANDATE.re.findall(r'<rect x="[-0-9.]+\w*"', document)
         self.assertTrue(rects)
 
+    def test_the_panel_inventory_is_a_pure_function_of_the_mandate_declaration(self):
+        # The tooling keeps no panel list of its own: it writes exactly the ids
+        # the mandate declares, adding and dropping nothing. So a `wire` panel
+        # can exist only while a *producer* declares one -- no stale name in the
+        # tooling can resurrect it -- and because the live M2 declaration names
+        # `delivery` and `latency` and nothing else, no M2 wire panel can be
+        # produced. The synthetic case below is the proof of the first half: the
+        # same renderer, handed a declaration that names a wire panel, writes
+        # one, so any `M2-wire` that ever appears is a producer's declaration and
+        # not a branch here.
+        synthetic_declaration = {
+            **M2_LATENCY_DECLARATION,
+            "panels": [{**M2_LATENCY_DECLARATION["panels"][0], "id": "wire"}],
+        }
+        synthetic_rows = [M2_LATENCY_ROWS[0]] + [
+            ["wire"] + row[1:] for row in M2_LATENCY_ROWS[1:]
+        ]
+        for name, declaration, rows in (
+            ("M2live", M2_LATENCY_DECLARATION, M2_LATENCY_ROWS),
+            ("M2declaredwire", synthetic_declaration, synthetic_rows),
+        ):
+            with self.subTest(case=name):
+                code, stderr, out = self.render_mandate(
+                    declaration,
+                    rows,
+                    name,
+                    "--run-values",
+                    json.dumps(M2_LATENCY_RUN_VALUES),
+                )
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(
+                    sorted(path.name for path in out.glob("*.svg")),
+                    sorted(
+                        f"{declaration['mandate']}-{panel['id']}.svg"
+                        for panel in declaration["panels"]
+                    ),
+                )
+
+    def test_no_panel_the_live_m2_declaration_draws_carries_a_wire_quantity(self):
+        # M2 is offered throughput in, non-degrading latency asserted, goodput
+        # inferred: the own-wire multiple is not a mandate quantity any more, so
+        # nothing the tooling draws for M2 may name one. Reintroducing a wire
+        # bound into either live panel makes the render draw its label and this
+        # check goes red -- which is what its vacuity was demonstrated with.
+        rendered = []
+        for name, declaration, rows, run_values in (
+            (
+                "M2nowire-delivery",
+                M2_DELIVERY_DECLARATION,
+                M2_DELIVERY_ROWS,
+                M2_RUN_VALUES,
+            ),
+            (
+                "M2nowire-latency",
+                M2_LATENCY_DECLARATION,
+                M2_LATENCY_ROWS,
+                M2_LATENCY_RUN_VALUES,
+            ),
+        ):
+            code, stderr, out = self.render_mandate(
+                declaration,
+                rows,
+                name,
+                "--run-values",
+                json.dumps(run_values),
+            )
+            self.assertEqual(code, 0, stderr)
+            rendered += [path.read_text(encoding="utf-8") for path in out.glob("*.svg")]
+        self.assertTrue(rendered)
+        for document in rendered:
+            for token in ("wire", "own-wire", "multiple", "6x", "14x"):
+                self.assertNotIn(token, document.lower(), token)
+
     def test_a_declared_governance_attributes_the_bound_without_a_run(self):
         declaration = {
-            **WIRE_DECLARATION,
+            **M2_LATENCY_DECLARATION,
             "panels": [
                 {
-                    **WIRE_DECLARATION["panels"][0],
+                    **M2_LATENCY_DECLARATION["panels"][0],
                     "bounds": [
-                        {"y": 6, "label": "M2 wire budget 6x", "series": "wire_x", "x": [1]}
+                        {"y": 6, "label": "M2 non-degrading p99 bound (ms)", "series": "p99_ms", "x": [1]}
                     ],
                 }
             ],
         }
-        code, stderr, out = self.render_mandate(declaration, WIRE_ROWS, "M2decl")
+        code, stderr, out = self.render_mandate(declaration, M2_LATENCY_ROWS, "M2decl")
         self.assertEqual(code, 0, stderr)
-        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
-        self.assertIn("governs series wire_x", document)
+        document = (out / "M2-latency.svg").read_text(encoding="utf-8")
+        self.assertIn("governs series p99_ms", document)
         self.assertIn("governs x=1", document)
         bounds = MANDATE.re.findall(
             r'class="bound" x1="([0-9.]+)" y1="[0-9.]+" x2="([0-9.]+)"', document
@@ -995,29 +1087,29 @@ class MandatePlotTest(unittest.TestCase):
 
     def test_a_governed_x_the_panel_does_not_draw_is_an_error(self):
         declaration = {
-            **WIRE_DECLARATION,
+            **M2_LATENCY_DECLARATION,
             "panels": [
                 {
-                    **WIRE_DECLARATION["panels"][0],
+                    **M2_LATENCY_DECLARATION["panels"][0],
                     "bounds": [{"y": 6, "label": "b", "x": [9]}],
                 }
             ],
         }
-        code, stderr, _ = self.render_mandate(declaration, WIRE_ROWS, "M2x")
+        code, stderr, _ = self.render_mandate(declaration, M2_LATENCY_ROWS, "M2x")
         self.assertNotEqual(code, 0)
         self.assertIn("draws no category", stderr)
 
     def test_a_governed_series_the_panel_does_not_declare_is_an_error(self):
         declaration = {
-            **WIRE_DECLARATION,
+            **M2_LATENCY_DECLARATION,
             "panels": [
                 {
-                    **WIRE_DECLARATION["panels"][0],
+                    **M2_LATENCY_DECLARATION["panels"][0],
                     "bounds": [{"y": 6, "label": "b", "series": "clean"}],
                 }
             ],
         }
-        code, stderr, _ = self.render_mandate(declaration, WIRE_ROWS, "M2s")
+        code, stderr, _ = self.render_mandate(declaration, M2_LATENCY_ROWS, "M2s")
         self.assertNotEqual(code, 0)
         self.assertIn("governs series 'clean'", stderr)
 
@@ -1030,15 +1122,15 @@ class MandatePlotTest(unittest.TestCase):
         ):
             with self.subTest(x=value):
                 declaration = {
-                    **WIRE_DECLARATION,
+                    **M2_LATENCY_DECLARATION,
                     "panels": [
                         {
-                            **WIRE_DECLARATION["panels"][0],
+                            **M2_LATENCY_DECLARATION["panels"][0],
                             "bounds": [{"y": 6, "label": "b", "x": value}],
                         }
                     ],
                 }
-                code, stderr, _ = self.render_mandate(declaration, WIRE_ROWS, "M2bad")
+                code, stderr, _ = self.render_mandate(declaration, M2_LATENCY_ROWS, "M2bad")
                 self.assertNotEqual(code, 0)
                 self.assertIn(fragment, stderr)
 
@@ -1098,7 +1190,7 @@ class MandatePlotTest(unittest.TestCase):
         self.assertIn("band view", document)
 
     def test_run_values_that_are_not_an_object_are_an_error(self):
-        declaration_path = self.write_mandate(WIRE_DECLARATION, WIRE_ROWS, name="M2v")
+        declaration_path = self.write_mandate(M2_LATENCY_DECLARATION, M2_LATENCY_ROWS, name="M2v")
         code, _, stderr = self.run_main(
             str(declaration_path),
             "--no-rasterize",
@@ -1145,10 +1237,10 @@ class MandatePlotTest(unittest.TestCase):
         cases = (
             ("M1line", HEALTHY_DECLARATION, HEALTHY_ROWS, ()),
             (
-                "M2wire",
-                WIRE_DECLARATION,
-                WIRE_ROWS,
-                ("--run-values", json.dumps(WIRE_RUN_VALUES)),
+                "M2latency",
+                M2_LATENCY_DECLARATION,
+                M2_LATENCY_ROWS,
+                ("--run-values", json.dumps(M2_LATENCY_RUN_VALUES)),
             ),
             ("M2delivery", M2_DELIVERY_DECLARATION, M2_DELIVERY_ROWS, ()),
             ("M4shares", SHARES_DECLARATION, SHARES_ROWS, ()),
@@ -1228,28 +1320,28 @@ class MandatePlotTest(unittest.TestCase):
         # its annotation running off the edge. This is the reachable failure --
         # `LABEL_MAX_LINES` caps the wrap, so the remainder is one line that no
         # longer fits.
-        label = "M2 wire budget 6x [" + "; ".join(
+        label = "M2 non-degrading p99 bound (ms) [" + "; ".join(
             f"arm_{index}_guard=1000000" for index in range(40)
         ) + "]"
         declaration = {
-            **WIRE_DECLARATION,
+            **M2_LATENCY_DECLARATION,
             "panels": [
                 {
-                    **WIRE_DECLARATION["panels"][0],
+                    **M2_LATENCY_DECLARATION["panels"][0],
                     "bounds": [{"y": 6, "label": label}],
                 }
             ],
         }
         code, stderr, _ = self.render_mandate(
             declaration,
-            WIRE_ROWS,
+            M2_LATENCY_ROWS,
             "M2long",
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         self.assertNotEqual(code, 0)
         self.assertIn("mandate_plot: error:", stderr)
-        self.assertIn("panel 'wire'", stderr)
+        self.assertIn("panel 'latency'", stderr)
         self.assertIn("does not fit the plot area", stderr)
         self.assertIn("past its left edge", stderr)
 
@@ -1275,26 +1367,26 @@ class MandatePlotTest(unittest.TestCase):
         self.assertIn("does not fit the plot area", stderr)
 
     def test_a_guard_for_every_arm_is_drawn_on_its_own_band_and_inside_the_plot(self):
-        # The four-arm wire panel: the run states a guard for *every* arm, so no
-        # arm is left for the declaration's budget to govern. The panel draws
+        # The four-arm latency panel: the run states a guard for *every* arm, so
+        # no arm is left for the declaration's bound to govern. The panel draws
         # each arm's guard over that arm's own band and the declared bound
         # across the whole plot saying exactly that it governs no arm -- rather
-        # than one budget line a reader has to read as four different arms'
+        # than one bound line a reader has to read as four different arms'
         # floors. Every label it draws, including the long declared one, has to
         # lie inside the plot.
         rows = [
             ["panel", "series", "x", "y"],
-            ["wire", "wire_x", 1.0, 2.1],
-            ["wire", "wire_x", 2.0, 5.0],
-            ["wire", "wire_x", 3.0, 4.4],
-            ["wire", "wire_x", 4.0, 6.63],
+            ["latency", "p99_ms", 1.0, 26.251],
+            ["latency", "p99_ms", 2.0, 61.5],
+            ["latency", "p99_ms", 3.0, 90.0],
+            ["latency", "p99_ms", 4.0, 185.8015],
         ]
         declaration = {
-            **WIRE_DECLARATION,
+            **M2_LATENCY_DECLARATION,
             "panels": [
                 {
-                    **WIRE_DECLARATION["panels"][0],
-                    "bounds": [{"y": 6, "label": "M2 wire budget 6x"}],
+                    **M2_LATENCY_DECLARATION["panels"][0],
+                    "bounds": [{"y": 100.0, "label": "M2 non-degrading p99 bound (ms)"}],
                 }
             ],
         }
@@ -1303,10 +1395,10 @@ class MandatePlotTest(unittest.TestCase):
             rows,
             "M2wrap",
             "--run-values",
-            json.dumps(WIRE_FOUR_ARM_RUN_VALUES),
+            json.dumps(M2_LATENCY_FOUR_ARM_RUN_VALUES),
         )
         self.assertGreater(len(boxes), 1, "the labels have to wrap or be several")
-        self.assertEqual(MANDATE.check_label_fit("wire", document), [])
+        self.assertEqual(MANDATE.check_label_fit("latency", document), [])
         for declared, _, (x0, y0, x1, y1) in boxes:
             self.assertGreaterEqual(x0, plot[0])
             self.assertLessEqual(x1, plot[2])
@@ -1317,16 +1409,16 @@ class MandatePlotTest(unittest.TestCase):
         titles = [declared for declared, _, _ in boxes]
         self.assertEqual(document.count('class="bound"'), 5)
         for key in (
-            "clean_wire_guard=3",
-            "hostile_wire_guard=10",
-            "lone_wire_guard=14",
-            "burst_wire_guard=21",
+            "clean_p99_guard=300",
+            "hostile_p99_guard=200",
+            "lone_p99_guard=400",
+            "burst_p99_guard=600",
         ):
             self.assertTrue(
                 any(title.startswith(f"run {key}") for title in titles), titles
             )
         self.assertTrue(
-            any(title.startswith("M2 wire budget 6x") for title in titles), titles
+            any(title.startswith("M2 non-degrading p99 bound (ms)") for title in titles), titles
         )
         self.assertTrue(
             any("governs no arm of this run" in title for title in titles), titles
@@ -1358,7 +1450,7 @@ class MandatePlotTest(unittest.TestCase):
         self.assertIn(
             "governs no arm of this run",
             wrapped[0],
-            "the wrapped label is the declared budget, not a guard's",
+            "the wrapped label is the declared bound, not a guard's",
         )
 
     def test_a_narrow_governed_window_moves_the_label_inside_the_plot(self):
@@ -1367,15 +1459,15 @@ class MandatePlotTest(unittest.TestCase):
         # rather than run the text off the plot's left edge, which is what the
         # old fixed anchor did.
         declaration = {
-            **WIRE_DECLARATION,
+            **M2_LATENCY_DECLARATION,
             "panels": [
                 {
-                    **WIRE_DECLARATION["panels"][0],
+                    **M2_LATENCY_DECLARATION["panels"][0],
                     "bounds": [
                         {
                             "y": 6,
-                            "label": "M2 wire budget 6x",
-                            "series": "wire_x",
+                            "label": "M2 non-degrading p99 bound (ms)",
+                            "series": "p99_ms",
                             "x": [1],
                         }
                     ],
@@ -1384,10 +1476,10 @@ class MandatePlotTest(unittest.TestCase):
         }
         document, plot, boxes = self.rendered_labels(
             declaration,
-            WIRE_ROWS,
+            M2_LATENCY_ROWS,
             "M2narrow",
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         line = MANDATE.re.search(
             r'class="bound" x1="[-0-9.]+" y1="[-0-9.]+" x2="([-0-9.]+)"',
@@ -1425,28 +1517,27 @@ class MandatePlotTest(unittest.TestCase):
         # the panel draws no `N of M` clause. Uniform failure is read from the
         # bars; a single bar past it is the case the clause exists for. The
         # guards are still named -- they are the arms' own bounds, and the axis
-        # has to carry them whether or not a bar has been past the budget yet --
+        # has to carry them whether or not a bar has been past the bound yet --
         # but no crossing is attributed.
         rows = [
             ["panel", "series", "x", "y"],
-            ["wire", "wire_x", 1.0, 7.2],
-            ["wire", "wire_x", 2.0, 9.5],
-            ["wire", "wire_x", 3.0, 8.1],
+            ["latency", "p99_ms", 1.0, 120.0],
+            ["latency", "p99_ms", 2.0, 158.3],
+            ["latency", "p99_ms", 3.0, 135.0],
         ]
         # Three arms, the number of bars the panel draws: a run enumerating four
         # arms over a three-bar panel attributes nothing, and the guards it
         # names would then have no band to be drawn on.
         run_values = {
-            "clean_wire_x": 7.2,
-            "hostile_wire_x": 9.5,
-            "lone_wire_x": 8.1,
-            "budget": 6.0,
-            "clean_wire_guard": 3.0,
-            "hostile_wire_guard": 10.0,
-            "lone_wire_guard": 14.0,
+            "clean_p99_ms": 120.0,
+            "hostile_p99_ms": 158.3,
+            "lone_p99_ms": 135.0,
+            "clean_p99_guard": 50.0,
+            "hostile_p99_guard": 266.7,
+            "lone_p99_guard": 333.3,
         }
         document, plot, boxes = self.rendered_labels(
-            WIRE_DECLARATION,
+            M2_LATENCY_DECLARATION,
             rows,
             "M2all",
             "--run-values",
@@ -1454,11 +1545,11 @@ class MandatePlotTest(unittest.TestCase):
         )
         self.assertNotIn("beyond it", document)
         self.assertNotIn("under it", document)
-        # Every guard the run states is drawn, and the declared budget says it
+        # Every guard the run states is drawn, and the declared bound says it
         # governs no arm.
         titles = [declared for declared, _, _ in boxes]
         self.assertEqual(document.count('class="bound"'), 4)
-        for key in ("clean_wire_guard=3", "hostile_wire_guard=10", "lone_wire_guard=14"):
+        for key in ("clean_p99_guard=50", "hostile_p99_guard=266.7", "lone_p99_guard=333.3"):
             self.assertTrue(
                 any(title.startswith(f"run {key}") for title in titles), titles
             )
@@ -1473,8 +1564,8 @@ class MandatePlotTest(unittest.TestCase):
             ticks[-1],
             max(value for _, value in MANDATE.run_guards(
                 run_values,
-                [("wire_x", [])],
-                "M2 wire budget 6x",
+                [("p99_ms", [])],
+                "M2 non-degrading p99 bound (ms)",
             )),
             "the axis must carry every guard the label names",
         )
@@ -1482,42 +1573,41 @@ class MandatePlotTest(unittest.TestCase):
             self.assertGreaterEqual(x0, plot[0])
             self.assertLessEqual(x1, plot[2])
 
-    def test_a_lone_bar_beyond_the_budget_is_drawn_under_its_own_arm_s_guard(self):
+    def test_a_lone_bar_beyond_the_bound_is_drawn_under_its_own_arm_s_guard(self):
         # The other boundary case, and the one this drawing exists for: one of
-        # three bars past the *declared budget*, with the run's guards drawn on
-        # the arms they govern. Before this the panel drew one line, the 6x
-        # budget across every arm, on an axis reaching 14.70 -- so the `lone`
-        # bar at 6.63 sat above the budget on a PASS with no line to cross, and
+        # three bars past the *declared bound*, with the run's guards drawn on
+        # the arms they govern. Before this the panel drew one line, the bound
+        # across every arm, on an axis reaching the guards -- so the `lone`
+        # bar sat above the bound on a PASS with no line to cross, and
         # the tolerance was a sentence the reader had to trust. Now the line
-        # over the `lone` band is its own guard at 14x, and the bar is under it.
+        # over the `lone` band is its own guard, and the bar is under it.
         document, plot, boxes = self.rendered_labels(
-            WIRE_DECLARATION,
-            WIRE_ROWS,
+            M2_LATENCY_DECLARATION,
+            M2_LATENCY_ROWS,
             "M2one",
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         titles = [declared for declared, _, _ in boxes]
         self.assertEqual(
             titles,
             [
-                "M2 wire budget 6x [governs clean; 1 of 3 bars beyond it]",
-                "run hostile_wire_guard=10 [governs hostile]",
-                "run lone_wire_guard=14 [governs lone]",
+                "M2 non-degrading p99 bound (ms) [governs clean; 1 of 3 bars beyond it]",
+                "run hostile_p99_guard=200 [governs hostile]",
+                "run lone_p99_guard=400 [governs lone]",
             ],
         )
         for _, _, (x0, _, x1, _) in boxes:
             self.assertGreaterEqual(x0, plot[0])
             self.assertLessEqual(x1, plot[2])
         # The drawn geometry, not the label: the line over the `lone` band is
-        # the 14x guard, and the 6.633 lone bar's top is below it and above the
-        # 6x budget.
-        panel = WIRE_DECLARATION["panels"][0]
-        series = [("wire_x", [(1.0, 2.151595), (2.0, 5.000262), (3.0, 6.633134)])]
+        # its guard, and the lone bar's top is below it and above the bound.
+        panel = M2_LATENCY_DECLARATION["panels"][0]
+        series = [("p99_ms", [(1.0, 26.251), (2.0, 61.5), (3.0, 185.8015)])]
         bounds = MANDATE._bound_specs(panel)
-        drawn_bounds = MANDATE.drawable_bounds(panel, series, bounds, WIRE_RUN_VALUES)
+        drawn_bounds = MANDATE.drawable_bounds(panel, series, bounds, M2_LATENCY_RUN_VALUES)
         axis = MANDATE.bar_axis_extent(
-            series, drawn_bounds, WIRE_RUN_VALUES, MANDATE.bar_plot_height(len(series))
+            series, drawn_bounds, M2_LATENCY_RUN_VALUES, MANDATE.bar_plot_height(len(series))
         )
         values = MANDATE.drawn_bound_values(document, axis)
         self.assertEqual(len(values), 3, values)
@@ -1531,38 +1621,40 @@ class MandatePlotTest(unittest.TestCase):
             f'x2="{rightmost[2]}" y2="{rightmost[1]}" />',
             axis,
         )[0]
-        self.assertAlmostEqual(guard, 14.0, places=2)
-        lone_bar = 6.633134
-        self.assertGreater(lone_bar, 6.0, "the lone bar is past the budget")
+        # The value is read back through the drawn pixel grid, so the round trip
+        # is a fraction of a pixel wide rather than exact.
+        self.assertAlmostEqual(guard, 400.0, delta=1.0)
+        lone_bar = 185.8015
+        self.assertGreater(lone_bar, 100.0, "the lone bar is past the bound")
         self.assertLess(lone_bar, guard, "and inside its own arm's guard")
 
     def test_a_guard_that_is_named_and_not_drawn_is_refused(self):
         # The vacuity of the guard-drawing rule, as a predicate and end to end.
-        # Both halves are the *pre-fix* artifact: one line, the 6x budget across
+        # Both halves are the *pre-fix* artifact: one line, the bound across
         # every arm, with the run's guards named on its caption and no line at
         # either of them. The predicate reads the drawn lines back out of the
         # SVG, so a renderer that stopped drawing a guard it names goes red.
-        panel = WIRE_DECLARATION["panels"][0]
-        series = MANDATE.panel_series(panel, _points(WIRE_ROWS))
+        panel = M2_LATENCY_DECLARATION["panels"][0]
+        series = MANDATE.panel_series(panel, _points(M2_LATENCY_ROWS))
         bounds = MANDATE._bound_specs(panel)
-        plan = MANDATE.drawable_bounds(panel, series, bounds, WIRE_RUN_VALUES)
+        plan = MANDATE.drawable_bounds(panel, series, bounds, M2_LATENCY_RUN_VALUES)
         axis = MANDATE.bar_axis_extent(
-            series, plan, WIRE_RUN_VALUES, MANDATE.bar_plot_height(len(series))
+            series, plan, M2_LATENCY_RUN_VALUES, MANDATE.bar_plot_height(len(series))
         )
         guards = MANDATE.named_guard_values(
-            series, plan, WIRE_RUN_VALUES, crossing=True
+            series, plan, M2_LATENCY_RUN_VALUES, crossing=True
         )
-        self.assertEqual(guards, [10.0, 14.0])
+        self.assertEqual(guards, [200.0, 400.0])
         drawn = MANDATE.svg_bar_chart(
-            "t", "x", "value", series, plan, axis, WIRE_RUN_VALUES
+            "t", "x", "value", series, plan, axis, M2_LATENCY_RUN_VALUES
         )
-        self.assertEqual(MANDATE.check_named_guards_drawn("wire", guards, axis, drawn), [])
+        self.assertEqual(MANDATE.check_named_guards_drawn("latency", guards, axis, drawn), [])
         stripped = MANDATE.svg_bar_chart(
-            "t", "x", "value", series, [plan[0]], axis, WIRE_RUN_VALUES
+            "t", "x", "value", series, [plan[0]], axis, M2_LATENCY_RUN_VALUES
         )
-        problems = MANDATE.check_named_guards_drawn("wire", guards, axis, stripped)
+        problems = MANDATE.check_named_guards_drawn("latency", guards, axis, stripped)
         self.assertEqual(len(problems), 2, problems)
-        for value in ("10", "14"):
+        for value in ("200", "400"):
             self.assertTrue(
                 any(f"names the guard {value}" in problem for problem in problems),
                 problems,
@@ -1574,15 +1666,15 @@ class MandatePlotTest(unittest.TestCase):
             MANDATE, "drawable_bounds", lambda *a, **k: [plan_of(*a, **k)[0]]
         ):
             code, stderr, _ = self.render_mandate(
-                WIRE_DECLARATION,
-                WIRE_ROWS,
+                M2_LATENCY_DECLARATION,
+                M2_LATENCY_ROWS,
                 "M2nodraw",
                 "--run-values",
-                json.dumps(WIRE_RUN_VALUES),
+                json.dumps(M2_LATENCY_RUN_VALUES),
             )
         self.assertNotEqual(code, 0, stderr)
-        self.assertIn("names the guard 10", stderr)
-        self.assertIn("names the guard 14", stderr)
+        self.assertIn("names the guard 200", stderr)
+        self.assertIn("names the guard 400", stderr)
         self.assertIn("take on trust", stderr)
 
     # -- healthy renders ---------------------------------------------------
@@ -1928,47 +2020,47 @@ class MandatePlotTest(unittest.TestCase):
     # -- the readings that only the eye made, now measurements ----------------
     #
     # Every defect below was found by *looking at* a run whose four mandate
-    # lines passed: the `M2-wire` panel announced guards at 10x and 14x on an
-    # axis that topped out at 6.6; `M4-shares` drew its fair share at the very
+    # lines passed: a panel announced guards on an axis that topped out below
+    # them; `M4-shares` drew its fair share at the very
     # top of its own axis, so a flow over the share could not be drawn at all;
     # one series' three bars were drawn flush and read as a staircase; the
-    # legend said `wire_x`; and a label long enough to run off the canvas was
+    # legend said `shaper_forwarded`; and a label long enough to run off the canvas was
     # drawn anyway. Each test renders the broken input and requires the refusal
     # (red), then renders the real input and requires the check to pass (green).
 
     def test_a_guard_the_panel_names_outside_its_axis_is_refused(self):
         broken = {
-            **WIRE_DECLARATION,
-            "panels": [{**WIRE_DECLARATION["panels"][0], "y_extent": [0.0, 7.0]}],
+            **M2_LATENCY_DECLARATION,
+            "panels": [{**M2_LATENCY_DECLARATION["panels"][0], "y_extent": [0.0, 190.0]}],
         }
         code, stderr, _ = self.render_mandate(
             broken,
-            WIRE_ROWS,
+            M2_LATENCY_ROWS,
             "M2pin",
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         self.assertNotEqual(code, 0)
-        self.assertIn("named guard 14", stderr)
+        self.assertIn("named guard 200", stderr)
         self.assertIn("does not resolve", stderr)
         # green: the automatic axis carries both guards, inside the frame
         document, _, _ = self.rendered_labels(
-            WIRE_DECLARATION,
-            WIRE_ROWS,
+            M2_LATENCY_DECLARATION,
+            M2_LATENCY_ROWS,
             "M2carry",
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         ticks = [
             float(value)
             for value in MANDATE.re.findall(r'text-anchor="end">([-0-9.]+)<', document)
         ]
-        self.assertGreater(ticks[-1], 14.0, "the axis tops out below the guard named")
+        self.assertGreater(ticks[-1], 400.0, "the axis tops out below the guard named")
         self.assertEqual(
             MANDATE.check_named_values_in_axis(
-                "wire",
-                [{"y": 6.0, "label": "M2 wire budget 6x"}],
-                [10.0, 14.0],
+                "latency",
+                [{"y": 100.0, "label": "M2 non-degrading p99 bound (ms)"}],
+                [200.0, 400.0],
                 (ticks[0], ticks[-1]),
             ),
             [],
@@ -2178,41 +2270,41 @@ class MandatePlotTest(unittest.TestCase):
             '<rect x="590.4" y="31.3" width="311.0" height="220.7" fill="#2563eb"/>'
             "</svg>"
         )
-        problems = MANDATE.check_bar_separation("wire", staircase)
+        problems = MANDATE.check_bar_separation("latency", staircase)
         self.assertTrue(problems)
         self.assertIn("overlap by 51.8 px", problems[0])
         # green: the rendered panel's three bars are separate
         code, stderr, out = self.render_mandate(
-            WIRE_DECLARATION,
-            WIRE_ROWS,
+            M2_LATENCY_DECLARATION,
+            M2_LATENCY_ROWS,
             "M2gap",
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         self.assertEqual(code, 0, stderr)
-        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+        document = (out / "M2-latency.svg").read_text(encoding="utf-8")
         self.assertEqual(len(MANDATE.bar_boxes(document)), 3)
-        self.assertEqual(MANDATE.check_bar_separation("wire", document), [])
+        self.assertEqual(MANDATE.check_bar_separation("latency", document), [])
 
     def test_a_legend_that_draws_a_column_name_is_refused(self):
         code, stderr, out = self.render_mandate(
-            WIRE_DECLARATION,
-            WIRE_ROWS,
+            M2_LATENCY_DECLARATION,
+            M2_LATENCY_ROWS,
             "M2legend",
             "--run-values",
-            json.dumps(WIRE_RUN_VALUES),
+            json.dumps(M2_LATENCY_RUN_VALUES),
         )
         self.assertEqual(code, 0, stderr)
-        document = (out / "M2-wire.svg").read_text(encoding="utf-8")
-        self.assertEqual(MANDATE.legend_text(document), ["own-wire multiple"])
-        series = [("wire_x", [(1.0, 2.0)])]
-        self.assertEqual(MANDATE.check_series_labels("wire", document, series), [])
+        document = (out / "M2-latency.svg").read_text(encoding="utf-8")
+        self.assertEqual(MANDATE.legend_text(document), ["p99 ms"])
+        series = [("p99_ms", [(1.0, 2.0)])]
+        self.assertEqual(MANDATE.check_series_labels("latency", document, series), [])
         # red: the same panel with the producer's column name in the legend --
         # the label the preserved run drew
-        raw = document.replace("own-wire multiple", "wire_x")
-        problems = MANDATE.check_series_labels("wire", raw, series)
+        raw = document.replace("p99 ms", "p99_ms")
+        problems = MANDATE.check_series_labels("latency", raw, series)
         self.assertTrue(problems)
-        self.assertIn("wire_x", problems[0])
+        self.assertIn("p99_ms", problems[0])
 
     def test_a_clipped_label_and_a_placeholder_are_refused(self):
         # red: the y label with the band-view note the old renderer appended,
@@ -2260,57 +2352,57 @@ class MandatePlotTest(unittest.TestCase):
         self.assertEqual(MANDATE.band_view_note((0.0, 0.26)), "")
 
 
-    def test_the_wire_panel_renders_on_a_run_whose_worst_arm_touches_the_budget(self):
-        # The runs the tool refused (2.12 / 4.91 / 5.91 and / 6.05): the band the
-        # axis test measures is now the tolerance the run's guards open between
-        # the budget and the arm's own limit, not the sliver between the budget
-        # and the worst arm -- which is a sliver *by construction* on any run
-        # whose worst arm lands near the budget. The range is the bound plus a
-        # margin, not the observed maximum, so the panel draws the crossing it
-        # is named for on both runs.
-        for name, worst in (("below", 5.91), ("above", 6.05)):
+    def test_the_latency_panel_renders_on_a_run_whose_worst_arm_touches_the_bound(self):
+        # The runs the tool refused (the bars just under and just over the
+        # bound): the band the axis test measures is now the tolerance the run's
+        # guards open between the bound and the arm's own limit, not the sliver
+        # between the bound and the worst arm -- which is a sliver *by
+        # construction* on any run whose worst arm lands near the bound. The
+        # range is the bound plus a margin, not the observed maximum, so the
+        # panel draws the crossing it is named for on both runs.
+        for name, worst in (("below", 98.5), ("above", 100.8)):
             with self.subTest(worst_arm=worst):
                 rows = [
                     ["panel", "series", "x", "y"],
-                    ["wire", "wire_x", 1.0, 2.12],
-                    ["wire", "wire_x", 2.0, 4.91],
-                    ["wire", "wire_x", 3.0, worst],
+                    ["latency", "p99_ms", 1.0, 35.3],
+                    ["latency", "p99_ms", 2.0, 81.8],
+                    ["latency", "p99_ms", 3.0, worst],
                 ]
                 code, stderr, out = self.render_mandate(
-                    WIRE_DECLARATION,
+                    M2_LATENCY_DECLARATION,
                     rows,
                     f"M2{name}",
                     "--run-values",
-                    json.dumps(WIRE_RUN_VALUES),
+                    json.dumps(M2_LATENCY_RUN_VALUES),
                 )
                 self.assertEqual(code, 0, stderr)
-                document = (out / "M2-wire.svg").read_text(encoding="utf-8")
+                document = (out / "M2-latency.svg").read_text(encoding="utf-8")
                 ticks = [
                     float(value)
                     for value in MANDATE.re.findall(
                         r'text-anchor="end">([-0-9.]+)<', document
                     )
                 ]
-                self.assertGreater(ticks[-1], 14.0)
-                self.assertIn("hostile_wire_guard=10", document)
-                self.assertIn("lone_wire_guard=14", document)
+                self.assertGreater(ticks[-1], 400.0)
+                self.assertIn("hostile_p99_guard=200", document)
+                self.assertIn("lone_p99_guard=400", document)
 
     def test_a_bound_with_no_tolerance_and_a_sliver_margin_is_still_refused(self):
         # The vacuity half of the tolerance rule: the same run, with the guards
         # the label would name not supplied. The observed margin is then the only
-        # band there is -- 0.09 of a 6x budget over a 6.2 axis, 3.3 px -- and it
-        # is still refused. The rule decides *which* region the axis owes the
-        # reader; it does not relax the threshold.
+        # band there is -- a couple of milliseconds under a 100 ms bound over a
+        # ~100 ms axis -- and it is still refused. The rule decides *which*
+        # region the axis owes the reader; it does not relax the threshold.
         rows = [
             ["panel", "series", "x", "y"],
-            ["wire", "wire_x", 1.0, 2.12],
-            ["wire", "wire_x", 2.0, 4.91],
-            ["wire", "wire_x", 3.0, 5.91],
+            ["latency", "p99_ms", 1.0, 35.3],
+            ["latency", "p99_ms", 2.0, 81.8],
+            ["latency", "p99_ms", 3.0, 98.5],
         ]
-        code, stderr, _ = self.render_mandate(WIRE_DECLARATION, rows, "M2noguard")
+        code, stderr, _ = self.render_mandate(M2_LATENCY_DECLARATION, rows, "M2noguard")
         self.assertNotEqual(code, 0)
         self.assertIn("sub-pixel", stderr)
-        self.assertIn("M2 wire budget 6x", stderr)
+        self.assertIn("M2 non-degrading p99 bound (ms)", stderr)
 
     # -- the sliver-bound test: a fault panel states where its bound sits -----
 
@@ -2426,10 +2518,10 @@ class MandatePlotTest(unittest.TestCase):
 
     def test_the_sliver_statement_is_not_owed_where_no_departure_is_drawn(self):
         # The other half of the rule: the statement is only the honest reading
-        # where the panel *shows* a departure. The wire budget's furthest bar is
-        # the lowest one and is a pass, so that panel keeps the refusal.
-        series = [("wire_x", [(1.0, 2.12), (2.0, 4.91), (3.0, 5.91)])]
-        bounds = [{"y": 6.0, "label": "M2 wire budget 6x"}]
+        # where the panel *shows* a departure. A bound's furthest bar can be
+        # the lowest one and a pass, so that panel keeps the refusal.
+        series = [("p99_ms", [(1.0, 35.3), (2.0, 81.8), (3.0, 98.5)])]
+        bounds = [{"y": 100.0, "label": "M2 non-degrading p99 bound (ms)"}]
         axis = MANDATE.bar_axis_extent(series, bounds, None)
         self.assertEqual(
             MANDATE.sliver_bound_statements(series, bounds, axis, MANDATE.bar_plot_height(1)),
@@ -3477,9 +3569,8 @@ class MandatePlotTest(unittest.TestCase):
         # across all three arms, and the run guards the other two at `0.995`,
         # so a hostile bar at `0.996` crossed the drawn line while sitting
         # inside its own arm's floor -- a breach the verdict tolerates, and the
-        # one difference between the arms the panel exists to compare. The wire
-        # panel beside it already names the run's per-arm guards; this is the
-        # same thing, drawn per arm.
+        # one difference between the arms the panel exists to compare. The run's
+        # per-arm guards are what it is split against, drawn per arm.
         declaration = M2_DELIVERY_DECLARATION
         panels = declaration["panels"]
         points = _points(M2_DELIVERY_ROWS)
@@ -3508,7 +3599,7 @@ class MandatePlotTest(unittest.TestCase):
             [declared for declared, _, _ in MANDATE.label_boxes(document)],
             [
                 "M2 delivery floor 1.000 [governs clean]",
-                "run delivery_floor=0.995 [governs hostile lone]",
+                "run hostile_delivery_guard=0.995 [governs hostile lone]",
             ],
         )
         self.assertEqual(
@@ -3577,11 +3668,11 @@ class MandatePlotTest(unittest.TestCase):
 
     def test_a_run_that_states_a_per_arm_bound_owes_a_line_over_that_arm(self):
         # The other half of the vacuity: the split is offered only where the
-        # run restates the quantity's bound at a different value. M4's own
-        # per-flow delivery floor is the value its declaration draws, and the
-        # wire panel's restatement is of a *different* quantity's bound, so
-        # neither panel is split -- and a split offered anyway would be an
-        # invention rather than a reading.
+        # run states a bound of its own for the panel's quantity. M4's own
+        # per-flow delivery floor is the value the M2 declaration already draws,
+        # and M4's run values bear on a different quantity, so the delivery
+        # panel is not split -- a split offered anyway would be an invention
+        # rather than a reading.
         delivery = {
             "id": "delivery",
             "chart": "bar",
@@ -3598,35 +3689,38 @@ class MandatePlotTest(unittest.TestCase):
             MANDATE.effective_bounds(delivery, series, bounds, M4_DELIVERY_RUN_VALUES),
             [{"y": 1.0, "label": "M2 delivery floor 1.000"}],
         )
-        # The wire panel is the opposite case: it restates no budget, but the
+        # The latency panel is the opposite case: it restates no bound, but the
         # run states a guard of its own for two of its three arms, and those
         # guards *are* those arms' bounds. Each is drawn over the arm it
-        # governs, and the declaration's budget keeps the one arm no guard
-        # claims -- which is what makes the lone bar's 6.63 a value under its
-        # own 14x guard rather than a breach of a 6x line drawn across it.
-        wire = {
-            "id": "wire",
+        # governs, and the declaration's bound keeps the one arm no guard
+        # claims -- which is what makes the lone-tail bar's 185.8 a value under
+        # its own 400 ms guard rather than a breach of a 100 ms line drawn
+        # across it.
+        latency = {
+            "id": "latency",
             "chart": "bar",
-            "series": [{"name": "wire_x"}],
-            "bounds": [{"y": 6.0, "label": "M2 wire budget 6x"}],
+            "series": [{"name": "p99_ms"}],
+            "bounds": [{"y": 100.0, "label": "M2 non-degrading p99 bound (ms)"}],
         }
-        wire_series = [("wire_x", [(1.0, 2.15), (2.0, 5.0), (3.0, 6.63)])]
-        wire_bounds = MANDATE._bound_specs(wire)
+        latency_series = [("p99_ms", [(1.0, 26.251), (2.0, 61.5), (3.0, 185.8015)])]
+        latency_bounds = MANDATE._bound_specs(latency)
         self.assertEqual(
-            MANDATE.arm_bound_values(wire, wire_series, wire_bounds, M2_RUN_VALUES),
-            {"clean": 6.0, "hostile": 10.0, "lone": 14.0},
+            MANDATE.arm_bound_values(
+                latency, latency_series, latency_bounds, M2_LATENCY_RUN_VALUES
+            ),
+            {"clean": 100.0, "hostile": 200.0, "lone": 400.0},
         )
         self.assertEqual(
             [
                 (plan["y"], plan["arms"], plan["window"], plan["label"])
                 for plan in MANDATE.effective_bounds(
-                    wire, wire_series, wire_bounds, M2_RUN_VALUES
+                    latency, latency_series, latency_bounds, M2_LATENCY_RUN_VALUES
                 )
             ],
             [
-                (6.0, ["clean"], [1.0], "M2 wire budget 6x"),
-                (10.0, ["hostile"], [2.0], "run hostile_wire_guard=10"),
-                (14.0, ["lone"], [3.0], "run lone_wire_guard=14"),
+                (100.0, ["clean"], [1.0], "M2 non-degrading p99 bound (ms)"),
+                (200.0, ["hostile"], [2.0], "run hostile_p99_guard=200"),
+                (400.0, ["lone"], [3.0], "run lone_p99_guard=400"),
             ],
         )
 

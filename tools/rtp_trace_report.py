@@ -86,8 +86,9 @@ PAD_BOTTOM = 48
 # -- bound-label metrics and placement -------------------------------------
 #
 # A bound's label is the annotation that says what its line means, and the
-# mandate panels make it long: `M2 wire budget 6x [1 of 3 bars beyond it; run
-# guards hostile_wire_guard=10 lone_wire_guard=14]`. Drawn at a fixed anchor the
+# mandate panels make it long: `M1 ceiling 250 ms [governs clean; hostile guards
+# hostile_p99_guard=900, hostile_over250_guard=8%; lone_tail guards
+# lone_p99_guard=3200, ...]`. Drawn at a fixed anchor the
 # label can leave the plot area; measured on the preserved battery run, the
 # three panels whose bound sits at the top of a band-view axis (`M2-delivery`,
 # `M4-imbalance`, `M4-shares`) put the label's top 4.6-14.7 px *above* the plot,
@@ -102,7 +103,8 @@ PAD_BOTTOM = 48
 # any of Times, serif, Helvetica, Arial, sans-serif, Georgia, Verdana, Tahoma
 # and system-ui gives a character of that class. A uniform advance would be
 # useless (`i` and `W` are 3.4x apart) and an underestimate is the defect, so
-# the table errs wide: it is 1.27x the real width of the `M2-wire` label, which
+# the table errs wide: it is no narrower than the real width of every label the
+# tests pin it to (`tests`' `RENDERED_LABEL_WIDTHS`), which
 # is why the real panels still draw theirs on one line.
 
 LABEL_FONT_PX = 11.0

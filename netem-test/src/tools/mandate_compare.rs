@@ -3354,7 +3354,7 @@ mod tests {
             set(
                 arm,
                 "cells",
-                Json::Array(vec![text("M2@impairment=clean+metric=own-wire")]),
+                Json::Array(vec![text("M2@impairment=clean+metric=offer-and-latency")]),
             );
         }
         let (code, stdout, stderr) = tool.run(&candidate, &[], None);

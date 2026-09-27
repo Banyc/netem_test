@@ -2,7 +2,9 @@
 """Render the per-mandate performance panels of the tri-mandate constitution.
 
 The perf tests that measure **M1** (interactive tail latency), **M2**
-(interactive delivery and wire amplification) and **M3** (bulk goodput) each
+(interactive delivery with the latency not degrading under the known offer --
+offered throughput is the input, non-degrading latency is the assertion, and
+the goodput is inferred from it) and **M3** (bulk goodput) each
 write two sibling files into one directory:
 
 - ``<mandate>.json`` — the panel declaration: ``mandate``, ``title``,
@@ -109,7 +111,8 @@ silenced by softening a declaration:
   by `tools/mandate-check`) are therefore named on the line, and a render that
   is *not* given the run's measurements, for a bound a minority of the bars
   crosses, is refused: without them the label would read as a breach the verdict
-  tolerates (the M2 wire budget line across the hostile and lone-tail arms). A
+  tolerates (a `hostile_p99` bar above the 250 ms ceiling on `M4-latency`,
+  whose own arm guard is 900 ms). A
   declaration may state its own governance instead with `bounds[i].series`
   and/or `bounds[i].x` (which also clips the drawn line to the x-window it
   governs). A crossing the run asserts nothing loosely against — a per-flow
@@ -140,12 +143,12 @@ silenced by softening a declaration:
   draws it.
 - **the axis-range test** — `check_named_values_in_axis` measures every value a
   panel *names* against the axis it draws: every bound, and every per-arm guard
-  its own label names. A `M2-wire` panel that announced
-  `hostile_wire_guard=10` and `lone_wire_guard=14` on an axis topping out at
-  6.6 was naming two values the reader could not see, and the region between
-  the budget and the guard — the region the crossing it explains lives in — was
-  off the frame with them. An axis that does not resolve a value the panel
-  names is an error, and so is a named value drawn on the frame's own edge.
+  its own label names. A panel whose bound announced `hostile_p99_guard=900` on
+  an axis topping out below it was naming a value the reader could not see, and
+  the region between the bound and the guard — the region the crossing it
+  explains lives in — was off the frame with it. An axis that does not resolve a
+  value the panel names is an error, and so is a named value drawn on the
+  frame's own edge.
 - **the headroom test** — `check_bound_headroom` requires `MIN_HEADROOM_PIXELS`
   of axis beyond every value a panel names, on the side a bar can fail towards:
   above the highest, so the bar that crosses that value has somewhere to go, and
@@ -188,7 +191,7 @@ silenced by softening a declaration:
   reason: appended to the y label it was 66 characters rotated down a 300 px
   margin.
 - **the legend test** — `check_series_labels` refuses a legend that draws a
-  producer's column name (`wire_x`, `shaper_forwarded`) instead of the
+  producer's column name (`shaper_forwarded`, `min_share`) instead of the
   quantity's name. `series_label` maps the names whose prettified form is still
   cryptic and prettifies the rest; a legend that shows the CSV's spelling is a
   claim about the producer's code, not about the run.
@@ -231,8 +234,8 @@ silenced by softening a declaration:
   so the declared bound is drawn over the reference arms and the run's own over
   the rest, each segment naming the arms it governs. The run's per-arm *guard*
   is the same fact (`arm_bound_source`): a guard the panel names is a bound the
-  panel owes the reader, so `M2-wire`'s `hostile_wire_guard=10` and
-  `lone_wire_guard=14` are drawn each over the arm it governs, and a guard that
+  panel owes the reader, so an arm's own `*_guard` is drawn over the arm it
+  governs, and a guard that
   names a whole drawn series (`hostile_p99_guard` on a panel drawing that
   statistic) spans the plot labelled with its series. Where *every* arm states a
   guard of its own, the declared bound is drawn across the panel saying it
@@ -429,13 +432,13 @@ CROSSING_BULK_SHARE = 1.0 / 3.0
 
 A bound the bars split around evenly (the fair share of `M4-shares`) is a
 value the bars are expected to sit at, and no attribution of it is owed; a
-bound with at most a third of the bars beyond it (`M2-wire`'s lone 6.6x bar
-against the 6x budget) is read as a departure, and the panel must say what the
-departure is asserted against.
+bound with at most a third of the bars beyond it (a lone `hostile_p99` bar
+above `M4-latency`'s 250 ms ceiling) is read as a departure, and the panel must
+say what the departure is asserted against.
 """
 
 GUARD_KEY_SUFFIX = "_guard"
-"""The `MANDATE` line's per-arm guard measurements: `hostile_wire_guard=10`."""
+"""The `MANDATE` line's per-arm guard measurements: `hostile_p99_guard=900`."""
 
 BAR_BOUND_LABEL_STYLE = REPORT.NOTE_LABEL_STYLE
 """A bar panel's bound label, haloed white.
@@ -478,13 +481,11 @@ BAR_GAP_SHARE = 0.18
 """The share of a bar's slot left as the gap to its neighbour."""
 
 SERIES_LABEL_VOCABULARY = {
-    "wire_x": "own-wire multiple",
     "fraction": "fraction of link rate",
 }
 """Human names for the producer columns whose prettified form is still cryptic.
 
-`wire_x` is this battery's own-wire multiple: the `x` is the multiple, not a
-run of the series, and no mechanical rule recovers that. `fraction` is a
+`fraction` is a
 *dimensionless* fraction of the configured link rate, and it is the panel's own
 `y_label` too (a panel with one series names that series' quantity), so a reader
 is never shown `MiB/s` — the sibling goodput panel's unit — over it. Every other
@@ -1055,11 +1056,11 @@ def bound_band(values, y, unit, tolerances=()):
     proxy when the run asserts a looser guard for the arms: a value inside its
     guard is not a departure, so where the run names one the region the axis
     owes the reader is the tolerance the guards open between the reference and
-    the point where a departure begins. `M2-wire` is exactly that panel, and it
-    is the reason the axis range cannot be derived from the data: an arm sitting
-    0.09 under a 6x budget makes the observed margin a sliver by construction,
-    and the tool refused the panel for a departure that is *tolerated* — three
-    times over, in three runs whose worst arm was 6.63, 6.05 and 5.91. The
+    the point where a departure begins. `M4-latency`'s 250 ms ceiling with a
+    `hostile_p99_guard` of 900 ms is that panel, and it is the reason the axis
+    range cannot be derived from the data: the observed margin between the
+    ceiling and the nearest hostile bar is a sliver by construction, and the
+    tool refused the panel for a departure that is *tolerated*. The
     margin rule is unchanged for every bound with no such guard (the delivery
     floors, the fair-share bounds), which is where a small departure really
     is the failure.
@@ -1105,7 +1106,8 @@ def crossing_values(values, y):
     Empty unless at most `CROSSING_BULK_SHARE` of the bars are beyond the
     bound: a bound the bars split around evenly is the value they are expected
     to sit at (`M4-shares`' fair share), while a lone bar past the line is a
-    crossing whose attribution the panel owes its reader (`M2-wire`). A bound
+    crossing whose attribution the panel owes its reader (a `hostile_p99` bar
+    above `M4-latency`'s ceiling). A bound
     the values are *clustered* around (`clustered_around`) has no crossing at
     all: it is the target they are read at, not a line any of them failed.
     """
@@ -1128,8 +1130,8 @@ def run_guards(run_values, series=None, text=""):
 
     Only a guard about *this* panel's quantity is named: the guard's last
     underscore token has to appear in one of the panel's series names or in the
-    text the bound carries, so `hostile_wire_guard` is named on the wire panel
-    while a `hostile_p99_guard` is not named on a delivery panel whose series
+    text the bound carries, so `hostile_p99_guard` is named on a panel whose
+    series is `p99_ms`, while it is not named on a delivery panel whose series
     are `clean`/`hostile`. A guard named against the wrong quantity would be
     worse than no attribution: it would look like evidence.
     """
@@ -1184,8 +1186,8 @@ def arm_guard_tokens(series, run_values):
     (`hostile_p99_guard`, `lone_over250_guard`), and a *line* panel's series are
     the arms themselves -- which is why the quantity-keyed clause
     `run_guards` builds cannot name them: there the statistic token has to
-    appear in a series name (`hostile_wire_guard` on the wire panel, whose
-    series is `wire_x`), while here it is the arm that has to.
+    appear in a series name (`hostile_p99_guard` on a panel whose series is
+    `p99_ms`), while here it is the arm that has to.
 
     The arm a key belongs to is the longest underscore-delimited prefix of the
     key's own name that a drawn series' name starts with (`lone` ->
@@ -1743,9 +1745,10 @@ def bound_is_the_scale(values, y, unit):
     bar at 0.994 against a 0.995 floor) and drawing it from zero would put the
     breach the panel exists for under a fifth of a pixel.
 
-    A **crossing** (`M2-wire`'s lone bar past the budget) is deliberately *not*
-    this shape: the band view draws the axis around the top of the unit, so a
-    crossing bound that is not at that top would be drawn off the axis entirely
+    A **crossing** (a lone `hostile_p99` bar past `M4-latency`'s ceiling) is
+    deliberately *not* this shape: the band view draws the axis around the top of
+    the unit, so a crossing bound that is not at that top would be drawn off the
+    axis entirely
     — which is how `M4-shares`' fair share at 0.25 came to be labelled 7553 px
     below its own plot. A bound the bars split around evenly is a target
     (`M4-shares`), and an untouched bound far from every bar is not the panel's
@@ -1764,10 +1767,9 @@ def bound_is_the_scale(values, y, unit):
 # (`0.995`), so a bar at `0.996` crosses the drawn line while being inside its
 # own arm's floor: the panel shows a breach the verdict tolerates, and the
 # difference between the arms it is comparing -- which floor applies to which
-# -- is exactly what it cannot show. The wire panel beside it already names
-# the run's per-arm guards (`hostile_wire_guard=10`, `lone_wire_guard=14`); a
-# bound the run restates is the same thing, drawn per arm instead of only
-# named on one line.
+# -- which floor applies to which -- is exactly what it cannot show. The same
+# thing is a bound the run restates for some arms (`delivery_floor=0.995` under
+# a declared `1.000`): drawn per arm instead of only named on one line.
 PER_ARM_BOUND_SUFFIXES = ("_guard", "_floor")
 """What a run's key ends in to be that arm's own bound for a quantity."""
 
@@ -1786,10 +1788,10 @@ def run_arm_names(series, run_values):
 
     Where the run states no per-arm measurement of the quantity but does state
     a guard for every arm, the guards' own keys enumerate them
-    (`clean_wire_guard` -> arm `clean`), in the run's order. Without that
+    (`clean_p99_guard` -> arm `clean`), in the run's order. Without that
     fallback a panel drawing exactly the arms the run guards would have no arms
-    to place them on, and would name guards it could not draw -- the defect the
-    wire panel's sentence had.
+    to place them on, and would name guards it could not draw -- the defect a
+    guard-naming caption had.
     """
     if not isinstance(run_values, dict) or len(series) != 1:
         return []
@@ -1817,12 +1819,12 @@ def per_arm_guard(arm, quantity, run_values):
     """The run's own guard for one arm's quantity, as ``(key, value)``, or ``None``.
 
     A `MANDATE` line names a per-arm guard as `<arm>_<statistic>_guard`
-    (`hostile_wire_guard`), and the statistic is the *quantity* the guard is
-    about: `wire` in the wire panel's series `wire_x`. That is the same filter
+    (`hostile_p99_guard`), and the statistic is the *quantity* the guard is
+    about: `p99` in a panel's series `p99_ms`. That is the same filter
     the caption's own clause applies (`run_guards`), so a guard about another
-    quantity (`hostile_p99_guard`) is never read as a bound on this panel's
-    axis -- a bound on something the panel does not measure would look like
-    evidence.
+    quantity (`hostile_delivery_guard` on a latency panel) is never read as a
+    bound on this panel's axis -- a bound on something the panel does not
+    measure would look like evidence.
     """
     if not isinstance(run_values, dict):
         return None
@@ -1843,7 +1845,7 @@ def arm_bound_source(arm, quantity, run_values):
 
     Two shapes, in the run's own order of authority: the run's restated bound
     for the arm (`<arm>_<quantity>_floor`), and then its per-arm *guard* for the
-    quantity (`hostile_wire_guard` on a panel whose series is `wire_x`). The
+    quantity (`hostile_p99_guard` on a panel whose series is `p99_ms`). The
     guard is the shape the caption named and no line carried: a guard a panel
     names is a bound the panel owes the reader, and a named bound the panel does
     not draw is the crossing the reader has to take on trust.
@@ -1880,7 +1882,7 @@ def guarded_arms(arms, run_values):
     """The arms the run states a guard of its own for, whatever the quantity.
 
     The `MANDATE` line's per-arm guards are how the run says which arms are not
-    its reference: `hostile_wire_guard` and `lone_wire_guard` leave the clean
+    its reference: `hostile_p99_guard` and `lone_p99_guard` leave the clean
     arm as the one the declaration's own bound governs. That is the same
     division the run's restated floor follows, so it is what decides which
     arms a restated bound is drawn over.
@@ -1909,11 +1911,11 @@ def arm_bound_values(panel, series, bounds, run_values):
     governs the reference arms and the run's own is drawn over the rest, so the
     panel shows which floor belongs to which arm.
 
-    The guard half is the measured `M2-wire` defect: the panel's caption read
-    `run guards hostile_wire_guard=10 lone_wire_guard=14` and the artifact drew
-    one line, at the 6x budget, on an axis reaching 14.70 -- so a `lone_tail`
-    bar at 6.21x sat *above* the budget on a PASS with no line to cross, and the
-    reader had to take the tolerance on trust from a sentence.
+    The guard half is the measured `M2-delivery` defect: the panel drew the
+    clean arm's `1.000` line across all three arms, and the run guards the other
+    two at `0.995`, so a hostile bar at `0.996` crossed the drawn line while
+    sitting inside its own arm's floor -- a breach the verdict tolerates -- and
+    the reader had to take the tolerance on trust from a sentence.
     """
     if panel["chart"] != "bar" or len(bounds) != 1 or len(series) != 1:
         return None
@@ -2020,8 +2022,9 @@ def with_drawn_guards(plan):
 def series_guard_bounds(panel, series, bounds, run_values):
     """The bound lines a bar panel owes the run's per-*series* guards.
 
-    `M2-wire` names its guards per arm (`hostile_wire_guard`) and
-    `effective_bounds` draws them over the arm's own band. A panel whose series
+    A panel whose series are the arms names its guards per arm
+    (`<arm>_<quantity>_guard`) and `effective_bounds` draws them over the arm's
+    own band. A panel whose series
     are statistics rather than arms -- `M4-latency` draws `clean_p50`,
     `clean_p99`, `hostile_p50`, `hostile_p99` -- names them as the series plus
     the guard suffix, and that guard's line spans the plot, labelled with the
@@ -2169,8 +2172,8 @@ def own_bound_names(chart, series, run_values):
     whose name prefixes it (`hostile_p99_guard` -> `hostile`). A **bar** panel's
     series are either statistics with a guard key of their own (`<series>_guard`
     -- the four `M4-latency` series) or the run's arms, for which
-    `arm_bound_source` resolves the per-arm bound (`hostile_wire_guard` on the
-    `wire_x` panel). A run that states no such bound leaves the panel's own
+    `arm_bound_source` resolves the per-arm bound (`hostile_p99_guard` on a
+    panel whose series is `p99_ms`). A run that states no such bound leaves the panel's own
     bound as the only one there is, and this check owes it nothing.
     """
     if not isinstance(run_values, dict):
@@ -2379,9 +2382,9 @@ def bar_axis_extent(series, bounds, run_values=None, plot_height=None):
     - **the zero baseline**, every other bar panel's shape, because there the
       bar's length from zero is the reading. The extent carries every bound the
       panel draws *and* every guard its own label names, because a panel that
-      announces `lone_wire_guard=14` on an axis topping out at 6.7 is naming a
-      value it does not draw — the guard is then off the chart, and so is the
-      region between the budget and it, which is where the crossing the panel
+      announces `hostile_p99_guard=900` on an axis topping out below 900 is
+      naming a value it does not draw — the guard is then off the chart, and so
+      is the region between the bound and it, which is where the crossing the panel
       exists to explain actually lies. The *failing* side of the lowest such
       bound is carried too: a two-sided band's lower arm, or a floor the data
       can fall through, needs `MIN_HEADROOM_PIXELS` below it for the same
@@ -2757,11 +2760,11 @@ def sliver_departure(values, bound, extent, plot_height):
     is a pass rather than a failure: a **cap**'s bars sit under it, a **floor**'s
     over it, and a bound a run's bars straddle — or one arm of a declared `±`
     band, whose mirror carries `band_arm` — fails on either side. The side
-    matters and the *distance* alone cannot stand in for it: measured on the
-    `M2 wire budget 6x` panel with no guard supplied, the furthest bar is the
-    *lowest* one (`2.12`, 140 px below a 6x budget it is well inside), which is
-    the bar's length and not a breach. The refusal there is right, so the
-    statement is reserved for a panel that draws the departure.
+    matters and the *distance* alone cannot stand in for it: measured on a
+    pinned delivery panel with no guard supplied, the furthest bar is the
+    *lowest* one (well inside the floor), which is the bar's length and not a
+    breach. The refusal there is right, so the statement is reserved for a panel
+    that draws the departure.
     """
     y = float(bound["y"])
     band_arm = bound.get("band_arm") is not None or two_sided_bound(bound)
@@ -3485,9 +3488,10 @@ def check_panel_summary_stated(
 def check_named_values_in_axis(panel_id, bounds, guards, extent, plot_height=None):
     """Problems that make a named value unreadable: the axis does not resolve it.
 
-    A panel whose label announces `lone_wire_guard=14` while its axis tops out
-    at 6.7 is announcing a value the reader cannot see — the guard, and with it
-    the whole region between the bound and the guard, are outside the frame, and
+    A panel whose label announces `hostile_p99_guard=900` while its axis tops
+    out below 900 is announcing a value the reader cannot see — the guard, and
+    with it the whole region between the bound and the guard, are outside the
+    frame, and
     that region is where the crossing the panel exists to explain actually lies.
     A verdict line cannot show this and neither can a summary, so it is measured
     on the drawn axis instead of left to the eye: *every* bound the panel draws
@@ -3527,13 +3531,13 @@ def check_named_guards_drawn(panel_id, guards, extent, markup, plot_height=None)
 
     `AGENTS.md`'s second panel test asks whether each drawn bound applies to
     every series it crosses; the mirror of it is whether every bound the panel
-    names is drawn at all. A caption reading `run guards hostile_wire_guard=10
-    lone_wire_guard=14` on a panel whose only line is the 6x budget tells the
-    reader a tolerance the artifact cannot show: a bar above the budget and
-    below its own guard is *between two lines* on the evidence and one line
-    plus a sentence on the panel. Measured on the recorded `M2-wire` artifact,
-    the axis reached 14.70 -- so both guards fit -- and the SVG carried one
-    `class="bound"` line, at 6.0.
+    names is drawn at all. A caption reading `run guards hostile_p99_guard=900`
+    on a panel whose only line is the 250 ms ceiling tells the reader a
+    tolerance the artifact cannot show: a bar above the ceiling and below its own
+    guard is *between two lines* on the evidence and one line plus a sentence on
+    the panel. Measured on a recorded `M4-latency` artifact, the axis reached
+    945 -- so the guard fit -- and the SVG carried one `class="bound"` line, at
+    250.
 
     Both sides are read off the artifact: the guards are the values the panel's
     own drawn labels name (`named_guard_values`), and the lines are the y each
@@ -3741,8 +3745,8 @@ def check_bound_governance(panel_id, series, bounds, run_values):
     arm's tolerated tripwire is a property of *the run*, held in the run's own
     per-arm guards. The panel therefore needs the run's measurements: without
     them it must not guess, and the render is refused rather than drawn so a
-    reader cannot conclude a breach the verdict tolerates (the `M2-wire`
-    defect).
+    reader cannot conclude a breach the verdict tolerates (a bar above the
+    ceiling that is inside its own arm's guard, the `M4-latency` defect).
 
     A crossing is *not* refused when the run's measurements are supplied but
     hold no guard for this panel's quantity: a mandate bound nothing is asserted
@@ -4669,8 +4673,8 @@ def check_series_labels(panel_id, markup, series):
     """Problems that make a series unnamed to a human reader.
 
     The legend is how a reader tells one series from another, and a column name
-    is not the name of a quantity: `wire_x` is the own-wire multiple and
-    `shaper_forwarded` is the shaper's forwarded rate. `series_label` is what
+    is not the name of a quantity: `shaper_forwarded` is the shaper's forwarded
+    rate and `min_share` is a flow's smallest share. `series_label` is what
     turns those into labels, and this is what keeps it applied -- a legend that
     shows the CSV's own spelling is the producer's *schema* leaking into the
     panel, which is a claim about the code rather than about the run.
@@ -4872,9 +4876,8 @@ def governed_label(bound, series, run_values, crossing=True):
         crossed = crossing_values(values, bound["y"])
         if crossed:
             # `crossing_values` returns whichever side of the bound is the
-            # minority -- and a guard line can sit *below* the bars (`M2`'s
-            # wire panel draws each arm's own guard, and a run is free to guard
-            # an arm tighter than the declaration's budget). A clause that said
+            # minority -- and a guard line can sit *below* the bars (an arm may
+            # be guarded tighter than the declaration's bound). A clause that said
             # `beyond it` for bars under the line would name a departure that
             # did not happen, in the direction it did not happen in.
             side = "beyond" if crossed[0] > bound["y"] else "under"
@@ -4882,7 +4885,7 @@ def governed_label(bound, series, run_values, crossing=True):
                 f"{len(crossed)} of {len(values)} bars {side} it"
             )
         # A guard the panel draws as its own line is read off that line's own
-        # label (`run hostile_wire_guard=10 [governs hostile]`), so the sentence
+        # label (`run hostile_p99_guard=900 [governs hostile]`), so the sentence
         # that used to carry it is dropped rather than repeated -- and a bound
         # that *is* a guard does not list itself among the guards it is read
         # against. Where nothing is drawn, the clause stays: naming a guard the

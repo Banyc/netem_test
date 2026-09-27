@@ -130,7 +130,7 @@ crate's author follows; the runners and the failure modes are these.
    Examples::
 
        MANDATE M1 PASS p99=31.5 ceiling=250.0 over250=0
-       MANDATE M2 FAIL delivery=0.998 amp=7.2 budget=6.0
+       MANDATE M2 FAIL clean_offer_msgs=120 clean_offer_floor=2352 clean_delivery=0.784 clean_p99=18223.9 nondergrading_p99_ms=100.0
 
    The bounds these keys are compared against live in ``rtp_mux/GATE.md``;
    they are deliberately not restated here.

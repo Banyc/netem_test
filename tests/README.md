@@ -21,8 +21,8 @@ records:
 | `dynamic_contested`, `hol_probe`, `rtp_longrun`, `rtp_mux_jitter`, `dual_lane_mandates`, `rtp_mux`, `explorer`, … | `rtp_mux/tests` | `rtp_mux/GATE.md` |
 
 Each mandate has exactly one asserting authority, so the tri-mandate
-constitution (low interactive-lane latency, interactive goodput without wire
-inflation, high bulk-lane goodput) lives in the owning crate's `GATE.md` and is
+constitution (low interactive-lane latency, interactive goodput without
+latency inflation under a known offer, high bulk-lane goodput) lives in the owning crate's `GATE.md` and is
 never restated here. See `tests/GATE.md` for the manifest/tier mechanics of
 THIS package, and each owning crate's `GATE.md` for the floors.
 
@@ -31,7 +31,7 @@ THIS package, and each owning crate's `GATE.md` for the floors.
 | mandate | asserted by (crate) | gate |
 | --- | --- | --- |
 | **M1** low latency of the interactive lane (p99 floor + zero >250 ms spikes, median-of-3) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate_p99` |
-| **M2** reasonable goodput of the interactive lane (`delivery == 1.000` + own-wire ≤ 6× offered) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate` (default tier) |
+| **M2** reasonable goodput of the interactive lane (`delivery == 1.000` + latency not degrading under the known offer) | `rtp_mux` | `rtp_mux_jitter::jitter_duallane_constitution_gate` (default tier) |
 | **M3** high goodput of the bulk lane (≥ 0.35 × configured link rate, median-of-3) | `rtp_mux` | `dual_lane_mandates::bulk_lane_goodput_stays_above_capacity_fraction` |
 
 The bounds and their derivations are stated in `rtp_mux/GATE.md`

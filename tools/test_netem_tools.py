@@ -844,7 +844,7 @@ class MandateCompareTest(unittest.TestCase):
     def test_a_cell_no_arm_covers_any_more_is_a_coverage_regression(self):
         candidate = baseline_report()
         for entry in candidate["arms"]:
-            entry["cells"] = ["M2@impairment=clean+metric=own-wire"]
+            entry["cells"] = ["M2@impairment=clean+metric=offer-and-latency"]
         code, stdout, stderr = self.run_tool(candidate)
         self.assertEqual(code, EXIT_COVERAGE_REGRESSION, stderr)
         self.assertIn("no longer covered", stdout)

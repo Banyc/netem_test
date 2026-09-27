@@ -77,11 +77,10 @@ const EXIT_M1_DEGRADATION: i32 = 6;
 const EXIT_EVIDENCE_FAILURE: i32 = 7;
 
 /// Metrics compared per arm, in the order a reader wants them. Latency
-/// percentiles are the product's promise and lead; delivery and the own-wire
-/// multiple follow because they are the two ways a latency win can be bought
-/// dishonestly.
+/// percentiles are the product's promise and lead; delivery follows because a
+/// latency win can be bought by starving the lane that would have delivered.
 const LATENCY_METRICS: &[&str] = &["p50", "p90", "p99", "p999", "max"];
-const OTHER_METRICS: &[&str] = &["over250", "wire_x", "delivery"];
+const OTHER_METRICS: &[&str] = &["over250", "delivery"];
 
 /// The arms whose tail *is* M1: the interactive lane, clean and impaired. Matched
 /// exactly, on the *arm* part of `<producer>/<arm>` — a substring test admits
@@ -413,10 +412,6 @@ fn parse_arm_lines(text: &str, into: &mut BTreeMap<String, BTreeMap<String, f64>
             if let Some(value) = parsed {
                 values.entry(key.to_string()).or_insert(value);
             }
-        }
-        // `wire=… x=2.28` — the own-wire multiple is the `x` key.
-        if let Some(x) = values.get("x").copied() {
-            values.insert("wire_x".to_string(), x);
         }
         // `delivery=1.000` arrives as `delivery` because the scan stops at the
         // space the producer writes after `=`; nothing to repair, the key is
