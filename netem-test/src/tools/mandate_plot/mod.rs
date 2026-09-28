@@ -1761,15 +1761,15 @@ fn series_guard_bounds(
     bounds: &[Bound],
     run_values: Option<&J>,
 ) -> Vec<Bound> {
-    if panel.chart != Chart::Bar || bounds.len() != 1 {
+    if panel.chart != Chart::Bar || bounds.is_empty() {
         return Vec::new();
     }
     let names: Vec<String> = series.iter().map(|(name, _)| name.clone()).collect();
-    let declared = bounds[0].y;
+    let declared: Vec<f64> = bounds.iter().map(|bound| bound.y).collect();
     let mut extra = Vec::new();
     for (key, value) in run_guards(run_values, Some(series), &bounds[0].label) {
         let owner = key[..key.len() - GUARD_KEY_SUFFIX.len()].to_string();
-        if !names.contains(&owner) || value == declared {
+        if !names.contains(&owner) || declared.contains(&value) {
             continue;
         }
         let mut bound = Bound::new(value, format!("run {key}={}", fg(value)));
@@ -2035,6 +2035,57 @@ mod tests {
         assert_eq!(tick_label(-0.000344, 2), "0.00");
         assert_eq!(tick_label(-1.5, 2), "-1.50");
         assert_eq!(tick_label(0.25, 2), "0.25");
+    }
+
+    #[test]
+    fn a_panel_with_two_declared_bounds_still_draws_a_series_guard() {
+        // The `M4-latency` shape the four-flow hostile ceiling added: the
+        // mandate's 250 ms ceiling, the hostile lane's own 452 ms level, and
+        // the run's loose 900 ms per-flow guard. The guard's line has to be
+        // drawn beside the two declared bounds and labelled with the series it
+        // governs; the single-bound precondition dropped it, so the panel
+        // named a guard it never drew and the render was refused.
+        let panel = Panel {
+            id: "latency".to_string(),
+            chart: Chart::Bar,
+            series: Vec::new(),
+            x_label: None,
+            y_label: None,
+            bounds: Vec::new(),
+            y_extent: None,
+        };
+        let series: Series = vec![
+            ("clean_p50".to_string(), vec![(1.0, 22.0)]),
+            ("clean_p99".to_string(), vec![(1.0, 180.0)]),
+            ("hostile_p50".to_string(), vec![(1.0, 70.0)]),
+            ("hostile_p99".to_string(), vec![(1.0, 1000.0)]),
+        ];
+        let mut level = Bound::new(452.0, "M4 hostile ceiling 452 ms".to_string());
+        level.series = Some("hostile_p99".to_string());
+        let bounds = vec![Bound::new(250.0, "M1 ceiling 250 ms".to_string()), level];
+        let run = pyjson::parse(r#"{"ceiling": 250.0, "hostile_p99_guard": 900.0, "flows": 4}"#)
+            .expect("parses");
+        let plan = bar_bound_plan(&panel, &series, &bounds, Some(&run));
+        let drawn: Vec<(f64, Option<String>)> = plan
+            .iter()
+            .map(|bound| (bound.y, bound.series.clone()))
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![
+                (250.0, None),
+                (452.0, Some("hostile_p99".to_string())),
+                (900.0, Some("hostile_p99".to_string())),
+            ]
+        );
+        // Vacuity: the 900 ms line is not a declared bound -- it exists only
+        // as the series guard the single-bound precondition dropped. Removing
+        // that line from the plan leaves the two declared bounds and the render
+        // refuses for a guard the panel names and does not draw.
+        assert!(
+            !bounds.iter().any(|bound| bound.y == 900.0),
+            "the 900 ms line is the drawn series guard, not a declared bound"
+        );
     }
 
     #[test]

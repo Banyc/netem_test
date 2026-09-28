@@ -1949,6 +1949,94 @@ class MandatePlotTest(unittest.TestCase):
             any("governs series hostile_p99" in label for label in labels), labels
         )
 
+    def test_a_panel_carries_a_second_ceiling_and_the_series_guard(self):
+        # The four-flow hostile ceiling case: the `M4-latency` panel declares
+        # the mandate's 250 ms ceiling *and* the hostile lane's own 452 ms
+        # level while the run still states its loose 900 ms per-flow guard. All
+        # three lines are drawn and each names the series it governs. The
+        # single-bound precondition dropped the guard line and refused the
+        # render, so the 452 ms level the arm asserts was absent from the panel
+        # that shows the bars it bounds.
+        declaration = {
+            **SERIES_GUARD_DECLARATION,
+            "panels": [
+                {
+                    **SERIES_GUARD_DECLARATION["panels"][0],
+                    "bounds": [
+                        {"y": 250.0, "label": "M1 ceiling 250 ms"},
+                        {
+                            "y": 452.0,
+                            "label": "M4 hostile ceiling 452 ms",
+                            "series": "hostile_p99",
+                        },
+                    ],
+                }
+            ],
+        }
+        code, stderr, out = self.render_mandate(
+            declaration,
+            SERIES_GUARD_ROWS,
+            "M4dual",
+            "--run-values",
+            json.dumps(SERIES_GUARD_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        svg = (out / "M4-latency.svg").read_text(encoding="utf-8")
+        self.assertEqual(svg.count('class="bound"'), 3)
+        titles = self.bound_titles(svg)
+        self.assertTrue(any(t.startswith("M1 ceiling 250 ms") for t in titles), titles)
+        self.assertTrue(
+            any(
+                t.startswith("M4 hostile ceiling 452 ms")
+                and "governs series hostile_p99" in t
+                for t in titles
+            ),
+            titles,
+        )
+        self.assertTrue(
+            any(
+                t.startswith("run hostile_p99_guard=900")
+                and "governs series hostile_p99" in t
+                for t in titles
+            ),
+            titles,
+        )
+
+    def test_two_bounds_too_close_to_read_are_still_refused(self):
+        # The multi-bound path keeps the label-overlap refusal: two ceilings a
+        # few milliseconds apart draw two sentences on one line, so the panel
+        # refuses instead of overprinting them.
+        declaration = {
+            **SERIES_GUARD_DECLARATION,
+            "panels": [
+                {
+                    **SERIES_GUARD_DECLARATION["panels"][0],
+                    "bounds": [
+                        {"y": 250.0, "label": "M1 ceiling 250 ms"},
+                        {
+                            "y": 452.0,
+                            "label": "M4 hostile ceiling 452 ms",
+                            "series": "hostile_p99",
+                        },
+                        {
+                            "y": 456.0,
+                            "label": "M4 hostile ceiling 456 ms",
+                            "series": "hostile_p99",
+                        },
+                    ],
+                }
+            ],
+        }
+        code, stderr, _ = self.render_mandate(
+            declaration,
+            SERIES_GUARD_ROWS,
+            "M4overlap",
+            "--run-values",
+            json.dumps(SERIES_GUARD_VALUES),
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("overlap", stderr)
+
     def test_every_bar_beyond_the_bound_is_not_labelled_as_a_crossing(self):
         # When *every* bar is past the bound the crossing is the verdict's, not
         # one arm's tolerated guard, so the panel draws no `N of M` clause.
