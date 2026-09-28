@@ -368,7 +368,17 @@ never run by `cargo test` and are listed here so their skip is explicit:
   --ignored`): `tests::clean_forwarding_perf_probe`,
   `tests::learned_destination_cache_perf_probe`,
   `tests::short_deadline_latency_perf_probe`,
-  `tests::std_udp_connected_peer_perf_probe`. Report-only wall-clock probes.
+  `tests::std_udp_connected_peer_perf_probe`. All four are report-only as
+  *measurements* — no floor is asserted on a rate or a time they print — and
+  all four assert that their own sample is valid (a payload length, a source
+  address, a round-trip count) rather than a rate they measured. Two also carry
+  a structural relation of the code under the measurement, which is a gate and
+  not a reading: `short_deadline_latency_perf_probe` asserts the median drain
+  stays under `RUNNER_IDLE_POLL`, and `learned_destination_cache_perf_probe`
+  asserts the cached path is faster than the locked one. They are declared in
+  the `probe` family of the ```gate-perf-design block below, whose `perf` tier
+  is their report-only reading; the two relations are stated here because the
+  tier cannot separate a reading from a gate.
 - **`rtp` in-process oracles and perf lanes** (`cargo test --release --lib --
   --ignored` from `crates/rtp`): `socket::stream::tests::probe_single_symbol_
   interactive_fec_repair`, `socket::stream::tests::probe_fresh_tail_armor_
