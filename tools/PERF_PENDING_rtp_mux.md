@@ -200,8 +200,11 @@ members.reorder = reorder-*
 members.rtp-ceiling = ceiling
 ```
 
-`netem-test/tests/check_gate_pending.rs` runs the checker's membership derivation on
-this proposal and pins the result, so the numbers below cannot rot:
+The checker's membership derivation over this proposal is what pins the result
+below, and the fixture target that ran it against this draft
+(`check_gate_pending.rs`) moved to `rtp_mux` with the tooling; it is queued for
+relocation there (`netem-test/tests/PENDING-check-gate-relocation.md`), so the
+numbers below are unguarded until that lands:
 
 - **14 cell names are claimed by two or more families**: `M1` (constitution,
   interactive, latency-sweep, lone-tail), `M2` (constitution, interactive),

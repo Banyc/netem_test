@@ -264,8 +264,9 @@ so the attribution a crate actually has is a visible number rather
 than a claim in prose.
 
 The exact grammar, the derivation rule, the checker's failure modes and the
-fixture tests that pin them are in `netem-tools check-gate` and its Rust test
-targets (`netem-test/tests/check_gate_perf.rs` and its neighbours).
+fixture tests that pin them are in `netem-tools check-gate`; its Rust test
+targets moved to `rtp_mux` with the tooling and are queued for relocation
+there (`netem-test/tests/PENDING-check-gate-relocation.md`).
 
 **What the relation check cannot see**, stated so its green is not read as more
 than it is. It verifies the **declaration**, never the code: it cannot tell
@@ -380,6 +381,12 @@ crate cannot make this sentence wrong, which is how the count went stale
 twice.
 **`proxy`** (its `tests/src/stream.rs` perf scenario) — pending, with no draft
 yet.
+- **The gate checker's own Rust test targets** — pending relocation. The
+tooling move (`e423c41b`) carried `check_gate` into `rtp_mux` but left its 150
+fixture tests in `netem-test/tests/`; they were removed there to restore the
+crate's build and are recorded, case by case, in
+`netem-test/tests/PENDING-check-gate-relocation.md`, which also names the
+`rtp_mux/GATE.md` `gate-env-tier` rows that moved with the code.
 - **`mux`** — owes no perf-test declaration, not "no opt-in scenario". Its own
 manifest is the authority: run
 `netem-tools check-gate --crate ../mux mux tests GATE.md` from here and it
