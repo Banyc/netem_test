@@ -358,9 +358,12 @@ tiers, and `mux` its benches. Those rows belong in those crates' `GATE.md`.
 Where the migration stands:
 
 - **`netem_test`** (this repository) — declared, in `tests/GATE.md`, and its
-  perf-tier probes are a recorded producer: their four `probe-*` rows are the
+  perf-tier probes are a recorded producer: their five `probe-*` rows are the
   `probe` family, and `tools/mandate-check` records their arms alongside
-  `rtp_mux`'s (see "The producers: which are covered").
+  `rtp_mux`'s (see "The producers: which are covered"). Four of the five are
+  `perf`-tier and recorded; `probe-deadline-accuracy` is `standard` tier and
+  asserts, because its reading is a property of the rig and not a number a
+  shortening pass consumes.
 - **`rtp_mux`** — pending. The exact rows, budgets and gap lines for it are
 drafted in `tools/PERF_PENDING_rtp_mux.md`, read from the landed
 `crates/rtp_mux` tree, so that crate's own iteration can apply them verbatim

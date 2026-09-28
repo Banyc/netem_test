@@ -173,8 +173,8 @@ fn the_harness_relation_counts_are_derived_from_its_own_blocks() {
     let fixture = DocCountFixture::new();
     fixture.edit(
         "tests/GATE.md",
-        "**11 orthogonal** rows",
         "**12 orthogonal** rows",
+        "**13 orthogonal** rows",
         1,
     );
     let (problems, _) = fixture.run_check();
@@ -182,8 +182,8 @@ fn the_harness_relation_counts_are_derived_from_its_own_blocks() {
         &problems,
         &[
             "'declared relation counts of the harness declaration'",
-            "'12'",
-            "11 is what determines it",
+            "'13'",
+            "12 is what determines it",
         ],
     );
 }

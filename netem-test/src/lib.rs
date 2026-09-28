@@ -56,6 +56,23 @@ pub use shaper::BottleneckShaper;
 /// how long the runner sleeps before it must re-check the queue for a packet
 /// whose deadline is about to arrive.
 const RUNNER_IDLE_POLL: Duration = Duration::from_millis(5);
+/// The divisor applied to the time still remaining before a queued deadline:
+/// the runner never waits out more than this fraction of the time it has left
+/// in one sleep.
+///
+/// The wait is what the platform is asked to sleep for, and the platform
+/// returns late by a fraction of the timeout it was given, so the instant a
+/// datagram leaves is its deadline plus that fraction of the last wait. A
+/// bounded wait is therefore a bounded lateness; without the divisor the last
+/// wait before a deadline is the deadline itself, and the overrun is a
+/// fraction of the whole remaining time.
+const RUNNER_DEADLINE_APPROACH_DIVISOR: u32 = 2;
+/// The floor under the divided wait: below it the wait is the time remaining
+/// itself, and dividing further buys no accuracy because a platform sleep has
+/// a minimum length of its own. It bounds the lateness the divisor cannot
+/// reach, so it is the runner's contribution to a delivery's excess over its
+/// own delay model.
+const RUNNER_MIN_DEADLINE_WAIT: Duration = Duration::from_micros(200);
 /// Hard per-direction cap on recycled packet payload buffers; drained buffers
 /// beyond this bound are dropped so a fast flow cannot grow the cache forever.
 const MAX_REUSED_PACKET_BUFFERS: usize = 64;
@@ -1147,15 +1164,17 @@ impl NetemState {
     }
 
     /// How long the runner may sleep before it must wake up again: until the
-    /// next queued packet's deadline, capped at [`RUNNER_IDLE_POLL`] (and at
-    /// the idle poll when the queue is empty). A zero wait means a packet is
-    /// due right now and the caller should re-drain instead of polling.
+    /// next queued packet's deadline, in [`deadline_approach_wait`] steps (and
+    /// at the idle poll, undivided, when the queue is empty -- an empty queue
+    /// holds no deadline, so there is nothing for a short wait to make
+    /// accurate, and the idle poll is what keeps an idle runner off the CPU).
     fn next_receive_wait(&self, now: Instant) -> Duration {
         self.queue
             .peek()
-            .map(|queued| queued.0.time_to_send.saturating_duration_since(now))
+            .map(|queued| {
+                deadline_approach_wait(queued.0.time_to_send.saturating_duration_since(now))
+            })
             .unwrap_or(RUNNER_IDLE_POLL)
-            .min(RUNNER_IDLE_POLL)
     }
 
     // ─────────────────────── FIFO scheduling path ───────────────────────
@@ -1299,16 +1318,37 @@ impl NetemState {
         }
     }
 
-    /// How long the runner may sleep before it must re-check the FIFO: until
-    /// the front packet's deadline, capped at [`RUNNER_IDLE_POLL`] (and at the
-    /// idle poll when the FIFO is empty).
+    /// How long the runner may sleep before it must re-check the FIFO: the
+    /// same [`deadline_approach_wait`] steps the heap path takes, or the
+    /// undivided idle poll when the FIFO is empty.
     fn next_receive_wait_fifo(&self, fifo: &FifoQueue, now: Instant) -> Duration {
         fifo.packets
             .front()
-            .map(|queued| queued.time_to_send.saturating_duration_since(now))
+            .map(|queued| {
+                deadline_approach_wait(queued.time_to_send.saturating_duration_since(now))
+            })
             .unwrap_or(RUNNER_IDLE_POLL)
-            .min(RUNNER_IDLE_POLL)
     }
+}
+
+/// The single authority for how long the runner sleeps while it is waiting for
+/// a queued deadline: the time remaining, divided by
+/// [`RUNNER_DEADLINE_APPROACH_DIVISOR`], floored at
+/// [`RUNNER_MIN_DEADLINE_WAIT`] and capped at [`RUNNER_IDLE_POLL`].
+///
+/// A sleep returns late by a fraction of the timeout it was given, so the last
+/// wait before a deadline is what a delivery's lateness is proportional to.
+/// Waiting `remaining / D` puts the runner at the deadline after `log_D`
+/// sleeps instead of one, and the last sleep before it is at most the floor --
+/// bounded lateness for `O(log)` extra wakeups, spent only in the final stretch
+/// when the runner is otherwise asleep and no datagram is arriving. The cap
+/// keeps an untouched long deadline (a tens-of-seconds stall) servable at the
+/// idle poll, and the floor keeps the recursion from asking the platform for a
+/// sleep shorter than any it can take.
+fn deadline_approach_wait(remaining: Duration) -> Duration {
+    remaining
+        .min(RUNNER_IDLE_POLL)
+        .min((remaining / RUNNER_DEADLINE_APPROACH_DIVISOR).max(RUNNER_MIN_DEADLINE_WAIT))
 }
 
 struct LinkRunner {
@@ -4018,8 +4058,16 @@ mod tests {
         drop(sent);
     }
 
+    /// The property the runner's wait must have, whatever shape it takes: it
+    /// never sleeps past the queued deadline by design, it never sleeps longer
+    /// than the idle poll, and it shrinks as the deadline nears so the last
+    /// wait before it is the floor rather than the whole remaining time.
+    ///
+    /// The platform's overrun is proportional to the timeout it was given, so
+    /// a wait longer than the remaining time is a late delivery by
+    /// construction -- which is what this pins, and what the divisor is for.
     #[test]
-    fn receive_wait_tracks_the_next_queued_deadline() {
+    fn receive_wait_never_exceeds_the_time_remaining() {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
         let config = NetemConfig {
             latency: Duration::from_millis(2),
@@ -4029,21 +4077,37 @@ mod tests {
         let clock = sent.clock();
         let t0 = clock.now();
         runner.handle_datagram(b"a", server_addr, t0);
-        // The next deadline is 2 ms out, below the 5 ms idle poll, so the wait
-        // tracks the queued deadline exactly.
-        assert_eq!(
-            runner.pipeline.next_receive_wait(t0),
-            Duration::from_millis(2)
-        );
-        // One ms later the remaining wait is 1 ms.
-        assert_eq!(
-            runner
-                .pipeline
-                .next_receive_wait(t0 + Duration::from_millis(1)),
-            Duration::from_millis(1)
+
+        let deadline = t0 + Duration::from_millis(2);
+        let mut previous = Duration::MAX;
+        let mut waits = Vec::new();
+        for elapsed_us in [0u64, 100, 500, 1_000, 1_500, 1_900, 1_999] {
+            let now = t0 + Duration::from_micros(elapsed_us);
+            let remaining = deadline.saturating_duration_since(now);
+            let wait = runner.pipeline.next_receive_wait(now);
+            assert!(
+                wait <= remaining,
+                "at {elapsed_us} us the wait {wait:?} exceeds the {remaining:?} left before the deadline: the runner would sleep past it"
+            );
+            assert!(
+                wait <= RUNNER_IDLE_POLL,
+                "at {elapsed_us} us the wait {wait:?} exceeds the idle poll {RUNNER_IDLE_POLL:?}"
+            );
+            assert!(
+                wait <= previous,
+                "the wait must shrink as the deadline nears: {wait:?} at {elapsed_us} us follows {previous:?}"
+            );
+            previous = wait;
+            waits.push((elapsed_us, wait));
+        }
+        // The waits really do shrink, so the three bound assertions above are
+        // not passing on a constant sequence.
+        assert!(
+            waits.first().unwrap().1 > waits.last().unwrap().1,
+            "the wait sequence {waits:?} never shrinks, so it pins nothing about the approach"
         );
         // Once drained there is nothing queued: the wait falls back to the
-        // idle poll.
+        // undivided idle poll, which is what keeps an idle runner off the CPU.
         clock.advance(Duration::from_millis(10));
         runner.drain_ready(clock.now());
         assert_eq!(runner.pipeline.queue.len(), 0);
@@ -4052,6 +4116,51 @@ mod tests {
             RUNNER_IDLE_POLL
         );
         drop(sent);
+    }
+
+    /// The wait the runner takes while approaching a deadline is bounded by a
+    /// fraction of the time left, floored, so the last one before the deadline
+    /// is at most the floor. Pinned as a table, because the property is a
+    /// relation between the remaining time and the wait and not a sequence of
+    /// literals: the divisor and the floor are each exercised by a row that
+    /// would move if either changed.
+    #[test]
+    fn deadline_approach_wait_divides_the_remaining_time_and_floors_it() {
+        // A long deadline is served at the idle poll: an untouched
+        // tens-of-seconds stall is polled, not slept through in one call.
+        assert_eq!(
+            deadline_approach_wait(Duration::from_secs(20)),
+            RUNNER_IDLE_POLL
+        );
+        assert_eq!(
+            deadline_approach_wait(RUNNER_IDLE_POLL * 2),
+            RUNNER_IDLE_POLL
+        );
+        // Inside the poll the wait is the remaining time divided by the
+        // divisor, so a deadline 2 ms out is approached in 1 ms steps and not
+        // slept out in one call whose overrun would be a fraction of the whole
+        // 2 ms.
+        assert_eq!(
+            deadline_approach_wait(Duration::from_millis(2)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            deadline_approach_wait(Duration::from_micros(800)),
+            Duration::from_micros(400)
+        );
+        // Below the floor the remaining time itself is the wait: dividing it
+        // further would ask the platform for a sleep shorter than any it can
+        // take, and the wait still never overruns the deadline.
+        assert_eq!(
+            deadline_approach_wait(Duration::from_micros(150)),
+            Duration::from_micros(150)
+        );
+        // Between the floor and twice it the floor binds: 300 us is approached
+        // 200 us at a time, which is the last wait's own bound.
+        assert_eq!(
+            deadline_approach_wait(Duration::from_micros(300)),
+            RUNNER_MIN_DEADLINE_WAIT
+        );
     }
 
     #[test]

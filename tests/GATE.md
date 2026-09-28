@@ -124,6 +124,7 @@ reported by `cargo test -p tests --test <target> -- --list --ignored`.
 
 ```gate-manifest
 lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot = standard
+scheduled_delivery_deadline::scheduled_deliveries_leave_at_their_own_deadline = standard
 ```
 
 The `gate-asserting` block below records the report-only/asserting split. It
@@ -152,8 +153,58 @@ raw_netem_pair::netem_pair_raw_udp_latency_is_observable
 lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_shaped_jitter_lane_cannot
 lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
 lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_battery_lanes_cannot
+scheduled_delivery_deadline::scheduled_deliveries_leave_at_their_own_deadline
 lib::tests::a_closed_blackout_gate_consumes_no_prng_draws
 ```
+
+## Deadline accuracy: the runner's own forward lateness
+
+`scheduled_delivery_deadline::scheduled_deliveries_leave_at_their_own_deadline`
+(`standard`, 7.1 s) is the rig's own assertion that a queued datagram leaves at
+the time its delay model gives it. The runner enforces a deadline by blocking
+in a socket read whose timeout is `deadline_approach_wait(remaining)`, and a
+platform sleep returns late by a fraction of the timeout it was handed, so an
+undivided wait makes a clean lane's maximum `ceiling + that fraction` rather
+than `ceiling` — the artefact `crates/rtp/tests/rtp_clean_tail.rs` attributed to
+the measurement path. The arm wraps each direction's `UdpTransport` in a
+recording one, so it reads the lateness `send - (receive + delay)` with no
+receiving endpoint in it, and reports the end-to-end split
+(`applied - ceiling` shaper side against `path_cost` endpoint side) beside it.
+
+Readings, all at the four-flow interleave and with the host load stated. The
+runner's own lateness median against the arm's two bounds (an absolute 0.060 ms
+and a 0.5x-of-`path_cost` ratio, the second carrying the host's load because
+`path_cost` is the same run's own endpoint reading):
+
+| build | load | median lateness | p90 | the two cells |
+|-------|------|-----------------|-----|---------------|
+| waits divided (this rig) | 5.5 | 0.013 / 0.012 ms | 0.027 / 0.027 | FIFO, heap |
+| waits divided | 6.2 | 0.013 / 0.014 ms | 0.027 / 0.027 | FIFO, heap |
+| waits divided | 17 | 0.029 / 0.033 ms | 0.023-1.117 | FIFO, heap |
+| waits **not** divided | 5.9 | 0.145 ms | 0.182 | FIFO |
+| waits **not** divided | 14 | 0.135 / 0.127 ms | 0.214 / 0.198 | FIFO, heap |
+| waits **not** divided | 20-25 | 0.145-0.167 ms | 0.179-0.183 | FIFO, heap |
+
+`p90` and the maximum are host-load dominated (0.02 ms to 17 ms across the
+same build) and are reported, never bounded; the median is what the bound uses,
+and the ratio bound is what separates the two regimes under load. The
+end-to-end tail at the deployed `25 ms +- 5 ms`: 0.77-1.76 % of deliveries
+above the 30 ms ceiling with the tail's excess at p50 0.06 ms, and the shaper
+side of that tail is **0 samples in the load-5.5 run against 1241 from the
+endpoints** — with the waits divided, nothing above the delay model's ceiling
+is the shaper's.
+
+The mechanism's own vacuity is a single constant:
+`RUNNER_DEADLINE_APPROACH_DIVISOR = 1` reduces `deadline_approach_wait` to
+`min(remaining, RUNNER_IDLE_POLL)` — the undivided wait this rig replaced — and
+both bounds then fail naming the observed median. It was run: 0.052 ms against
+the 0.060 ms bound, and 0.89x `path_cost` against the 0.5x bound. The always-run
+teeth are the `netem-test` lib tests
+`deadline_approach_wait_divides_the_remaining_time_and_floors_it` (fails on the
+same mutation with `left: 2ms right: 1ms`) and
+`receive_wait_never_exceeds_the_time_remaining`; this arm is opt-in because its
+reading moves with the host's load in a way a per-commit gate should not
+inherit, exactly as `rtp_clean_tail` is.
 
 ## Perf-tier reach into asserting helpers
 
@@ -403,14 +454,17 @@ namespaces:
 - **`probe`** — `lib::tests::clean_forwarding_perf_probe`, the harness's
   wall-clock probe cell (`metric=throughput layer=netem-runner`), in the
   `probe-*` namespace (`members.probe = probe-*`: `probe-forwarding`,
-  `probe-dest-cache`, `probe-deadline`, `probe-std-udp`). The deadline
-  probe differs in `metric` and the std-udp probe in `transport`, so both are
+  `probe-dest-cache`, `probe-deadline`, `probe-deadline-accuracy`,
+  `probe-std-udp`). The deadline probe differs in `metric` and the std-udp probe
+  in `transport`, so both are orthogonal; the deadline-accuracy probe is the
+  harness's own deadline measurement taken at the real clock rather than the
+  emulated one, so it differs from the reference in `metric` too and is
   orthogonal; the destination-cache probe declares the reference's own cell
   point, so it is a `re-measurement(second-arm-same-declared-point)` — a
   deliberate second arm whose declared cell repeats its reference's, which is
   the redundancy a shortening pass must see rather than a silent duplicate.
 
-Declared: **11 orthogonal** rows, **2 composite** rows and **1
+Declared: **12 orthogonal** rows, **2 composite** rows and **1
 re-measurement**, plus the four baseline rows.
 
 The composites are not a re-cut of the arms — every window, cadence and tier
@@ -423,7 +477,7 @@ combination, not to one dimension; the label is what stops it from being read
 as a single-dimension result, and no arm is to be retuned to make a label
 simpler. The other six composites the single-baseline derivation used to
 report were rows measured against the wrong reference: the pair rows differ
-from the raw pair's own clean cell in one dimension, and the three probes
+from the raw pair's own clean cell in one dimension, and the four probes
 differ from the probe cell in one dimension each. The two remaining composites
 are recorded as `attribution@baseline-family=…` gaps below, with the
 single-axis arm that would close each.
@@ -450,9 +504,10 @@ lib::tests::clean_forwarding_perf_probe = perf | 0.2 | baseline@probe | probe-fo
 lib::tests::learned_destination_cache_perf_probe = perf | 0.2 | re-measurement(second-arm-same-declared-point)@probe | probe-dest-cache@metric=throughput+layer=netem-runner
 lib::tests::short_deadline_latency_perf_probe = perf | 0.1 | orthogonal@probe | probe-deadline@metric=latency+layer=netem-runner
 lib::tests::std_udp_connected_peer_perf_probe = perf | 1.2 | orthogonal@probe | probe-std-udp@metric=throughput+layer=netem-runner+transport=std-udp
+scheduled_delivery_deadline::scheduled_deliveries_leave_at_their_own_deadline = standard | 7.1 | orthogonal@probe | probe-deadline-accuracy@metric=latency+layer=netem-runner
 ```
 
-The declared sums are `default` 10.5 s of a 60 s budget, `standard` 14.8 s of
+The declared sums are `default` 10.5 s of a 60 s budget, `standard` 21.9 s of
 120 s, `perf` 1.7 s of 60 s, and no row in `full`, whose 300 s budget is
 declared so a later row cannot be added without one. `drift` is the relative
 tolerance `netem-tools check-gate` applies when it is handed a fresh
