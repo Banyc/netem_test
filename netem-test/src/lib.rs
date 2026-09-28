@@ -2390,6 +2390,45 @@ mod tests {
         }
     }
 
+    /// `sample_delay` clamps a negative sampled delay to zero; without it the
+    /// negative `i64` nanoseconds value is cast to `u64` and becomes a duration
+    /// of centuries. This arm pins the clamp's *effect* rather than its
+    /// arithmetic: `sub_clamp_jitter_is_untouched_by_the_ceiling` reads each
+    /// delay back through `as_nanos() as i64`, which recovers the negative
+    /// value the wrap had encoded and so cannot see the clamp at all. Here the
+    /// comparison stays in `u128` nanoseconds, so a wrapped delay fails the
+    /// ceiling, and the negative tail must appear as exactly zero.
+    #[test]
+    fn jitter_larger_than_latency_clamps_the_lower_tail_to_zero() {
+        let config = NetemConfig {
+            latency: Duration::from_millis(300),
+            jitter: Duration::from_millis(500),
+            ..NetemConfig::default()
+        };
+        assert!(
+            config.jitter > config.latency,
+            "the fixture needs jitter > latency so the sampled delay can go negative"
+        );
+        let ceiling = config.latency.as_nanos() + config.jitter.as_nanos();
+        let mut rng = RndState::seed(config.seed);
+        let mut cor = CorRng::new(config.delay_corr);
+        let mut zeros = 0u32;
+        for _ in 0..512 {
+            let ns = sample_delay(&config, &mut rng, &mut cor).as_nanos();
+            assert!(
+                ns <= ceiling,
+                "a negative sampled delay must clamp to zero, not wrap: got {ns} ns, ceiling {ceiling} ns"
+            );
+            if ns == 0 {
+                zeros += 1;
+            }
+        }
+        assert!(
+            zeros > 0,
+            "the negative tail must realize as exactly zero at least once in 512 draws"
+        );
+    }
+
     #[test]
     fn four_state_loss_can_drop_and_transmit() {
         let p = FourStateLoss {
