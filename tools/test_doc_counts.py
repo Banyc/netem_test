@@ -92,7 +92,7 @@ class DocCountTest(unittest.TestCase):
     def test_a_sentence_that_left_the_prose_fails_rather_than_being_skipped(self):
         self.edit(
             "tools/PERF_INFRA.md",
-            "**216.3 s** on a warm build (10 panels, 20 SVG+PNG plot\nfiles)",
+            "**216.3 s** on a warm build (12 panels, 24 SVG+PNG plot\nfiles)",
             "**216.3 s** on a warm build",
         )
         problems, _summary = self.run_check()

@@ -599,7 +599,7 @@ runner's own, so every test's reported duration is libtest's own measurement of
 that test rather than a bracket between two lines' arrivals),
 renders one validated SVG+PNG per panel through `netem-tools mandate-plot`, prints
 a verdict block and writes `mandate-check.json` alongside the eight evidence
-files. Measured cost: **216.3 s** on a warm build (10 panels, 20 SVG+PNG plot
+files. Measured cost: **216.3 s** on a warm build (12 panels, 24 SVG+PNG plot
 files). It **refuses
 loudly rather than reporting success on absent evidence** — it fails when it
 cannot produce the evidence as well as when a mandate fails. The contract,
@@ -873,16 +873,15 @@ and the cells it reads.
 `tools/mandate-baseline.json` is the `mandate-check.json` of one real
 `tools/mandate-check` run, checked in so that the `mandate-compare` subcommand has a
 reference: it records the per-arm measurements a later run's coverage is
-compared against. It was taken with `tools/mandate-check --no-rasterize` (no
-`--quick`, and no other argument that reaches a producer — `--no-rasterize`
-only skips the PNG step, so the arms are those of a default run) on
-2026-09-26, with the runner at commit `9c4fcabe` (change
-`nnozsvltxvvnuqzkmvkoknvsrquuwttr`; the working-copy snapshot read at that
+compared against. It was taken with `tools/mandate-check` (no `--quick`, and no
+other argument that reaches a producer) on
+2026-09-28, with the runner at commit `baf53011` (change
+`xpnvwtnp`; the working-copy snapshot read at that
 moment was empty, so the recorded runner `tree_id`
-`d72f0d5824461f0eded3b0af4d8b5a7024b114cd` is what actually names the content
-it built) and the sibling `rtp_mux` at commit `4632257a` (change
-`xwwmprmsltkkkuwpuvkvwkoukusvuooo`), whose tree `937a25b0` pins `rtp v0.0.95`
-and `mux v0.0.31`. The run took **147.1 s**, passed all four mandates with 10
+`0532c09b8dd04055b264529a2a870a37791b07c5` is what actually names the content
+it built) and the sibling `rtp_mux` at commit `bdb9ffb9` (change
+`xruzoxlsvnsxyokrolxypmronxuplums`), whose tree `6a20dbb9` pins `rtp v0.0.100`
+and `mux v0.0.34`. The run took **189.7 s**, passed all four mandates with 12
 verified SVG panels, and recorded **23 arms from both producers**: 19 for
 `rtp_mux` (3 M1, 3 M2, 3 M3 reps and 10 M4 arms) and the 4 probes
 (`probe/forwarding` over 200 000 iterations, `probe/deadline` over 1 000,
@@ -898,10 +897,8 @@ regenerate them.
 Because the comparison refuses a baseline whose schema predates the per-arm
 record, this file has to be re-recorded with a current `tools/mandate-check`
 (no `--quick`) whenever the runner or a producer changes shape; the checked-in
-file is schema `mandate-check/5`, so its `timings` block is the per-test
-numbers the pre-`/6` bracketing produced — `m2_interactive_delivery_and_wire`
-at 0.000 s beside `m3_bulk_goodput_fraction` at 61.981 s, in a run libtest
-timed at 147.1 s — and is read by nothing: only `arms` is compared. A `/4`
+file is schema `mandate-check/10`, whose `timings` block is libtest's own
+per-test measurement, and is read by nothing: only `arms` is compared. A `/4`
 file is still read, but it carries
 one producer's arms only, so a run compared against it cannot show the second
 producer's coverage — re-record rather than compare across the addition.
