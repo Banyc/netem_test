@@ -54,6 +54,14 @@ impl Json {
         self.as_object().and_then(|map| map.get(key))
     }
 
+    /// The mutable object, or `None` for a non-object.
+    pub fn as_object_mut(&mut self) -> Option<&mut BTreeMap<String, Json>> {
+        match self {
+            Json::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
     /// Whether the value is a JSON number (an integer or a float).
     pub fn is_number(&self) -> bool {
         matches!(self, Json::Int(_) | Json::Float(_))
@@ -99,6 +107,104 @@ pub fn format_float(value: f64) -> String {
     } else {
         format!("{text}.0")
     }
+}
+
+/// A string value, or JSON `null` for an absent one. The ported tools record
+/// an optional name as `null` rather than omitting the key, so the report's
+/// schema is the same shape whatever a run measured.
+pub fn opt_str(value: Option<&str>) -> Json {
+    match value {
+        Some(text) => Json::Str(text.to_string()),
+        None => Json::Null,
+    }
+}
+
+/// A number value, or JSON `null` for an absent one.
+pub fn opt_float(value: Option<f64>) -> Json {
+    match value {
+        Some(number) => Json::Float(number),
+        None => Json::Null,
+    }
+}
+
+/// An array of strings.
+pub fn str_list(items: &[String]) -> Json {
+    Json::Array(items.iter().cloned().map(Json::Str).collect())
+}
+
+/// An object value built from a borrowed map, cloning each member.
+pub fn object(map: &BTreeMap<String, Json>) -> Json {
+    Json::Object(map.clone())
+}
+
+/// An object value built from an owned member list.
+pub fn object_map(map: BTreeMap<String, Json>) -> Json {
+    Json::Object(map)
+}
+
+/// Python's `json.dumps(value)`: the compact form, with `", "` and `": "`
+/// separators, which is what the runner hands the plotter's `--run-values`.
+pub fn to_compact(value: &Json) -> String {
+    let mut out = String::new();
+    write_compact(&mut out, value);
+    out
+}
+
+fn write_compact(out: &mut String, value: &Json) {
+    match value {
+        Json::Null => out.push_str("null"),
+        Json::Bool(true) => out.push_str("true"),
+        Json::Bool(false) => out.push_str("false"),
+        Json::Int(number) => {
+            let _ = write!(out, "{number}");
+        }
+        Json::Float(number) => out.push_str(&format_float(*number)),
+        Json::Str(text) => write_string(out, text),
+        Json::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_compact(out, item);
+            }
+            out.push(']');
+        }
+        Json::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_string(out, key);
+                out.push_str(": ");
+                write_compact(out, item);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// The compact form of an object, preserving the member order given.
+pub fn object_compact(members: &[(String, Json)]) -> String {
+    let mut out = String::from("{");
+    for (index, (key, value)) in members.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        write_string(&mut out, key);
+        out.push_str(": ");
+        write_compact(&mut out, value);
+    }
+    out.push('}');
+    out
+}
+
+/// Read and parse one JSON document, with the failure Python's `json.load`
+/// raised as a sentence.
+pub fn parse_document(path: &std::path::Path) -> Result<Json, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    parse(&text)
 }
 
 /// Parse one JSON document. Trailing non-whitespace is an error, so a

@@ -605,6 +605,75 @@ loudly rather than reporting success on absent evidence** — it fails when it
 cannot produce the evidence as well as when a mandate fails. The contract,
 what it writes and its exit codes are in `tools/MANDATE_SMOKE.md`.
 
+### The runner is Rust: `netem-tools mandate-check`
+
+`tools/mandate_check.py` (2857 lines) was the last Python authority for the
+battery: it built and invoked the producers, collected each mandate's `json` and
+`csv`, called the plotter, enforced the producer contract and wrote the report.
+It is now the `mandate-check` subcommand of `netem-tools`, built from
+`netem-test/src/tools/mandate_check/` (`lines.rs` for the verdict and arm lines,
+`timings.rs` for the libtest stamps and the mandate brackets, `delivery.rs` for a
+declaration's unit budget, `producers.rs` for the registry and the revision/tree
+resolution, `exec.rs` for the two child processes and the panel verifier,
+`history.rs` for the archive/compare step, `value.rs` for Python-compatible
+number coercion). The Python file is deleted with the port, so no behaviour has
+two implementations.
+
+`tools/mandate-check` remains, as the documented entry point, but it is a **sh
+shim**: it resolves `target/{release,debug}/netem-tools`, builds it when it is
+missing, and `exec`s it with the arguments unchanged. The battery, the history
+step (which runs the `perf-history` bin and carries its status), the artifacts
+and the exit codes are all the binary's — the shim has no behaviour of its own
+to drift from the binary's.
+
+**Where the runner's coverage lives now.** The black-box suite
+`tools/test_mandate_check.py` drives the built binary over fake-cargo fixtures
+(one plan per case, exactly as before) and covers every end-to-end path: the
+healthy run and its report, each refusal the contract names, the two producers,
+the arms, the delivery granularity, the timings, the run directory, and the
+history step's two text artifacts. What cannot be driven from a plan — the line
+parsers, the timing derivation, the declaration validation, the panel verifier —
+is unit-tested where it lives, under `netem-test/src/tools/mandate_check/`. The
+cases that moved, so that no case was dropped without a named replacement:
+
+| Python case (in `tools/mandate_check.py`'s suite) | Rust assertion that carries it |
+|---|---|
+| `test_grammar_accepts_the_documented_shape` | `lines::tests::the_documented_shape_parses_into_typed_values` |
+| `test_grammar_rejects_repeated_keys_and_unparsable_tokens` | `lines::tests::a_repeated_key_and_an_unparsable_token_are_refused` |
+| `test_grammar_normalises_units_stats_counters_and_windows` | `lines::tests::an_arm_line_is_normalised_into_stats_counters_and_windows` |
+| `test_parse_arm_lines_attributes_by_the_next_mandate_line` | `lines::tests::arms_are_attributed_by_the_mandate_line_that_follows` |
+| `test_declared_cells_match_the_longest_arm_prefix` | `lines::tests::the_longest_declared_prefix_wins_and_a_word_boundary_ends_it` |
+| `test_a_missing_arm_declaration_is_refused` | `lines::tests::a_missing_arm_declaration_is_refused` |
+| `test_a_malformed_arm_declaration_is_refused` | `lines::tests::a_malformed_arm_declaration_is_refused_and_a_good_one_is_not` |
+| `test_a_section_declared_by_two_producers_is_refused` | `producers::tests::a_section_declared_by_two_producers_is_refused` |
+| `test_a_registry_entry_cannot_declare_its_evidence_away` | `producers::tests::a_registry_entry_cannot_declare_its_evidence_away` |
+| `test_an_unresolvable_tree_id_is_recorded_as_null_not_fabricated` | `producers::tests::an_unresolvable_revision_or_tree_is_null_and_never_fabricated` |
+| `test_derive_timings_takes_each_duration_from_its_own_stamp` | `timings::tests::each_duration_comes_from_its_own_stamp` |
+| `test_a_bracket_that_prints_as_zero_is_reported_unmeasured_and_says_why` | `timings::tests::a_bracket_that_prints_as_zero_is_reported_unmeasured_and_says_why` |
+| `test_the_duration_check_is_red_on_a_printable_zero_and_green_on_the_record_written` | `timings::tests::a_duration_that_prints_as_zero_is_refused_even_with_a_note` and `a_mandate_timing_with_no_note_and_no_duration_is_refused` |
+| `test_a_stamp_less_result_is_marked_and_never_bracketed` | `timings::tests::a_stamp_less_result_is_marked_and_never_bracketed` |
+| `test_derive_timings_reads_a_completion_split_by_the_tests_own_output` | `timings::tests::a_completion_split_by_the_tests_own_output_is_read_from_the_state_line` |
+| `test_a_serial_targets_stamps_must_sum_to_no_more_than_its_total` | `timings::tests::a_serial_targets_stamps_must_sum_to_no_more_than_its_total` |
+| `test_a_stamp_that_cannot_fit_its_targets_total_is_refused` | `timings::tests::a_stamp_over_the_targets_total_is_refused` |
+| `test_a_run_whose_panels_lack_a_summary_is_an_evidence_failure` | `exec::tests::a_panel_without_its_summary_is_an_evidence_failure` |
+| `test_a_panel_whose_summary_sidecar_is_missing_is_an_evidence_failure` | `exec::tests::a_panel_without_its_summary_sidecar_is_an_evidence_failure` |
+
+Six further cases were in-process calls that are now end-to-end cases in
+`tools/test_mandate_check.py`, because the command can be driven where the
+function could only be called: `test_the_registry_declares_the_primary_producers_default_checkout`
+and `test_the_shipped_registry_and_arm_declaration_cover_the_second_producer`
+are `test_the_shipped_registry_records_every_declared_producer` and
+`test_the_arm_declaration_and_its_cells_are_recorded`;
+`test_declared_checkouts_resolve_to_real_directories` and
+`test_default_out_dir_is_beneath_tmpdir` keep their names;
+`test_tree_id_follows_the_tree_and_not_the_commit_id` is
+`test_tree_id_follows_the_content_and_not_the_commit_id`, and
+`test_tree_id_is_stable_across_jj_rewrites_of_the_working_copy` is
+`test_tree_id_is_stable_across_a_jj_rewrite_of_the_working_copy`. Each drives
+the binary over a real git/jj repository or the shipped registry, so the case
+that used to assert a function's return value now asserts the report the
+command wrote.
+
 ### The perf-history M1 band — measured, not a fixed percentage
 
 After the battery, `tools/mandate-check` runs the `perf-history` bin

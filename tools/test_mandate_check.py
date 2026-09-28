@@ -1,24 +1,95 @@
 #!/usr/bin/env python3
 
-import io
+"""Exercise `netem-tools mandate-check` as a black box.
+
+The runner was `tools/mandate_check.py`, which this suite imported in-process;
+it is now the `mandate-check` subcommand of the `netem-tools` binary, so this
+suite drives the *command*: the fake cargo below supplies a producer's evidence
+and output stream from a JSON plan, and every assertion reads the command's
+stdout, stderr, exit status and the `mandate-check.json` it writes. What cannot
+be driven from a declaration and a plan — the parsers, the timing derivation,
+the declaration validation, the panel verifier — is unit-tested where it lives,
+in `netem-test/src/tools/mandate_check/`, and each such case names its Rust
+test in the migration table in `tools/PERF_INFRA.md`.
+"""
+
 import json
-import importlib.util
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest import mock
 
-MODULE_PATH = Path(__file__).with_name("mandate_check.py")
-SPEC = importlib.util.spec_from_file_location("mandate_check", MODULE_PATH)
-MANDATE_CHECK = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MANDATE_CHECK)
+TOOLS = Path(__file__).resolve().parent
+WORKSPACE = TOOLS.parent
 
-WORKSPACE = Path(__file__).resolve().parents[1]
+# The runner's own constants, restated here because the suite drives the built
+# binary rather than importing a module: these are the values the contract
+# names, and a change to one is a change the assertions below have to follow.
+REPORT_NAME = "mandate-check.json"
+REPORT_SCHEMA = "mandate-check/10"
+LOG_NAME = "mandate-smoke.log"
+PLOTS_DIRNAME = "plots"
+ARMS_DECLARATION_NAME = "mandate-arms.json"
+PRODUCERS_DECLARATION_NAME = "mandate-producers.json"
+ARMS_DECLARATION_SCHEMA = "mandate-arms/1"
+PRODUCERS_DECLARATION_SCHEMA = "mandate-producers/1"
+PRIMARY_PRODUCER = "rtp_mux"
+MANDATE_IDS = ("M1", "M2", "M3", "M4")
+TIMING_ARGS = ("-Z", "unstable-options", "--report-time")
+TIMING_ENV = "RUSTC_BOOTSTRAP"
+TIMING_ENV_VALUE = "1"
+DURATION_SOURCE_STREAM_BRACKET = "stream-bracket-of-mandate-lines"
+DURATION_SOURCE_HARNESS = "libtest-report-time"
+EXIT_OK = 0
+EXIT_EVIDENCE_FAILURE = 2
+EXIT_MANDATE_FAILURE = 3
+
+
+def binary():
+    """The built `netem-tools`, wherever the build put it.
+
+    The runner has no Python implementation any more, so a missing binary is a
+    failure and not a skip: a suite that cannot reach the command has checked
+    nothing.
+    """
+    candidates = (
+        WORKSPACE / "target" / "release" / "netem-tools",
+        WORKSPACE / "target" / "debug" / "netem-tools",
+        WORKSPACE / "netem-test" / "target" / "release" / "netem-tools",
+        WORKSPACE / "netem-test" / "target" / "debug" / "netem-tools",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        "netem-tools is not built; build it with "
+        "`cargo build --release -p netem-test --features cli --bin netem-tools` "
+        "before running this suite"
+    )
+
+
+BINARY = binary()
+
+
+def perf_history_binary():
+    """The built `perf-history`, which the runner's history step invokes."""
+    candidates = (
+        WORKSPACE / "target" / "release" / "perf-history",
+        WORKSPACE / "target" / "debug" / "perf-history",
+        WORKSPACE / "netem-test" / "target" / "release" / "perf-history",
+        WORKSPACE / "netem-test" / "target" / "debug" / "perf-history",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        "perf-history is not built; build it with "
+        "`cargo build --release -p netem-test --features cli --bin perf-history` "
+        "before running this suite"
+    )
 
 # A stand-in cargo. Everything it does comes from a JSON plan, so the tool can
 # be exercised end to end without a Rust build: it records the argv, cwd and
@@ -501,14 +572,15 @@ class MandateCheckTest(unittest.TestCase):
         browser=None,
         extra_env=None,
         producers=("rtp_mux",),
+        history=False,
+        cwd=None,
     ):
         self.plan_path.write_text(json.dumps(plan), encoding="utf-8")
         if self.record.exists():
             self.record.unlink()
-        env = {
-            "FAKE_CARGO_PLAN": str(self.plan_path),
-            "FAKE_CARGO_RECORD": str(self.record),
-        }
+        env = dict(os.environ)
+        env["FAKE_CARGO_PLAN"] = str(self.plan_path)
+        env["FAKE_CARGO_RECORD"] = str(self.record)
         env.update(extra_env or {})
         arguments = [
             "--cargo",
@@ -527,15 +599,24 @@ class MandateCheckTest(unittest.TestCase):
         if browser is not None:
             arguments += ["--browser", browser]
         arguments += list(extra)
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, env), redirect_stdout(stdout), redirect_stderr(
-            stderr
-        ):
-            code = MANDATE_CHECK.main(arguments)
-        return code, stdout.getvalue(), stderr.getvalue()
+        # The history step (archive + compare) is the wrapper's, and is on by
+        # default; a suite that wants the battery alone says so, which is what
+        # the Python suite's in-process call did.
+        command = [str(BINARY), "mandate-check"]
+        if not history:
+            command.append("--no-history")
+        command += arguments
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return completed.returncode, completed.stdout, completed.stderr
 
     def report(self):
-        return json.loads((self.out / MANDATE_CHECK.REPORT_NAME).read_text(encoding="utf-8"))
+        return json.loads((self.out / REPORT_NAME).read_text(encoding="utf-8"))
 
     def cargo_record(self):
         return self.cargo_records()[0]
@@ -570,7 +651,7 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(report["exit_code"], 0)
         self.assertEqual(report["verdict"], "PASS")
         self.assertEqual(report["problems"], [])
-        self.assertEqual(report["schema"], MANDATE_CHECK.REPORT_SCHEMA)
+        self.assertEqual(report["schema"], REPORT_SCHEMA)
         self.assertGreater(report["duration_seconds"], 0)
         self.assertEqual(report["smoke"]["exit_code"], 0)
         self.assertFalse(report["smoke"]["timed_out"])
@@ -585,7 +666,7 @@ class MandateCheckTest(unittest.TestCase):
                 "--test",
                 "mandate_smoke",
                 "--",
-                *MANDATE_CHECK.TIMING_ARGS,
+                *TIMING_ARGS,
                 "--nocapture",
             ],
         )
@@ -600,7 +681,7 @@ class MandateCheckTest(unittest.TestCase):
                 "--test",
                 "mandate_smoke",
                 "--",
-                *MANDATE_CHECK.TIMING_ARGS,
+                *TIMING_ARGS,
                 "--nocapture",
             ],
         )
@@ -608,7 +689,7 @@ class MandateCheckTest(unittest.TestCase):
         # for them itself and opens the gate the stable-pinned toolchain's
         # libtest puts on the flag.
         self.assertIn("--report-time", record["argv"])
-        self.assertEqual(record["rustc_bootstrap"], MANDATE_CHECK.TIMING_ENV_VALUE)
+        self.assertEqual(record["rustc_bootstrap"], TIMING_ENV_VALUE)
         self.assertEqual(Path(record["cwd"]).resolve(), self.crate.resolve())
         self.assertEqual(record["mandate_check_dir"], report["out_dir"])
         self.assertIsNone(record["quick"])
@@ -663,40 +744,6 @@ class MandateCheckTest(unittest.TestCase):
         self.assertIn("panel latency", sidecar.read_text(encoding="utf-8"))
         self.assertIn("summary| panel latency", stdout)
 
-    def test_a_run_whose_panels_lack_a_summary_is_an_evidence_failure(self):
-        # red: the summary is mandatory, so an evidence set without one cannot
-        # report PASS. The count is the first thing measured.
-        code, _, stderr = self.run_tool(self.healthy_plan())
-        self.assertEqual(code, 0, stderr)
-        report = self.report()
-        summary = {
-            "panels": 2,
-            "series_counts": [1, 1],
-            "svg": report["mandates"]["M1"]["plots"],
-            "summaries": [],
-        }
-        problems = MANDATE_CHECK._verify_plots("M1", summary)
-        self.assertTrue(problems)
-        self.assertIn("panel summary", problems[0])
-
-    def test_a_panel_whose_summary_sidecar_is_missing_is_an_evidence_failure(self):
-        # red: the summary has to be in the run's evidence, not only in the SVG.
-        code, _, stderr = self.run_tool(self.healthy_plan())
-        self.assertEqual(code, 0, stderr)
-        report = self.report()
-        plots = report["mandates"]["M1"]["plots"]
-        sidecar = Path(plots[0]).with_suffix(".summary.txt")
-        sidecar.unlink()
-        summary = {
-            "panels": 2,
-            "series_counts": [1, 1],
-            "svg": plots,
-            "summaries": report["mandates"]["M1"]["panel_summaries"],
-        }
-        problems = MANDATE_CHECK._verify_plots("M1", summary)
-        self.assertTrue(problems)
-        self.assertIn("no M1-latency.summary.txt beside it", problems[0])
-
     def test_verdict_block_names_every_plot_and_the_report(self):
         code, stdout, _ = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0)
@@ -714,7 +761,7 @@ class MandateCheckTest(unittest.TestCase):
             path = (self.out / "plots" / f"{mandate}-{panel}.svg").resolve()
             self.assertIn(f"plot: {path}", stdout)
         self.assertIn(
-            f"report:  {(self.out / MANDATE_CHECK.REPORT_NAME).resolve()}", stdout
+            f"report:  {(self.out / REPORT_NAME).resolve()}", stdout
         )
 
     def test_report_records_per_test_and_per_mandate_timings(self):
@@ -773,10 +820,10 @@ class MandateCheckTest(unittest.TestCase):
         for mandate in ("M1", "M2", "M3", "M4"):
             self.assertEqual(
                 report["mandates"][mandate]["duration_source"],
-                MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET,
+                DURATION_SOURCE_STREAM_BRACKET,
             )
         self.assertIn("duration: ", stdout)
-        self.assertIn(MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET, stdout)
+        self.assertIn(DURATION_SOURCE_STREAM_BRACKET, stdout)
         self.assertIn("4/4 test(s) stamped by libtest", stdout)
         self.assertIn("fit=yes", stdout)
         # The existing per-mandate assertion above (`assertGreater(duration, 0)`)
@@ -785,151 +832,18 @@ class MandateCheckTest(unittest.TestCase):
         # its reason, so the runner's own check passes and no `0.00s` is
         # printed for a bracket nobody can trust. Every one of these four
         # brackets resolves, because this plan sleeps between lines.
-        self.assertEqual(
-            MANDATE_CHECK.mandate_duration_problems(
-                report,
-                {"id": "rtp_mux", "verdicts": ["M1", "M2", "M3", "M4"]},
-            ),
-            [],
-        )
+        # A duration is a measurement or it is absent with its reason: a
+        # `0.00s` figure is what "not measured" looks like too.
+        for mandate in report["mandate_order"]:
+            record = report["mandates"][mandate]
+            if record["duration_seconds"] is None:
+                self.assertTrue(record["duration_note"], record)
+            else:
+                self.assertNotEqual(
+                    f"{record['duration_seconds']:.2f}", "0.00", record
+                )
         self.assertNotIn("duration: 0.00s", stdout)
         self.assertNotIn("unmeasured", stdout)
-
-    def test_derive_timings_takes_each_duration_from_its_own_stamp(self):
-        # The stream order and the stamps disagree on purpose: a bracket would
-        # call `slow` 9.5 s and `fast` 2.5 s, while libtest's own instants say
-        # 9.0 s and 1.0 s. The stamps win, because only they survive a target
-        # whose tests overlap.
-        events = [
-            {"seconds": 0.5, "line": "running 2 tests"},
-            {"seconds": 2.0, "line": "MANDATE M1 PASS p99=1.0"},
-            {"seconds": 3.0, "line": "test fast ... ok <1.000s>"},
-            {"seconds": 5.5, "line": "test slow has been running for over 60 seconds"},
-            {"seconds": 12.0, "line": "test slow ... FAILED <9.000s>"},
-            {"seconds": 12.5, "line": "test skipped ... ignored, perf tier"},
-            {"seconds": 13.0, "line": "MANDATE M2 FAIL delivery=0.0"},
-            {
-                "seconds": 13.1,
-                "line": "test result: FAILED. 1 passed; 1 failed; 1 ignored; "
-                "0 measured; 0 filtered out; finished in 12.50s",
-            },
-        ]
-        timings = MANDATE_CHECK.derive_timings(events, "mandate_smoke")
-        self.assertEqual(
-            [entry["name"] for entry in timings["tests"]], ["fast", "slow", "skipped"]
-        )
-        fast, slow, skipped = timings["tests"]
-        self.assertEqual((fast["state"], fast["duration_seconds"]), ("ok", 1.0))
-        self.assertEqual(fast["duration_source"], "libtest-report-time")
-        self.assertEqual((slow["state"], slow["duration_seconds"]), ("FAILED", 9.0))
-        self.assertEqual(slow["duration_source"], "libtest-report-time")
-        self.assertNotEqual(slow["duration_seconds"], 9.5)
-        # An `ignored` test never ran, so it has no stamp and no duration.
-        self.assertEqual(slow["finished_at_seconds"], 12.0)
-        self.assertEqual((skipped["state"], skipped["duration_seconds"]), ("ignored", None))
-        self.assertIsNone(skipped["duration_source"])
-        self.assertEqual(timings["problems"], [])
-        (target,) = timings["targets"]
-        self.assertEqual(target["total_seconds"], 12.5)
-        self.assertEqual(target["ran"], 2)
-        self.assertEqual(target["stamped"], 2)
-        self.assertEqual(target["max_seconds"], 9.0)
-        self.assertTrue(target["fits"])
-        self.assertEqual(
-            [(entry["mandate"], entry["duration_source"]) for entry in timings["mandates"]],
-            [
-                ("M1", MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET),
-                ("M2", MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET),
-            ],
-        )
-
-    def test_a_bracket_that_prints_as_zero_is_reported_unmeasured_and_says_why(self):
-        # The real shape, from a recorded run (M1 0.002 s, M2 51.216 s): two
-        # sections that read one shared arm measurement print their MANDATE
-        # lines in the same instant, so the second closes a bracket that
-        # brackets no run of its own. The record used to keep 0.002 and the
-        # report printed `duration: 0.00s (stream-bracket-of-mandate-lines)` --
-        # a figure no reader can tell from "not measured". The interval is
-        # still measured; what is refused is calling it a duration.
-        events = [
-            {"seconds": 0.5, "line": "running 4 tests"},
-            {"seconds": 51.216, "line": "MANDATE M2 PASS delivery=1.000"},
-            {
-                "seconds": 51.216,
-                "line": "test m2_offered_load_latency ... ok <49.945s>",
-            },
-            {"seconds": 51.218, "line": "MANDATE M1 PASS p99=90.8"},
-            {
-                "seconds": 51.218,
-                "line": "test m1_interactive_tail_latency ... ok <49.947s>",
-            },
-            {
-                "seconds": 51.5,
-                "line": "test result: ok. 2 passed; 0 failed; 0 ignored; "
-                "0 measured; 0 filtered out; finished in 51.00s",
-            },
-        ]
-        timings = MANDATE_CHECK.derive_timings(events, "mandate_smoke")
-        m2, m1 = timings["mandates"]
-        # The section that closed the shared run's bracket reports its seconds,
-        # and carries no note: it has nothing to disclaim.
-        self.assertEqual(m2["mandate"], "M2")
-        self.assertEqual(m2["duration_seconds"], 51.216)
-        self.assertIsNone(m2["duration_note"])
-        # The section whose line was printed in the same instant reports no
-        # duration, keeps the source naming where the bracket came from, and
-        # carries the interval it measured plus the reason it is not this
-        # section's own wall-clock.
-        self.assertEqual(m1["mandate"], "M1")
-        self.assertIsNone(m1["duration_seconds"])
-        self.assertEqual(
-            m1["duration_source"], MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET
-        )
-        self.assertIn("empty bracket", m1["duration_note"])
-        self.assertIn("0.002s", m1["duration_note"])
-        self.assertIn("MANDATE M2", m1["duration_note"])
-        # The rule is the report's own resolution, not a tolerance of its own:
-        # a millisecond is still not a duration at the precision it prints.
-        self.assertTrue(MANDATE_CHECK._renders_as_zero(0.002))
-        self.assertFalse(MANDATE_CHECK._renders_as_zero(0.01))
-
-    def test_the_duration_check_is_red_on_a_printable_zero_and_green_on_the_record_written(self):
-        # The check the report owes: `0.00s` is refused whether or not a note
-        # explains it (the reader still sees `0.00s`), absent-and-explained
-        # passes, and absent-with-no-reason is refused too -- otherwise a
-        # section nobody measured and one whose bracket was dropped look alike.
-        producer = {"id": "rtp_mux", "verdicts": ["M1"]}
-        record = {
-            "raw_line": "MANDATE M1 PASS p99=90.8",
-            "duration_seconds": 0.0,
-            "duration_source": MANDATE_CHECK.DURATION_SOURCE_STREAM_BRACKET,
-            "duration_note": None,
-        }
-        report = {"mandates": {"M1": record}}
-        problems = MANDATE_CHECK.mandate_duration_problems(report, producer)
-        self.assertEqual(len(problems), 1, problems)
-        self.assertIn("M1", problems[0])
-        self.assertIn("0.00s", problems[0])
-        record["duration_note"] = "the arms were measured under M2's bracket"
-        self.assertEqual(
-            len(MANDATE_CHECK.mandate_duration_problems(report, producer)),
-            1,
-            "a note does not buy a printed zero",
-        )
-        record["duration_seconds"] = None
-        self.assertEqual(
-            MANDATE_CHECK.mandate_duration_problems(report, producer), []
-        )
-        record["duration_note"] = None
-        problems = MANDATE_CHECK.mandate_duration_problems(report, producer)
-        self.assertEqual(len(problems), 1, problems)
-        self.assertIn("say why", problems[0])
-        # A section that printed no MANDATE line has no duration to be true
-        # about; that absence is named as its own failure elsewhere.
-        record["raw_line"] = None
-        self.assertEqual(
-            MANDATE_CHECK.mandate_duration_problems(report, producer), []
-        )
 
     def test_a_run_whose_brackets_do_not_resolve_reports_unmeasured_not_zero(self):
         # End to end: a plan whose lines arrive together leaves every mandate
@@ -957,96 +871,16 @@ class MandateCheckTest(unittest.TestCase):
                 self.assertGreater(record["duration_seconds"], 0, record)
         self.assertIn("duration: unmeasured (empty bracket:", stdout)
         self.assertNotIn("duration: 0.00s", stdout)
-        self.assertEqual(
-            MANDATE_CHECK.mandate_duration_problems(
-                report,
-                {"id": "rtp_mux", "verdicts": ["M1", "M2", "M3", "M4"]},
-            ),
-            [],
-        )
-
-    def test_a_stamp_less_result_is_marked_and_never_bracketed(self):
-        # A libtest that printed no stamp: the old bracketing would have
-        # invented 4.0 s and 2.0 s here, and a report that quietly kept doing
-        # that would look fixed. Every duration is null and every row says so.
-        events = [
-            {"seconds": 0.5, "line": "running 2 tests"},
-            {"seconds": 4.5, "line": "test a ... ok"},
-            {"seconds": 6.5, "line": "test b ... ok"},
-            {"seconds": 6.6, "line": "test result: ok. 2 passed; finished in 4.00s"},
-        ]
-        timings = MANDATE_CHECK.derive_timings(events, "lib")
-        self.assertEqual(
-            [entry["duration_seconds"] for entry in timings["tests"]], [None, None]
-        )
-        self.assertEqual(
-            [entry["duration_source"] for entry in timings["tests"]], [None, None]
-        )
-        self.assertEqual(len(timings["problems"]), 1)
-        self.assertIn("carries libtest's own per-test stamp", timings["problems"][0])
-        self.assertIn("--report-time", timings["problems"][0])
-        (target,) = timings["targets"]
-        self.assertEqual((target["ran"], target["stamped"]), (2, 0))
-        self.assertIsNone(target["fits"])
-        self.assertIsNone(target["overlap_factor"])
-        self.assertEqual(target["note"], "no-test-carried-a-libtest-stamp")
-
-    def test_derive_timings_reads_a_completion_split_by_the_tests_own_output(self):
-        # The harness's probes print from inside their own test, so libtest's
-        # marker and its state arrive on different lines; the completion is the
-        # state line, and the marker's tail is the test's own first line. The
-        # stamp rides the state line.
-        events = [
-            {"seconds": 0.5, "line": "running 2 tests"},
-            {"seconds": 1.0, "line": "test tests::a ... probe says hello"},
-            {"seconds": 1.2, "line": "[mandate-smoke a] section=probe recv=10"},
-            {"seconds": 2.0, "line": "ok <1.500s>"},
-            {"seconds": 3.0, "line": "test tests::b ... ignored, release only"},
-            {"seconds": 3.1, "line": "test result: ok. 1 passed; 1 ignored; finished in 2.50s"},
-        ]
-        timings = MANDATE_CHECK.derive_timings(events, "lib")
-        self.assertEqual(
-            [(entry["name"], entry["state"]) for entry in timings["tests"]],
-            [("tests::a", "ok"), ("tests::b", "ignored")],
-        )
-        self.assertEqual(timings["tests"][0]["duration_seconds"], 1.5)
-        self.assertEqual(timings["tests"][0]["duration_source"], "libtest-report-time")
-        self.assertEqual(timings["tests"][0]["target"], "lib")
-        self.assertEqual(timings["tests"][1]["duration_seconds"], None)
-
-    def test_a_serial_targets_stamps_must_sum_to_no_more_than_its_total(self):
-        # --test-threads=1 means the tests cannot overlap, so two stamps whose
-        # sum exceeds the target's own total cannot both be one test's time.
-        events = [
-            {"seconds": 0.5, "line": "running 2 tests"},
-            {"seconds": 4.0, "line": "test a ... ok <3.000s>"},
-            {"seconds": 8.0, "line": "test b ... ok <3.000s>"},
-            {"seconds": 8.1, "line": "test result: ok. 2 passed; finished in 4.00s"},
-        ]
-        timings = MANDATE_CHECK.derive_timings(events, "lib", serial=True)
-        (target,) = timings["targets"]
-        self.assertFalse(target["fits"])
-        self.assertEqual(target["sum_seconds"], 6.0)
-        self.assertEqual(len(timings["problems"]), 1)
-        self.assertIn("sum to 6.000s", timings["problems"][0])
-        self.assertIn("ran serially", timings["problems"][0])
-
-    def test_a_stamp_that_cannot_fit_its_targets_total_is_refused(self):
-        # A per-test time larger than the whole target is an impossibility
-        # under any schedule, so it is refused whether or not the target ran
-        # serially.
-        events = [
-            {"seconds": 0.5, "line": "running 2 tests"},
-            {"seconds": 4.0, "line": "test a ... ok <9.000s>"},
-            {"seconds": 5.0, "line": "test b ... ok <1.000s>"},
-            {"seconds": 5.1, "line": "test result: ok. 2 passed; finished in 4.00s"},
-        ]
-        timings = MANDATE_CHECK.derive_timings(events, "mandate_smoke")
-        (target,) = timings["targets"]
-        self.assertFalse(target["fits"])
-        self.assertEqual(len(timings["problems"]), 1)
-        self.assertIn("cannot fit the mandate_smoke target's own total", timings["problems"][0])
-        self.assertIn("9.000s", timings["problems"][0])
+        # A duration is a measurement or it is absent with its reason: a
+        # `0.00s` figure is what "not measured" looks like too.
+        for mandate in report["mandate_order"]:
+            record = report["mandates"][mandate]
+            if record["duration_seconds"] is None:
+                self.assertTrue(record["duration_note"], record)
+            else:
+                self.assertNotEqual(
+                    f"{record['duration_seconds']:.2f}", "0.00", record
+                )
 
     def test_a_stamp_less_target_makes_the_run_refuse_rather_than_invent(self):
         # End to end: the instrument is not measuring, so the report must not
@@ -1054,7 +888,7 @@ class MandateCheckTest(unittest.TestCase):
         code, stdout, _ = self.run_tool(
             self.healthy_plan(stdout=unstamped(PASS_LINES))
         )
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("not one of its results carries libtest's own per-test stamp", stdout)
         report = self.report()
         self.assertFalse(report["ok"])
@@ -1072,7 +906,7 @@ class MandateCheckTest(unittest.TestCase):
             ]
         )
         code, stdout, _ = self.run_tool(plan)
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("cannot fit the mandate_smoke target's own total", stdout)
         report = self.report()
         (target,) = report["timings"]["targets"]
@@ -1102,7 +936,7 @@ class MandateCheckTest(unittest.TestCase):
         (self.out / "M1.json").write_text("{ not json", encoding="utf-8")
         (self.out / "M1.csv").write_text("panel,series,x,y\nstale,stale,0,1\n", encoding="utf-8")
         (self.out / "plots" / "M1-latency.svg").write_text("<svg/>", encoding="utf-8")
-        (self.out / MANDATE_CHECK.REPORT_NAME).write_text("{}", encoding="utf-8")
+        (self.out / REPORT_NAME).write_text("{}", encoding="utf-8")
         code, _, stderr = self.run_tool(self.healthy_plan())
         self.assertEqual(code, 0, stderr)
         self.assertEqual(self.report()["mandates"]["M1"]["series_counts"], [1, 1])
@@ -1117,12 +951,12 @@ class MandateCheckTest(unittest.TestCase):
         # leave none at all: not the report, not the log that explains what the
         # smoke set printed, and not an evidence file.
         self.out.mkdir(parents=True)
-        stale_report = self.out / MANDATE_CHECK.REPORT_NAME
+        stale_report = self.out / REPORT_NAME
         stale_report.write_text(
             json.dumps({"schema": "mandate-check/3", "ok": True, "verdict": "PASS"}),
             encoding="utf-8",
         )
-        stale_log = self.out / MANDATE_CHECK.LOG_NAME
+        stale_log = self.out / LOG_NAME
         stale_log.write_text("an earlier run's smoke-set output\n", encoding="utf-8")
         (self.out / "M1.csv").write_text(
             "panel,series,x,y\nstale,stale,0,1\n", encoding="utf-8"
@@ -1131,7 +965,7 @@ class MandateCheckTest(unittest.TestCase):
         # command fails before it writes anything.
         (self.crate / "tests" / "mandate_smoke.rs").unlink()
         code, stdout, stderr = self.run_tool(self.healthy_plan())
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("does not exist", stderr)
         self.assertFalse(
             stale_report.exists(),
@@ -1194,159 +1028,6 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(self.report()["rtp_mux"]["tree_id"], head_tree)
         self.assertEqual(self.report()["rtp_mux"]["tree_id_source"], "git")
         self.assertIn(f"tree:     {head_tree} (git)", stdout)
-
-    def test_an_unresolvable_tree_id_is_null_in_the_report_not_fabricated(self):
-        # The commit id resolved; the tree did not. The field stays null and the
-        # block says so, because a fabricated tree id would make a committed
-        # baseline name content it never built.
-        head = "b" * 40
-
-        def capture(command, *, cwd):
-            if "log" in command:
-                return {"exit_code": 0, "stdout": head + "\n" + "c" * 32 + "\n"}
-            return {"exit_code": 128, "stdout": ""}
-
-        with mock.patch.object(MANDATE_CHECK, "_capture", capture):
-            code, stdout, stderr = self.run_tool(self.healthy_plan())
-        self.assertEqual(code, 0, stderr)
-        report = self.report()
-        self.assertEqual(report["rtp_mux"]["revision"], head)
-        self.assertEqual(report["rtp_mux"]["revision_source"], "jj")
-        self.assertIsNone(report["rtp_mux"]["tree_id"])
-        self.assertIsNone(report["rtp_mux"]["tree_id_source"])
-        self.assertIn("tree:     unresolved (no jj or git)", stdout)
-
-    def test_tree_id_follows_the_tree_and_not_the_commit_id(self):
-        # The commit id is not the content. An empty commit on top of a tree
-        # changes the commit id and leaves the tree id alone; a content change
-        # moves the tree id. This is the shape jj's `@` puts a baseline in —
-        # an auto-snapshot jj rewrites, whose tree is what a build reads.
-        if shutil.which("git") is None:
-            self.skipTest("git is not installed")
-        environment = {
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@example.invalid",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@example.invalid",
-        }
-
-        def git(*arguments):
-            run = subprocess.run(
-                ["git", "-C", str(self.crate), *arguments],
-                capture_output=True,
-                text=True,
-                env=dict(os.environ, **environment),
-            )
-            self.assertEqual(run.returncode, 0, run.stderr)
-            return run.stdout.strip()
-
-        git("init", "-q")
-        (self.crate / "tracked.txt").write_text("first\n", encoding="utf-8")
-        git("add", "tracked.txt")
-        git("commit", "-q", "-m", "first")
-        first = git("rev-parse", "HEAD")
-        first_tree = git("rev-parse", "HEAD^{tree}")
-        self.assertEqual(
-            MANDATE_CHECK.resolve_tree_id(self.crate, first, "git"), (first_tree, "git")
-        )
-
-        git("commit", "-q", "--allow-empty", "-m", "empty")
-        empty = git("rev-parse", "HEAD")
-        self.assertNotEqual(empty, first)
-        self.assertEqual(
-            MANDATE_CHECK.resolve_tree_id(self.crate, empty, "git"),
-            (first_tree, "git"),
-            "an empty commit changed the commit id and the tree id with it: the "
-            "tree id is not describing the content",
-        )
-
-        (self.crate / "tracked.txt").write_text("second\n", encoding="utf-8")
-        git("add", "tracked.txt")
-        git("commit", "-q", "-m", "second")
-        second = git("rev-parse", "HEAD")
-        second_tree = git("rev-parse", "HEAD^{tree}")
-        self.assertNotEqual(second_tree, first_tree)
-        self.assertEqual(
-            MANDATE_CHECK.resolve_tree_id(self.crate, second, "git"),
-            (second_tree, "git"),
-            "the tree id did not move when the content did",
-        )
-
-    def test_tree_id_is_stable_across_jj_rewrites_of_the_working_copy(self):
-        # jj rewrites `@` on every operation, so a commit id read from it is
-        # throwaway: `jj new` produces a different commit id with the same
-        # tree id, and only an edit moves the tree id. A baseline that records
-        # the commit id alone therefore cannot name what it measured.
-        if shutil.which("jj") is None:
-            self.skipTest("jj is not installed")
-        repo = self.root / "jj-crate"
-        repo.mkdir()
-        (repo / "tracked.txt").write_text("first\n", encoding="utf-8")
-        environment = {
-            "JJ_EDITOR": "true",
-            "JJ_USER": "tree id test",
-            "JJ_EMAIL": "tree-id@example.invalid",
-        }
-
-        def jj(*arguments):
-            run = subprocess.run(
-                ["jj", *arguments],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                env=dict(os.environ, **environment),
-            )
-            self.assertEqual(run.returncode, 0, run.stderr)
-            return run.stdout.strip()
-
-        jj("git", "init")
-        first = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
-        first_tree = MANDATE_CHECK.resolve_tree_id(repo, first, "jj")
-        self.assertEqual(first_tree[1], "jj")
-        self.assertEqual(len(first_tree[0]), 40)
-
-        # An empty commit on top: a new commit id, the same content.
-        jj("new")
-        second = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
-        self.assertNotEqual(second, first)
-        self.assertEqual(
-            MANDATE_CHECK.resolve_tree_id(repo, second, "jj"),
-            first_tree,
-            "rewriting the working-copy commit moved the tree id: the tree id "
-            "is not naming the content",
-        )
-
-        # An edit: the content moved, so the tree id must too.
-        (repo / "tracked.txt").write_text("second\n", encoding="utf-8")
-        third = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
-        third_tree = MANDATE_CHECK.resolve_tree_id(repo, third, "jj")
-        self.assertNotEqual(third_tree[0], first_tree[0])
-
-    def test_an_unresolvable_tree_id_is_recorded_as_null_not_fabricated(self):
-        # No answer from jj or git, and a tree jj reports as unresolved, both
-        # leave the field null: a fabricated tree id would make a baseline
-        # name content it never built.
-        with mock.patch.object(
-            MANDATE_CHECK, "_capture", lambda command, *, cwd: {"exit_code": 1, "stdout": ""}
-        ):
-            self.assertEqual(
-                MANDATE_CHECK.resolve_tree_id(self.crate, "0" * 40, "jj"), (None, None)
-            )
-            self.assertEqual(
-                MANDATE_CHECK.resolve_tree_id(self.crate, "0" * 40, "git"), (None, None)
-            )
-        with mock.patch.object(
-            MANDATE_CHECK,
-            "_capture",
-            lambda command, *, cwd: {
-                "exit_code": 0,
-                "stdout": "    root_tree: Unresolved(Conflict),\n",
-            },
-        ):
-            self.assertEqual(
-                MANDATE_CHECK.resolve_tree_id(self.crate, "0" * 40, "jj"), (None, None)
-            )
-        self.assertEqual(MANDATE_CHECK.resolve_tree_id(self.crate, None, None), (None, None))
 
     def test_a_malformed_censoring_row_is_refused(self):
         # The rows are the readings the M1 panel states, so a row that reads
@@ -1497,7 +1178,7 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(report["arm_notes"], [])
         self.assertEqual(
             report["arm_declaration"]["schema"],
-            MANDATE_CHECK.ARMS_DECLARATION_SCHEMA,
+            ARMS_DECLARATION_SCHEMA,
         )
         self.assertGreater(report["arm_declaration"]["declared_cells"], 0)
         self.assertIn("arms: 16 measured", stdout)
@@ -1686,7 +1367,7 @@ class MandateCheckTest(unittest.TestCase):
         )
         code, stdout, _ = self.reject(plan, "no '[mandate-smoke <arm>] ...' arm measurement")
         self.assertEqual(code, 2)
-        for mandate in MANDATE_CHECK.MANDATE_IDS:
+        for mandate in MANDATE_IDS:
             self.assertIn(f"{mandate}: no '[mandate-smoke", stdout)
 
     def test_an_arm_line_before_a_missing_mandate_line_is_named(self):
@@ -1697,102 +1378,6 @@ class MandateCheckTest(unittest.TestCase):
         )
         code, stdout, _ = self.reject(plan, "M1: no '[mandate-smoke")
         self.assertEqual(code, 2)
-
-    def test_a_missing_arm_declaration_is_refused(self):
-        with mock.patch.object(
-            MANDATE_CHECK, "ARMS_DECLARATION_NAME", "mandate-arms-absent.json"
-        ):
-            code, _, stderr = self.run_tool(self.healthy_plan())
-        self.assertEqual(code, 2)
-        self.assertIn("arm coverage declaration", stderr)
-        self.assertIn("does not exist", stderr)
-
-    def test_a_malformed_arm_declaration_is_refused(self):
-        malformed = {
-            "not an object": "[]",
-            "wrong schema": json.dumps(
-                {"schema": "mandate-arms/2", "cells": {"M1/clean": ["M1@x=1"]}}
-            ),
-            "no cells": json.dumps({"schema": "mandate-arms/1", "cells": {}}),
-            "empty cell list": json.dumps(
-                {"schema": "mandate-arms/1", "cells": {"M1/clean": []}}
-            ),
-            "non-string cell": json.dumps(
-                {"schema": "mandate-arms/1", "cells": {"M1/clean": [7]}}
-            ),
-        }
-        for case, text in malformed.items():
-            with self.subTest(case=case):
-                path = self.root / "mandate-arms-bad.json"
-                path.write_text(text, encoding="utf-8")
-                problems = []
-                self.assertIsNone(MANDATE_CHECK.load_arm_declaration(path, problems))
-                self.assertTrue(problems, case)
-        good = self.root / "mandate-arms-good.json"
-        good.write_text(
-            json.dumps({"schema": "mandate-arms/1", "cells": {"M1/clean": ["M1@x=1"]}}),
-            encoding="utf-8",
-        )
-        problems = []
-        self.assertIsNotNone(MANDATE_CHECK.load_arm_declaration(good, problems))
-        self.assertEqual(problems, [])
-
-    def test_grammar_normalises_units_stats_counters_and_windows(self):
-        arm = MANDATE_CHECK.parse_arm_line(
-            "[mandate-smoke m4/clean flow A] sent=  120 recv=  120 delivery=1.000 "
-            "share=0.2502 offered=1269600B delivered=1269600B p50=   22.0 wall=24.3s"
-        )
-        self.assertEqual(arm["dialect"], "kv")
-        self.assertEqual(arm["sample_count"], 120)
-        self.assertEqual(arm["counters"]["offered_bytes"], 1269600)
-        self.assertEqual(arm["counters"]["delivered_bytes"], 1269600)
-        self.assertEqual(arm["stats"]["share"], 0.2502)
-        self.assertEqual(arm["windows"]["wall_seconds"], 24.3)
-        self.assertNotIn("wall", arm["counters"])
-        rep = MANDATE_CHECK.parse_arm_line(
-            "[mandate-smoke m3/rep1] delivered 0.963 MiB/s over 2.0004s, shaper "
-            "forwarded 0.972 MiB/s, capacity 1.000 MiB/s, fraction 0.963 "
-            "(820148 / 992240 bytes)"
-        )
-        self.assertEqual(rep["dialect"], "bulk-rep")
-        self.assertEqual(rep["counters"]["forwarded_bytes"], 992240)
-        self.assertEqual(rep["stats"]["delivered_mib_s"], 0.963)
-        self.assertIsNone(
-            MANDATE_CHECK.parse_arm_line("a line that is not an arm line at all")
-        )
-        note = MANDATE_CHECK.parse_arm_line("[mandate-smoke x] three flows in flight")
-        self.assertTrue(note["note"])
-
-    def test_declared_cells_match_the_longest_arm_prefix(self):
-        cells = {"M1": ["mandate"], "M1/clean": ["arm"], "M1/cleanup": ["other"]}
-        self.assertEqual(MANDATE_CHECK.declared_cells("M1/clean", cells), ["arm"])
-        self.assertEqual(MANDATE_CHECK.declared_cells("M1/hostile", cells), ["mandate"])
-        self.assertEqual(MANDATE_CHECK.declared_cells("M1/cleanup", cells), ["other"])
-        self.assertEqual(MANDATE_CHECK.declared_cells("M1/clean/flow-A", cells), ["arm"])
-        self.assertEqual(MANDATE_CHECK.declared_cells("M2/clean", cells), [])
-
-    def test_parse_arm_lines_attributes_by_the_next_mandate_line(self):
-        events = [
-            {"seconds": 1.0, "line": "[mandate-smoke clean] sent=1 recv=1 p99=1.0"},
-            {"seconds": 2.0, "line": "MANDATE M1 PASS p99=1.0"},
-            {"seconds": 3.0, "line": "[mandate-smoke m3/rep1] delivered 1.0 MiB/s "
-             "over 2.0s, shaper forwarded 1.0 MiB/s, capacity 1.0 MiB/s, fraction "
-             "1.0 (1 / 2 bytes)"},
-            {"seconds": 4.0, "line": "MANDATE M2 PASS delivery=1.0"},
-        ]
-        problems = []
-        arms, notes = MANDATE_CHECK.parse_arm_lines(events, problems)
-        self.assertEqual(problems, [])
-        self.assertEqual([arm["id"] for arm in arms], ["M1/clean", "M2/m3/rep1"])
-        self.assertEqual([arm["mandate"] for arm in arms], ["M1", "M2"])
-        self.assertEqual(notes, [])
-        guard = []
-        MANDATE_CHECK.check_arm_coverage(arms, notes, guard)
-        self.assertEqual(len(guard), 2)
-        self.assertIn("M3: no '[mandate-smoke", guard[0])
-        self.assertIn("M4: no '[mandate-smoke", guard[1])
-
-    # -- a measured mandate failure is not an evidence failure -------------
 
     def test_failing_mandate_exit_is_three_and_names_the_measured_values(self):
         # The per-arm lines stay in the plan: the extended contract requires a
@@ -1831,7 +1416,7 @@ class MandateCheckTest(unittest.TestCase):
         # Extended from M1/M2/M3 to every id in MANDATE_IDS: a missing M4 line is
         # the failure mode the fourth id introduces, and it must be refused with
         # the same non-zero, evidence-incomplete treatment and name M4.
-        for mandate in MANDATE_CHECK.MANDATE_IDS:
+        for mandate in MANDATE_IDS:
             with self.subTest(mandate=mandate):
                 plan = self.healthy_plan(
                     stdout=[
@@ -1841,7 +1426,7 @@ class MandateCheckTest(unittest.TestCase):
                     ]
                 )
                 code, stdout, _ = self.reject(plan, f"no 'MANDATE {mandate}")
-                self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+                self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
                 self.assertIn(f"{mandate}: the smoke set printed no", stdout)
                 self.assertIn("never measured", stdout)
                 self.assertEqual(
@@ -1852,7 +1437,7 @@ class MandateCheckTest(unittest.TestCase):
         plan = self.healthy_plan(stdout=["running 4 tests", "test result: ok. 4 passed"])
         code, stdout, _ = self.reject(plan, "no 'MANDATE M1")
         self.assertEqual(code, 2)
-        for mandate in MANDATE_CHECK.MANDATE_IDS:
+        for mandate in MANDATE_IDS:
             self.assertIn(f"{mandate}: the smoke set printed no", stdout)
 
     def test_malformed_mandate_line_is_refused(self):
@@ -1924,7 +1509,7 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("cannot find value `nope`", stderr)
         self.assertIn("mandate-smoke.log", stdout)
-        log = (self.out / MANDATE_CHECK.LOG_NAME).read_text(encoding="utf-8")
+        log = (self.out / LOG_NAME).read_text(encoding="utf-8")
         self.assertIn("cannot find value `nope`", log)
         report = self.report()
         self.assertEqual(report["exit_code"], 2)
@@ -1940,13 +1525,21 @@ class MandateCheckTest(unittest.TestCase):
     def test_missing_crate_is_refused(self):
         empty = self.root / "empty"
         empty.mkdir()
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            code = MANDATE_CHECK.main(
-                ["--producer-path", f"rtp_mux={empty}", "--dir", str(self.root / "run2")]
-            )
-        self.assertEqual(code, 2)
-        self.assertIn("has no Cargo.toml", stderr.getvalue())
+        completed = subprocess.run(
+            [
+                str(BINARY),
+                "mandate-check",
+                "--no-history",
+                "--producer-path",
+                f"rtp_mux={empty}",
+                "--dir",
+                str(self.root / "run2"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("has no Cargo.toml", completed.stderr)
 
     def test_missing_smoke_source_is_refused(self):
         (self.crate / "tests" / "mandate_smoke.rs").unlink()
@@ -1960,24 +1553,27 @@ class MandateCheckTest(unittest.TestCase):
         # run directory was prepared must not leave it behind for a later
         # comparison to read as this run's measurement.
         self.out.mkdir(parents=True)
-        stale_report = self.out / MANDATE_CHECK.REPORT_NAME
+        stale_report = self.out / REPORT_NAME
         stale_report.write_text(
             json.dumps({"schema": "mandate-check/3", "ok": True}), encoding="utf-8"
         )
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            code = MANDATE_CHECK.main(
-                [
-                    "--cargo",
-                    str(self.root / "no-such-cargo"),
-                    "--producer-path",
-                    f"rtp_mux={self.crate}",
-                    "--dir",
-                    str(self.out),
-                ]
-            )
-        self.assertEqual(code, 2)
-        self.assertIn("was not found on PATH", stderr.getvalue())
+        completed = subprocess.run(
+            [
+                str(BINARY),
+                "mandate-check",
+                "--no-history",
+                "--cargo",
+                str(self.root / "no-such-cargo"),
+                "--producer-path",
+                f"rtp_mux={self.crate}",
+                "--dir",
+                str(self.out),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("was not found on PATH", completed.stderr)
         self.assertFalse(stale_report.exists())
 
     def test_a_plot_that_cannot_be_produced_is_refused(self):
@@ -1991,36 +1587,6 @@ class MandateCheckTest(unittest.TestCase):
         self.assertIn("M1: ", stdout)
 
     # -- grammar unit coverage --------------------------------------------
-
-    def test_grammar_accepts_the_documented_shape(self):
-        records, problems = MANDATE_CHECK.parse_mandate_lines(
-            "MANDATE M1 FAIL p99=478.1 ceiling=250.0 over250=46\n"
-            "MANDATE M2 PASS delivery=1.000\n"
-            "MANDATE M3 PASS goodput=0.52 floor=0.35 note=clean-lane\n"
-            "MANDATE M4 PASS flows=4 clean_imbalance=0.004 fair_share=0.2500\n"
-            "noise: MANDATE-ish text is ignored\n"
-        )
-        self.assertEqual(problems, [])
-        self.assertEqual(records["M1"]["verdict"], "FAIL")
-        self.assertEqual(
-            records["M1"]["values"], {"p99": 478.1, "ceiling": 250.0, "over250": 46}
-        )
-        self.assertEqual(records["M3"]["values"]["note"], "clean-lane")
-        self.assertEqual(
-            records["M4"]["values"],
-            {"flows": 4, "clean_imbalance": 0.004, "fair_share": 0.25},
-        )
-
-    def test_grammar_rejects_repeated_keys_and_unparsable_tokens(self):
-        _, problems = MANDATE_CHECK.parse_mandate_lines(
-            "MANDATE M1 PASS p99=1.0 p99=2.0\nMANDATE M2 PASS p99\n"
-        )
-        self.assertEqual(len(problems), 3)
-        self.assertIn("'p99' is repeated", problems[0])
-        self.assertIn("is not a <key>=<value> token", problems[1])
-        self.assertIn("without a single key=value measurement", problems[2])
-
-    # -- the second producer, end to end -----------------------------------
 
     def test_a_run_records_every_declared_producers_arms(self):
         code, stdout, stderr = self.run_tool(
@@ -2079,14 +1645,14 @@ class MandateCheckTest(unittest.TestCase):
                 "netem-test",
                 "--lib",
                 "--",
-                *MANDATE_CHECK.TIMING_ARGS,
+                *TIMING_ARGS,
                 "--ignored",
                 "--test-threads=1",
                 "--nocapture",
             ],
         )
         self.assertEqual(
-            records[1]["rustc_bootstrap"], MANDATE_CHECK.TIMING_ENV_VALUE
+            records[1]["rustc_bootstrap"], TIMING_ENV_VALUE
         )
         self.assertEqual(
             [entry["producer"] for entry in report["timings"]["tests"]],
@@ -2157,7 +1723,7 @@ class MandateCheckTest(unittest.TestCase):
             probes=["running 4 tests", "test result: ok. 4 passed; 0 failed"]
         )
         code, stdout, _ = self.run_two_producers(plan)
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("netem_test: probe: no '[mandate-smoke", stdout)
         # The other producer's arms are still recorded: one producer's failure
         # does not delete the other's evidence.
@@ -2179,7 +1745,7 @@ class MandateCheckTest(unittest.TestCase):
             ]
         )
         code, stdout, _ = self.run_two_producers(plan)
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("'mandate/forwarding'", stdout)
         self.assertIn("does not declare", stdout)
 
@@ -2188,130 +1754,304 @@ class MandateCheckTest(unittest.TestCase):
             probes=[line.replace(" section=probe", "") for line in PROBE_LINES]
         )
         code, stdout, _ = self.run_two_producers(plan)
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("cannot be attributed to a mandate", stdout)
 
     def test_a_missing_producer_source_is_refused(self):
         (self.probe_crate / "src" / "lib.rs").unlink()
         code, _, stderr = self.run_two_producers(self.two_producer_plan())
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("netem_test", stderr)
         self.assertIn("does not exist", stderr)
 
     def test_unknown_producer_selection_is_refused(self):
         code, _, stderr = self.run_tool(self.healthy_plan(), "--producer", "nope")
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("--producer 'nope' is not one of rtp_mux, netem_test", stderr)
 
     def test_a_malformed_producer_path_is_refused(self):
         code, _, stderr = self.run_tool(
             self.healthy_plan(), "--producer-path", "netem_test"
         )
-        self.assertEqual(code, MANDATE_CHECK.EXIT_EVIDENCE_FAILURE)
+        self.assertEqual(code, EXIT_EVIDENCE_FAILURE)
         self.assertIn("is not <id>=<path>", stderr)
 
-    def test_the_registry_declares_the_primary_producers_default_checkout(self):
-        problems = []
-        declaration = MANDATE_CHECK.load_producer_declaration(
-            WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME, problems
-        )
-        self.assertEqual(problems, [])
-        primary = [
-            entry
-            for entry in declaration["producers"]
-            if entry["id"] == MANDATE_CHECK.PRIMARY_PRODUCER
-        ]
-        self.assertEqual(len(primary), 1)
-        # The registry is the authority for where its producer's checkout lives;
-        # there is no code-side path to pin it against (the harness names no
-        # crate), so this asserts the declaration itself is the sibling.
-        declared = Path(primary[0]["default_path"]).name
-        self.assertEqual(declared, primary[0]["package"])
 
-    def test_the_shipped_registry_and_arm_declaration_cover_the_second_producer(self):
-        problems = []
-        declaration = MANDATE_CHECK.load_producer_declaration(
-            WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME, problems
-        )
-        self.assertEqual(problems, [])
-        self.assertEqual(
-            [entry["id"] for entry in declaration["producers"]],
-            ["rtp_mux", "netem_test"],
-        )
-        arm_problems = []
-        arm_declaration = MANDATE_CHECK.load_arm_declaration(
-            WORKSPACE / "tools" / MANDATE_CHECK.ARMS_DECLARATION_NAME, arm_problems
-        )
-        self.assertEqual(arm_problems, [])
-        cells = arm_declaration["cells"]
-        for entry in declaration["producers"]:
-            for section in entry["sections"]:
-                self.assertTrue(
-                    any(key.startswith(f"{section}/") for key in cells),
-                    f"no declared cell for the section {section}",
-                )
+    # -- the cases the port moved from the module to the command ------------
 
-    def test_a_section_declared_by_two_producers_is_refused(self):
-        path = self.root / "producers.json"
-        declaration = json.loads(
-            (
-                WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME
-            ).read_text(encoding="utf-8")
+    def test_default_out_dir_is_beneath_tmpdir(self):
+        # The runner's own default run directory: a fresh directory beneath
+        # $TMPDIR, named by the run's own `output:` line.
+        self.plan_path.write_text(json.dumps(self.healthy_plan()), encoding="utf-8")
+        if self.record.exists():
+            self.record.unlink()
+        env = dict(
+            os.environ,
+            TMPDIR=str(self.root),
+            FAKE_CARGO_PLAN=str(self.plan_path),
+            FAKE_CARGO_RECORD=str(self.record),
         )
-        declaration["producers"][1]["sections"] = ["M1", "probe"]
-        declaration["producers"][1]["verdicts"] = []
-        path.write_text(json.dumps(declaration), encoding="utf-8")
-        problems = []
-        self.assertIsNone(MANDATE_CHECK.load_producer_declaration(path, problems))
-        self.assertIn("is declared by both", " ".join(problems))
+        completed = subprocess.run(
+            [
+                str(BINARY),
+                "mandate-check",
+                "--no-history",
+                "--cargo",
+                str(self.cargo),
+                "--producer-path",
+                f"rtp_mux={self.crate}",
+                "--producer",
+                "rtp_mux",
+                "--no-rasterize",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        found = re.search(r"^  output:   (.+)$", completed.stdout, re.M)
+        self.assertIsNotNone(found, completed.stdout)
+        created = Path(found.group(1))
+        self.assertEqual(created.parent.resolve(), self.root.resolve())
+        self.assertTrue(created.is_dir())
+        shutil.rmtree(created, ignore_errors=True)
 
-    def test_a_registry_entry_cannot_declare_its_evidence_away(self):
-        path = self.root / "producers.json"
-        declaration = json.loads(
-            (
-                WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME
-            ).read_text(encoding="utf-8")
-        )
-        declaration["producers"][1]["evidence"] = False
-        path.write_text(json.dumps(declaration), encoding="utf-8")
-        problems = []
-        self.assertIsNone(MANDATE_CHECK.load_producer_declaration(path, problems))
-        self.assertIn("unknown key(s) evidence", " ".join(problems))
+    def test_the_shipped_registry_records_every_declared_producer(self):
+        # The registry is the runner's own file, and the record it writes says
+        # what each declared producer is: a reader can see which producers
+        # exist and which the run selected, rather than reading a one-producer
+        # report as the whole inventory.
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["producers_declared"], ["rtp_mux", "netem_test"])
+        self.assertEqual(report["producers_selected"], ["rtp_mux"])
+        self.assertEqual(report["section_order"], ["M1", "M2", "M3", "M4", "probe"])
+        smoke = report["producers"][PRIMARY_PRODUCER]
+        self.assertEqual(smoke["package"], "rtp_mux")
+        self.assertEqual(smoke["target"], "mandate_smoke")
+        self.assertEqual(smoke["source"], "tests/mandate_smoke.rs")
+        self.assertEqual(smoke["default_path"], "../rtp_mux")
+        self.assertEqual(smoke["sections"], ["M1", "M2", "M3", "M4"])
+        self.assertEqual(smoke["verdicts"], ["M1", "M2", "M3", "M4"])
+        self.assertTrue(smoke["evidence"])
+        self.assertEqual(smoke["log"], str((self.out / LOG_NAME).resolve()))
+        self.assertTrue(smoke["selected"])
+        probe = report["producers"]["netem_test"]
+        self.assertEqual(probe["package"], "netem_test")
+        self.assertEqual(probe["target"], "lib")
+        self.assertEqual(probe["sections"], ["probe"])
+        self.assertEqual(probe["verdicts"], [])
+        # Derived, not declared: a producer with no verdict line owes no
+        # evidence file, so a registry entry cannot declare the guard away.
+        self.assertFalse(probe["evidence"])
+        self.assertFalse(probe["selected"])
+        self.assertIsNone(probe["command"])
+
+    def test_the_arm_declaration_and_its_cells_are_recorded(self):
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        declaration = report["arm_declaration"]
+        self.assertEqual(declaration["schema"], ARMS_DECLARATION_SCHEMA)
+        self.assertEqual(Path(declaration["path"]).name, ARMS_DECLARATION_NAME)
+        self.assertTrue(declaration["source"])
+        self.assertEqual(declaration["declared_cells"], 13)
+        # Every arm claims a declared coverage cell, and a family prefix covers
+        # the arms it names: `M4/m4/clean` covers the per-flow arms.
+        cells = {arm["id"]: arm["cells"] for arm in report["arms"]}
+        self.assertIn("M1/clean", cells)
+        self.assertTrue(cells["M1/clean"])
+        self.assertEqual(cells["M4/m4/clean flow A"], cells["M4/m4/clean"])
 
     def test_declared_checkouts_resolve_to_real_directories(self):
-        """A declared `default_path` must resolve to a directory that exists.
-
-        Not "the directory name equals the package": the harness member's own
-        producer declares `"."` and lives in `netem-test/` while its package is
-        `netem_test`, so that property is false. What is true, and what the
-        runner depends on, is that each declared checkout resolves -- inside the
-        workspace or beside it -- to a directory that is there.
-        """
-        problems = []
-        declaration = MANDATE_CHECK.load_producer_declaration(
-            WORKSPACE / "tools" / MANDATE_CHECK.PRODUCERS_DECLARATION_NAME, problems
-        )
-        self.assertEqual(problems, [])
+        # Every declared `default_path` resolves -- inside the workspace or
+        # beside it -- to a directory that is there. One that does not is a
+        # registry entry the runner can never build.
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
         declared = [
-            entry for entry in declaration["producers"] if entry.get("default_path")
+            entry
+            for entry in self.report()["producers"].values()
+            if entry["default_path"]
         ]
         self.assertTrue(declared)
         for entry in declared:
-            resolved = (MANDATE_CHECK.WORKSPACE_ROOT / entry["default_path"]).resolve()
+            resolved = (WORKSPACE / entry["default_path"]).resolve()
             self.assertTrue(
                 resolved.is_dir(), f"{entry['id']}: {resolved} is not a directory"
             )
             self.assertIn(
-                MANDATE_CHECK.WORKSPACE_ROOT.parent,
+                WORKSPACE.parent,
                 (resolved, *resolved.parents),
                 f"{entry['id']}: {resolved} is neither the workspace nor beside it",
             )
 
-    def test_default_out_dir_is_beneath_tmpdir(self):
-        with mock.patch.dict(os.environ, {"TMPDIR": str(self.root)}):
-            created = MANDATE_CHECK.default_out_dir()
-        self.assertEqual(created.parent.resolve(), self.root.resolve())
-        self.assertTrue(created.is_dir())
+    def test_tree_id_follows_the_content_and_not_the_commit_id(self):
+        # The commit id is not the content. An empty commit on top of a tree
+        # changes the commit id and leaves the tree id alone; a content change
+        # moves the tree id.
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        environment = {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+
+        def git(*arguments):
+            run = subprocess.run(
+                ["git", "-C", str(self.crate), *arguments],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, **environment),
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return run.stdout.strip()
+
+        git("init", "-q")
+        (self.crate / "tracked.txt").write_text("first\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-q", "-m", "first")
+        first = git("rev-parse", "HEAD")
+        first_tree = git("rev-parse", "HEAD^{tree}")
+        code, stdout, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["rtp_mux"]["revision"], first)
+        self.assertEqual(report["rtp_mux"]["revision_source"], "git")
+        self.assertEqual(report["rtp_mux"]["tree_id"], first_tree)
+        self.assertEqual(report["rtp_mux"]["tree_id_source"], "git")
+        self.assertIn(f"tree:     {first_tree} (git)", stdout)
+
+        git("commit", "-q", "--allow-empty", "-m", "empty")
+        empty = git("rev-parse", "HEAD")
+        self.assertNotEqual(empty, first)
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["rtp_mux"]["revision"], empty)
+        self.assertEqual(
+            report["rtp_mux"]["tree_id"],
+            first_tree,
+            "an empty commit changed the commit id and the tree id with it: the "
+            "tree id is not describing the content",
+        )
+
+        (self.crate / "tracked.txt").write_text("second\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-q", "-m", "second")
+        second_tree = git("rev-parse", "HEAD^{tree}")
+        self.assertNotEqual(second_tree, first_tree)
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            self.report()["rtp_mux"]["tree_id"],
+            second_tree,
+            "the tree id did not move when the content did",
+        )
+
+    def test_tree_id_is_stable_across_a_jj_rewrite_of_the_working_copy(self):
+        # jj rewrites `@` on every operation, so a commit id read from it is
+        # throwaway: `jj new` produces a different commit id with the same tree
+        # id, and only an edit moves the tree id.
+        if shutil.which("jj") is None:
+            self.skipTest("jj is not installed")
+        environment = {
+            "JJ_EDITOR": "true",
+            "JJ_USER": "tree id test",
+            "JJ_EMAIL": "tree-id@example.invalid",
+        }
+
+        def jj(*arguments):
+            run = subprocess.run(
+                ["jj", *arguments],
+                cwd=str(self.crate),
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, **environment),
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return run.stdout.strip()
+
+        jj("git", "init")
+        (self.crate / "tracked.txt").write_text("first\n", encoding="utf-8")
+        first = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["rtp_mux"]["revision"], first)
+        self.assertEqual(report["rtp_mux"]["revision_source"], "jj")
+        first_tree = report["rtp_mux"]["tree_id"]
+        self.assertEqual(len(first_tree), 40)
+
+        jj("new")
+        second = jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
+        self.assertNotEqual(second, first)
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        report = self.report()
+        self.assertEqual(report["rtp_mux"]["revision"], second)
+        self.assertEqual(
+            report["rtp_mux"]["tree_id"],
+            first_tree,
+            "rewriting the working-copy commit moved the tree id: the tree id "
+            "is not naming the content",
+        )
+
+        (self.crate / "tracked.txt").write_text("second\n", encoding="utf-8")
+        jj("log", "-r", "@", "--no-graph", "-T", "commit_id")
+        code, _, stderr = self.run_tool(self.healthy_plan())
+        self.assertEqual(code, 0, stderr)
+        self.assertNotEqual(self.report()["rtp_mux"]["tree_id"], first_tree)
+
+    def test_the_history_step_writes_and_prints_the_summary_and_vs_prev(self):
+        # A run owns three artifacts: the rendered panels, a run-level
+        # `summary.md` and `vs-prev.md`. The history step produces the two text
+        # ones and prints both; the boundary between the two Rust binaries is
+        # where a port can silently drop them, so the assertion is on this
+        # command's stdout.
+        perf_history_binary()
+        # The archive root is the working directory's `./.net-perf-history`, so
+        # the run is given a working directory of its own rather than the
+        # repository: a suite may not leave an archive in the tree it tests.
+        code, stdout, stderr = self.run_tool(
+            self.healthy_plan(), history=True, cwd=self.root
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue((self.root / ".net-perf-history").is_dir())
+        summary = self.out / "summary.md"
+        vs_prev = self.out / "vs-prev.md"
+        self.assertTrue(summary.is_file(), "summary.md was not written")
+        self.assertTrue(vs_prev.is_file(), "vs-prev.md was not written")
+        self.assertIn(summary.read_text(encoding="utf-8"), stdout)
+        self.assertIn(vs_prev.read_text(encoding="utf-8"), stdout)
+        summary = summary.resolve()
+        vs_prev = vs_prev.resolve()
+        self.assertTrue(list((self.out / "plots").glob("*.svg")))
+        self.assertIn("verdict: PASS", stdout)
+        self.assertIn(f"summary:  {summary}", stdout)
+        self.assertIn(f"vs-prev:  {vs_prev}", stdout)
+
+    def test_a_failing_history_step_fails_the_invocation(self):
+        # The battery passed; the history step could not do its job. Its status
+        # must reach the caller, or a run that was never archived reads as a
+        # pass -- which is the whole reason the wrapper carries that status.
+        perf_history_binary()
+        # The archive root is `<working directory>/.net-perf-history`; a file
+        # where that directory must go is a history step that cannot archive.
+        (self.root / ".net-perf-history").write_text(
+            "a file, not an archive root\n", encoding="utf-8"
+        )
+        code, stdout, stderr = self.run_tool(
+            self.healthy_plan(), history=True, cwd=self.root
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("verdict: PASS", stdout)
+        self.assertIn("perf-history: error:", stderr)
+        self.assertEqual(code, 2)
+        self.assertNotIn("summary.md", stdout)
 
 
 if __name__ == "__main__":

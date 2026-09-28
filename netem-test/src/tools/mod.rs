@@ -14,6 +14,7 @@
 
 pub mod check_gate;
 pub mod json;
+pub mod mandate_check;
 pub mod mandate_compare;
 pub mod mandate_plot;
 pub mod pyformat;

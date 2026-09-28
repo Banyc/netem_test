@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use netem_test::tools::check_gate::{self, Args as CheckGateArgs};
+use netem_test::tools::mandate_check::{self, Args as MandateCheckArgs};
 use netem_test::tools::mandate_compare::{self, Args};
 use netem_test::tools::mandate_plot::{self, Args as PlotArgs};
 use netem_test::tools::pyformat;
@@ -41,6 +42,8 @@ struct Cli {
 enum Tool {
     /// verify a crate's scenario gate manifest against the compiled tests
     CheckGate(CheckGate),
+    /// run the perf producers, render their panels and write the report
+    MandateCheck(MandateCheck),
     /// diff a mandate-check run against the committed baseline
     MandateCompare(MandateCompare),
     /// apply a Python `format()` spec to a value (the port's prerequisite)
@@ -68,6 +71,65 @@ struct PyFormat {
         allow_hyphen_values = true
     )]
     spec: String,
+}
+
+// The flags of `mandate-check`, converted into the runner's own `Args`. The
+// wrapper's two history flags live here too, because the runner is the whole
+// flow: the battery, then the archive/compare step unless `--no-history`.
+#[derive(Debug, clap::Args)]
+struct MandateCheck {
+    /// run only this producer, repeatably; with none named every declared
+    /// producer runs
+    #[arg(long = "producer", value_name = "ID")]
+    producer: Vec<String>,
+    /// point one producer at another checkout, repeatably (<id>=<path>)
+    #[arg(long = "producer-path", value_name = "ID=PATH")]
+    producer_path: Vec<String>,
+    /// run directory for the evidence, the plots and mandate-check.json
+    #[arg(long, value_name = "dir")]
+    dir: Option<PathBuf>,
+    /// set MANDATE_SMOKE_QUICK=1 so a producer takes its shortest windows
+    #[arg(long)]
+    quick: bool,
+    /// seconds before a producer is killed, applied per producer
+    #[arg(long, value_name = "s", default_value_t = mandate_check::DEFAULT_TIMEOUT_SECONDS)]
+    timeout: f64,
+    /// cargo executable to build and run the producers
+    #[arg(long, value_name = "path", default_value = mandate_check::DEFAULT_CARGO)]
+    cargo: String,
+    /// headless browser for the PNG step
+    #[arg(long, value_name = "path")]
+    browser: Option<String>,
+    /// verify and keep the panel SVGs only; skip the external PNG step
+    #[arg(long = "no-rasterize")]
+    no_rasterize: bool,
+    /// the deliberate-fault selector this run took
+    #[arg(long, value_name = "NAME")]
+    fault: Option<String>,
+    /// run the battery only; do not archive or compare the run
+    #[arg(long)]
+    no_history: bool,
+    /// label this archived run with a name instead of its timestamp
+    #[arg(long, value_name = "name")]
+    history_label: Option<String>,
+}
+
+impl From<MandateCheck> for MandateCheckArgs {
+    fn from(cli: MandateCheck) -> MandateCheckArgs {
+        MandateCheckArgs {
+            producer: cli.producer,
+            producer_path: cli.producer_path,
+            dir: cli.dir,
+            quick: cli.quick,
+            timeout: cli.timeout,
+            cargo: cli.cargo,
+            browser: cli.browser,
+            rasterize: !cli.no_rasterize,
+            fault: cli.fault,
+            no_history: cli.no_history,
+            history_label: cli.history_label,
+        }
+    }
 }
 
 // The flags of `mandate-compare`, converted into the comparison's own `Args`.
@@ -243,6 +305,7 @@ fn main() {
                 1
             }
         },
+        Tool::MandateCheck(args) => mandate_check::main(&args.into()),
         Tool::MandateCompare(args) => mandate_compare::main(args.into()),
         Tool::PyFormat(args) => pyformat::main(pyformat::Args {
             value: args.value,

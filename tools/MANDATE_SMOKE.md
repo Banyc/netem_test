@@ -450,10 +450,15 @@ read as agreement.
 
 ## Tests
 
-`tools/test_mandate_check.py` exercises the whole command against a fake
-cargo and fake producer checkouts, so it needs no Rust build and no
-network; `python3 -m pytest tools/ -q` runs it with the rest of the tooling
-suite. It covers the passing run with its written report and its per-arm
+`tools/test_mandate_check.py` exercises the whole command through the built
+`netem-tools` binary against a fake cargo and fake producer checkouts, so it
+needs no network and no real producer build — but it does need the runner
+built (`cargo build --release -p netem-test --features cli --bin netem-tools`),
+and a missing binary is a failure rather than a skip; `python3 -m pytest tools/
+-q` runs it with the rest of the tooling suite. The parts that cannot be driven
+from a fixture (the line parsers, the timing derivation, the declaration
+validation, the panel verifier) are unit tests under
+`netem-test/src/tools/mandate_check/`. It covers the passing run with its written report and its per-arm
 record, a failing mandate, a missing mandate line, a missing or empty CSV, a
 declaration whose series has no rows, a compile failure, a timeout, a missing
 checkout and a plot that cannot be produced, that a directory holding someone
