@@ -4268,13 +4268,22 @@ mod tests {
                 "hostile_p99_guard": 200.0, "lone_p99_guard": 400.0}"#,
         )
         .expect("parses");
+        let plan = arm_bound_values(panel, &series, &bounds, Some(&run))
+            .expect("the run restates two arms");
+        assert_eq!(plan.arms, vec!["clean", "hostile", "lone"]);
+        let per_arm: Vec<(&str, Vec<f64>)> = plan
+            .arms
+            .iter()
+            .zip(plan.lines.iter())
+            .map(|(arm, lines)| (arm.as_str(), lines.iter().map(|line| line.value).collect()))
+            .collect();
         assert_eq!(
-            arm_bound_values(panel, &series, &bounds, Some(&run)),
-            Some(vec![
-                ("clean".to_string(), 100.0),
-                ("hostile".to_string(), 200.0),
-                ("lone".to_string(), 400.0),
-            ])
+            per_arm,
+            vec![
+                ("clean", vec![100.0]),
+                ("hostile", vec![200.0]),
+                ("lone", vec![400.0]),
+            ]
         );
         // Vacuity: the same panel against a run that bears on a different
         // quantity restates nothing, so the declaration's own bound stands.
@@ -4283,9 +4292,9 @@ mod tests {
                 "delivery_floor": 0.995, "hostile_p99_guard": 900.0}"#,
         )
         .expect("parses");
-        assert_eq!(
-            arm_bound_values(panel, &series, &bounds, Some(&unrelated)),
-            None
+        assert!(
+            arm_bound_values(panel, &series, &bounds, Some(&unrelated)).is_none(),
+            "a run that bears on another quantity owes no restatement"
         );
         let effective = effective_bounds(panel, &series, &bounds, Some(&run));
         assert_eq!(effective.len(), 3, "{effective:?}");
@@ -4910,20 +4919,19 @@ mod tests {
         let panel = panel_of("delivery", Chart::Bar, &["delivery"]);
         let series = series_of("delivery", vec![(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)]);
         let bounds = vec![Bound::new(1.0, "M2 delivery floor 1.000".to_string())];
-        assert_eq!(
-            crate::tools::mandate_plot::arm_bound_values(&panel, &series, &bounds, None),
-            None
+        assert!(
+            crate::tools::mandate_plot::arm_bound_values(&panel, &series, &bounds, None).is_none()
         );
         let unrelated = run(r#"{"flows": 4, "imbalance_bound": 0.01, "fair_share": 0.25,
                 "delivery_floor": 0.995, "hostile_p99_guard": 900.0}"#);
-        assert_eq!(
+        assert!(
             crate::tools::mandate_plot::arm_bound_values(
                 &panel,
                 &series,
                 &bounds,
                 Some(&unrelated)
-            ),
-            None
+            )
+            .is_none()
         );
         assert_eq!(
             crate::tools::mandate_plot::effective_bounds(
@@ -4941,13 +4949,22 @@ mod tests {
                 "hostile_delivery_guard": 0.995, "lone_delivery_guard": 0.995,
                 "delivery_floor": 0.995}"#,
         );
+        let plan =
+            crate::tools::mandate_plot::arm_bound_values(&panel, &series, &bounds, Some(&restated))
+                .expect("the run restates two arms");
+        let per_arm: Vec<(&str, Vec<f64>)> = plan
+            .arms
+            .iter()
+            .zip(plan.lines.iter())
+            .map(|(arm, lines)| (arm.as_str(), lines.iter().map(|line| line.value).collect()))
+            .collect();
         assert_eq!(
-            crate::tools::mandate_plot::arm_bound_values(&panel, &series, &bounds, Some(&restated)),
-            Some(vec![
-                ("clean".to_string(), 1.0),
-                ("hostile".to_string(), 0.995),
-                ("lone".to_string(), 0.995),
-            ])
+            per_arm,
+            vec![
+                ("clean", vec![1.0]),
+                ("hostile", vec![0.995]),
+                ("lone", vec![0.995]),
+            ]
         );
     }
 

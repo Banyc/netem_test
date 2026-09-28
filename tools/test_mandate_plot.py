@@ -2002,6 +2002,102 @@ class MandatePlotTest(unittest.TestCase):
             titles,
         )
 
+    def test_a_single_series_panel_carries_a_second_bound_and_the_run_guard(self):
+        # A single-series, arm-axis panel with two declared ceilings -- one per
+        # arm window -- and a run that restates one arm. The single-bound
+        # precondition dropped the whole restatement here, so the panel drew
+        # its two declared bounds and silently lost the run's own 200 ms guard,
+        # the line that says the hostile arm is read against it.
+        declaration = {
+            **M2_LATENCY_DECLARATION,
+            "panels": [
+                {
+                    **M2_LATENCY_DECLARATION["panels"][0],
+                    "bounds": [
+                        {"y": 100.0, "label": "M2 non-degrading p99 bound (ms)", "x": [1]},
+                        {"y": 400.0, "label": "M2 impaired ceiling 400 ms", "x": [2, 3]},
+                    ],
+                }
+            ],
+        }
+        run_values = {
+            "clean_p99_ms": 26.251,
+            "hostile_p99_ms": 61.5,
+            "lone_p99_ms": 185.8015,
+            "hostile_p99_guard": 200.0,
+        }
+        summaries, stderr, out = self.render_json(
+            declaration, M2_LATENCY_ROWS, "M2dual", "--run-values", json.dumps(run_values)
+        )
+        document = (out / "M2-latency.svg").read_text(encoding="utf-8")
+        titles = self.bound_titles(document)
+        self.assertEqual(document.count('class="bound"'), 3, titles)
+        for expected in (
+            "M2 non-degrading p99 bound (ms)",
+            "run hostile_p99_guard=200",
+            "M2 impaired ceiling 400 ms",
+        ):
+            self.assertTrue(any(title.startswith(expected) for title in titles), titles)
+        # No declared bound is drawn across the whole axis: each carries the
+        # arm its own window names, and the run's guard covers its own arm.
+        spans = [
+            (float(a), float(b))
+            for a, b in re.findall(
+                r'class="bound" x1="([-0-9.]+)"[^>]*x2="([-0-9.]+)"', document
+            )
+        ]
+        self.assertEqual(len(spans), 3, spans)
+        full = max(b for _, b in spans) - min(a for a, _ in spans)
+        for left, right in spans:
+            self.assertLess(left, right)
+            self.assertLess(right - left, full)
+        # The summary the run carries names every drawn line, so the second
+        # declared bound is read back off the panel's own statement.
+        bounds = summaries["latency"]["bounds"]
+        self.assertEqual(
+            [(entry["value"], entry["drawn"]) for entry in bounds],
+            [(100.0, "labelled"), (200.0, "labelled"), (400.0, "labelled")],
+        )
+        block = summaries["latency"]["block"]
+        for label in (
+            "M2 non-degrading p99 bound (ms)",
+            "run hostile_p99_guard=200",
+            "M2 impaired ceiling 400 ms",
+        ):
+            self.assertIn(label, block, block)
+
+    def test_two_declared_bounds_at_one_value_are_refused_by_name(self):
+        # Two declared bounds at one y are one line with two names, and only
+        # one label can be drawn there. The panel refuses and names both, so
+        # the redundancy is reported rather than one bound being dropped.
+        declaration = {
+            **M2_LATENCY_DECLARATION,
+            "panels": [
+                {
+                    **M2_LATENCY_DECLARATION["panels"][0],
+                    "bounds": [
+                        {"y": 250.0, "label": "ceiling A 250 ms"},
+                        {"y": 250.0, "label": "ceiling B 250 ms"},
+                    ],
+                }
+            ],
+        }
+        run_values = {
+            "clean_p99_ms": 26.251,
+            "hostile_p99_ms": 61.5,
+            "lone_p99_ms": 185.8015,
+            "hostile_p99_guard": 200.0,
+            "lone_p99_guard": 400.0,
+        }
+        code, stderr, _ = self.render_mandate(
+            declaration, M2_LATENCY_ROWS, "M2same", "--run-values", json.dumps(run_values)
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("mandate_plot: error:", stderr)
+        self.assertIn("ceiling A 250 ms", stderr)
+        self.assertIn("ceiling B 250 ms", stderr)
+        self.assertIn("overlap", stderr)
+
     def test_two_bounds_too_close_to_read_are_still_refused(self):
         # The multi-bound path keeps the label-overlap refusal: two ceilings a
         # few milliseconds apart draw two sentences on one line, so the panel

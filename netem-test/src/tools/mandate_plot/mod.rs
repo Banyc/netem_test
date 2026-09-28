@@ -1629,17 +1629,61 @@ fn guarded_arms(arms: &[String], run_values: Option<&J>) -> Vec<String> {
     guarded
 }
 
-/// Each drawn arm's own bound, or `None` when one bound serves them all.
+/// One drawn arm's bound line: the value the arm is read against, the label
+/// the line carries, and the run key that stated it when the run did.
+struct ArmBound {
+    value: f64,
+    label: String,
+    guard_key: Option<String>,
+}
+
+/// What every drawn arm of a single-series, arm-axis bar panel is read against.
+struct ArmBoundPlan {
+    /// The arms, in the run's own order, which is the order their bars draw in.
+    arms: Vec<String>,
+    /// One entry per arm: the bound line(s) that arm is read against.
+    lines: Vec<Vec<ArmBound>>,
+    /// One entry per declared bound: the arm categories it governs.
+    governed: Vec<Vec<f64>>,
+}
+
+/// Whether a declared bound governs one arm category of a single-series panel:
+/// its `series` must be this panel's own series (or unnamed), and its `x`
+/// window must contain the category (or be unnamed).
+fn declared_bound_governs(bound: &Bound, category: f64, quantity: &str) -> bool {
+    if let Some(name) = &bound.series
+        && name != quantity
+    {
+        return false;
+    }
+    if let Some((low, high)) = bound.x
+        && !(low <= category && category <= high)
+    {
+        return false;
+    }
+    true
+}
+
+/// What each drawn arm of a single-series, arm-axis bar panel is read against,
+/// or `None` when the declaration serves the arms without the run restating
+/// any of them.
+///
+/// This refused more than one declared bound outright, and the refusal
+/// suppressed the whole restatement: a panel that drew two declared bounds
+/// silently lost every per-arm bound the run stated. Each arm now carries the
+/// declared bound that governs it, so a second declared bound adds its own
+/// line over the arms it governs instead of removing the run's. The run's own
+/// bound for an arm replaces the declared ones for that arm, which is how
+/// `M2-delivery`'s per-arm floor has always been drawn.
 fn arm_bound_values(
     panel: &Panel,
     series: &Series,
     bounds: &[Bound],
     run_values: Option<&J>,
-) -> Option<Vec<(String, f64)>> {
-    if panel.chart != Chart::Bar || bounds.len() != 1 || series.len() != 1 {
+) -> Option<ArmBoundPlan> {
+    if panel.chart != Chart::Bar || bounds.is_empty() || series.len() != 1 {
         return None;
     }
-    let declared = bounds[0].y;
     let arms = run_arm_names(series, run_values);
     let mut categories: Vec<f64> = series[0].1.iter().map(|(x, _)| *x).collect();
     categories.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1650,94 +1694,145 @@ fn arm_bound_values(
     }
     let quantity = series[0].0.as_str();
     let restated = quantity_bound(quantity, run_values);
-    let own: Vec<(String, Option<(String, f64)>)> = arms
+    let own: Vec<Option<(String, f64)>> = arms
         .iter()
-        .map(|arm| (arm.clone(), arm_bound_source(arm, quantity, run_values)))
+        .map(|arm| arm_bound_source(arm, quantity, run_values))
         .collect();
-    if restated.is_none() && own.iter().all(|(_, source)| source.is_none()) {
+    if restated.is_none() && own.iter().all(Option::is_none) {
         return None;
     }
     let guarded = guarded_arms(&arms, run_values);
     if guarded.is_empty() {
         return None;
     }
+    // The declared bounds each arm is read against. A bound that governs none
+    // of this panel's arms is left to `bounds` as written: the x/series check
+    // names what is wrong with it, and this function does not restate a bound
+    // the panel does not draw.
+    let governing: Vec<Vec<usize>> = categories
+        .iter()
+        .map(|category| {
+            bounds
+                .iter()
+                .enumerate()
+                .filter(|(_, bound)| declared_bound_governs(bound, *category, quantity))
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
+    // A declared bound that governs no arm of this panel is not this
+    // function's to restate: the declaration is left as written and the
+    // x/series check names the bound that governs nothing here.
+    if (0..bounds.len()).any(|index| !governing.iter().flatten().any(|other| *other == index)) {
+        return None;
+    }
+    let governed: Vec<Vec<f64>> = (0..bounds.len())
+        .map(|index| {
+            governing
+                .iter()
+                .enumerate()
+                .filter(|(_, indices)| indices.contains(&index))
+                .map(|(arm, _)| (arm + 1) as f64)
+                .collect()
+        })
+        .collect();
     // The arms keep the run's own order, which is the order its bars are drawn
     // in: a sorted map here would reorder the segments a panel draws.
-    let mut values = Vec::new();
-    for (arm, source) in &own {
-        let value = if let Some((_, value)) = source {
-            *value
-        } else if let Some((_, restated_value)) = &restated {
-            if guarded.contains(arm) {
-                *restated_value
-            } else {
-                declared
-            }
-        } else {
-            declared
+    let mut lines: Vec<Vec<ArmBound>> = Vec::new();
+    for (index, arm) in arms.iter().enumerate() {
+        let stated = match &own[index] {
+            Some((key, value)) => Some((key.clone(), *value)),
+            None if guarded.contains(arm) => restated.clone(),
+            None => None,
         };
-        values.push((arm.clone(), value));
+        let lines_for_arm = match stated {
+            Some((key, value)) => {
+                let declared = governing[index].first().map(|index| &bounds[*index]);
+                let label = match declared {
+                    Some(declared) if value == declared.y => declared.label.clone(),
+                    _ => format!("run {key}={}", fg(value)),
+                };
+                vec![ArmBound {
+                    value,
+                    label,
+                    guard_key: key.ends_with(GUARD_KEY_SUFFIX).then_some(key),
+                }]
+            }
+            None => governing[index]
+                .iter()
+                .map(|index| ArmBound {
+                    value: bounds[*index].y,
+                    label: bounds[*index].label.clone(),
+                    guard_key: None,
+                })
+                .collect(),
+        };
+        lines.push(lines_for_arm);
     }
-    Some(values)
+    Some(ArmBoundPlan {
+        arms,
+        lines,
+        governed,
+    })
 }
 
-/// The bound lines a bar panel draws: one per contiguous run of equal values.
+/// The bound lines a bar panel draws: one per contiguous run of equal values,
+/// for every declared bound the run's own bounds leave standing.
 fn effective_bounds(
     panel: &Panel,
     series: &Series,
     bounds: &[Bound],
     run_values: Option<&J>,
 ) -> Vec<Bound> {
-    let Some(values) = arm_bound_values(panel, series, bounds, run_values) else {
+    let Some(plan) = arm_bound_values(panel, series, bounds, run_values) else {
         return bounds.to_vec();
     };
-    let arms: Vec<String> = values.iter().map(|(arm, _)| arm.clone()).collect();
-    let value_of = |arm: &str| {
-        values
-            .iter()
-            .find(|(name, _)| name == arm)
-            .map(|(_, value)| *value)
-            .expect("the arm was enumerated from this table")
-    };
-    let quantity = series[0].0.as_str();
-    let restated = quantity_bound(quantity, run_values);
     let mut segments: Vec<Bound> = Vec::new();
-    let mut start = 0;
-    while start < arms.len() {
-        let value = value_of(&arms[start]);
-        let mut end = start + 1;
-        while end < arms.len() && value_of(&arms[end]) == value {
-            end += 1;
-        }
-        let run: Vec<String> = arms[start..end].to_vec();
-        let mut source = arm_bound_source(&run[0], quantity, run_values);
-        if source.is_none() && restated.is_some() {
-            source = restated.clone();
-        }
-        let label = if value == bounds[0].y {
-            bounds[0].label.clone()
-        } else {
-            match &source {
-                Some((key, source_value)) => format!("run {key}={}", fg(*source_value)),
-                None => bounds[0].label.clone(),
+    for (index, lines) in plan.lines.iter().enumerate() {
+        for line in lines {
+            // A line joins the segment that ended on the previous arm with the
+            // same value, which is how one per-arm floor stated for two
+            // adjacent arms draws as one line.
+            if index > 0
+                && let Some(segment) = segments.iter_mut().rev().find(|segment| {
+                    segment.y == line.value
+                        && segment.window.as_ref().and_then(|window| window.last())
+                            == Some(&(index as f64))
+                })
+            {
+                if let Some(run) = segment.arms.as_mut() {
+                    run.push(plan.arms[index].clone());
+                }
+                if let Some(window) = segment.window.as_mut() {
+                    window.push((index + 1) as f64);
+                }
+                continue;
             }
-        };
-        let mut segment = Bound::new(value, label);
-        segment.arms = Some(run);
-        segment.window = Some((start..end).map(|index| (index + 1) as f64).collect());
-        if let Some((key, _)) = &source
-            && key.ends_with(GUARD_KEY_SUFFIX)
-        {
-            segment.guard_key = Some(key.clone());
+            let mut segment = Bound::new(line.value, line.label.clone());
+            segment.arms = Some(vec![plan.arms[index].clone()]);
+            segment.window = Some(vec![(index + 1) as f64]);
+            segment.guard_key = line.guard_key.clone();
+            segments.push(segment);
         }
-        segments.push(segment);
-        start = end;
     }
-    let declared_value = bounds[0].y;
-    if segments.iter().all(|segment| segment.y != declared_value) {
-        let mut segment = Bound::new(declared_value, bounds[0].label.clone());
+    // A declared bound the run restates on every arm it governs is still
+    // drawn: it is named by the declaration, and a bound named with no line is
+    // a claim the reader has to take on trust.
+    for (index, declared) in bounds.iter().enumerate() {
+        let carried = segments
+            .iter()
+            .any(|segment| segment.y == declared.y && segment.label == declared.label);
+        if carried {
+            continue;
+        }
+        let window = if plan.governed[index].is_empty() {
+            vec![1.0, plan.arms.len() as f64]
+        } else {
+            plan.governed[index].clone()
+        };
+        let mut segment = Bound::new(declared.y, declared.label.clone());
         segment.arms = Some(Vec::new());
-        segment.window = Some(vec![1.0, arms.len() as f64]);
+        segment.window = Some(window);
         segment.governs_none = true;
         segments.push(segment);
     }
@@ -2086,6 +2181,153 @@ mod tests {
             !bounds.iter().any(|bound| bound.y == 900.0),
             "the 900 ms line is the drawn series guard, not a declared bound"
         );
+    }
+
+    /// An arm-axis bar panel: one series, one bar per arm.
+    fn arm_axis_panel() -> Panel {
+        Panel {
+            id: "latency".to_string(),
+            chart: Chart::Bar,
+            series: Vec::new(),
+            x_label: None,
+            y_label: None,
+            bounds: Vec::new(),
+            y_extent: None,
+        }
+    }
+
+    /// Three arms whose own p99 the panel draws, with the run's own names.
+    fn arm_axis_series() -> Series {
+        vec![(
+            "p99_ms".to_string(),
+            vec![(1.0, 26.0), (2.0, 61.5), (3.0, 185.8)],
+        )]
+    }
+
+    /// The drawn plan as `(value, label, arms)`.
+    fn drawn(plan: &[Bound]) -> Vec<(f64, String, Option<Vec<String>>)> {
+        plan.iter()
+            .map(|bound| (bound.y, bound.label.clone(), bound.arms.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_second_declared_bound_carries_the_per_arm_restatement() {
+        // Two declared ceilings on one arm axis, each governing its own arms,
+        // and a run that restates one arm. The single-bound precondition used
+        // to drop the whole restatement here, so the run's own 200 ms line
+        // vanished from a panel that drew two declared bounds.
+        let panel = arm_axis_panel();
+        let series = arm_axis_series();
+        let mut clean_ceiling = Bound::new(100.0, "clean ceiling 100 ms".to_string());
+        clean_ceiling.x = Some((1.0, 1.0));
+        let mut impaired_ceiling = Bound::new(400.0, "impaired ceiling 400 ms".to_string());
+        impaired_ceiling.x = Some((2.0, 3.0));
+        let bounds = vec![clean_ceiling, impaired_ceiling];
+        let run = pyjson::parse(
+            r#"{"clean_p99_ms": 26.0, "hostile_p99_ms": 61.5, "lone_p99_ms": 185.8,
+                "hostile_p99_guard": 200.0}"#,
+        )
+        .expect("parses");
+        let plan = effective_bounds(&panel, &series, &bounds, Some(&run));
+        assert_eq!(
+            drawn(&plan),
+            vec![
+                (
+                    100.0,
+                    "clean ceiling 100 ms".to_string(),
+                    Some(vec!["clean".to_string()])
+                ),
+                (
+                    200.0,
+                    "run hostile_p99_guard=200".to_string(),
+                    Some(vec!["hostile".to_string()])
+                ),
+                (
+                    400.0,
+                    "impaired ceiling 400 ms".to_string(),
+                    Some(vec!["lone".to_string()])
+                ),
+            ]
+        );
+        // Each declared bound keeps the arm its own window names: the run's
+        // guard replaces the declared one for its arm and nothing else.
+        assert_eq!(plan[0].window, Some(vec![1.0]));
+        assert_eq!(plan[2].window, Some(vec![3.0]));
+        // Vacuity: the 200 ms line is the run's own and no declared bound
+        // states it; the old guard returned `bounds` unchanged, which is this
+        // plan with that line removed.
+        assert!(
+            !bounds.iter().any(|bound| bound.y == 200.0),
+            "the 200 ms line is the restated run guard, not a declared bound"
+        );
+        assert_eq!(
+            effective_bounds(&panel, &series, &bounds, None),
+            bounds,
+            "with no run values the declaration stands as written"
+        );
+    }
+
+    #[test]
+    fn two_declared_bounds_at_one_value_still_restate_and_are_refused_by_name() {
+        // Two names for one line: both declared bounds are carried (so neither
+        // is dropped silently) and the run's own guards are still drawn, which
+        // leaves the label-overlap refusal to name both bounds at the one y
+        // they cannot share. Suppressing the restatement here instead, as the
+        // single-bound precondition did, would refuse the same panel for a
+        // guard the label names and the artifact does not draw -- a second,
+        // misleading failure in place of the real one.
+        let panel = arm_axis_panel();
+        let series = arm_axis_series();
+        let bounds = vec![
+            Bound::new(250.0, "ceiling A 250 ms".to_string()),
+            Bound::new(250.0, "ceiling B 250 ms".to_string()),
+        ];
+        let run = pyjson::parse(
+            r#"{"clean_p99_ms": 26.0, "hostile_p99_ms": 61.5, "lone_p99_ms": 185.8,
+                "hostile_p99_guard": 200.0, "lone_p99_guard": 400.0}"#,
+        )
+        .expect("parses");
+        assert!(
+            arm_bound_values(&panel, &series, &bounds, Some(&run)).is_some(),
+            "the equal value is not a reason to drop the run's per-arm bounds"
+        );
+        let plan = effective_bounds(&panel, &series, &bounds, Some(&run));
+        let values: Vec<f64> = plan.iter().map(|bound| bound.y).collect();
+        assert_eq!(values, vec![250.0, 250.0, 200.0, 400.0], "{plan:?}");
+        // The two same-y lines are over the same arm, which is what makes the
+        // label-overlap check the authority that names them both.
+        assert_eq!(plan[0].arms, plan[1].arms);
+    }
+
+    #[test]
+    fn a_declared_bound_for_another_series_is_left_to_the_x_series_check() {
+        // A bound that names a series this panel does not draw governs no arm
+        // of it. Restating the other bound alone would silently drop this one,
+        // so the declaration stands as written and the x/series check refuses
+        // it by name.
+        let panel = arm_axis_panel();
+        let series = arm_axis_series();
+        let mut foreign = Bound::new(900.0, "hostile ceiling 900 ms".to_string());
+        foreign.series = Some("hostile_p99".to_string());
+        let bounds = vec![Bound::new(100.0, "M2 bound 100 ms".to_string()), foreign];
+        let run = pyjson::parse(
+            r#"{"clean_p99_ms": 26.0, "hostile_p99_ms": 61.5, "lone_p99_ms": 185.8,
+                "hostile_p99_guard": 200.0, "lone_p99_guard": 400.0}"#,
+        )
+        .expect("parses");
+        assert!(arm_bound_values(&panel, &series, &bounds, Some(&run)).is_none());
+        assert_eq!(
+            effective_bounds(&panel, &series, &bounds, Some(&run)),
+            bounds
+        );
+        // Vacuity: naming this panel's own series instead makes the bound
+        // govern every arm, so it is the foreign name that blocks the
+        // restatement and not the count of declared bounds.
+        let mut own = Bound::new(900.0, "hostile ceiling 900 ms".to_string());
+        own.series = Some("p99_ms".to_string());
+        let restated = vec![Bound::new(100.0, "M2 bound 100 ms".to_string()), own];
+        assert!(arm_bound_values(&panel, &series, &restated, Some(&run)).is_some());
     }
 
     #[test]
