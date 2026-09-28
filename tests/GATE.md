@@ -24,6 +24,20 @@ the checker derives the crate root from its own path — and the parameterized
 form from there names the root instead of `.`:
 `netem-tools check-gate --crate .. tests tests/tests tests/GATE.md`.
 
+Both forms check this manifest; the no-argument form (the checker's *harness
+mode*) additionally runs its documented-count half, which re-derives the counts
+stated in `tools/PERF_INFRA.md` and `tools/MANDATE_SMOKE.md` from the mandate
+data. That data moved to the `rtp_mux` checkout with the tooling (`e423c41b`)
+and the checker still looks for it under this root, so from a `netem_test`
+checkout alone harness mode is **red with 31 `DOC COUNT` lines** — the migrated
+counts, and no other problem in the run — while the parameterized form below is
+green, because it does not run that half. The four authorities' new locations,
+the declaration-by-declaration owner, and the exact `rtp_mux` change that
+closes it are in `netem-test/tests/PENDING-check-gate-relocation.md`
+("A second consequence"). Until that lands, harness mode needs a checkout that
+also holds the sibling `crates/rtp_mux` checkout, and the parameterized form is
+the one this crate's own gate rests on.
+
 The same gate through the parameterized form the sibling crates use (the
 scenario directory is `tests/tests`, one level below this package's own root):
 

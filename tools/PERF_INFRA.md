@@ -386,7 +386,15 @@ tooling move (`e423c41b`) carried `check_gate` into `rtp_mux` but left its 150
 fixture tests in `netem-test/tests/`; they were removed there to restore the
 crate's build and are recorded, case by case, in
 `netem-test/tests/PENDING-check-gate-relocation.md`, which also names the
-`rtp_mux/GATE.md` `gate-env-tier` rows that moved with the code.
+`rtp_mux/GATE.md` `gate-env-tier` rows that moved with the code. The same move
+left the checker's *harness mode* red: it re-derives the counts in
+`tools/PERF_INFRA.md` and `tools/MANDATE_SMOKE.md` from
+`mandate-producers.json`, `mandate-arms.json`, `mandate-baseline.json` and
+`mandate_compare.rs`, all of which now live in the `rtp_mux` checkout, so from
+the harness root it reports 31 `DOC COUNT` lines and cannot derive a value.
+That inventory, each declaration's new owner, and the exact re-point it needs
+are in the same queue file; `tests/GATE.md` states which checkout the
+no-argument form needs until it lands.
 - **`mux`** — owes no perf-test declaration, not "no opt-in scenario". Its own
 manifest is the authority: run
 `netem-tools check-gate --crate ../mux mux tests GATE.md` from here and it
