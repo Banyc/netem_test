@@ -367,6 +367,6 @@ block, whose readers are `src/tools/mandate_plot/render.rs` (`BROWSER_ENV`),
 (`TMPDIR`, `HOME` via `expanduser`). The rows' `tools/render_graph.py` and
 `tools/test_mandate_check.py` runners are files of the **harness** checkout,
 not of `rtp_mux`, so in rtp_mux's manifest those rows must be scriptless
-(`-`) with the external runner named in prose — exactly as that manifest
-already records the harness's `tools/mandate-check` runner for its own seven
-surfaces.
+(`-`) with the runner named in prose — exactly as that manifest
+already names rtp_mux's own `tools/mandate-check` (a sh shim the checker cannot
+name, having no script suffix) in prose for its own seven surfaces.
