@@ -4628,4 +4628,1276 @@ mod tests {
             problems[0]
         );
     }
+
+    // -- coverage recovered from the deleted `tools/test_mandate_plot.py` -----
+    //
+    // The port to Rust left several check-level cases with no counterpart: the
+    // CDF reference-reach, per-arm-governance, panel-summary-extent and
+    // caption/reading-number families, the render-integration halves of the
+    // sliver and clip families, and the two-sided-bound and axis-label cases.
+    // Each test below starts from the artifact that satisfies the property and
+    // then shows the artifact that violates it being refused, the way the
+    // cases removed from the Python suite were written.
+
+    fn run(values: &str) -> J {
+        pyjson::parse(values).expect("parses")
+    }
+
+    fn panel_of(id: &str, chart: Chart, names: &[&str]) -> Panel {
+        Panel {
+            id: id.to_string(),
+            chart,
+            series: names
+                .iter()
+                .map(|name| SeriesEntry {
+                    name: name.to_string(),
+                    role: None,
+                })
+                .collect(),
+            x_label: None,
+            y_label: None,
+            bounds: Vec::new(),
+            y_extent: None,
+        }
+    }
+
+    fn cdf_markup(series: &Series, scale: &'static str, note: &str) -> String {
+        draw::svg_cdf_chart(&draw::LineChart {
+            title: "M1 [cdf]",
+            x_label: "latency (ms)",
+            y_label: "percentile (%)",
+            series,
+            y_extent: None,
+            bounds: &[],
+            walls: false,
+            markers: false,
+            readings: &[],
+            note,
+            x_bounds: &[],
+            x_scale: scale,
+            y_clip: None,
+        })
+    }
+
+    fn line_markup(series: &Series, bounds: &[(f64, String)]) -> String {
+        draw::svg_line_chart(&draw::LineChart {
+            title: "M1 [latency]",
+            x_label: "elapsed time (s)",
+            y_label: "latency (ms)",
+            series,
+            y_extent: None,
+            bounds,
+            walls: true,
+            markers: true,
+            readings: &[],
+            note: "",
+            x_bounds: &[],
+            x_scale: "linear",
+            y_clip: None,
+        })
+    }
+
+    fn reading_markup(sentences: &[String]) -> String {
+        let mut body = String::new();
+        let mut row = 0usize;
+        for sentence in sentences {
+            for line in draw::wrap_label(sentence, draw::READING_PLOT_WIDTH as f64) {
+                body.push_str(&format!(
+                    "<text class=\"arm-reading\" x=\"76\" y=\"{}\">{}</text>",
+                    24 + row * 13,
+                    pyjson::escape(&line)
+                ));
+                row += 1;
+            }
+        }
+        format!("<svg><g class=\"arm-readings\">{body}</g></svg>")
+    }
+
+    fn note_markup(note: &str) -> String {
+        format!(
+            "<svg><rect x=\"72\" y=\"24\" width=\"864\" height=\"228\" class=\"plot-bg\"/>\
+             <text class=\"panel-note\" x=\"77\" y=\"60\">{}</text></svg>",
+            pyjson::escape(note)
+        )
+    }
+
+    fn summary_issues(
+        markup: &str,
+        series: &Series,
+        bounds: &[Bound],
+        extent: (f64, f64),
+        fault: Option<&str>,
+    ) -> Vec<String> {
+        check_panel_summary_stated(
+            "imbalance",
+            Chart::Bar,
+            "flow (1..4)",
+            "departure from the fair share",
+            series,
+            bounds,
+            extent,
+            markup,
+            draw::bar_plot_height(1) as f64,
+            "",
+            None,
+            fault,
+        )
+    }
+
+    fn the_m1_arms() -> Series {
+        vec![
+            (
+                "clean".to_string(),
+                vec![
+                    (20.137, 0.0),
+                    (85.316, 98.0),
+                    (93.088, 99.0),
+                    (107.674, 100.0),
+                ],
+            ),
+            (
+                "hostile".to_string(),
+                vec![
+                    (0.05, 0.0),
+                    (213.408, 98.0),
+                    (231.837, 99.0),
+                    (277.114, 100.0),
+                ],
+            ),
+            (
+                "lone_tail".to_string(),
+                vec![
+                    (0.092417, 0.0),
+                    (122.818459, 98.0),
+                    (172.260084, 99.0),
+                    (1567.110834, 100.0),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_cdf_reference_arm_squeezed_to_a_sliver_is_refused_unless_the_panel_states_it() {
+        // `M1-cdf` is read for where its reference arm's body sits; a linear
+        // axis out to the worst arm's tail paints it as a sliver. The axis goes
+        // logarithmic, and an axis that cannot is refused unless it says so.
+        let series = the_m1_arms();
+        let panel = panel_of("cdf", Chart::Cdf, &["clean", "hostile", "lone_tail"]);
+        let guards = run(r#"{"hostile_p99_guard": 900.0, "lone_p99_guard": 3200.0,
+                "lone_p999_guard": 8000.0}"#);
+        let reference = reference_arm_names(&series, Some(&guards));
+        assert_eq!(reference, vec!["clean".to_string()]);
+        assert_eq!(cdf_x_scale(&series, &reference), "log");
+        let linear = cdf_markup(&series, "linear", "");
+        assert_eq!(drawn_x_scale(&linear), "linear");
+        let problems = check_cdf_reference_reach("cdf", &panel, &series, &reference, &linear);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("6.9% of the width"), "{}", problems[0]);
+        assert!(problems[0].contains("clean"), "{}", problems[0]);
+        // Green: the logarithmic axis keeps the reference arm legible.
+        let log = cdf_markup(&series, "log", "");
+        assert_eq!(drawn_x_scale(&log), "log");
+        assert!(check_cdf_reference_reach("cdf", &panel, &series, &reference, &log).is_empty());
+        // Green: a squeezed axis that *states* the share is accepted, which is
+        // the escape a frame that cannot show what it owes is allowed.
+        let note = cdf_scale_note(&series, &reference, "linear");
+        assert!(note.contains("7% of the width"), "{note}");
+        assert!(note.contains("clean"), "{note}");
+        let stated = note_markup(&note);
+        assert!(check_cdf_reference_reach("cdf", &panel, &series, &reference, &stated).is_empty());
+    }
+
+    #[test]
+    fn a_bar_bound_with_a_different_floor_per_arm_is_drawn_per_arm_and_named() {
+        // The measured defect: `M2-delivery` drew the clean arm's `1.000` line
+        // across all three arms while the run guards the other two at `0.995`.
+        let panel = panel_of("delivery", Chart::Bar, &["delivery"]);
+        let series = series_of("delivery", vec![(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)]);
+        let bounds = vec![Bound::new(1.0, "M2 delivery floor 1.000".to_string())];
+        let values = run(
+            r#"{"clean_delivery": 1.0, "hostile_delivery": 1.0, "lone_delivery": 1.0,
+                "hostile_delivery_guard": 0.995, "lone_delivery_guard": 0.995,
+                "delivery_floor": 0.995}"#,
+        );
+        let planned =
+            crate::tools::mandate_plot::bar_bound_plan(&panel, &series, &bounds, Some(&values));
+        assert!(planned.len() > bounds.len(), "{planned:?}");
+        // Red: one line at the declared bound, naming no arm.
+        let one_line = draw::svg_bar_chart(
+            "M2 [delivery]",
+            "arm",
+            "delivery (received / offered)",
+            &series,
+            &bounds,
+            None,
+            Some(&values),
+            "",
+        );
+        let problems = check_bound_arm_governance(
+            "delivery",
+            &panel,
+            &series,
+            &bounds,
+            Some(&values),
+            &one_line,
+        );
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        let joined = problems.join("\n");
+        assert!(joined.contains("would be the floor of neither"), "{joined}");
+        assert!(joined.contains("governs clean"), "{joined}");
+        assert!(joined.contains("governs hostile lone"), "{joined}");
+        // Green: each arm's own line, labelled with the arm it governs.
+        let split = draw::svg_bar_chart(
+            "M2 [delivery]",
+            "arm",
+            "delivery (received / offered)",
+            &series,
+            &planned,
+            None,
+            Some(&values),
+            "",
+        );
+        assert!(
+            check_bound_arm_governance("delivery", &panel, &series, &bounds, Some(&values), &split)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_line_bound_that_names_no_arm_is_refused() {
+        // One ceiling across three arms whose own guards differ by more than
+        // the ceiling itself: the label has to say which arm it governs.
+        let panel = panel_of("latency", Chart::Line, &["clean", "hostile", "lone_tail"]);
+        let series: Series = vec![
+            ("clean".to_string(), vec![(1.0, 20.0), (2.0, 107.0)]),
+            ("hostile".to_string(), vec![(1.0, 0.05), (2.0, 277.0)]),
+            ("lone_tail".to_string(), vec![(1.0, 0.09), (2.0, 1567.1)]),
+        ];
+        let bounds = vec![Bound::new(250.0, "M1 ceiling 250 ms".to_string())];
+        let values = run(
+            r#"{"hostile_p99_guard": 900.0, "hostile_over250_guard": 8.0,
+                "lone_p99_guard": 3200.0, "lone_over250_guard": 8.0}"#,
+        );
+        let bare = line_markup(&series, &[(250.0, "M1 ceiling 250 ms".to_string())]);
+        let problems =
+            check_bound_arm_governance("latency", &panel, &series, &bounds, Some(&values), &bare);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("the bound of none of them"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains("lone_p99_guard=3200"),
+            "{}",
+            problems[0]
+        );
+        // Green: the same line carrying the arm-guard clause.
+        let label = governed_label(&bounds[0], &series, Some(&values), false);
+        assert!(label.contains("governs clean"), "{label}");
+        assert!(label.contains("lone_p99_guard=3200"), "{label}");
+        let named = line_markup(&series, &[(250.0, label)]);
+        assert!(
+            check_bound_arm_governance("latency", &panel, &series, &bounds, Some(&values), &named)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_run_that_states_a_per_arm_bound_owes_a_line_over_that_arm() {
+        // A split offered where the run states no bound of its own for the
+        // panel's quantity would be an invention, not a reading.
+        let panel = panel_of("delivery", Chart::Bar, &["delivery"]);
+        let series = series_of("delivery", vec![(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)]);
+        let bounds = vec![Bound::new(1.0, "M2 delivery floor 1.000".to_string())];
+        assert_eq!(
+            crate::tools::mandate_plot::arm_bound_values(&panel, &series, &bounds, None),
+            None
+        );
+        let unrelated = run(r#"{"flows": 4, "imbalance_bound": 0.01, "fair_share": 0.25,
+                "delivery_floor": 0.995, "hostile_p99_guard": 900.0}"#);
+        assert_eq!(
+            crate::tools::mandate_plot::arm_bound_values(
+                &panel,
+                &series,
+                &bounds,
+                Some(&unrelated)
+            ),
+            None
+        );
+        assert_eq!(
+            crate::tools::mandate_plot::effective_bounds(
+                &panel,
+                &series,
+                &bounds,
+                Some(&unrelated)
+            ),
+            bounds
+        );
+        // The run that *does* restate the floor for two of the three arms gets
+        // a bound per arm, which is what the panel then has to draw.
+        let restated = run(
+            r#"{"clean_delivery": 1.0, "hostile_delivery": 1.0, "lone_delivery": 1.0,
+                "hostile_delivery_guard": 0.995, "lone_delivery_guard": 0.995,
+                "delivery_floor": 0.995}"#,
+        );
+        assert_eq!(
+            crate::tools::mandate_plot::arm_bound_values(&panel, &series, &bounds, Some(&restated)),
+            Some(vec![
+                ("clean".to_string(), 1.0),
+                ("hostile".to_string(), 0.995),
+                ("lone".to_string(), 0.995),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_guard_the_panel_names_without_a_line_is_refused() {
+        // A tolerance the panel names and does not draw is a claim the reader
+        // has to take on trust.
+        let guards = vec![200.0, 400.0];
+        let axis = (0.0, 450.0);
+        let y_of = |value: f64| 24.0 + (axis.1 - value) / (axis.1 - axis.0) * 228.0;
+        let line = |value: f64| {
+            format!(
+                "<line class=\"bound\" x1=\"72\" y1=\"{}\" x2=\"936\" y2=\"{}\"/>",
+                y_of(value),
+                y_of(value)
+            )
+        };
+        let one = format!(
+            "<svg><rect x=\"72\" y=\"24\" width=\"864\" height=\"228\" class=\"plot-bg\"/>{}</svg>",
+            line(100.0)
+        );
+        let problems = check_named_guards_drawn("latency", &guards, axis, &one, Some(228.0));
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        for value in ["200", "400"] {
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains(&format!("names the guard {value}"))),
+                "{problems:?}"
+            );
+        }
+        // Green: the same panel with a line at each named guard.
+        let all = format!(
+            "<svg><rect x=\"72\" y=\"24\" width=\"864\" height=\"228\" class=\"plot-bg\"/>{}{}{}</svg>",
+            line(100.0),
+            line(200.0),
+            line(400.0)
+        );
+        assert!(check_named_guards_drawn("latency", &guards, axis, &all, Some(228.0)).is_empty());
+    }
+
+    #[test]
+    fn a_crossing_whose_arm_is_named_nowhere_is_refused() {
+        // The lone tail crosses the ceiling while sitting inside its own arm's
+        // guard; with no drawn line saying so, a pass and a breach are the same
+        // picture.
+        let series: Series = vec![
+            (
+                "clean".to_string(),
+                (0..10).map(|i| (i as f64, 20.0 + i as f64)).collect(),
+            ),
+            (
+                "hostile".to_string(),
+                (0..10).map(|i| (i as f64, 100.0 + i as f64)).collect(),
+            ),
+            (
+                "lone_tail".to_string(),
+                (0..9)
+                    .map(|i| (i as f64, 100.0 + i as f64))
+                    .chain(std::iter::once((9.0, 1600.0)))
+                    .collect(),
+            ),
+        ];
+        let bounds = vec![Bound::new(250.0, "M1 ceiling 250 ms".to_string())];
+        let values = run(
+            r#"{"ceiling": 250.0, "clean_p99": 27.0, "hostile_p99_guard": 900.0,
+                "hostile_over250_guard": 8.0, "lone_p99_guard": 3200.0,
+                "lone_over250_guard": 8.0}"#,
+        );
+        assert_eq!(
+            own_bound_names(Chart::Line, &series, Some(&values)),
+            vec!["hostile".to_string(), "lone_tail".to_string()]
+        );
+        let bare = line_markup(&series, &[(250.0, "M1 ceiling 250 ms".to_string())]);
+        let problems = check_crossing_series_governed(
+            "latency",
+            Chart::Line,
+            &series,
+            &bounds,
+            Some(&values),
+            &bare,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("'lone_tail'"), "{}", problems[0]);
+        assert!(problems[0].contains("M1 ceiling 250 ms"), "{}", problems[0]);
+        // Green: the clause naming the arm the crossing belongs to.
+        let label = governed_label(&bounds[0], &series, Some(&values), false);
+        let named = line_markup(&series, &[(250.0, label.clone())]);
+        assert!(
+            check_crossing_series_governed(
+                "latency",
+                Chart::Line,
+                &series,
+                &bounds,
+                Some(&values),
+                &named
+            )
+            .is_empty(),
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn a_summary_that_is_not_the_drawn_panel_is_refused() {
+        // A summary carrying a number the run did not measure is worse than
+        // silence, because the reader trusts it instead of the pixels.
+        let series = series_of("clean", vec![(1.0, 0.000118), (2.0, 0.000118)]);
+        let bounds = vec![Bound::new(0.01, "fair-share bound \u{b1}1.0%".to_string())];
+        let extent = (0.0, 0.02);
+        let markup = draw::svg_bar_chart(
+            "M4 [imbalance]",
+            "flow (1..4)",
+            "departure from the fair share",
+            &series,
+            &bounds,
+            Some(extent),
+            None,
+            "",
+        );
+        let document = panel_summary_document(
+            "imbalance",
+            Chart::Bar,
+            "flow (1..4)",
+            "departure from the fair share",
+            &series,
+            &bounds,
+            extent,
+            &markup,
+            "",
+            draw::bar_plot_height(1) as f64,
+            None,
+            None,
+        );
+        let with_summary = introduce_panel_summary(&markup, &document);
+        assert!(
+            summary_issues(&with_summary, &series, &bounds, extent, None).is_empty(),
+            "the introduced summary is the drawn panel's"
+        );
+        // Red: the same panel with its `<desc>` removed.
+        let problems = summary_issues(&markup, &series, &bounds, extent, None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("carries no panel summary"),
+            "{}",
+            problems[0]
+        );
+        // Red: the x extent dropped from the summary.
+        let mut no_x = document.clone();
+        if let J::Obj(members) = &mut no_x {
+            members.retain(|(key, _)| key != "x_axis");
+        }
+        let markup_no_x = introduce_panel_summary(&markup, &no_x);
+        let problems = summary_issues(&markup_no_x, &series, &bounds, extent, None);
+        assert!(
+            problems.iter().any(|problem| problem.contains("'x_axis'")),
+            "{problems:?}"
+        );
+        // Red: a summary that does not state the fault the panel took.
+        let problems = summary_issues(&with_summary, &series, &bounds, extent, Some("M4_drop"));
+        assert!(
+            problems.iter().any(|problem| problem.contains("'fault'")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_x_extent_that_is_not_the_drawn_axis_is_refused() {
+        let series: Series = vec![(
+            "impaired".to_string(),
+            vec![(12.5, 33.3), (31.5, 66.7), (88.25, 100.0)],
+        )];
+        let markup = cdf_markup(&series, "linear", "");
+        assert!(check_x_axis_extent_stated("cdf", Chart::Cdf, (12.5, 88.25), &markup).is_empty());
+        let problems = check_x_axis_extent_stated("cdf", Chart::Cdf, (0.0, 100.0), &markup);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("states the x axis 0..100"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("12.5"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn a_panel_that_cannot_draw_the_bound_says_where_it_is_drawn() {
+        let mut latency = panel_of("latency", Chart::Line, &["impaired"]);
+        latency.bounds = vec![Bound::new(250.0, "M1 ceiling 250 ms".to_string())];
+        let cdf = panel_of("cdf", Chart::Cdf, &["impaired"]);
+        let panels = vec![latency, cdf.clone()];
+        let points = points_of(&[
+            ("latency", "impaired", "0.0", "12.5"),
+            ("latency", "impaired", "1.0", "31.5"),
+            ("cdf", "impaired", "12.5", "33.3"),
+            ("cdf", "impaired", "31.5", "66.7"),
+        ]);
+        let note =
+            bound_reference_note(&cdf, &panels, &points, "elapsed time (s)", "RTT (ms)", None);
+        assert!(note.contains("drawn on panel 'latency'"), "{note}");
+        // Red: the panel drawn with no note at all.
+        let bare = cdf_markup(
+            &{
+                let series: Series =
+                    vec![("impaired".to_string(), vec![(12.5, 33.3), (31.5, 66.7)])];
+                series
+            },
+            "linear",
+            "",
+        );
+        let problems = check_departure_view_stated(
+            "cdf",
+            &cdf,
+            &panels,
+            &points,
+            &bare,
+            "elapsed time (s)",
+            "RTT (ms)",
+            None,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("draws no bound at all"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("'latency'"), "{}", problems[0]);
+        // Green: the note drawn, and inside the plot.
+        let said = note_markup(&note);
+        assert!(
+            check_departure_view_stated(
+                "cdf",
+                &cdf,
+                &panels,
+                &points,
+                &said,
+                "elapsed time (s)",
+                "RTT (ms)",
+                None
+            )
+            .is_empty()
+        );
+        assert!(check_note_fit("cdf", &said).expect("reads").is_empty());
+        // Red: the same note placed outside the plot area.
+        let outside = format!(
+            "<svg><rect x=\"72\" y=\"24\" width=\"864\" height=\"228\" class=\"plot-bg\"/>\
+             <text class=\"panel-note\" x=\"10\" y=\"10\">{}</text></svg>",
+            pyjson::escape(&note)
+        );
+        assert!(!check_note_fit("cdf", &outside).expect("reads").is_empty());
+    }
+
+    #[test]
+    fn a_share_panel_without_its_departure_statement_is_refused() {
+        let mut shares = panel_of("shares", Chart::Bar, &["clean", "hostile"]);
+        shares.bounds = vec![Bound::new(0.25, "fair share 25.0%".to_string())];
+        let mut imbalance = panel_of("imbalance", Chart::Bar, &["clean", "hostile"]);
+        imbalance.bounds = vec![Bound::new(0.01, "fair-share bound \u{b1}1.0%".to_string())];
+        let panels = vec![shares.clone(), imbalance.clone()];
+        let points = points_of(&[
+            ("shares", "clean", "1.0", "0.250029"),
+            ("imbalance", "clean", "1.0", "0.000118"),
+            ("shares", "clean", "2.0", "0.250029"),
+            ("imbalance", "clean", "2.0", "0.000118"),
+            ("shares", "clean", "3.0", "0.250029"),
+            ("imbalance", "clean", "3.0", "0.000118"),
+            ("shares", "clean", "4.0", "0.249912"),
+            ("imbalance", "clean", "4.0", "-0.000353"),
+            ("shares", "hostile", "1.0", "0.250029"),
+            ("imbalance", "hostile", "1.0", "0.000114"),
+            ("shares", "hostile", "2.0", "0.249914"),
+            ("imbalance", "hostile", "2.0", "-0.000343"),
+            ("shares", "hostile", "3.0", "0.250029"),
+            ("imbalance", "hostile", "3.0", "0.000114"),
+            ("shares", "hostile", "4.0", "0.250029"),
+            ("imbalance", "hostile", "4.0", "0.000114"),
+        ]);
+        let note = departure_view_note(&shares, &panels, &points);
+        assert!(note.contains("drawn on panel 'imbalance'"), "{note}");
+        let bare_series = panel_series(&shares, &points);
+        let bare = draw::svg_bar_chart(
+            "M4 [shares]",
+            "flow (1..4)",
+            "share of the lane's delivered bytes",
+            &bare_series,
+            &shares.bounds,
+            None,
+            None,
+            "",
+        );
+        let problems = check_departure_view_stated(
+            "shares",
+            &shares,
+            &panels,
+            &points,
+            &bare,
+            "flow (1..4)",
+            "share of the lane's delivered bytes",
+            None,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("cannot carry the failure its mandate is read for"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("'imbalance'"), "{}", problems[0]);
+        assert!(
+            problems[0].contains("no failure to draw"),
+            "{}",
+            problems[0]
+        );
+        // Green: the same panel carrying its own note.
+        let said = draw::svg_bar_chart(
+            "M4 [shares]",
+            "flow (1..4)",
+            "share of the lane's delivered bytes",
+            &bare_series,
+            &shares.bounds,
+            None,
+            None,
+            &note,
+        );
+        assert!(
+            check_departure_view_stated(
+                "shares",
+                &shares,
+                &panels,
+                &points,
+                &said,
+                "flow (1..4)",
+                "share of the lane's delivered bytes",
+                None
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_caption_whose_numbers_come_from_another_source_is_refused() {
+        // The caption is what the reader trusts instead of the pixels, so an
+        // authoritative and wrong caption is worse than no caption.
+        let series = series_of("lone_tail", vec![(0.0, 10.0), (1.0, 1000.0), (6.0, 20.0)]);
+        let points = draw::decimate(&series[0].1);
+        let drawn = arm_reading("lone_tail", &points, None);
+        let good = reading_markup(std::slice::from_ref(&drawn));
+        assert!(check_reading_numbers("latency", &series, &good).is_empty());
+        // Red: the magnitude taken from somewhere else.
+        let wrong = drawn.replace("peak 1000 ms", "peak 1074.1 ms");
+        assert_ne!(wrong, drawn);
+        let problems = check_reading_numbers("latency", &series, &reading_markup(&[wrong]));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("'lone_tail'"), "{}", problems[0]);
+        assert!(problems[0].contains("1074.1"), "{}", problems[0]);
+        assert!(problems[0].contains("1000"), "{}", problems[0]);
+        assert!(
+            problems[0].contains("worse than no caption"),
+            "{}",
+            problems[0]
+        );
+        // The other numbers are pinned too, and a caption that states no
+        // maximum at all is refused rather than skipped.
+        for (broken, fragment) in [
+            (
+                drawn.replace("at 1.00 s", "at 9.56 s"),
+                "where its maximum is",
+            ),
+            (
+                drawn.replace("last 20 ms", "last 424.3 ms"),
+                "its last sample",
+            ),
+            (
+                drawn.replace("peak 1000 ms at 1.00 s", "the series is quiet"),
+                "states no maximum",
+            ),
+        ] {
+            let problems = check_reading_numbers(
+                "latency",
+                &series,
+                &reading_markup(std::slice::from_ref(&broken)),
+            );
+            assert!(
+                problems.iter().any(|problem| problem.contains(fragment)),
+                "{fragment}: {problems:?} ({broken})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caption_taken_from_another_arm_is_refused() {
+        // The band is split by the arm's own marker, so a sentence that names
+        // the wrong arm is measured against the wrong points.
+        let series: Series = vec![
+            (
+                "first".to_string(),
+                (1..8)
+                    .map(|index| (index as f64, 10.0 * index as f64))
+                    .collect(),
+            ),
+            (
+                "second".to_string(),
+                (1..8)
+                    .map(|index| (index as f64, 100.0 * index as f64))
+                    .collect(),
+            ),
+        ];
+        let first = arm_reading("first", &series[0].1, None);
+        let second = arm_reading("second", &series[1].1, None);
+        assert!(
+            check_reading_numbers(
+                "latency",
+                &series,
+                &reading_markup(&[first, second.clone()])
+            )
+            .is_empty()
+        );
+        let mislabelled = reading_markup(&[second.replace("second - ", "first - ")]);
+        let problems = check_reading_numbers("latency", &series, &mislabelled);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("'first'"), "{}", problems[0]);
+        assert!(
+            problems[0].contains("states its maximum as 700"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("is 70"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn a_clipped_axis_must_state_the_clip_and_an_unclipped_one_is_refused() {
+        let series: Series = vec![
+            (
+                "clean".to_string(),
+                (0..200)
+                    .map(|i| (i as f64, 20.0 + (i % 20) as f64))
+                    .collect(),
+            ),
+            (
+                "hostile".to_string(),
+                (0..200)
+                    .map(|i| (i as f64, 40.0 + 2.0 * (i % 20) as f64))
+                    .collect(),
+            ),
+            (
+                "lone_tail".to_string(),
+                (0..200)
+                    .map(|i| (i as f64, 10.0 + (i % 20) as f64))
+                    .chain(std::iter::once((199.0, 1400.0)))
+                    .collect(),
+            ),
+        ];
+        let bounds = vec![Bound::new(250.0, "M1 ceiling 250 ms".to_string())];
+        let plot_height = draw::line_plot_height(3, 0);
+        let clipped = line_axis_extent(&series, &bounds, None, Some(plot_height));
+        assert!(clipped.1 < 1400.0, "{clipped:?}");
+        let unclipped =
+            draw::extent_including_bounds(draw::finite_extent(&series), &[(250.0, String::new())]);
+        let statement = y_clip_statement(&series, Some(250.0));
+        assert!(!statement.is_empty());
+        let stated = format!(
+            "<svg><rect x=\"72\" y=\"24\" width=\"864\" height=\"228\" class=\"plot-bg\"/>\
+             <line class=\"y-clip\" x1=\"72\" y1=\"26\" x2=\"936\" y2=\"26\"/>\
+             <text class=\"panel-note\" x=\"77\" y=\"60\">{}</text></svg>",
+            pyjson::escape(&statement)
+        );
+        assert!(
+            check_line_axis_clip_stated(
+                "latency",
+                Chart::Line,
+                &series,
+                &bounds,
+                clipped,
+                &stated,
+                None
+            )
+            .is_empty()
+        );
+        // Red: the clipped axis drawn without the sentence that says so.
+        let silent = stated
+            .replace(
+                "<line class=\"y-clip\" x1=\"72\" y1=\"26\" x2=\"936\" y2=\"26\"/>",
+                "",
+            )
+            .replace(
+                &format!(
+                    "<text class=\"panel-note\" x=\"77\" y=\"60\">{}</text>",
+                    pyjson::escape(&statement)
+                ),
+                "",
+            );
+        let problems = check_line_axis_clip_stated(
+            "latency",
+            Chart::Line,
+            &series,
+            &bounds,
+            clipped,
+            &silent,
+            None,
+        );
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("does not state it")),
+            "{problems:?}"
+        );
+        // Red: the axis the old policy drew -- the data's own extent, outlier
+        // and all.
+        let problems = check_line_axis_clip_stated(
+            "latency",
+            Chart::Line,
+            &series,
+            &bounds,
+            unclipped,
+            &stated,
+            None,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("one outlier set the axis"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("1400"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn a_sliver_bound_must_be_stated_or_it_is_refused() {
+        let series: Series = vec![
+            (
+                "clean".to_string(),
+                vec![(1.0, -1.0), (2.0, -1.0), (3.0, -1.0), (4.0, -1.0)],
+            ),
+            (
+                "hostile".to_string(),
+                vec![
+                    (1.0, 0.000116),
+                    (2.0, 0.000116),
+                    (3.0, -0.000347),
+                    (4.0, 0.000116),
+                ],
+            ),
+        ];
+        let bounds = vec![Bound::new(0.01, "fair-share bound \u{b1}1.0%".to_string())];
+        let mut drawn = crate::tools::mandate_plot::mirrored_bounds(&bounds);
+        let axis = draw::bar_axis_extent(&series, &drawn, None, None);
+        let problems = check_panel_axis("imbalance", &series, &drawn, axis, Some(228.0), None, "");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("sub-pixel"), "{}", problems[0]);
+        // Red: the panel that draws the sliver and states nothing.
+        let silent = draw::svg_bar_chart(
+            "M4 [imbalance]",
+            "flow (1..4)",
+            "departure from the fair share",
+            &series,
+            &drawn,
+            Some(axis),
+            None,
+            "",
+        );
+        let problems = check_sliver_bound_stated(
+            "imbalance",
+            &series,
+            &drawn,
+            axis,
+            &silent,
+            Some(228.0),
+            None,
+        );
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("states nothing")),
+            "{problems:?}"
+        );
+        // Green: the sentence measured off the same series answers the refusal.
+        let statements = sliver_bound_statements(&series, &mut drawn, axis, 228.0, None);
+        assert!(!statements.is_empty(), "a departure is drawn");
+        let sentence = statements
+            .iter()
+            .map(|(_, sentence)| sentence.clone())
+            .collect::<Vec<String>>()
+            .join("; ");
+        let stated = note_markup(&sentence);
+        assert!(
+            check_sliver_bound_stated(
+                "imbalance",
+                &series,
+                &drawn,
+                axis,
+                &stated,
+                Some(228.0),
+                None
+            )
+            .is_empty()
+        );
+        // Red: a stated distance that is not the run's.
+        let number_before = crate::tools::mandate_plot::regex(r"([-0-9.]+) px from the bound");
+        let tampered = number_before.replace_all(&sentence, "1.0 px from the bound");
+        assert_ne!(tampered, sentence);
+        let problems = check_sliver_bound_stated(
+            "imbalance",
+            &series,
+            &drawn,
+            axis,
+            &note_markup(&tampered),
+            Some(228.0),
+            None,
+        );
+        assert!(
+            problems.iter().any(|problem| problem.contains("far_px=1")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_band_view_whose_ticks_repeat_is_refused() {
+        let repeated: String = ["0.01", "0.01", "0.01", "0.00", "0.00", "0.00"]
+            .iter()
+            .map(|tick| format!("<text x=\"63\" y=\"0\" text-anchor=\"end\">{tick}</text>"))
+            .collect();
+        let problems = check_tick_labels_distinct("imbalance", &repeated);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("repeat"), "{}", problems[0]);
+        assert!(
+            problems[0].contains("cannot carry the quantity"),
+            "{}",
+            problems[0]
+        );
+        let distinct: String = ["-0.01", "-0.005", "0.00", "0.005", "0.01", "0.015"]
+            .iter()
+            .map(|tick| format!("<text x=\"63\" y=\"0\" text-anchor=\"end\">{tick}</text>"))
+            .collect();
+        assert!(check_tick_labels_distinct("imbalance", &distinct).is_empty());
+    }
+
+    #[test]
+    fn a_two_sided_bound_is_drawn_on_both_of_its_sides() {
+        let series: Series = vec![
+            (
+                "clean".to_string(),
+                vec![
+                    (1.0, 0.000118),
+                    (2.0, 0.000118),
+                    (3.0, 0.000118),
+                    (4.0, -0.000353),
+                ],
+            ),
+            (
+                "hostile".to_string(),
+                vec![
+                    (1.0, 0.000114),
+                    (2.0, -0.000343),
+                    (3.0, 0.000114),
+                    (4.0, 0.000114),
+                ],
+            ),
+        ];
+        let bounds = vec![Bound::new(0.01, "fair-share bound \u{b1}1.0%".to_string())];
+        let mirrored = crate::tools::mandate_plot::mirrored_bounds(&bounds);
+        assert_eq!(mirrored.len(), 2, "{mirrored:?}");
+        let axis = draw::bar_axis_extent(&series, &mirrored, None, None);
+        let markup = draw::svg_bar_chart(
+            "M4 [imbalance]",
+            "flow (1..4)",
+            "departure from the fair share",
+            &series,
+            &mirrored,
+            Some(axis),
+            None,
+            "",
+        );
+        assert!(
+            check_two_sided_bound_drawn("imbalance", &mirrored, axis, &markup, Some(228.0))
+                .is_empty()
+        );
+        // Green: the lower arm keeps its own pixel of headroom below it.
+        assert!(
+            check_bound_headroom(
+                "imbalance",
+                &mirrored,
+                &[],
+                axis,
+                Some(228.0),
+                Some(&series)
+            )
+            .is_empty()
+        );
+        let below = (-0.01 - axis.0) / (axis.1 - axis.0) * 228.0;
+        assert!(below >= MIN_HEADROOM_PIXELS, "{below}");
+        // Red: the axis flush with the lower arm draws breach and arm alike.
+        let flush = (-0.01, axis.1);
+        let problems = check_bound_headroom(
+            "imbalance",
+            &mirrored,
+            &[],
+            flush,
+            Some(228.0),
+            Some(&series),
+        );
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("below the bound")),
+            "{problems:?}"
+        );
+        // Red: the one-sided artifact the run actually drew, with only the
+        // upper arm of the band drawn.
+        let upper_only = vec![mirrored[0].clone()];
+        let one_sided = draw::svg_bar_chart(
+            "M4 [imbalance]",
+            "flow (1..4)",
+            "departure from the fair share",
+            &series,
+            &upper_only,
+            Some(axis),
+            None,
+            "",
+        );
+        let problems =
+            check_two_sided_bound_drawn("imbalance", &mirrored, axis, &one_sided, Some(228.0));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("draws no line at -0.01"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("crossing nothing"), "{}", problems[0]);
+        // Red: a declaration whose band is drawn as a single line is refused.
+        let one_sided_bounds = vec![bounds[0].clone()];
+        let single = draw::svg_bar_chart(
+            "M4 [imbalance]",
+            "flow (1..4)",
+            "departure from the fair share",
+            &series,
+            &one_sided_bounds,
+            Some(axis),
+            None,
+            "",
+        );
+        let problems =
+            check_two_sided_bound_drawn("imbalance", &one_sided_bounds, axis, &single, Some(228.0));
+        assert!(!problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn every_drawn_panel_keeps_its_bound_labels_inside_the_plot() {
+        let series = bars_of("delivery", vec![(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)]);
+        let bounds = vec![Bound::new(1.0, "M2 delivery floor 1.000".to_string())];
+        let markup = draw::svg_bar_chart(
+            "M2 [delivery]",
+            "arm",
+            "delivery",
+            &series,
+            &bounds,
+            None,
+            None,
+            "",
+        );
+        assert!(
+            check_label_fit("delivery", &markup)
+                .expect("reads")
+                .is_empty()
+        );
+        let (left, top, right, bottom) = panel_plot_rect("delivery", &markup).expect("reads");
+        let boxes = label_boxes(&markup);
+        assert!(!boxes.is_empty(), "the panel drew no bound label");
+        for (declared, _, (x0, y0, x1, y1)) in &boxes {
+            assert!(*x0 >= left, "{declared}");
+            assert!(*x1 <= right, "{declared}");
+            assert!(*y0 >= top, "{declared}");
+            assert!(*y1 <= bottom, "{declared}");
+        }
+        // A bound at the top of its axis is labelled *below* its line rather
+        // than escaping into the legend.
+        let bound_y = drawn_bound_lines(&markup)[0];
+        for (declared, _, (_, y0, _, _)) in &boxes {
+            assert!(*y0 > bound_y, "{declared} is drawn above its own bound");
+        }
+        // Red: the same markup with its own label moved to the canvas origin.
+        let found = crate::tools::mandate_plot::regex_dotall(r#"<text class="bound-label"[^>]*>"#)
+            .search(&markup)
+            .expect("the panel draws a bound label")
+            .group(0)
+            .unwrap_or_default();
+        let misplaced = markup.replacen(
+            &found,
+            "<text class=\"bound-label\" x=\"0.0\" y=\"0.0\">",
+            1,
+        );
+        assert_ne!(misplaced, markup);
+        assert!(
+            !check_label_fit("delivery", &misplaced)
+                .expect("reads")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_axis_policy_spends_the_pixel_floor_and_keeps_a_zero_baseline() {
+        // The span's own 5% of headroom is a third of a pixel on a fair share
+        // pinned at 25%, so the pixel floor is what keeps an over-share bar
+        // drawable.
+        let (_, high) = draw::axis_with_headroom(0.0, 0.250029, 0.25, 228.0, None);
+        assert!(
+            (high - 0.25) / high * 228.0 >= MIN_HEADROOM_PIXELS,
+            "{high}"
+        );
+        assert!(high > 0.25 + FRAME_HEADROOM * 0.25, "{high}");
+        // The downward-failing side of the same rule.
+        let (low, high) = draw::axis_with_headroom(-0.01, 0.01, 0.01, 228.0, Some(-0.01));
+        assert!(
+            (-0.01 - low) / (high - low) * 228.0 >= MIN_HEADROOM_PIXELS,
+            "{low}"
+        );
+        // A floor far below the data is not the scale, so the axis keeps the
+        // zero baseline it had.
+        let series = series_of("fraction", vec![(1.0, 0.958217), (2.0, 0.958271)]);
+        let bounds = vec![Bound::new(0.35, "M3 floor 0.35x link rate".to_string())];
+        assert_eq!(draw::bar_axis_extent(&series, &bounds, None, None).0, 0.0);
+    }
+
+    #[test]
+    fn the_label_width_model_does_not_underestimate_the_rendered_text() {
+        // The widths are the labels headless Chrome measured on the panels a
+        // recorded run drew; the model is a *model*, so the only thing that
+        // keeps it honest is a check that fails when it underestimates.
+        for (label, measured) in [
+            ("M4 per-flow delivery floor 0.995", 144.94),
+            ("M1 ceiling 250 ms", 82.77),
+            ("fair-share bound \u{b1}1.0%", 103.94),
+            ("fair share 25.0%", 72.36),
+        ] {
+            assert!(
+                draw::label_text_width(label) >= measured,
+                "{label}: {} < {measured}",
+                draw::label_text_width(label)
+            );
+        }
+        // Vacuity: a model narrowed below the measured widths fails the same
+        // assertion, so the calibration is about the model and not a tautology.
+        let narrowed = |text: &str| -> f64 { draw::label_text_width(text) * 0.5 };
+        assert!(narrowed("M4 per-flow delivery floor 0.995") < 144.94);
+        assert_eq!(draw::label_text_width(""), 0.0);
+    }
+
+    #[test]
+    fn an_x_bound_without_its_reading_is_refused() {
+        // A mandate bound carried to a panel whose own x axis is that quantity
+        // has to say what each curve reads there; a mark with no reading is a
+        // claim with no value.
+        let mut latency = panel_of("latency", Chart::Line, &["clean", "lone_tail"]);
+        latency.y_label = Some("latency (ms)".to_string());
+        latency.bounds = vec![Bound::new(250.0, "M1 ceiling 250 ms".to_string())];
+        let mut cdf = panel_of("cdf", Chart::Cdf, &["clean", "lone_tail"]);
+        cdf.x_label = Some("latency (ms)".to_string());
+        cdf.y_label = Some("percentile (%)".to_string());
+        let panels = vec![latency, cdf.clone()];
+        let points = points_of(&[
+            ("latency", "clean", "1.0", "20.0"),
+            ("latency", "lone_tail", "1.0", "1567.1"),
+            ("cdf", "clean", "107.674", "100.0"),
+            ("cdf", "lone_tail", "1567.110834", "100.0"),
+            ("cdf", "clean", "20.137", "0.0"),
+            ("cdf", "lone_tail", "0.092417", "0.0"),
+        ]);
+        let series = panel_series(&cdf, &points);
+        let derived =
+            derived_x_bounds(&cdf, &panels, &points, "elapsed time (s)", "RTT (ms)", None);
+        assert_eq!(derived.len(), 1, "{derived:?}");
+        let reading = x_bound_label(&derived[0], &series, "ms", "%", None);
+        assert!(reading.contains("at 250 ms:"), "{reading}");
+        let draw_cdf = |label: &str| {
+            draw::svg_cdf_chart(&draw::LineChart {
+                title: "M1 [cdf]",
+                x_label: "latency (ms)",
+                y_label: "percentile (%)",
+                series: &series,
+                y_extent: None,
+                bounds: &[],
+                walls: false,
+                markers: false,
+                readings: &[],
+                note: "",
+                x_bounds: &[(250.0, label.to_string())],
+                x_scale: "log",
+                y_clip: None,
+            })
+        };
+        let green = check_x_bound_drawn(
+            "cdf",
+            &cdf,
+            &panels,
+            &points,
+            "elapsed time (s)",
+            "RTT (ms)",
+            None,
+            &draw_cdf(&reading),
+        )
+        .expect("reads");
+        assert!(green.is_empty(), "{green:?} reading={reading}");
+        // Red: the mark drawn, its label carrying no reading.
+        let problems = check_x_bound_drawn(
+            "cdf",
+            &cdf,
+            &panels,
+            &points,
+            "elapsed time (s)",
+            "RTT (ms)",
+            None,
+            &draw_cdf("M1 ceiling 250 ms"),
+        )
+        .expect("reads");
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("has to say what the bound reads there")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_bound_the_bars_split_around_is_a_target_and_a_minority_beyond_one_is_a_crossing() {
+        let shares = series_of(
+            "clean",
+            vec![
+                (1.0, 0.250059),
+                (2.0, 0.250059),
+                (3.0, 0.249941),
+                (4.0, 0.249941),
+                (5.0, 0.250173),
+                (6.0, 0.249365),
+                (7.0, 0.250289),
+                (8.0, 0.250173),
+            ],
+        );
+        let mut panel = panel_of("shares", Chart::Bar, &["clean"]);
+        panel.bounds = vec![Bound::new(0.25, "fair share 25.0%".to_string())];
+        assert_eq!(target_bounds(&panel, &shares).len(), 1);
+        let latency = series_of("p99_ms", vec![(1.0, 26.251), (2.0, 61.5), (3.0, 185.8015)]);
+        let mut latency_panel = panel_of("latency", Chart::Bar, &["p99_ms"]);
+        latency_panel.bounds = vec![Bound::new(
+            100.0,
+            "M2 non-degrading p99 bound (ms)".to_string(),
+        )];
+        assert!(target_bounds(&latency_panel, &latency).is_empty());
+        assert_eq!(
+            crate::tools::mandate_plot::crossing_values(&[26.251, 61.5, 185.8015], 100.0),
+            vec![185.8015]
+        );
+    }
 }

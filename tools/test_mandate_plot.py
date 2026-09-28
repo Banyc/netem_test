@@ -698,6 +698,80 @@ LONE_TAIL_DECLARATION = {
 
 
 
+# A real run's M1 readings, and the shape both of its panels are about: the
+# line panel draws one 250 ms ceiling across three arms whose own guards differ
+# by more than the ceiling itself, and the CDF beside it draws the same three
+# distributions with no horizontal bound at all. `clean` reached the ceiling's
+# side of its distribution at 107.674 ms, so on a linear axis it is 6.9 % of the
+# width -- the CDF reference-reach case the renderer answers with a log axis.
+M1_RUN_VALUES = {
+    "clean_p50": 24.4,
+    "clean_p99": 93.1,
+    "clean_max": 107.7,
+    "hostile_p50": 45.8,
+    "hostile_p99": 231.8,
+    "hostile_max": 277.1,
+    "lone_p50": 0.2,
+    "lone_p99": 166.4,
+    "lone_p999": 1465.8,
+    "lone_max": 1567.1,
+    "ceiling": 250.0,
+    "hostile_p99_guard": 900.0,
+    "hostile_over250_guard": 8.0,
+    "lone_p99_guard": 3200.0,
+    "lone_p999_guard": 8000.0,
+    "lone_over250_guard": 8.0,
+}
+
+M1_ARMS_DECLARATION = {
+    "mandate": "M1",
+    "title": "M1 interactive tail latency",
+    "x_label": "elapsed time (s)",
+    "y_label": "latency (ms)",
+    "panels": [
+        {
+            "id": "latency",
+            "chart": "line",
+            "series": [{"name": "clean"}, {"name": "hostile"}, {"name": "lone_tail"}],
+            "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+        },
+        {
+            "id": "cdf",
+            "chart": "cdf",
+            "x_label": "latency (ms)",
+            "y_label": "percentile (%)",
+            "series": [{"name": "clean"}, {"name": "hostile"}, {"name": "lone_tail"}],
+            "bounds": [],
+        },
+    ],
+}
+
+M1_ARMS_ROWS = [
+    ["panel", "series", "x", "y"],
+    ["latency", "clean", 1.53, 20.137],
+    ["latency", "clean", 2.06, 107.674],
+    ["latency", "clean", 13.52, 20.8],
+    ["latency", "hostile", 1.5, 0.05],
+    ["latency", "hostile", 2.44, 277.114],
+    ["latency", "hostile", 13.55, 69.55],
+    ["latency", "lone_tail", 1.5, 0.092417],
+    ["latency", "lone_tail", 10.87, 1567.111],
+    ["latency", "lone_tail", 17.23, 1466.0],
+    ["cdf", "clean", 20.137, 0.0],
+    ["cdf", "clean", 85.316, 98.0],
+    ["cdf", "clean", 93.088, 99.0],
+    ["cdf", "clean", 107.674, 100.0],
+    ["cdf", "hostile", 0.05, 0.0],
+    ["cdf", "hostile", 213.408, 98.0],
+    ["cdf", "hostile", 231.837, 99.0],
+    ["cdf", "hostile", 277.114, 100.0],
+    ["cdf", "lone_tail", 0.092417, 0.0],
+    ["cdf", "lone_tail", 122.818459, 98.0],
+    ["cdf", "lone_tail", 172.260084, 99.0],
+    ["cdf", "lone_tail", 1567.110834, 100.0],
+]
+
+
 class MandatePlotTest(unittest.TestCase):
     """The command-line contract: render, refuse, and state what was drawn."""
 
@@ -1916,6 +1990,161 @@ class MandatePlotTest(unittest.TestCase):
                 any(label.startswith(f"run {key}") for label in labels), labels
             )
         self.assertTrue(any("governs no arm of this run" in label for label in labels))
+
+    # -- the render-integration halves the port left without a case ----------
+
+    def test_a_cdf_carries_the_ceiling_and_the_value_it_is_read_at(self):
+        # The CDF draws no bound of its own; the mandate's ceiling is a value on
+        # the axis its *x* carries, so the panel can draw the failure its
+        # mandate is read for and has to state, at that x, what each curve
+        # reads. The readings are the run's own drawn `M1.csv` points.
+        code, stderr, out = self.render_mandate(
+            M1_ARMS_DECLARATION,
+            M1_ARMS_ROWS,
+            "M1ceil",
+            "--run-values",
+            json.dumps(M1_RUN_VALUES),
+        )
+        self.assertEqual(code, 0, stderr)
+        cdf = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        self.assertEqual(cdf.count('class="x-bound"'), 1)
+        self.assertEqual(
+            self.bound_titles(cdf),
+            [
+                "M1 ceiling 250 ms [at 250 ms: clean 100%, hostile 99.4%, "
+                "lone_tail 99.06%]"
+            ],
+        )
+        # The frame now carries the failure, so the bare pointer to the sibling
+        # panel is gone.
+        self.assertEqual(self.panel_notes(cdf), "")
+        # The reference arm is legible on the drawn axis: the clean curve's own
+        # left-most and right-most points are both past the axis' halfway mark.
+        plot = re.search(
+            r'<rect x="([-0-9.]+)" y="[-0-9.]+" width="([-0-9.]+)" height="[-0-9.]+" class="plot-bg"',
+            cdf,
+        )
+        left, width = (float(value) for value in plot.groups())
+        clean = re.search(
+            r'<polyline points="([^"]*)" fill="none" stroke="#2563eb"', cdf
+        ).group(1)
+        xs = [float(pair.split(",")[0]) for pair in clean.split()]
+        self.assertGreaterEqual((min(xs) - left) / width, 0.5)
+        self.assertGreaterEqual((max(xs) - left) / width, 0.5)
+
+    def test_a_ceiling_beyond_the_drawn_x_range_is_stated_not_drawn(self):
+        # A run whose samples all sit under the ceiling has no pixel for the
+        # mark. It still owes the reading, and it owes saying that the value is
+        # outside the drawn range, so the clamp cannot pass for a measurement.
+        declaration = {
+            "mandate": "M1",
+            "title": "M1 interactive tail latency",
+            "x_label": "elapsed time (s)",
+            "y_label": "latency (ms)",
+            "panels": [
+                {
+                    "id": "latency",
+                    "chart": "line",
+                    "series": [{"name": "clean"}, {"name": "hostile"}],
+                    "bounds": [{"y": 250.0, "label": "M1 ceiling 250 ms"}],
+                },
+                {
+                    "id": "cdf",
+                    "chart": "cdf",
+                    "x_label": "latency (ms)",
+                    "y_label": "percentile (%)",
+                    "series": [{"name": "clean"}, {"name": "hostile"}],
+                    "bounds": [],
+                },
+            ],
+        }
+        rows = [
+            ["panel", "series", "x", "y"],
+            ["latency", "clean", 1.0, 20.0],
+            ["latency", "clean", 2.0, 60.0],
+            ["latency", "clean", 3.0, 24.0],
+            ["latency", "hostile", 1.0, 30.0],
+            ["latency", "hostile", 2.0, 70.0],
+            ["latency", "hostile", 3.0, 34.0],
+            ["cdf", "clean", 20.0, 0.0],
+            ["cdf", "clean", 60.0, 50.0],
+            ["cdf", "clean", 100.0, 100.0],
+            ["cdf", "hostile", 30.0, 0.0],
+            ["cdf", "hostile", 70.0, 50.0],
+            ["cdf", "hostile", 100.0, 100.0],
+        ]
+        code, stderr, out = self.render_mandate(
+            declaration, rows, "M1under", "--run-values", json.dumps({"ceiling": 250.0})
+        )
+        self.assertEqual(code, 0, stderr)
+        cdf = (out / "M1-cdf.svg").read_text(encoding="utf-8")
+        self.assertEqual(cdf.count('class="x-bound"'), 0)
+        self.assertEqual(
+            self.bound_titles(cdf),
+            [
+                "M1 ceiling 250 ms [at 250 ms: clean 100%, hostile 100%] "
+                "(x beyond this panel's drawn range)"
+            ],
+        )
+
+    def test_a_two_sided_bound_is_drawn_on_both_of_its_sides(self):
+        # The measured defect: a panel read `fair-share bound \u00b11.0%` beside a
+        # single `+0.01` line, so the `-1 %` arm a starved flow crosses was not
+        # drawn at all. Both arms are in the artifact, each at its own value.
+        code, stderr, out = self.render_mandate(
+            SHARES_IMBALANCE_DECLARATION, SHARES_IMBALANCE_ROWS, "M4band"
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M4-imbalance.svg").read_text(encoding="utf-8")
+        self.assertEqual(document.count('class="bound"'), 2)
+        self.assertEqual(
+            self.bound_titles(document),
+            ["fair-share bound \u00b11.0%", "fair-share bound -1.0%"],
+        )
+
+    def test_a_bound_at_the_top_of_its_axis_is_labelled_below_its_line(self):
+        # `M2-delivery`'s floor is the band view's own top, so the label has to
+        # drop below the line rather than escape into the legend.
+        code, stderr, out = self.render_mandate(
+            M2_DELIVERY_DECLARATION, M2_DELIVERY_ROWS, "M2top"
+        )
+        self.assertEqual(code, 0, stderr)
+        document = (out / "M2-delivery.svg").read_text(encoding="utf-8")
+        bound_y = float(
+            re.search(r'class="bound" x1="[^"]*" y1="([-0-9.]+)"', document).group(1)
+        )
+        for label_y in re.findall(
+            r'<text class="bound-label"[^>]*\by="([-0-9.]+)"', document
+        ):
+            self.assertGreater(
+                float(label_y),
+                bound_y,
+                f"a label at y={label_y} is drawn above its own bound at y={bound_y}",
+            )
+
+    def test_panels_whose_axis_can_already_show_their_bound_are_unchanged(self):
+        # The coarse view whose fine counterpart is M4-imbalance, and a floor
+        # with half the axis between it and the data: both keep their zero
+        # baseline. What they no longer keep is an axis that tops out on the
+        # bound itself, so an over-share bar would be clipped by the frame.
+        for name, declaration, rows, bound in (
+            ("M4shares", SHARES_DECLARATION, SHARES_ROWS, 0.25),
+            ("M3frac", FRACTION_DECLARATION, FRACTION_ROWS, 0.35),
+        ):
+            with self.subTest(panel=name):
+                code, stderr, out = self.render_mandate(declaration, rows, name)
+                self.assertEqual(code, 0, stderr)
+                panel_id = declaration["panels"][0]["id"]
+                document = (out / f"{declaration['mandate']}-{panel_id}.svg").read_text(
+                    encoding="utf-8"
+                )
+                self.assertNotIn("band view", document)
+                ticks = [
+                    float(value)
+                    for value in re.findall(r'text-anchor="end">([-0-9.]+)<', document)
+                ]
+                self.assertEqual(ticks[0], 0.0)
+                self.assertGreater(ticks[-1], bound, "no room above the bound")
 
 
 if __name__ == "__main__":
