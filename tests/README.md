@@ -45,14 +45,14 @@ stay with the tooling: `perf-loop run|analyze --fail-on-phase-drift` and
 
 ## Running the gate
 
-`python3 tools/check-gate.py` verifies this package's manifest and the
+`netem-tools check-gate` verifies this package's manifest and the
 perf-loop lane roles against the compiled test binaries. The per-crate gates
 run with the parameterized checker from each crate checkout:
 
 ```sh
-python3 ../netem_test/tools/check-gate.py --crate . rtp tests GATE.md
-python3 ../netem_test/tools/check-gate.py --crate . mux tests GATE.md
-python3 ../netem_test/tools/check-gate.py --crate . rtp_mux tests GATE.md
+netem-tools check-gate --crate . rtp tests GATE.md
+netem-tools check-gate --crate . mux tests GATE.md
+netem-tools check-gate --crate . rtp_mux tests GATE.md
 ```
 
 ## The perf-loop probe is rtp_mux's
@@ -83,7 +83,7 @@ cannot attribute a delta to a candidate, so it must not be read as a verdict.
 Report its paired numbers as a diagnostic only.
 
 The full lane-role table lives in `tests/GATE.md` (`gate-lane-roles`) and is
-machine-checked by `python3 tools/check-gate.py` against
+machine-checked by `netem-tools check-gate` against
 `perf_loop.lane_classification`, so a verdict lane cannot be mis-declared
 diagnostic (or the reverse) without the checker failing.
 

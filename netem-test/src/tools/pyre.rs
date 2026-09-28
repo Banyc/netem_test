@@ -23,8 +23,26 @@
 //! Failure restores the captures: every attempt that sets a group and then fails
 //! puts the group back, so `None` from [`Regex::search`] leaves the caller's
 //! state exactly as it found it.
+//!
+//! Three of Python's flags are honoured, because a ported checker's patterns use
+//! them: `re.S` ([`Flags::dotall`]), `re.M` ([`Flags::multiline`], where `^` and
+//! `$` also match at a line boundary) and `re.I` ([`Flags::ignorecase`], folded
+//! over ASCII -- the documents these patterns read are ASCII, and folding over
+//! ASCII keeps every match offset pointing into the original text). `\A` and
+//! `\Z` stay string anchors under `re.M`, as Python's do.
 
 use std::collections::BTreeMap;
+
+/// The `re` flags a ported pattern may set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Flags {
+    /// `re.S`: `.` matches a newline.
+    pub dotall: bool,
+    /// `re.M`: `^`/`$` also match at a line boundary.
+    pub multiline: bool,
+    /// `re.I`: matching folds ASCII case.
+    pub ignorecase: bool,
+}
 
 /// The `\w` class, in Python's `re` sense over the ASCII this tooling reads.
 fn is_word(character: char) -> bool {
@@ -60,8 +78,10 @@ enum Node {
         negate: bool,
         items: Vec<ClassItem>,
     },
-    Start,
-    End,
+    /// `^`: the text's start always, and under `re.M` also a line's start.
+    Start(bool),
+    /// `$`: the text's end always, and under `re.M` also a line's end.
+    End(bool),
     WordBoundary,
     NotWordBoundary,
     Group {
@@ -74,6 +94,10 @@ enum Node {
         inner: Box<Node>,
         positive: bool,
     },
+    /// `\A`: start of the whole text, never a line boundary.
+    TextStart,
+    /// `\Z`: end of the whole text, never a line boundary.
+    TextEnd,
     Concat(Vec<Node>),
     Alt(Vec<Node>),
     Repeat {
@@ -93,6 +117,7 @@ pub struct Match {
     pub end: usize,
     whole: String,
     groups: Vec<Option<String>>,
+    spans: Vec<Option<(usize, usize)>>,
     names: BTreeMap<String, usize>,
 }
 
@@ -116,6 +141,15 @@ impl Match {
         let index = *self.names.get(name)?;
         self.group(index)
     }
+
+    /// Group `index`'s `(start, end)` character offsets, or `None` when it did
+    /// not take part in the match.
+    pub fn group_span(&self, index: usize) -> Option<(usize, usize)> {
+        if index == 0 {
+            return Some((self.start, self.end));
+        }
+        self.spans.get(index - 1).copied().flatten()
+    }
 }
 
 /// A compiled pattern.
@@ -124,6 +158,7 @@ pub struct Regex {
     root: Node,
     names: BTreeMap<String, usize>,
     group_count: usize,
+    ignorecase: bool,
 }
 
 /// A pattern that could not be compiled. The ported tools' patterns are
@@ -142,16 +177,31 @@ struct Parser {
     pos: usize,
     group_count: usize,
     names: BTreeMap<String, usize>,
+    ignorecase: bool,
+    multiline: bool,
 }
 
 impl Regex {
     /// Compile a pattern. `dotall` is Python's `re.S`.
     pub fn new(pattern: &str, dotall: bool) -> Result<Regex, RegexError> {
+        Regex::new_with_flags(
+            pattern,
+            Flags {
+                dotall,
+                ..Flags::default()
+            },
+        )
+    }
+
+    /// Compile a pattern with Python's `re` flags.
+    pub fn new_with_flags(pattern: &str, flags: Flags) -> Result<Regex, RegexError> {
         let mut parser = Parser {
             chars: pattern.chars().collect(),
             pos: 0,
             group_count: 0,
             names: BTreeMap::new(),
+            ignorecase: flags.ignorecase,
+            multiline: flags.multiline,
         };
         let root = parser.alternation()?;
         if parser.pos != parser.chars.len() {
@@ -162,12 +212,31 @@ impl Regex {
         }
         // `dotall` is folded into the tree by rewriting `.` into a negated empty
         // class, so the matcher's hot path carries no flag lookup.
-        let root = if dotall { rewrite_dotall(root) } else { root };
+        let root = if flags.dotall {
+            rewrite_dotall(root)
+        } else {
+            root
+        };
         Ok(Regex {
             root,
             names: parser.names,
             group_count: parser.group_count,
+            ignorecase: flags.ignorecase,
         })
+    }
+
+    /// The caller's text, and the text the matcher sees: ASCII-folded when
+    /// `re.I` is set. Both are the same length, so a match's offsets index the
+    /// original -- which is what a captured group must be read from, since
+    /// Python returns the document's own spelling rather than the folded one.
+    fn texts(&self, text: &str) -> (Vec<char>, Vec<char>) {
+        let original: Vec<char> = text.chars().collect();
+        if self.ignorecase {
+            let folded = original.iter().map(|c| c.to_ascii_lowercase()).collect();
+            (original, folded)
+        } else {
+            (original.clone(), original)
+        }
     }
 
     fn empty_captures(&self) -> Captures {
@@ -209,6 +278,7 @@ impl Regex {
             end,
             whole: chars[start..end].iter().collect(),
             groups,
+            spans: captures.iter().skip(1).copied().collect(),
             names: self.names.clone(),
         }
     }
@@ -226,22 +296,36 @@ impl Regex {
         Some((found.start, found.end))
     }
 
+    /// Python's `re.match(text, pos)`: whether the pattern matches starting at
+    /// `pos` (a character offset), free at the end.
+    pub fn match_from(&self, text: &str, from: usize) -> bool {
+        let (_original, chars) = self.texts(text);
+        let mut captures = self.empty_captures();
+        run(
+            &self.root,
+            &chars,
+            from,
+            &mut captures,
+            &mut |_caps, _stop| true,
+        )
+    }
+
     /// The first match, or `None`.
     pub fn search(&self, text: &str) -> Option<Match> {
-        let chars: Vec<char> = text.chars().collect();
+        let (original, chars) = self.texts(text);
         let found = self.search_from(&chars, 0)?;
-        Some(self.materialize(&chars, found))
+        Some(self.materialize(&original, found))
     }
 
     /// Whether the pattern matches anywhere.
     pub fn is_match(&self, text: &str) -> bool {
-        let chars: Vec<char> = text.chars().collect();
+        let (_original, chars) = self.texts(text);
         self.search_from(&chars, 0).is_some()
     }
 
     /// Python's `re.match`: anchored at the start, free at the end.
     pub fn match_at(&self, text: &str) -> Option<Match> {
-        let chars: Vec<char> = text.chars().collect();
+        let (original, chars) = self.texts(text);
         let mut captures = self.empty_captures();
         let mut end: Option<usize> = None;
         let matched = run(&self.root, &chars, 0, &mut captures, &mut |_caps, stop| {
@@ -251,12 +335,12 @@ impl Regex {
         if !matched {
             return None;
         }
-        Some(self.materialize(&chars, (0, end.expect("matched"), captures)))
+        Some(self.materialize(&original, (0, end.expect("matched"), captures)))
     }
 
     /// Python's `re.fullmatch`: the whole string, anchors not required.
     pub fn full_match(&self, text: &str) -> Option<Match> {
-        let chars: Vec<char> = text.chars().collect();
+        let (original, chars) = self.texts(text);
         let mut captures = self.empty_captures();
         let mut end: Option<usize> = None;
         let matched = run(&self.root, &chars, 0, &mut captures, &mut |_caps, stop| {
@@ -270,12 +354,12 @@ impl Regex {
         if !matched {
             return None;
         }
-        Some(self.materialize(&chars, (0, end.expect("matched"), captures)))
+        Some(self.materialize(&original, (0, end.expect("matched"), captures)))
     }
 
     /// Every non-overlapping match, in order.
     pub fn find_iter(&self, text: &str) -> Vec<Match> {
-        let chars: Vec<char> = text.chars().collect();
+        let (original, chars) = self.texts(text);
         let mut out = Vec::new();
         let mut position = 0;
         while position <= chars.len() {
@@ -287,7 +371,7 @@ impl Regex {
             // An empty match cannot advance the scan by itself, or the loop
             // would never terminate.
             position = if end == start { end + 1 } else { end };
-            out.push(self.materialize(&chars, found));
+            out.push(self.materialize(&original, found));
         }
         out
     }
@@ -317,7 +401,7 @@ impl Regex {
     /// Python's `re.sub(pattern, replacement, text)` with a literal
     /// replacement: every match replaced.
     pub fn replace_all(&self, text: &str, replacement: &str) -> String {
-        let chars: Vec<char> = text.chars().collect();
+        let (chars, _folded) = self.texts(text);
         let mut out = String::new();
         let mut consumed = 0;
         for found in self.find_iter(text) {
@@ -553,11 +637,11 @@ impl Parser {
             }
             '^' => {
                 self.pos += 1;
-                Ok(Node::Start)
+                Ok(Node::Start(self.multiline))
             }
             '$' => {
                 self.pos += 1;
-                Ok(Node::End)
+                Ok(Node::End(self.multiline))
             }
             '\\' => {
                 self.pos += 1;
@@ -568,8 +652,17 @@ impl Parser {
             ))),
             other => {
                 self.pos += 1;
-                Ok(Node::Char(other))
+                Ok(Node::Char(self.fold_char(other)))
             }
+        }
+    }
+
+    /// A pattern literal as the matcher sees it: ASCII-folded under `re.I`.
+    fn fold_char(&self, character: char) -> char {
+        if self.ignorecase {
+            character.to_ascii_lowercase()
+        } else {
+            character
         }
     }
 
@@ -593,20 +686,23 @@ impl Parser {
                     negate: false,
                     items: vec![item],
                 },
-                None => Node::Char(character),
+                None => {
+                    let character = escaped_char(character);
+                    Node::Char(self.fold_char(character))
+                }
             });
         }
         Ok(match character {
             'b' => Node::WordBoundary,
             'B' => Node::NotWordBoundary,
-            'A' => Node::Start,
-            'Z' => Node::End,
+            'A' => Node::TextStart,
+            'Z' => Node::TextEnd,
             _ => match item {
                 Some(item) => Node::Class {
                     negate: false,
                     items: vec![item],
                 },
-                None => Node::Char(character),
+                None => Node::Char(self.fold_char(escaped_char(character))),
             },
         })
     }
@@ -640,7 +736,10 @@ impl Parser {
                     'W' => items.push(ClassItem::NotWord),
                     's' => items.push(ClassItem::Space),
                     'S' => items.push(ClassItem::NotSpace),
-                    other => items.push(ClassItem::Range(other, other)),
+                    other => {
+                        let folded = self.fold_char(escaped_char(other));
+                        items.push(ClassItem::Range(folded, folded));
+                    }
                 }
                 continue;
             }
@@ -649,14 +748,39 @@ impl Parser {
                 && self.chars.get(self.pos + 2).is_some_and(|c| *c != ']')
             {
                 let high = self.chars[self.pos + 2];
-                items.push(ClassItem::Range(character, high));
+                items.push(ClassItem::Range(
+                    self.fold_char(character),
+                    self.fold_char(high),
+                ));
                 self.pos += 3;
                 continue;
             }
-            items.push(ClassItem::Range(character, character));
+            items.push(ClassItem::Range(
+                self.fold_char(character),
+                self.fold_char(character),
+            ));
             self.pos += 1;
         }
         Ok(Node::Class { negate, items })
+    }
+}
+
+/// The character a backslash escape stands for, as Python's `re` reads it.
+///
+/// Only the control escapes `re` defines are translated; every other escaped
+/// character stands for itself (`.` stays `.`, `-` stays `-`), which is what
+/// makes a pattern like `[^"\n]` mean "not a quote and not a newline" rather
+/// than the literal `n` a hand-rolled scanner would read.
+fn escaped_char(character: char) -> char {
+    match character {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        'f' => '\x0c',
+        'v' => '\x0b',
+        'a' => '\x07',
+        '0' => '\0',
+        other => other,
     }
 }
 
@@ -705,15 +829,32 @@ fn run(
             Some(character) if class_matches(items, *negate, *character) => k(caps, pos + 1),
             _ => false,
         },
-        Node::Start => {
+        Node::Start(multiline) => {
+            if pos == 0 || (*multiline && text[pos - 1] == '\n') {
+                k(caps, pos)
+            } else {
+                false
+            }
+        }
+        Node::End(multiline) => {
+            let at_end = pos == text.len();
+            let before_a_final_newline = pos + 1 == text.len() && text.get(pos) == Some(&'\n');
+            let at_a_line_end = *multiline && text.get(pos) == Some(&'\n');
+            if at_end || before_a_final_newline || at_a_line_end {
+                k(caps, pos)
+            } else {
+                false
+            }
+        }
+        Node::TextStart => {
             if pos == 0 {
                 k(caps, pos)
             } else {
                 false
             }
         }
-        Node::End => {
-            if pos == text.len() || (pos + 1 == text.len() && text[pos] == '\n') {
+        Node::TextEnd => {
+            if pos == text.len() {
                 k(caps, pos)
             } else {
                 false
@@ -971,6 +1112,69 @@ mod tests {
         assert_eq!(found.start, 1);
         assert_eq!(found.end, 3);
         assert_eq!(found.group(0).as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn a_control_escape_is_the_character_python_reads_it_as() {
+        // The checker's patterns spell a newline `\n`; a scanner that read the
+        // escape as the literal letter `n` would make `[^"\n]` mean "not a
+        // quote and not an n", which is what a string-literal scan did before
+        // this engine translated it. The pair below is the vacuity: the same
+        // pattern with the escape removed answers differently on the same
+        // input, so the test measures the translation rather than the engine's
+        // willingness to match.
+        let escaped = Regex::new(r#""([^"\n]*)""#, false).expect("compiles");
+        let literal = Regex::new(r#""([^"n]*)""#, false).expect("compiles");
+        let text = "\"alpha\",\n    \"banana\"";
+        let group = |regex: &Regex| -> Vec<Option<String>> {
+            regex
+                .find_all(text)
+                .into_iter()
+                .map(|groups| groups[0].clone())
+                .collect()
+        };
+        assert_eq!(
+            group(&escaped),
+            vec![Some("alpha".to_string()), Some("banana".to_string())]
+        );
+        assert_ne!(group(&escaped), group(&literal));
+    }
+
+    #[test]
+    fn ignore_case_reports_the_documents_own_spelling() {
+        let folding = Regex::new_with_flags(
+            r"\b(one|two|three) producers",
+            Flags {
+                ignorecase: true,
+                ..Flags::default()
+            },
+        )
+        .expect("compiles");
+        let found = folding
+            .search("Two producers are declared")
+            .expect("matches");
+        assert_eq!(found.group(1).as_deref(), Some("Two"));
+        // Vacuity: without `re.I` the same pattern does not match the same
+        // text at all, so the case measures the fold and not a permissive scan.
+        let strict = Regex::new(r"\b(one|two|three) producers", false).expect("compiles");
+        assert!(!strict.is_match("Two producers are declared"));
+    }
+
+    #[test]
+    fn multiline_anchors_a_line_but_a_text_anchor_does_not() {
+        let line = Regex::new_with_flags(
+            r"^\*\*Read report-only output",
+            Flags {
+                multiline: true,
+                ..Flags::default()
+            },
+        )
+        .expect("compiles");
+        assert!(line.is_match("intro\n**Read report-only output; do not rely"));
+        let strict = Regex::new(r"^\*\*Read report-only output", false).expect("compiles");
+        assert!(!strict.is_match("intro\n**Read report-only output; do not rely"));
+        let text_anchor = Regex::new(r"\Aabc", false).expect("compiles");
+        assert!(!text_anchor.is_match("intro\nabc"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ instrument whose probe and lanes are hosted by the crates they measure.
   crates' own test targets, where the code they exercise lives; the harness
   depends on none of them.
 - `tools/` — the performance capture and comparison tooling (`perf-loop`,
-  `perf_loop.py`, `mandate-check`, `netem-tools mandate-plot`, `check-gate.py`,
+  `perf_loop.py`, `mandate-check`, `netem-tools mandate-plot`, `netem-tools check-gate`,
   `render_graph.py`, `rtp_trace_compare.py`, `rtp_trace_report.py`,
   `samply_hotspots.py`, `calib.py`, …). The tooling stays here; the probe it
   drives is `rtp_mux/tests/perf_probe.rs`, so
@@ -88,13 +88,13 @@ When a performance comparison is part of a conclusion, report:
 conformance scenarios. Every scenario that needs `rtp`/`mux`/`rtp_mux` runs in
 the crate that owns it and is gated there (`rtp/GATE.md`, `mux/GATE.md`,
 `rtp_mux/GATE.md`), each checked with the parameterized
-`tools/check-gate.py --crate <root> <package> <dir> GATE.md`; the harness's own
+`netem-tools check-gate --crate <root> <package> <dir> GATE.md`; the harness's own
 gate is `tests/GATE.md`. An unnoticeable skip cannot happen: the checker fails
 if a scenario is not classified.
 
 ```sh
 cargo test -p netem-test        # harness unit tests
 cargo test -p tests             # default gate (see tests/GATE.md)
-python3 tools/check-gate.py     # verify the gate manifest matches reality
+netem-tools check-gate     # verify the gate manifest matches reality
 python3 -m pytest tools/ -q     # verify the tooling
 ```

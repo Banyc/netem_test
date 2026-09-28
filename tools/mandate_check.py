@@ -43,7 +43,7 @@ one test's own time is a named failure rather than a plausible-looking row.
 The report records the method alongside the numbers so a reader knows what was
 measured, and a declared nominal cost that has drifted from this measured
 wall-clock is visible rather than assumed (the owning crate's
-``gate-perf-design`` block states the declared cost, ``check-gate.py``
+``gate-perf-design`` block states the declared cost, ``netem-tools check-gate``
 compares them).
 
 The per-arm record is the other half. A mandate verdict says a bound was

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use netem_test::tools::check_gate::{self, Args as CheckGateArgs};
 use netem_test::tools::mandate_compare::{self, Args};
 use netem_test::tools::mandate_plot::{self, Args as PlotArgs};
 use netem_test::tools::pyformat;
@@ -38,6 +39,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Tool {
+    /// verify a crate's scenario gate manifest against the compiled tests
+    CheckGate(CheckGate),
     /// diff a mandate-check run against the committed baseline
     MandateCompare(MandateCompare),
     /// apply a Python `format()` spec to a value (the port's prerequisite)
@@ -183,9 +186,63 @@ impl From<MandatePlot> for PlotArgs {
     }
 }
 
+// The flags of `check-gate`, converted into the checker's own `Args`. `--crate`
+// takes the four positional values the Python checker's `nargs=4` took
+// (`ROOT PACKAGE DIR GATE_MD`); omitted, the run is harness mode, whose root is
+// the working directory (the `cd netem_test && netem-tools check-gate`
+// invocation the document records).
+#[derive(Debug, clap::Args)]
+struct CheckGate {
+    /// check PACKAGE's gate in ROOT with scenarios in DIR and manifest GATE_MD
+    #[arg(
+        long = "crate",
+        num_args = 4,
+        value_names = ["ROOT", "PACKAGE", "DIR", "GATE_MD"]
+    )]
+    crate_spec: Option<Vec<String>>,
+    /// a fresh mandate-check.json whose per-test timings are drift-checked
+    #[arg(long, value_name = "path")]
+    mandate_check_json: Option<PathBuf>,
+}
+
+impl TryFrom<CheckGate> for CheckGateArgs {
+    type Error = String;
+
+    fn try_from(cli: CheckGate) -> Result<CheckGateArgs, String> {
+        let crate_spec = match cli.crate_spec {
+            None => None,
+            Some(values) if values.len() == 4 => {
+                let mut iter = values.into_iter();
+                let root = PathBuf::from(iter.next().expect("four values"));
+                let package = iter.next().expect("four values");
+                let dir = PathBuf::from(iter.next().expect("four values"));
+                let manifest = PathBuf::from(iter.next().expect("four values"));
+                Some((root, package, dir, manifest))
+            }
+            Some(values) => {
+                return Err(format!(
+                    "--crate takes exactly four values (ROOT PACKAGE DIR GATE_MD), got {}",
+                    values.len()
+                ));
+            }
+        };
+        Ok(CheckGateArgs {
+            crate_spec,
+            mandate_check_json: cli.mandate_check_json,
+        })
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let status = match cli.command {
+        Tool::CheckGate(args) => match CheckGateArgs::try_from(args) {
+            Ok(args) => check_gate::main(args),
+            Err(message) => {
+                eprintln!("check_gate: error: {message}");
+                1
+            }
+        },
         Tool::MandateCompare(args) => mandate_compare::main(args.into()),
         Tool::PyFormat(args) => pyformat::main(pyformat::Args {
             value: args.value,

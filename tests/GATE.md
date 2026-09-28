@@ -6,29 +6,29 @@ conformance suite — and the perf-loop lane roles, which belong to the harness
 tooling. `cargo test -p tests` silently skips every `#[ignore]`d scenario, so
 the gate is defined in tiers and the `gate-manifest` block below names every
 opt-in scenario and its tier. The manifest is machine-checked by
-`python3 tools/check-gate.py`, which fails if a scenario is added or removed
+`netem-tools check-gate`, which fails if a scenario is added or removed
 without the manifest being updated, making an unnoticed `#[ignore]` skip
 impossible.
 
 Run the checker after adding, removing, or re-tiering any scenario. Both
 commands below are written for this crate's root, one level above this file:
-`tools/check-gate.py` is the path from there, and the parameterized form's
+`netem-tools check-gate` is the path from there, and the parameterized form's
 `--crate .` is the directory it is run in, not the one this file lives in.
 
 ```sh
-python3 tools/check-gate.py
+netem-tools check-gate
 ```
 
-From this file's directory the same check is `python3 ../tools/check-gate.py` —
+From this file's directory the same check is `netem-tools check-gate` —
 the checker derives the crate root from its own path — and the parameterized
 form from there names the root instead of `.`:
-`python3 ../tools/check-gate.py --crate .. tests tests/tests tests/GATE.md`.
+`netem-tools check-gate --crate .. tests tests/tests tests/GATE.md`.
 
 The same gate through the parameterized form the sibling crates use (the
 scenario directory is `tests/tests`, one level below this package's own root):
 
 ```sh
-python3 tools/check-gate.py --crate . tests tests/tests tests/GATE.md
+netem-tools check-gate --crate . tests tests/tests tests/GATE.md
 ```
 
 The application scenarios that consume `rtp`, `mux` or `rtp_mux` are asserted
@@ -36,7 +36,7 @@ by **those crates'** own gates, never here: the harness keeps the impairment
 instrument and its conformance suite, and each layer's floors are stated and
 checked in the crate that owns the code they exercise
 (`rtp/GATE.md`, `mux/GATE.md`, `rtp_mux/GATE.md`), each with
-`python3 ../netem_test/tools/check-gate.py --crate . <crate> tests GATE.md`.
+`netem-tools check-gate --crate . <crate> tests GATE.md`.
 `netem_test` itself consumes none of `rtp`/`mux`/`rtp_mux`, so a pinned harness
 revision cannot put two versions of the harness in one graph.
 
@@ -52,7 +52,7 @@ revision cannot put two versions of the harness in one graph.
   too slow for the default gate. Run the target explicitly.
 - **perf** — `#[ignore]`d, report-only measurement or long-run tooling; these
   produce numbers (or feed `tools/perf-loop`), they do not assert a gate floor.
-  A `perf` scenario must not contain an assertion in its own body; `check-gate.py`
+  A `perf` scenario must not contain an assertion in its own body; `netem-tools check-gate`
   fails with the scenario name, its file, and the token if one does, because a
   check that never runs is not coverage. It must also not reach an assertion
   through a helper: the checker derives the crate-local call-graph closure of
@@ -79,7 +79,7 @@ battery lanes cannot separate. Nothing else lives here — the layer scenarios a
 in the crates that own the code they exercise.
 
 The `gate-default-required` block names the asserting scenarios that must stay
-in this tier; `check-gate.py` fails if one is re-`#[ignore]`d or removed. It may
+in this tier; `netem-tools check-gate` fails if one is re-`#[ignore]`d or removed. It may
 name the reserved `lib` target beside the scenario targets — the harness's own
 `--lib` unit tests — and the checker resolves such an entry against
 `cargo test -p netem-test --lib` rather than `--test lib`:
@@ -239,13 +239,13 @@ candidate can move — cannot carry a verdict. Each lane's measured shape and
 blind spots are recorded in `tools/PERF_LOOP.md`.
 
 The `gate-lane-roles` block below records every lane's role. It is
-machine-checked by `tools/check-gate.py` against `perf_loop.lane_classification`
+machine-checked by `netem-tools check-gate` against `perf_loop.lane_classification`
 — the same function that stamps `link_role` into `run.json` — so a lane cannot
 be declared verdict in one place and diagnostic in the other. Run the checker
 after adding a lane or changing a role:
 
 ```sh
-python3 tools/check-gate.py
+netem-tools check-gate
 ```
 
 ```gate-lane-roles
@@ -310,7 +310,7 @@ endpoint never observed protocol-timer wakes) stay `null` and never fail.
 
 ## Opt-in targets outside this manifest
 
-`check-gate.py` covers only the `tests` package. Three other opt-in sets are
+`netem-tools check-gate` covers only the `tests` package. Three other opt-in sets are
 never run by `cargo test` and are listed here so their skip is explicit:
 
 - **`netem-test` harness probes** (`cargo test --release -p netem-test --
@@ -341,7 +341,7 @@ and its **coverage** must be declared, with every cell it claims naming the
 test that asserts it and every cell it does not cover recording why.
 
 This block is the harness's own declaration. It is checked by
-`python3 tools/check-gate.py`, which resolves each row's `<target>::<test>`
+`netem-tools check-gate`, which resolves each row's `<target>::<test>`
 from the compiled test binaries and fails on an unknown target or test, a test
 in the wrong tier, a tier sum over its budget, an empty coverage cell, a gap
 without a reason, and a row whose declared relation to the baseline disagrees
@@ -455,7 +455,7 @@ lib::tests::std_udp_connected_peer_perf_probe = perf | 1.2 | orthogonal@probe | 
 The declared sums are `default` 10.5 s of a 60 s budget, `standard` 14.8 s of
 120 s, `perf` 1.7 s of 60 s, and no row in `full`, whose 300 s budget is
 declared so a later row cannot be added without one. `drift` is the relative
-tolerance `tools/check-gate.py` applies when it is handed a fresh
+tolerance `netem-tools check-gate` applies when it is handed a fresh
 `mandate-check.json` (50 %, with a 2 s absolute floor, so a sub-second probe
 measured a second slower is a note and not a false alarm): a declared cost
 that no longer matches the measured wall-clock is reported.
@@ -529,7 +529,7 @@ other block in any manifest can see them, and they are declared in the
 
 **This file is their manifest, and no second one is needed.** The checker
 resolves one manifest per invocation, and this is the one every `netem_test`
-invocation reads: harness mode's layout is `tests/GATE.md` (`check-gate.py`,
+invocation reads: harness mode's layout is `tests/GATE.md` (`netem-tools check-gate`,
 `harness_layout`), and both documented parameterized forms below name it
 explicitly. The other half of the check is anchored differently — the variable
 set is detected from the whole crate root's Rust sources

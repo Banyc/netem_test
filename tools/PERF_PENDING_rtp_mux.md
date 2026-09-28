@@ -9,7 +9,7 @@ the family membership those relations imply is derived from the rows' cells in
 "Family membership" below. It is
 a draft, not an
 authority — the numbers become `rtp_mux`'s when that crate's iteration lands
-them in its own `GATE.md`, where `python3 ../netem_test/tools/check-gate.py
+them in its own `GATE.md`, where `netem-tools check-gate
 --crate . rtp_mux tests GATE.md` will enforce them.
 
 **Nothing here retunes an arm, threshold, window, cadence or tier.** The rows
@@ -77,14 +77,14 @@ relation with a trailing `@<family>` is derived against that
 cell). The kinds are `baseline` for a family's reference row itself,
 `orthogonal` when the row's cells vary exactly one dimension from that
 reference, `composite(<dimension>[,<dimension>…])` when they vary several, and
-`re-measurement(<reason>)` when they vary none. `check-gate.py` derives the
+`re-measurement(<reason>)` when they vary none. `netem-tools check-gate` derives the
 varied dimensions from the row's own cells — a dimension whose value differs
 from its family reference's, or that the reference does not state at all (a
 dimension the row does not name is inherited) — and refuses a label that
 disagrees with that derivation, so these are not a judgement call. Nor is a
 row stated against a reference of a family it belongs to by inspection: which
 family a row belongs to is exactly what the `@<family>` suffix declares, and
-`check-gate.py` only enforces that the family exists, that a family's
+`netem-tools check-gate` only enforces that the family exists, that a family's
 reference row carries its `baseline@<family>` label, that every declared
 family is used by some row, and that the row's cells lie in the family's own
 **cell-name namespace** (`members.<family>`, see "Family membership" below).
@@ -157,7 +157,7 @@ not machine-checked; the claims stated in either block's numbers above are.
 ## Family membership
 
 A `@<family>` suffix is a claim that the row **belongs** to that family, and
-`check-gate.py` derives that membership from the row's own cells rather than
+`netem-tools check-gate` derives that membership from the row's own cells rather than
 taking the label: each family declares the **cell-name namespace** its rows
 live in (`members.<family> = <prefix>`, a cell's property name optionally
 followed by `*`), a cell name may not be claimed by two families, a family's
@@ -200,7 +200,7 @@ members.reorder = reorder-*
 members.rtp-ceiling = ceiling
 ```
 
-`tools/test_pending_declaration.py` runs the checker's membership derivation on
+`netem-test/tests/check_gate_pending.rs` runs the checker's membership derivation on
 this proposal and pins the result, so the numbers below cannot rot:
 
 - **14 cell names are claimed by two or more families**: `M1` (constitution,
@@ -445,11 +445,11 @@ attribution@baseline-family=lone-tail = rtp_mux_jitter::jitter_request_response_
    not name their cells. Land the declaration either with the rows refiled
    into cell-name-coherent families — a change to the labels, not to any
    window, cadence or tier — or with a new single-axis arm per foreign row,
-   and only then add the `members.<family>` lines `check-gate.py` requires;
+   and only then add the `members.<family>` lines `netem-tools check-gate` requires;
    pasting them as they stand is a red gate.
 4. Run `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`
    through `tools/mandate-check`, then
-   `python3 ../netem_test/tools/check-gate.py --crate . rtp_mux tests GATE.md
+   `netem-tools check-gate --crate . rtp_mux tests GATE.md
    --mandate-check-json <run>/mandate-check.json`. The checker resolves every
    row against the compiled test set and compares the four `mandate_smoke`
    costs with the report's per-test wall-clock, so a stale or invented cost

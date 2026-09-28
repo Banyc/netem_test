@@ -38,7 +38,7 @@
 //!   rate, a share. On a shared host these move run to run, so by default they
 //!   are *reported* and the comparison stays green; with `--fail-on-value-drift`
 //!   a move past `--value-tolerance` is a failure (exit `5`). The tolerance is
-//!   deliberately loose (50 %, the same relative tolerance `tools/check-gate.py`
+//!   deliberately loose (50 %, the same relative tolerance `netem-tools check-gate`
 //!   applies to a declared cost) because the point of the default is to be
 //!   usable on a loaded host.
 //!
@@ -269,7 +269,7 @@ pub const UNSTATED: &str = "unstated";
 // whose every cell says the lane is idle is left uncompared.
 const CLAIM_PRECEDENCE: &[&str] = &[CLAIMED, UNSTATED, IDLE];
 
-// `<dimension>=<value>`, the per-dimension shape `tools/check-gate.py`'s
+// `<dimension>=<value>`, the per-dimension shape `netem-tools check-gate`'s
 // `CELL_DIMENSION_RE` admits. That checker is the grammar's authority and has
 // already rejected a malformed cell before a claim is read; this repeats the
 // shape rather than importing the checker into every claim call.
@@ -1212,7 +1212,7 @@ fn cells_for(report: &Report) -> BTreeMap<String, Vec<String>> {
 
 /// Why `cell` is not `<property>@<dimension>=<value>[+...]`, or `None`.
 ///
-/// `tools/check-gate.py`'s `cell_problem` is the grammar's authority; this
+/// `netem-tools check-gate`'s `cell_problem` is the grammar's authority; this
 /// repeats its shape so the Rust comparison can validate a report on its own.
 fn cell_problem(cell: &str) -> Option<String> {
     let (property, dimensions) = match cell.split_once('@') {

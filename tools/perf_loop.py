@@ -92,7 +92,7 @@ LINK_PROFILES = (
 # second of warmup, and the teardown time is set by the early ACK/queue
 # dynamics a candidate can move, so the lane cannot carry a verdict.  The role
 # of every lane is documented in tests/GATE.md (`gate-lane-roles`) and
-# machine-checked by tools/check-gate.py against `lane_classification`, so a
+# machine-checked by netem-tools check-gate against `lane_classification`, so a
 # lane cannot be mis-declared verdict or diagnostic.
 DIAGNOSTIC_LANES = ("hostile", "jittery-short-rtt", "high-rtt-low-rate-bottleneck")
 

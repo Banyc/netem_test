@@ -12,6 +12,7 @@
 //! They exist so a ported tool keeps its twin's *messages* and *spelling*, not
 //! merely its decisions.
 
+pub mod check_gate;
 pub mod json;
 pub mod mandate_compare;
 pub mod mandate_plot;

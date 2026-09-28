@@ -264,8 +264,8 @@ so the attribution a crate actually has is a visible number rather
 than a claim in prose.
 
 The exact grammar, the derivation rule, the checker's failure modes and the
-fixture tests that pin them are in `tools/check-gate.py` and
-`tools/test_check_gate.py`.
+fixture tests that pin them are in `netem-tools check-gate` and its Rust test
+targets (`netem-test/tests/check_gate_perf.rs` and its neighbours).
 
 **What the relation check cannot see**, stated so its green is not read as more
 than it is. It verifies the **declaration**, never the code: it cannot tell
@@ -313,7 +313,7 @@ tied references split differently the composite/re-measurement counts move with
 the choice, so the reference stays visible in the run summary and in
 the `mandate-compare` subcommand's per-arm record rather than being claimed derivable.
 
-`tools/check-gate.py` enforces the declaration for any crate whose `GATE.md`
+`netem-tools check-gate` enforces the declaration for any crate whose `GATE.md`
 carries the blocks: an unknown target, an unknown test, a test declared in the
 wrong tier, a tier sum over its budget, an empty or malformed coverage cell, a
 gap without a reason, a missing `baseline`, a named baseline whose row does not
@@ -331,7 +331,7 @@ the problem and what to write instead. It runs the same way as the other gate
 checks:
 
 ```sh
-python3 tools/check-gate.py
+netem-tools check-gate
 ```
 
 **The measured side** is the runner's report. `tools/mandate-check` times each
@@ -346,7 +346,7 @@ silently believed. A declared row the report did not time is not compared,
 and the checker prints how many of the declared rows it compared, so an
 absent measurement is visible rather than read as agreement.
 
-**The mechanism is central; the rows are not.** `tools/check-gate.py` is the
+**The mechanism is central; the rows are not.** `netem-tools check-gate` is the
 enforcement and it lives with the harness tooling, but a crate's budgets, its
 nominal costs, its baseline and its coverage cells are that crate's own
 declaration in its own `GATE.md`. The checker can name a row it cannot resolve;
@@ -378,7 +378,7 @@ twice.
 yet.
 - **`mux`** — owes no perf-test declaration, not "no opt-in scenario". Its own
 manifest is the authority: run
-`python3 tools/check-gate.py --crate ../mux mux tests GATE.md` from here and it
+`netem-tools check-gate --crate ../mux mux tests GATE.md` from here and it
 prints the tiers that manifest classifies, reporting the `PENDING` note only
 when a perf-tier scenario is present — which it is not, so the checker has no
 perf row to enforce there. The fairness and perf probes that used to live in
@@ -395,7 +395,7 @@ gate; the checker enforces a crate's declaration the moment its blocks appear.
 The smoke set, the hostile and lone-tail arms, and the rule that **the plots
 must be read** all exist because of one hard-won lesson. A shipped `rtp`
 change passed **714 unit tests**, the default tier, the burst-loss and standard
-tiers, `check-gate.py`, `fmt` and `clippy` — and was still a **−37 % goodput /
+tiers, `netem-tools check-gate`, `fmt` and `clippy` — and was still a **−37 % goodput /
 +60–280 % tail** regression. It passed because it was validated only on a
 low-loss, low-jitter arm. A gate roster that does not include the hostile
 regime, and a verdict read without its panel, cannot see that class of
@@ -886,7 +886,7 @@ verified SVG panels, and recorded **23 arms from both producers**: 19 for
 `rtp_mux` (3 M1, 3 M2, 3 M3 reps and 10 M4 arms) and the 4 probes
 (`probe/forwarding` over 200 000 iterations, `probe/deadline` over 1 000,
 `probe/std-udp` over 21 paired medians, `probe/dest-cache` over 5 000 000).
-Its `timings` cover both producers, so `tools/check-gate.py
+Its `timings` cover both producers, so `netem-tools check-gate
 --mandate-check-json` drift-checks the four `lib::tests::*` rows as well as
 `rtp_mux`'s. The checked-in copy is the run's JSON with machine-local absolute
 paths replaced by tokens (`<baseline run dir>`, `<rtp_mux checkout>`,
@@ -1090,7 +1090,7 @@ graph is produced by `tools/render_graph.py`.
 - **`tools/render_graph.py`** — extracts and verifies the `<svg>` panels of a
   perf-loop `comparison.html` and writes standalone SVG+PNG; an unproducible
   or data-free panel is a non-zero-exit error, not a blank file.
-- **`tools/check-gate.py`** — re-derives each crate's opt-in scenario set and
+- **`netem-tools check-gate`** — re-derives each crate's opt-in scenario set and
   tiers from the compiled test binaries and fails when a crate's `GATE.md`
   manifest disagrees, so an `#[ignore]` skip cannot go unnoticed; it also
   enforces the report-only/asserting split.
@@ -1105,7 +1105,7 @@ body must still carry an assertion token; a `probe` body must carry one
 measurement, or quietly gained or lost a check under the ignore flag, fails
 with the probe and the recorded count named; the tier that must carry
 **no** assertion token is the report-only `perf` scenario, and the asserting
-helpers it reaches are `netem_test/tools/check-gate.py`'s
+helpers it reaches are `netem-tools check-gate`'s
 `gate-perf-guard-helpers` closure, not this checker's.
 - **`tools/hygiene.py`** — report-only sweep for stale jj registrations,
   leaked test processes, stale scratch, wrong jj layout and stalled logs;
@@ -1180,5 +1180,5 @@ the probe body's token count, so a probe that lost its validation, or quietly
 gained, lost or moved a check under the ignore flag, is an error that names
 the probe. The checkers refuse
 an assertion token in the report-only **`perf` scenario** tier —
-`netem_test/tools/check-gate.py` scans a relocated scenario's own body and the
+`netem-tools check-gate` scans a relocated scenario's own body and the
 asserting helpers it reaches (`gate-perf-guard-helpers`) — never in a `probe`.

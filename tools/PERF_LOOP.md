@@ -85,7 +85,7 @@ baseline and candidate trees were byte-identical in the control). It remains
 useful as a diagnostic, but it cannot attribute a delta to a candidate. A run
 records the lane's role as `link_role` (`verdict` or `diagnostic`) in
 `run.json`; the full role table lives in `tests/GATE.md` (`gate-lane-roles`) and
-is machine-checked by `python3 tools/check-gate.py` against
+is machine-checked by `netem-tools check-gate` against
 `perf_loop.lane_classification`.
 
 # Reanalyze an existing capture

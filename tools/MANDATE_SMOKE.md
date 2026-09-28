@@ -380,7 +380,7 @@ rows are `lib::tests::clean_forwarding_perf_probe`, and that is the key this
 records for them.
 
 The declaring side is the owning crate's `gate-perf-design` block, and
-`tools/check-gate.py` is what compares the two: it fails when a declared cost
+`netem-tools check-gate` is what compares the two: it fails when a declared cost
 has drifted past the tolerance the crate declares, and when a measured test
 exceeds its tier budget. It only compares a row whose `<target>::<test>` the
 report measured, and it says how many rows it compared.
