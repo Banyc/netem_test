@@ -26,7 +26,7 @@ of them required:
 | `--quick` | off | ask a producer that honours it for its shortest windows (`MANDATE_SMOKE_QUICK=1`) |
 | `--timeout <seconds>` | 900 | how long each producer may run before it is killed |
 | `--cargo <path>` | `cargo` on `PATH` | the cargo that builds and runs the producers |
-| `--browser <path>`, `--no-rasterize` | rasterize with a found browser | passed through to the PNG step of `tools/mandate_plot.py` |
+| `--browser <path>`, `--no-rasterize` | rasterize with a found browser | passed through to the PNG step of `netem-tools mandate-plot` |
 
 ## The producers, and which are covered
 
@@ -112,7 +112,7 @@ only.
    named by `$MANDATE_CHECK_DIR` (always set and cleared by this command):
    `M1.json`/`M1.csv`, `M2.json`/`M2.csv`, `M3.json`/`M3.csv`,
    `M4.json`/`M4.csv`, in exactly
-   the shape `tools/mandate_plot.py` consumes — the `<mandate>.json` panel
+   the shape `netem-tools mandate-plot` consumes — the `<mandate>.json` panel
    declaration (`mandate`, `title`, `x_label`, `y_label`, a non-empty
    `panels` list of `id`/`chart`/`series`/`bounds`) and the `<mandate>.csv`
    rows under the header `panel,series,x,y`. A producer that declares no

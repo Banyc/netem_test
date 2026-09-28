@@ -1314,4 +1314,59 @@ mod tests {
         let headroom2 = (high2 - 250.0) / (high2 - low2) * 228.0;
         assert!((headroom2 - FRAME_HEADROOM / (1.0 + FRAME_HEADROOM) * 228.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn a_floor_far_below_the_data_keeps_the_zero_baseline() {
+        let series: Series = vec![(
+            "fraction".to_string(),
+            vec![(1.0, 0.958217), (2.0, 0.958271)],
+        )];
+        let bounds = vec![Bound::new(0.35, "M3 floor 0.35x link rate".to_string())];
+        assert_eq!(bar_axis_extent(&series, &bounds, None, None).0, 0.0);
+    }
+
+    #[test]
+    fn the_label_width_model_does_not_underestimate_the_rendered_text() {
+        // Widths measured on real standalone panels by headless Chrome
+        // (`getBBox().width`, 11 px text with no font-family declared,
+        // resolved as Times). The model is a *model*, so the only thing that
+        // keeps it honest is a check that fails when it starts
+        // underestimating the drawn text.
+        let rendered: [(&str, f64); 8] = [
+            (
+                "M2 non-degrading p99 bound (ms) [1 of 3 bars beyond it; run guards \
+                 hostile_p99_guard=200 lone_p99_guard=400]",
+                512.22,
+            ),
+            (
+                "M1 ceiling 250 ms [4 of 16 bars beyond it; run guards \
+                 hostile_p99_guard=900]",
+                349.0,
+            ),
+            ("M4 per-flow delivery floor 0.995", 144.94),
+            ("fair-share bound \u{b1}1.0%", 103.94),
+            ("fair share 25.0%", 72.36),
+            ("M3 floor 0.35x link rate", 105.37),
+            ("M2 delivery floor 1.000", 105.1),
+            ("M1 ceiling 250 ms", 82.77),
+        ];
+        for (label, measured) in rendered {
+            assert!(
+                label_text_width(label) >= measured,
+                "{label:?}: the model {} is narrower than the drawn {measured}",
+                label_text_width(label)
+            );
+        }
+        // Vacuity: a model narrowed below the measured widths would fail the
+        // assertion above, so it is about the model and not a tautology. The
+        // safety factor is what carries the margin, and 0.2 of it is below the
+        // narrowest measured label.
+        let narrowed = |text: &str| {
+            text.chars()
+                .map(|character| label_char_advance(character) * 0.2 / LABEL_ADVANCE_SAFETY)
+                .sum::<f64>()
+        };
+        let (label, measured) = rendered[0];
+        assert!(narrowed(label) < measured);
+    }
 }

@@ -20,7 +20,7 @@ instrument whose probe and lanes are hosted by the crates they measure.
   crates' own test targets, where the code they exercise lives; the harness
   depends on none of them.
 - `tools/` — the performance capture and comparison tooling (`perf-loop`,
-  `perf_loop.py`, `mandate-check`, `mandate_plot.py`, `check-gate.py`,
+  `perf_loop.py`, `mandate-check`, `netem-tools mandate-plot`, `check-gate.py`,
   `render_graph.py`, `rtp_trace_compare.py`, `rtp_trace_report.py`,
   `samply_hotspots.py`, `calib.py`, …). The tooling stays here; the probe it
   drives is `rtp_mux/tests/perf_probe.rs`, so

@@ -4036,6 +4036,304 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_inside_the_axis_owes_no_clip() {
+        // A peak the axis can hold, or one that is a *majority* of the
+        // samples, is the data's own extent and clips nothing; a lone outlier
+        // against a read-at bound is clipped at that bound.
+        let inside = series_of("arm", (0..20).map(|i| (i as f64, 200.0)).collect());
+        let ceil = vec![Bound::new(250.0, "ceil".to_string())];
+        assert_eq!(line_clip_owed(&inside, &ceil), None);
+        let majority = series_of(
+            "arm",
+            (0..100)
+                .map(|i| (i as f64, 400.0 + i as f64))
+                .chain((0..100).map(|i| (i as f64, 100.0)))
+                .collect(),
+        );
+        assert_eq!(line_clip_owed(&majority, &ceil), None);
+        // The clip fixture: three bodies whose own ranges are tens of ms and a
+        // single 1400 ms sample on the lone tail.
+        let clean: Vec<(f64, f64)> = (0..200)
+            .map(|i| (i as f64, 20.0 + (i % 20) as f64))
+            .collect();
+        let hostile: Vec<(f64, f64)> = (0..200)
+            .map(|i| (i as f64, 40.0 + 2.0 * (i % 20) as f64))
+            .collect();
+        let lone: Vec<(f64, f64)> = (0..200)
+            .map(|i| (i as f64, 10.0 + (i % 20) as f64))
+            .chain(std::iter::once((199.0, 1400.0)))
+            .collect();
+        let series: Series = vec![
+            ("clean".to_string(), clean),
+            ("hostile".to_string(), hostile),
+            ("lone_tail".to_string(), lone),
+        ];
+        let clip_series = series.clone();
+        assert_eq!(line_clip_owed(&clip_series, &ceil), Some(250.0));
+        // Green: the axis the policy draws is the clipped one, and the body it
+        // used to compress is at least twice the height it had before.
+        let plot_height = draw::line_plot_height(3, 0);
+        let unclipped = draw::extent_including_bounds(
+            draw::finite_extent(&clip_series),
+            &[(250.0, String::new())],
+        );
+        let clipped = line_axis_extent(&clip_series, &ceil, None, Some(plot_height));
+        let clean_values: Vec<f64> = clip_series[0].1.iter().map(|(_, y)| *y).collect();
+        let spread = clean_values.iter().cloned().fold(f64::MIN, f64::max)
+            - clean_values.iter().cloned().fold(f64::MAX, f64::min);
+        let before = spread / (unclipped.1 - unclipped.0) * plot_height;
+        let after = spread / (clipped.1 - clipped.0) * plot_height;
+        assert!(clipped.1 < 1400.0, "{clipped:?}");
+        assert!(after > 2.0 * before, "{before} -> {after}");
+        // The vacuity of the clip's own refusal: the same panel measured
+        // against the axis the old policy drew -- the data's own extent,
+        // outlier and all, with no clip stated -- is refused by name.
+        let problems = check_line_axis_clip_stated(
+            "latency",
+            Chart::Line,
+            &clip_series,
+            &ceil,
+            unclipped,
+            "<svg></svg>",
+            None,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("one outlier set the axis"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("1400"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn a_sliver_statement_is_not_owed_where_no_departure_is_drawn() {
+        // The statement is only the honest reading where the panel *shows* a
+        // departure: here the bound's furthest bar is below it and a pass, so
+        // the panel keeps the refusal.
+        let series = series_of("p99_ms", vec![(1.0, 35.3), (2.0, 81.8), (3.0, 98.5)]);
+        let mut bounds = vec![Bound::new(
+            100.0,
+            "M2 non-degrading p99 bound (ms)".to_string(),
+        )];
+        let axis = draw::bar_axis_extent(&series, &bounds, None, None);
+        assert!(
+            sliver_bound_statements(
+                &series,
+                &mut bounds,
+                axis,
+                draw::bar_plot_height(1) as f64,
+                None,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_departure_smaller_than_the_band_is_not_a_statement() {
+        // A departure has to be at least as legible as the six pixels the band
+        // is measured against, or the panel has nothing to state but the
+        // sliver itself. On a `0..5` axis `0.02` is 0.9 px and `0.2` is 9.1 px.
+        let bound = Bound::new(0.0, "synthetic bound".to_string());
+        let height = draw::bar_plot_height(1) as f64;
+        assert_eq!(
+            bound_sliver_statement(&bound, &[-0.02, 0.02], 0.005, (0.0, 5.0), height),
+            ""
+        );
+        let statement = bound_sliver_statement(&bound, &[-0.2, 0.2], 0.005, (0.0, 5.0), height);
+        assert!(
+            statement.contains("furthest -0.2, 9.1 px from the bound"),
+            "{statement}"
+        );
+    }
+
+    #[test]
+    fn a_panel_with_no_bound_states_none_by_design() {
+        let block = panel_summary_block(
+            &pyjson::parse(
+                r#"{"panel": "goodput", "chart": "bar", "axis": [0.0, 1.0],
+                "x_label": "rep (1..3)", "y_label": "MiB/s",
+                "series": [{"name": "goodput", "points": 3, "min": 0.948, "max": 0.953}],
+                "bounds": [], "reading": "goodput 0.948..0.953 (3 pts)", "fault": null}"#,
+            )
+            .expect("parses"),
+        );
+        assert!(block.contains("bound: none by design"), "{block}");
+        assert!(!block.contains("fault:"), "{block}");
+    }
+
+    fn panels_of(declaration: &str) -> Vec<Panel> {
+        let document = pyjson::parse(declaration).expect("parses");
+        validate_declaration(&document, Path::new("M.json"))
+            .expect("valid declaration")
+            .panels
+    }
+
+    fn points_of(rows: &[(&str, &str, &str, &str)]) -> Points {
+        let rows: Vec<(usize, String, String, String, String)> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (panel, series, x, y))| {
+                (
+                    index + 2,
+                    panel.to_string(),
+                    series.to_string(),
+                    x.to_string(),
+                    y.to_string(),
+                )
+            })
+            .collect();
+        parse_points(&rows).expect("points parse")
+    }
+
+    #[test]
+    fn the_guards_of_every_arm_on_a_line_panel_are_tokenised() {
+        // The run states a guard per arm and the panel draws the arms, so each
+        // guard is read off its own key and the panel's own legend
+        // (`lone` -> `lone_tail`); a guard for an arm this panel does not draw
+        // is left out rather than named against the wrong series.
+        let run = pyjson::parse(
+            r#"{"clean_p50": 24.4, "clean_p99": 93.1, "clean_max": 107.7,
+                "hostile_p50": 45.8, "hostile_p99": 231.8, "hostile_max": 277.1,
+                "lone_p50": 0.2, "lone_p99": 166.4, "lone_p999": 1465.8, "lone_max": 1567.1,
+                "ceiling": 250.0, "hostile_p99_guard": 900, "hostile_over250_guard": 8,
+                "lone_p99_guard": 3200, "lone_p999_guard": 8000, "lone_over250_guard": 8}"#,
+        )
+        .expect("parses");
+        let series: Series = vec![
+            ("clean".to_string(), vec![(1.0, 20.0)]),
+            ("hostile".to_string(), vec![(1.0, 100.0)]),
+            ("lone_tail".to_string(), vec![(1.0, 1600.0)]),
+        ];
+        let tokens = arm_guard_tokens(&series, Some(&run));
+        let hostile = tokens
+            .iter()
+            .find(|(arm, _)| arm == "hostile")
+            .expect("hostile's guards")
+            .clone();
+        let lone = tokens
+            .iter()
+            .find(|(arm, _)| arm == "lone_tail")
+            .expect("lone_tail's guards")
+            .clone();
+        assert_eq!(
+            hostile.1,
+            vec![
+                ("hostile_p99_guard".to_string(), "p99".to_string(), 900.0),
+                (
+                    "hostile_over250_guard".to_string(),
+                    "over250".to_string(),
+                    8.0
+                ),
+            ]
+        );
+        assert_eq!(
+            lone.1,
+            vec![
+                ("lone_p99_guard".to_string(), "p99".to_string(), 3200.0),
+                ("lone_p999_guard".to_string(), "p999".to_string(), 8000.0),
+                ("lone_over250_guard".to_string(), "over250".to_string(), 8.0),
+            ]
+        );
+        // Only the arms that have a guard are returned at all, and an arm the
+        // panel does not draw is not named against it.
+        let arms: Vec<String> = tokens.iter().map(|(arm, _)| arm.clone()).collect();
+        assert_eq!(arms, vec!["hostile".to_string(), "lone_tail".to_string()]);
+        assert!(
+            arm_guard_tokens(
+                &vec![("clean".to_string(), Vec::<(f64, f64)>::new())],
+                Some(&run)
+            )
+            .is_empty(),
+            "a guard for an arm the panel does not draw is not named against it"
+        );
+    }
+
+    #[test]
+    fn a_per_arm_bound_is_stated_only_where_the_run_restates_it() {
+        let panels = panels_of(
+            r#"{"mandate": "M2", "title": "t", "x_label": "arm", "y_label": "value",
+                "panels": [{"id": "latency", "chart": "bar",
+                    "series": [{"name": "p99_ms"}],
+                    "bounds": [{"y": 100.0, "label": "M2 non-degrading p99 bound (ms)"}]}]}"#,
+        );
+        let panel = &panels[0];
+        let series: Series = vec![(
+            "p99_ms".to_string(),
+            vec![(1.0, 26.251), (2.0, 61.5), (3.0, 185.8015)],
+        )];
+        let bounds = bound_specs(panel);
+        let run = pyjson::parse(
+            r#"{"clean_p99_ms": 26.251, "hostile_p99_ms": 61.5, "lone_p99_ms": 185.8015,
+                "hostile_p99_guard": 200.0, "lone_p99_guard": 400.0}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            arm_bound_values(panel, &series, &bounds, Some(&run)),
+            Some(vec![
+                ("clean".to_string(), 100.0),
+                ("hostile".to_string(), 200.0),
+                ("lone".to_string(), 400.0),
+            ])
+        );
+        // Vacuity: the same panel against a run that bears on a different
+        // quantity restates nothing, so the declaration's own bound stands.
+        let unrelated = pyjson::parse(
+            r#"{"flows": 4, "imbalance_bound": 0.01, "fair_share": 0.25,
+                "delivery_floor": 0.995, "hostile_p99_guard": 900.0}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            arm_bound_values(panel, &series, &bounds, Some(&unrelated)),
+            None
+        );
+        let effective = effective_bounds(panel, &series, &bounds, Some(&run));
+        assert_eq!(effective.len(), 3, "{effective:?}");
+        assert_eq!(effective[0].y, 100.0);
+        assert_eq!(effective[0].arms, Some(vec!["clean".to_string()]));
+        assert_eq!(effective[0].window, Some(vec![1.0]));
+        assert_eq!(effective[0].label, "M2 non-degrading p99 bound (ms)");
+        assert_eq!(effective[1].y, 200.0);
+        assert_eq!(effective[1].arms, Some(vec!["hostile".to_string()]));
+        assert_eq!(effective[1].window, Some(vec![2.0]));
+        assert_eq!(effective[1].label, "run hostile_p99_guard=200");
+        assert_eq!(effective[2].y, 400.0);
+        assert_eq!(effective[2].arms, Some(vec!["lone".to_string()]));
+        assert_eq!(effective[2].window, Some(vec![3.0]));
+        assert_eq!(effective[2].label, "run lone_p99_guard=400");
+    }
+
+    #[test]
+    fn a_panel_that_can_show_its_own_failure_owes_no_departure_note() {
+        // The check is about a bound the bars *straddle*, not about every bar
+        // panel: a floor is a line a bar can fail, so that panel can show its
+        // own failure and is left alone -- as is a share panel whose mandate
+        // declares no panel carrying the departure for it to name.
+        let panels = panels_of(
+            r#"{"mandate": "M4", "title": "t", "x_label": "flow", "y_label": "value",
+                "panels": [
+                    {"id": "delivery", "chart": "bar", "series": [{"name": "clean"}],
+                     "bounds": [{"y": 0.995, "label": "M4 per-flow delivery floor 0.995"}]},
+                    {"id": "shares", "chart": "bar", "series": [{"name": "clean"}],
+                     "bounds": [{"y": 0.25, "label": "fair share 25.0%"}]}]}"#,
+        );
+        let points = points_of(&[
+            ("delivery", "clean", "1.0", "1.0"),
+            ("shares", "clean", "1.0", "0.250029"),
+            ("shares", "clean", "2.0", "0.249912"),
+        ]);
+        let delivery = &panels[0];
+        let shares = &panels[1];
+        let delivery_series = panel_series(delivery, &points);
+        let shares_series = panel_series(shares, &points);
+        assert!(target_bounds(delivery, &delivery_series).is_empty());
+        assert_eq!(target_bounds(shares, &shares_series).len(), 1);
+        for panel in [delivery, shares] {
+            assert_eq!(departure_view_note(panel, &panels, &points), "");
+        }
+    }
+
+    #[test]
     fn a_legend_drawing_a_column_name_is_refused() {
         let series = series_of("shaper_forwarded", vec![(1.0, 1.0)]);
         let bad = "<svg><g class=\"legend\"><line/><text x=\"1\" y=\"1\">shaper_forwarded</text></g></svg>";
@@ -4043,5 +4341,291 @@ mod tests {
         assert!(!problems.is_empty(), "{problems:?}");
         let good = "<svg><g class=\"legend\"><line/><text x=\"1\" y=\"1\">shaper forwarded</text></g></svg>";
         assert!(check_series_labels("goodput", good, &series).is_empty());
+    }
+
+    // -- the checks ported from `tools/test_mandate_plot.py` -----------------
+    //
+    // Each of these reads the *drawn* artifact rather than trusting the code
+    // that wrote it, and each is paired with the markup that is green on the
+    // same rule, so the refusal is a measurement and not a predicate that is
+    // true of everything.
+
+    fn bars_of(name: &str, points: Vec<(f64, f64)>) -> Series {
+        series_of(name, points)
+    }
+
+    #[test]
+    fn a_bound_label_moved_to_the_canvas_origin_is_refused() {
+        let series = bars_of("s", vec![(1.0, 1.0), (2.0, 2.5)]);
+        let bounds = vec![Bound::new(2.0, "a bound".to_string())];
+        let markup = draw::svg_bar_chart("t", "x", "arm", &series, &bounds, None, None, "");
+        assert!(check_label_fit("p", &markup).expect("reads").is_empty());
+        // The same markup with its own label moved to the canvas origin: the
+        // vertical extent is width-free, so the left edge and the top are both
+        // what a misplaced label crosses.
+        let found = regex_dotall(r#"<text class="bound-label"[^>]*>"#)
+            .search(&markup)
+            .expect("the panel draws a bound label")
+            .group(0)
+            .unwrap_or_default();
+        let misplaced = markup.replacen(
+            &found,
+            "<text class=\"bound-label\" x=\"0.0\" y=\"0.0\">",
+            1,
+        );
+        assert_ne!(misplaced, markup);
+        let problems = check_label_fit("p", &misplaced).expect("reads");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("does not fit the plot area"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains("past its left edge"),
+            "{}",
+            problems[0]
+        );
+        assert!(problems[0].contains("above it"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn a_bound_label_drawn_twice_on_one_anchor_is_refused() {
+        // The fair-share panel the preserved run drew, whose label is a real
+        // annotation the first time.
+        let series = bars_of(
+            "clean",
+            vec![
+                (1.0, 0.250059),
+                (2.0, 0.250059),
+                (3.0, 0.249941),
+                (4.0, 0.249941),
+            ],
+        );
+        let bounds = vec![Bound::new(0.25, "fair share 25.0%".to_string())];
+        let markup = draw::svg_bar_chart("t", "x", "share", &series, &bounds, None, None, "");
+        assert!(check_label_overlap("shares", &markup).is_empty());
+        let element = regex_dotall(r#"<text class="bound-label".*?</text>"#)
+            .search(&markup)
+            .expect("a bound label")
+            .group(0)
+            .unwrap_or_default();
+        // Red: the artifact with its own label duplicated on the same anchor.
+        let duplicated = markup.replacen(&element, &format!("{element}{element}"), 1);
+        let problems = check_label_overlap("shares", &duplicated);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("drawn twice on the same anchor"),
+            "{}",
+            problems[0]
+        );
+        // Red: two *different* labels over one another are an overlap.
+        let other = element.replace("fair share 25.0%", "fair-share bound");
+        let overlapping = markup.replacen(&element, &format!("{element}{other}"), 1);
+        let problems = check_label_overlap("shares", &overlapping);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("overlap"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn bars_drawn_flush_are_refused() {
+        // The geometry the preserved run drew: three 311 px bars whose
+        // rectangles overlapped, which the eye read as one staircase.
+        let staircase = r##"<svg viewBox="0 0 960 300">
+            <rect x="72.0" y="178.2" width="311.0" height="73.8" fill="#2563eb"/>
+            <rect x="331.2" y="90.1" width="311.0" height="161.9" fill="#2563eb"/>
+            <rect x="590.4" y="31.3" width="311.0" height="220.7" fill="#2563eb"/>
+            </svg>"##;
+        let problems = check_bar_separation("latency", staircase);
+        assert!(!problems.is_empty());
+        assert!(
+            problems[0].contains("overlap by 51.8 px"),
+            "{}",
+            problems[0]
+        );
+        // Green: a panel the renderer drew has its bars apart.
+        let series = bars_of("p99_ms", vec![(1.0, 26.251), (2.0, 61.5), (3.0, 185.8)]);
+        let bounds = vec![Bound::new(
+            100.0,
+            "M2 non-degrading p99 bound (ms)".to_string(),
+        )];
+        let markup = draw::svg_bar_chart("t", "x", "value", &series, &bounds, None, None, "");
+        assert_eq!(bar_boxes(&markup).len(), 3);
+        assert!(check_bar_separation("latency", &markup).is_empty());
+    }
+
+    #[test]
+    fn a_clipped_axis_label_and_an_empty_placeholder_are_refused() {
+        // Red: the y label the old renderer wrote with its band-view note
+        // appended is long enough to run off the canvas when it is rotated
+        // down the left margin.
+        let series = bars_of("delivery", vec![(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)]);
+        let long = "delivery (received / offered) [band view 0.979..1.001, not 0-based]";
+        let markup = draw::svg_bar_chart("t", "arm", long, &series, &[], None, None, "");
+        let problems = check_canvas_text_fit("delivery", &markup);
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("draws it clipped")),
+            "{problems:?}"
+        );
+        // Red: a drawn label carrying the empty template its absent evidence
+        // left behind.
+        let bounds = vec![Bound::new(1.0, "M2 delivery floor 1.000 []".to_string())];
+        let templated =
+            draw::svg_bar_chart("t", "arm", "delivery", &series, &bounds, None, None, "");
+        let problems = check_canvas_text_fit("delivery", &templated);
+        assert!(
+            problems.iter().any(|p| p.contains("empty placeholder")),
+            "{problems:?}"
+        );
+        // Green: the same panel with the measurement in place of the template.
+        let bounds = vec![Bound::new(1.0, "M2 delivery floor 1.000".to_string())];
+        let good = draw::svg_bar_chart("t", "arm", "delivery", &series, &bounds, None, None, "");
+        assert!(check_canvas_text_fit("delivery", &good).is_empty());
+        assert_eq!(
+            draw::band_view_note((0.979, 1.001)),
+            "band view 0.979..1.001, not 0-based"
+        );
+        assert_eq!(draw::band_view_note((0.0, 0.26)), "");
+    }
+
+    #[test]
+    fn a_named_guard_the_axis_does_not_reach_is_refused() {
+        let bounds = vec![Bound::new(
+            100.0,
+            "M2 non-degrading p99 bound (ms)".to_string(),
+        )];
+        // Red: an axis that tops out below a guard the panel's own label names.
+        let problems = check_named_values_in_axis(
+            "latency",
+            &bounds,
+            &[200.0, 400.0],
+            (0.0, 190.0),
+            Some(228.0),
+        );
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("named guard 200")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("does not resolve")),
+            "{problems:?}"
+        );
+        // Green: the automatic axis carries every guard, with the inset a
+        // named value needs.
+        assert!(
+            check_named_values_in_axis(
+                "latency",
+                &bounds,
+                &[200.0, 400.0],
+                (0.0, 450.0),
+                Some(228.0)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_axis_with_no_room_over_its_bound_is_refused() {
+        let bounds = vec![Bound::new(0.25, "fair share 25.0%".to_string())];
+        // Red: the axis the audit found -- 0..0.25, the bound itself, so a bar
+        // over the share is clipped at the line the panel exists to watch.
+        let problems = check_bound_headroom("shares", &bounds, &[], (0.0, 0.25), Some(228.0), None);
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("over-bound bar")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("same picture")),
+            "{problems:?}"
+        );
+        // Green: the automatic extent keeps the pixel floor above the bound.
+        assert!(
+            check_bound_headroom("shares", &bounds, &[], (0.0, 0.2601), Some(228.0), None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_axis_label_carried_from_a_sibling_panel_is_refused() {
+        let series = series_of("fraction", vec![(1.0, 0.958217), (2.0, 0.958271)]);
+        // Red: the goodput panel's unit carried over the mandate's shared
+        // y_label onto a single-series fraction panel.
+        let problems = check_axis_label("fraction", "MiB/s", &series, None, "MiB/s");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("MiB/s"), "{}", problems[0]);
+        // Green: the label a single-series panel draws for itself, a panel
+        // that states its own label, and a panel with several series.
+        assert!(
+            check_axis_label("fraction", "fraction of link rate", &series, None, "MiB/s")
+                .is_empty()
+        );
+        assert!(check_axis_label("fraction", "MiB/s", &series, Some("MiB/s"), "MiB/s").is_empty());
+        let several: Series = vec![
+            ("delivered".to_string(), vec![]),
+            ("shaper_forwarded".to_string(), vec![]),
+        ];
+        assert!(check_axis_label("goodput", "MiB/s", &several, None, "MiB/s").is_empty());
+    }
+
+    #[test]
+    fn an_x_axis_that_contradicts_the_runs_categories_is_refused() {
+        let run = pyjson::parse(r#"{"reps": 3, "measured_s": 18.0}"#).expect("parses");
+        // Red: a panel drawing one bar per repetition (x=1..3) labelled `seed`.
+        let problems = check_x_axis_label("fraction", "seed", &[1.0, 2.0, 3.0], Some(&run));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("seed"), "{}", problems[0]);
+        assert!(problems[0].contains("reps=3"), "{}", problems[0]);
+        assert!(
+            check_x_axis_label("fraction", "rep (1..3)", &[1.0, 2.0, 3.0], Some(&run)).is_empty()
+        );
+        // Green: categories that are not the run's repetitions, or a run with
+        // no repetition count, keeps the declaration's label.
+        assert!(check_x_axis_label("goodput", "seed", &[11.0, 21.0, 31.0], Some(&run)).is_empty());
+        let fewer = pyjson::parse(r#"{"reps": 3}"#).expect("parses");
+        assert!(check_x_axis_label("fraction", "seed", &[1.0, 2.0], Some(&fewer)).is_empty());
+    }
+
+    #[test]
+    fn a_reading_the_panel_does_not_state_is_refused() {
+        // A climb the window cut off: the shape the eye cannot tell from a
+        // peak that returned, and the shape the run's own detector classified.
+        let reading = pyjson::parse(
+            r#"{"lone_tail": {"verdict": "Censored", "rungs_at_edge": 1.0, "room": 1200.0}}"#,
+        )
+        .expect("parses");
+        let series = series_of(
+            "lone_tail",
+            (1..7)
+                .map(|index| (index as f64 * 0.25, index as f64 * 300.0))
+                .collect(),
+        );
+        let readings = panel_readings(&series, Some(&reading));
+        assert_eq!(readings.len(), 1);
+        // Red: a panel drawn without the run's reading is refused by name.
+        let problems = check_readings_stated("latency", &series, &readings, "<svg></svg>");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("Censored"), "{}", problems[0]);
+        assert!(
+            problems[0].contains("the opposite conclusion"),
+            "{}",
+            problems[0]
+        );
+    }
+
+    #[test]
+    fn a_reading_band_that_eats_the_plot_is_refused() {
+        // Three arms of readings leave most of the plot; a band that leaves too
+        // little is refused rather than drawn.
+        assert!(check_reading_band("latency", draw::line_plot_height(3, 6)).is_empty());
+        let problems = check_reading_band("latency", draw::line_plot_height(3, 20));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("shape its readings are about"),
+            "{}",
+            problems[0]
+        );
     }
 }

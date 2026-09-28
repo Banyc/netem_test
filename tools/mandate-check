@@ -49,6 +49,46 @@ def find_binary() -> Path | None:
     return None
 
 
+# The battery renders every panel through the Rust `netem-tools mandate-plot`
+# subcommand, so that binary has to exist before the battery runs. It is built
+# here when it is missing because this script is the documented entry point and
+# an operator who runs it should not have to know a second build command. A
+# build that fails is reported and the battery is left to fail with the
+# plotter's own message rather than this script's paraphrase of it.
+PLOT_BINARY_CANDIDATES = (
+    TOOLS_DIR.parent / "target" / "release" / "netem-tools",
+    TOOLS_DIR.parent / "netem-test" / "target" / "release" / "netem-tools",
+)
+PLOT_BUILD = (
+    "cargo", "build", "--release", "-p", "netem-test",
+    "--features", "cli", "--bin", "netem-tools",
+)
+
+
+def ensure_plotter() -> None:
+    if any(candidate.is_file() for candidate in PLOT_BINARY_CANDIDATES):
+        return
+    print(
+        "mandate-check: the panel plotter is not built; building it with "
+        + " ".join(PLOT_BUILD),
+        file=sys.stderr,
+    )
+    try:
+        completed = subprocess.run(PLOT_BUILD, cwd=str(TOOLS_DIR.parent), check=False)
+    except OSError as error:
+        print(
+            f"mandate-check: warning: could not build the panel plotter: {error}",
+            file=sys.stderr,
+        )
+        return
+    if completed.returncode != 0:
+        print(
+            "mandate-check: warning: the panel plotter build failed, so the run's "
+            "panels cannot be rendered",
+            file=sys.stderr,
+        )
+
+
 def run_dir_from(argv) -> Path | None:
     """The `--dir` the battery was given, else the runner's own default."""
     for index, arg in enumerate(argv):
@@ -94,6 +134,7 @@ def main() -> int:
     sys.path.insert(0, str(TOOLS_DIR))
     from mandate_check import main as battery_main  # type: ignore
 
+    ensure_plotter()
     battery_status = battery_main(argv)
     if "--no-history" in argv:
         return battery_status

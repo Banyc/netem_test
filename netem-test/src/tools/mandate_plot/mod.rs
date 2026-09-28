@@ -2026,4 +2026,29 @@ mod tests {
         );
         assert_eq!(repeated_category_index(&[1.0, 2.0], Some(&run)), None);
     }
+
+    #[test]
+    fn a_tick_that_rounds_to_zero_is_not_drawn_negative() {
+        // A band view starting a few ten-thousandths below zero used to draw
+        // its tick as `-0.00` under an all-positive panel: a sign the value
+        // does not mean.
+        assert_eq!(tick_label(-0.000344, 2), "0.00");
+        assert_eq!(tick_label(-1.5, 2), "-1.50");
+        assert_eq!(tick_label(0.25, 2), "0.25");
+    }
+
+    #[test]
+    fn the_value_at_a_bound_is_read_off_the_drawn_segment() {
+        // Interpolated between the bracketing samples, clamped at the series'
+        // own end, and no value at all for a series with no samples.
+        assert_eq!(
+            value_at(&[(0.0, 0.0), (100.0, 50.0), (200.0, 100.0)], 150.0),
+            Some(75.0)
+        );
+        assert_eq!(value_at(&[(0.0, 0.0), (100.0, 100.0)], 250.0), Some(100.0));
+        assert_eq!(value_at(&[], 250.0), None);
+        assert_eq!(panel_unit("percentile (%)"), "%");
+        assert_eq!(panel_unit("latency (ms)"), "ms");
+        assert_eq!(panel_unit("share"), "");
+    }
 }

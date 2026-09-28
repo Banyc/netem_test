@@ -1,6 +1,7 @@
-# `kind TAB value-repr TAB spec` for every pair mandate_plot.py
-# actually formats, captured by tools/pyformat_instrument.py from the
-# recorded runs. 250 renders, 66293 float and
+# `kind TAB value-repr TAB spec` for every pair the panel plotter
+# (then `tools/mandate_plot.py`, now `netem-tools mandate-plot`) actually
+# formats, captured by tools/pyformat_instrument.py from the
+# recorded runs (both tools since deleted). 250 renders, 66293 float and
 # 401616 int format calls, 14900 distinct pairs.
 f	-0.000112	g
 f	-0.000113	g

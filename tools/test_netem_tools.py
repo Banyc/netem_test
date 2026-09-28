@@ -985,8 +985,10 @@ class PyFormatTest(unittest.TestCase):
 
     def test_the_realized_pairs_from_the_recorded_runs_agree(self):
         # `tools/pyformat-realized-pairs.txt` is the set of float (spec, value)
-        # pairs `mandate_plot.py` actually formats, captured from the recorded
-        # runs by `tools/pyformat_instrument.py`. This is the tightest form of
+        # pairs the plot tool actually formats, captured from the recorded runs
+        # by `tools/pyformat_instrument.py` while the plotter was still
+        # `tools/mandate_plot.py` (both since deleted; the fixture is committed).
+        # This is the tightest form of
         # the claim: not a cross product, the calls themselves -- including the
         # ones inside refusal strings, which come from runs the plot refuses.
         pairs_file = TOOLS / "pyformat-realized-pairs.txt"
@@ -1202,7 +1204,8 @@ class MandatePlotTest(unittest.TestCase):
     """Exercise `netem-tools mandate-plot`'s render, its summary and its refusals.
 
     The plotter was `tools/mandate_plot.py`, which `tools/mandate-check` imported
-    in-process; this is the command-line contract of the port, so every case runs
+    in-process and which is now deleted; this is the command-line contract of the
+    port, so every case runs
     the *binary*. Each refusal that makes a panel's own statement forced has a
     case, and the pair of a refusal with its rendering sibling is stated rather
     than implied: a bound the axis cannot resolve is refused, and the same bound

@@ -49,7 +49,7 @@ of the tag against itself.
 The one-command, always-run instrument for the interactive path is
 `tools/mandate-check`. It runs `rtp_mux`'s tri-mandate smoke set
 (`cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`),
-renders each mandate's panels through `tools/mandate_plot.py`, prints a
+renders each mandate's panels through `netem-tools mandate-plot`, prints a
 verdict line per mandate, and writes `mandate-check.json` so a reader can
 verify from a machine that the mandated checks ran and what they measured:
 

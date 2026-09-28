@@ -1,6 +1,7 @@
 //! The JSON and text-repr codec the ported plot tool needs.
 //!
-//! `tools/mandate_plot.py` reads two kinds of JSON document and writes a third,
+//! `netem-tools mandate-plot` (the port of `tools/mandate_plot.py`, now deleted)
+//! reads two kinds of JSON document and writes a third,
 //! and the three are not interchangeable:
 //!
 //! - its **inputs** (the panel declaration, and the runner's per-arm `MANDATE`

@@ -3,7 +3,7 @@
 
 The mandate smoke set is ``rtp_mux``'s ``mandate_smoke`` test target. This
 command runs it with ``--release``, renders each mandate's panels through
-``tools/mandate_plot.py``, prints one verdict line per mandate, and writes
+``netem-tools mandate-plot``, prints one verdict line per mandate, and writes
 ``mandate-check.json`` into the run directory so a reader (or a master agent)
 can verify from a machine, not from prose, that the mandated checks ran and
 what they measured.
@@ -104,7 +104,7 @@ crate's author follows; the runners and the failure modes are these.
        <dir>/M1.json <dir>/M1.csv <dir>/M2.json <dir>/M2.csv
        <dir>/M3.json <dir>/M3.csv <dir>/M4.json <dir>/M4.csv
 
-   in exactly the shape ``tools/mandate_plot.py`` consumes: ``<mandate>.json``
+   in exactly the shape ``netem-tools mandate-plot`` consumes: ``<mandate>.json``
    is the panel declaration (``mandate``, ``title``, ``x_label``, ``y_label``
    and a non-empty ``panels`` list of ``id``/``chart``/``series``/``bounds``),
    and ``<mandate>.csv`` carries the plotted points under the header
@@ -296,7 +296,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import importlib.util
 import json
 import math
 import os
@@ -511,7 +510,7 @@ pixels: a peak that returned and a climb cut off by the window's end are the
 same shape, and a hole in the sampling draws as a wall. So the smoke set prints
 one row per arm carrying the arm's own censoring reading (`verdict`,
 `rungs_at_edge`, the arm's `room`), this command hands those readings to
-`tools/mandate_plot.py`, and the panel states them per arm. A producer that
+`netem-tools mandate-plot`, and the panel states them per arm. A producer that
 declares M1 without printing them is refused: the panel would be drawn for a
 failure it cannot show.
 """
@@ -542,16 +541,70 @@ TIMING_METHOD = (
 )
 
 
-def _load_sibling(name):
-    """Load a sibling tool by path, the way the other tools load each other."""
-    path = MODULE_DIR / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+# -- the panel plotter ---------------------------------------------------------
+#
+# The plotter was `tools/mandate_plot.py`, which this command imported
+# in-process. It is now the `netem-tools mandate-plot` subcommand
+# (`netem-test/src/tools/mandate_plot/`), so one implementation renders and
+# verifies the panels and there is no second copy of the rules to drift from
+# it. The runner invokes the binary and reads back its `--json` summary, which
+# carries the same keys the in-process call returned: the panel count, the
+# series counts, each panel's summary document, the SVG (and PNG) paths, and
+# the censoring arms the panels stated.
+
+PLOT_TOOL = "netem-tools"
+
+# Where `cargo build --release -p netem-test --features cli --bin netem-tools`
+# puts the binary. Both the workspace target and the crate's own target are
+# looked at: a build from the workspace root writes the first and one from the
+# crate directory the second, and guessing wrong reads as "the plotter is
+# missing" rather than as a path that was never checked.
+PLOT_BINARY_CANDIDATES = (
+    WORKSPACE_ROOT / "target" / "release" / PLOT_TOOL,
+    WORKSPACE_ROOT / "target" / "debug" / PLOT_TOOL,
+    WORKSPACE_ROOT / "netem-test" / "target" / "release" / PLOT_TOOL,
+    WORKSPACE_ROOT / "netem-test" / "target" / "debug" / PLOT_TOOL,
+)
+
+PLOT_BUILD_COMMAND = "cargo build --release -p netem-test --features cli --bin netem-tools"
+
+# The render is bounded rather than trusted to finish: a plotter that hangs is
+# an evidence failure to report, not a run to wait on forever. The bound is far
+# above the slowest measured render (the PNG step resolves a browser per panel)
+# so it fires on a hang and not on a slow machine.
+PLOT_TIMEOUT_SECONDS = 1800.0
 
 
-MANDATE_PLOT = _load_sibling("mandate_plot")
+def plot_binary():
+    """The built `netem-tools`, or a failure naming the command that builds it.
+
+    A missing plotter is an error rather than a skip: the panels are the
+    evidence a run is read from, so a run that cannot render them has not
+    measured anything.
+    """
+    for candidate in PLOT_BINARY_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    raise MandateCheckError(
+        f"the panel plotter {PLOT_TOOL!r} is not built, so no panel can be "
+        f"rendered; build it with `{PLOT_BUILD_COMMAND}` from {WORKSPACE_ROOT}"
+    )
+
+
+def _plot_error(stderr):
+    """The plotter's own error sentence, out of its `mandate_plot: error:` line.
+
+    The binary prints one ``mandate_plot: error: <message>`` line to stderr for
+    every refusal, which is the same shape the Python tool's command line had,
+    so a reader sees the plotter's sentence and not a wrapper's paraphrase. A
+    non-zero exit *without* that line (a usage error, a crash) is reported as
+    the stderr the binary did print rather than as an empty message.
+    """
+    text = stderr.strip()
+    prefix = "mandate_plot: error: "
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text or "the plotter exited non-zero without a message"
 
 
 class MandateCheckError(Exception):
@@ -1801,18 +1854,47 @@ def render_mandate(
             problems.append(f"{mandate}: {kind} {path} is empty")
     if problems:
         return None, problems
+    command = [
+        str(plot_binary()),
+        "mandate-plot",
+        str(declaration),
+        "--out",
+        str(out_dir / PLOTS_DIRNAME),
+        "--json",
+    ]
+    if not rasterize:
+        command.append("--no-rasterize")
+    if browser is not None:
+        command += ["--browser", browser]
+    if run_values is not None:
+        command += ["--run-values", json.dumps(run_values)]
+    if run_censoring is not None:
+        command += ["--run-censoring", json.dumps(run_censoring)]
+    if fault is not None:
+        command += ["--fault", fault]
     try:
-        summary = MANDATE_PLOT.render_mandate(
-            declaration,
-            out_dir / PLOTS_DIRNAME,
-            rasterize=rasterize,
-            browser=browser,
-            run_values=run_values,
-            run_censoring=run_censoring,
-            fault=fault,
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=PLOT_TIMEOUT_SECONDS,
+            check=False,
         )
-    except (MANDATE_PLOT.MandatePlotError, MANDATE_PLOT.RENDER.RenderGraphError) as error:
-        return None, [f"{mandate}: {error}"]
+    except subprocess.TimeoutExpired:
+        return None, [
+            f"{mandate}: the panel plotter did not finish within "
+            f"{PLOT_TIMEOUT_SECONDS:.0f}s and was killed"
+        ]
+    except OSError as error:
+        return None, [f"{mandate}: the panel plotter could not be run: {error}"]
+    if completed.returncode != 0:
+        return None, [f"{mandate}: {_plot_error(completed.stderr)}"]
+    try:
+        summary = json.loads(completed.stdout)
+    except ValueError as error:
+        return None, [
+            f"{mandate}: the panel plotter's --json summary could not be read: {error}"
+        ]
     return summary, []
 
 

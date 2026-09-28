@@ -597,7 +597,7 @@ It runs `cargo test --release -p rtp_mux --test mandate_smoke -- -Z
 unstable-options --report-time --nocapture` (the two timing flags are the
 runner's own, so every test's reported duration is libtest's own measurement of
 that test rather than a bracket between two lines' arrivals),
-renders one validated SVG+PNG per panel through `tools/mandate_plot.py`, prints
+renders one validated SVG+PNG per panel through `netem-tools mandate-plot`, prints
 a verdict block and writes `mandate-check.json` alongside the eight evidence
 files. Measured cost: **216.3 s** on a warm build (10 panels, 20 SVG+PNG plot
 files). It **refuses
@@ -906,7 +906,11 @@ file is still read, but it carries
 one producer's arms only, so a run compared against it cannot show the second
 producer's coverage — re-record rather than compare across the addition.
 
-### `tools/mandate_plot.py` — the validated panel renderer
+### `netem-tools mandate-plot` — the validated panel renderer
+
+(Once `tools/mandate_plot.py`, which `mandate-check` imported in-process; the
+Python twin is deleted and this is the one implementation, so there is nothing
+left for the two to disagree about.)
 
 Reads a `<mandate>.json` panel declaration and its `<mandate>.csv`, writes one
 verified SVG per panel (and a PNG by default). It **refuses** a malformed

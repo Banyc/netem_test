@@ -401,7 +401,7 @@ def reading_lines(readings, plot_width=None):
     """The wrapped lines of each ``(name, sentence)`` reading, in draw order.
 
     ``svg_line_chart`` reserves one line height per line this returns, and
-    ``tools/mandate_plot.py`` measures the drawn plot against the height that
+    ``netem-tools mandate-plot`` measures the drawn plot against the height that
     reservation leaves, so both read the geometry from this one function.
     """
     if not readings:

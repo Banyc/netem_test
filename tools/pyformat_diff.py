@@ -49,8 +49,8 @@ TOOLS = Path(__file__).resolve().parent
 CRATE = TOOLS.parent
 CORPUS = TOOLS / "pyformat-corpus.txt"
 
-# The specs the mandated plot path applies, read out of `mandate_plot.py`'s
-# f-strings by its own AST: `g` x44, `:.1f` x67, `:.4g` x30, `:.0f` x13,
+# The specs the mandated plot path applies, read out of the Python plot tool's
+# f-strings by its own AST before the port to `netem-tools mandate-plot`: `g` x44, `:.1f` x67, `:.4g` x30, `:.0f` x13,
 # `:.2f` x14, `:+.4g` x2, `:.6g` x2, `:.1%` x3, `:.0%` x3, `:.2%` x1, plus the
 # two dynamic families `:.{decimals}f` (decimals 2..6) and `:.{decimals}g`
 # (decimals 2..8). The empty spec is the one `{path}`, `{error}` and the bare
