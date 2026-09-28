@@ -1,16 +1,22 @@
-# The producer contract: what a perf test binary owes `tools/mandate-check`
+# The producer contract: what a perf test binary owes `rtp_mux/tools/mandate-check`
 
-`tools/mandate-check` is the one command that runs every **producer** of perf
+The mandate runner lives in the sibling `rtp_mux` checkout, not in this one:
+it is `rtp_mux/tools/mandate-check`, an `sh` shim over `netem-tools
+mandate-check` (built with `cargo build --release -p rtp_mux --features perf
+--bin netem-tools`). Every `tools/mandate-check`, `./tools/mandate-check` and
+`netem-tools <subcommand>` below names that checkout's tool, while the other
+`tools/…` paths here (`tools/PERF_INFRA.md`, the Python capture tooling) are
+this crate's. It is the one command that runs every **producer** of perf
 arms, renders each mandate's panels, prints a verdict, and leaves evidence a
 machine can check: per arm, its sample count, the statistics and counters it
 measured, the windows it measured them over, and the coverage cells it is
 declared to exercise. What the mandates are for, what built them, and the
 wider tool and gate inventory are in `tools/PERF_INFRA.md`; this file is the
 contract, and it is the form a crate's author follows to make a new test
-binary recordable. Run it from this workspace root with no arguments:
+binary recordable. Run it from the `rtp_mux` checkout with no arguments:
 
 ```sh
-./tools/mandate-check
+cd ../rtp_mux && ./tools/mandate-check
 ```
 
 It then runs every producer declared in `rtp_mux/tools/mandate-producers.json`, so one
@@ -89,7 +95,7 @@ it is asked to measure.
 
 ## The producer contract
 
-`tools/mandate-check` refuses a run that does not satisfy the parts of this
+`rtp_mux/tools/mandate-check` refuses a run that does not satisfy the parts of this
 contract its producer owes. It cannot tell a compliant producer from a
 changed one any other way. Rule 1 and rule 6 are owed by every producer; rules
 2, 3 and 4 are owed by a producer that declares a **verdict** section, which
@@ -228,7 +234,7 @@ Into `--dir` (the path is printed, and recorded in the report):
   paints an absence as a near-vertical climb, and the two readings of the
   `M1-latency` panel are the same pixels, so the panel states the instrument's
   verdict instead of leaving it to the reader's eye;
-- `mandate-check.json` — `schema` (`mandate-check/9`), `ok`, `exit_code`,
+- `mandate-check.json` — `schema` (`mandate-check/10`), `ok`, `exit_code`,
   `verdict`, `started_at`, `duration_seconds`, `producers_declared` and
   `producers_selected`, a `producers` record per *declared* producer (`id`,
   `package`, `target`, `source`, `selected`, the resolved `path`, `sections`,
@@ -434,7 +440,7 @@ report whose `schema` predates `mandate-check/3` (the per-arm record; `/3`,
 `/4` and `/5` are all read), a report carrying no arms, a
 candidate recorded with a different window set from the baseline's, and a
 coverage cell the gate checker's grammar rejects. The committed baseline must
-therefore be re-recorded with a current `tools/mandate-check` before it can
+therefore be re-recorded with a current `rtp_mux/tools/mandate-check` before it can
 certify anything — a baseline from before the per-arm record is refused, not
 read as agreement.
 

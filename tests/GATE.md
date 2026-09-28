@@ -432,7 +432,7 @@ lane is where it must always hold).
 
 `perf-loop run --fail-on-wakes-cap <WAKES_PER_GIB>` exits 2 when any valid
 pair's per-endpoint protocol-timer wakes per GiB of delivered application
-bytes exceeds the cap. The counters already exist in the trace (schema 28)
+bytes exceeds the cap. The counters already exist in the comparison (schema 28)
 and were compared only; the flag makes the absolute ceiling asserting. On the
 deterministic controller-fat-pipe lane the delivered rate is link-shaped
 (~12 MiB/s), so wakes/GiB is a fixed ratio — measured 0 sender / ~21.5k peer
@@ -613,7 +613,7 @@ The four `probe-*` rows are more than a declaration: their tests are a
 coverage-neutral rather than argued so. Each of the harness's four perf-tier
 probes prints one `[mandate-smoke <arm>] section=probe <key>=<value> ...` line
 carrying the arm's sample count — the iteration count it actually ran — and the
-rates it measured, and `tools/mandate-check` records those arms in the same
+rates it measured, and `rtp_mux/tools/mandate-check` records those arms in the same
 report as `rtp_mux`'s, which is what the `mandate-compare` subcommand diffs against
 `rtp_mux/mandate-baseline.json`.
 

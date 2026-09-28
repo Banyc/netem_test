@@ -272,25 +272,27 @@ diagnostic prints today).
 
 | `DocCount` label (keys) | prose | new owner |
 | --- | --- | --- |
-| `producers declared` (`producers`) | `tools/PERF_INFRA.md:826`, `tools/MANDATE_SMOKE.md:55` | `rtp_mux/tools/mandate-producers.json`, the `producers[]` array |
-| `the ordinal after the declared producers` (`next_producer`) | `tools/MANDATE_SMOKE.md:62` | the same array, one past its end |
-| `evidence files per run` (`evidence_files`) | `tools/PERF_INFRA.md:612`, `:831`, `tools/MANDATE_SMOKE.md:59`, `:155`, `:330` | `rtp_mux/tools/mandate-producers.json`, `2 x len(producers[id=rtp_mux].verdicts)` |
-| `MANDATE lines per run` (`verdicts`) | `tools/MANDATE_SMOKE.md:154` | the same `verdicts[]` array |
-| `panels and plot files of a mandate-check run` (`baseline_panels`, `baseline_plot_files`) | `tools/PERF_INFRA.md:613` | `rtp_mux/mandate-baseline.json`, the summed `mandates[*].panels` (twice for the plot files) |
-| `mandates and verified panels of the baseline run` (`verdicts`, `baseline_panels`) | `tools/PERF_INFRA.md:964` | both of the above |
-| `arms recorded in the baseline run` (`arms_total`) | `tools/PERF_INFRA.md:965` | `rtp_mux/mandate-baseline.json`, `len(arms)` |
-| `rtp_mux arms in the baseline run` (`arms_rtp_mux`) | `tools/PERF_INFRA.md:965` | the same `arms[]`, `producer == "rtp_mux"` |
-| `per-mandate arm counts in the baseline run` (`arms_M1`..`arms_M4`) | `tools/PERF_INFRA.md:966` | the same `arms[]`, grouped by `mandate` |
-| `probes recorded in the baseline run` (`baseline_probes`) | `tools/PERF_INFRA.md:966` | the same `arms[]`, `producer == "netem_test"` |
-| `probe arms in the probe section` (`arms_probe`) | `tools/PERF_INFRA.md:836`, `tools/MANDATE_SMOKE.md:60` | `rtp_mux/mandate-arms.json`, the `probe/` keys of `cells` |
-| `perf-tier probes of the harness` (`arms_probe`) | `tools/PERF_INFRA.md:832`, `tools/MANDATE_SMOKE.md:60` | the same `probe/` keys |
-| `duration of the baseline run` (`baseline_duration`) | `tools/PERF_INFRA.md:964` | `rtp_mux/mandate-baseline.json`, `duration_seconds` |
-| `producers a two-producer case runs` (`producers`) | `tools/MANDATE_SMOKE.md:469` | `rtp_mux/tools/mandate-producers.json`, the `producers[]` array |
-| `counted floors applied to an unstated lane` (`count_floor_counters`) | `tools/MANDATE_SMOKE.md:421` | `rtp_mux/src/tools/mandate_compare.rs`, the `COUNT_FLOORS_BYTES` const array |
+| `producers declared` (`producers`) | `tools/PERF_INFRA.md` "Two producers are declared and covered today"; `tools/MANDATE_SMOKE.md` "Two producers are declared today" | `rtp_mux/tools/mandate-producers.json`, the `producers[]` array |
+| `the ordinal after the declared producers` (`next_producer`) | `tools/MANDATE_SMOKE.md` "A third producer is a registry entry" | the same array, one past its end |
+| `evidence files per run` (`evidence_files`) | `tools/PERF_INFRA.md` "writes `mandate-check.json` alongside the eight evidence files" and "the eight evidence files"; `tools/MANDATE_SMOKE.md` "the eight evidence files", "writing all eight evidence files", "The eight expected evidence files" | `rtp_mux/tools/mandate-producers.json`, `2 x len(producers[id=rtp_mux].verdicts)` |
+| `MANDATE lines per run` (`verdicts`) | `tools/MANDATE_SMOKE.md` "all four `MANDATE` lines" | the same `verdicts[]` array |
+| `panels and plot files of a mandate-check run` (`baseline_panels`, `baseline_plot_files`) | `tools/PERF_INFRA.md` "12 panels, 24 SVG+PNG plot files" | `rtp_mux/mandate-baseline.json`, the summed `mandates[*].panels` (twice for the plot files) |
+| `mandates and verified panels of the baseline run` (`verdicts`, `baseline_panels`) | `tools/PERF_INFRA.md` "passed all four mandates with 12 verified SVG panels" | both of the above |
+| `arms recorded in the baseline run` (`arms_total`) | `tools/PERF_INFRA.md` "23 arms from both producers" | `rtp_mux/mandate-baseline.json`, `len(arms)` |
+| `rtp_mux arms in the baseline run` (`arms_rtp_mux`) | `tools/PERF_INFRA.md` "23 arms from both producers" | the same `arms[]`, `producer == "rtp_mux"` |
+| `per-mandate arm counts in the baseline run` (`arms_M1`..`arms_M4`) | `tools/PERF_INFRA.md` "3 M1, 3 M2, 3 M3 reps and 10 M4 arms" | the same `arms[]`, grouped by `mandate` |
+| `probes recorded in the baseline run` (`baseline_probes`) | `tools/PERF_INFRA.md` "the 4 probes" | the same `arms[]`, `producer == "netem_test"` |
+| `probe arms in the probe section` (`arms_probe`) | `tools/PERF_INFRA.md` "four report-only arms in the `probe` section"; `tools/MANDATE_SMOKE.md` "4 arms in the `probe` section" | `rtp_mux/mandate-arms.json`, the `probe/` keys of `cells` |
+| `perf-tier probes of the harness` (`arms_probe`) | `tools/PERF_INFRA.md` "this workspace's four perf-tier probes"; `tools/MANDATE_SMOKE.md` "this workspace's four perf-tier probes" | the same `probe/` keys |
+| `duration of the baseline run` (`baseline_duration`) | `tools/PERF_INFRA.md` "The run took **189.7 s**" | `rtp_mux/mandate-baseline.json`, `duration_seconds` |
+| `producers a two-producer case runs` (`producers`) | `tools/MANDATE_SMOKE.md` "Its two-producer cases run both producers" | `rtp_mux/tools/mandate-producers.json`, the `producers[]` array |
+| `counted floors applied to an unstated lane` (`count_floor_counters`) | `tools/MANDATE_SMOKE.md` "`COUNT_FLOORS_BYTES`, the two bulk-lane byte counters" | `rtp_mux/src/tools/mandate_compare.rs`, the `COUNT_FLOORS_BYTES` const array |
 
 The prose here is **not** stale. Every sentence is still present, and the
-ones that name a source already name the `rtp_mux` path
-(`tools/PERF_INFRA.md:821`, `:843`, `:887`, `:947`). Read once by hand against
+ones that name a source already name the `rtp_mux` path (`tools/PERF_INFRA.md`:
+the `rtp_mux/tools/mandate-producers.json` and `rtp_mux/mandate-arms.json`
+references, and the `rtp_mux/src/tools/mandate_compare.rs` reference). Read
+once by hand against
 the moved data, every number they state still matches: two producers, eight
 evidence files, 12 panels and 24 plot files, 23 arms (19 `rtp_mux` + 4 probes;
 3 M1, 3 M2, 3 M3, 10 M4), 189.7 s, four `probe/` cells, two counted floors.

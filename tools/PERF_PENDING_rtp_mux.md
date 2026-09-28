@@ -63,10 +63,10 @@ A cost is a number only where a document already records one; the rest are
 - **`rtp_mux/GATE.md`** ("Tiers") records the constitution gate as "a ~40 s
   wall-clock dual-lane run" → `40` s.
 - **`mandate_smoke`'s four rows** are the per-test measurements of one
-  `tools/mandate-check` full run (release, warm build), read from that report's
+  `rtp_mux/tools/mandate-check` full run (release, warm build), read from that report's
   `timings.tests` (schema `mandate-check/2`, see `tools/MANDATE_SMOKE.md`).
   Re-measure them on the landed revision: they are one sample, and
-  `tools/mandate-check` is what a `rtp_mux` change runs anyway.
+  `rtp_mux/tools/mandate-check` is what a `rtp_mux` change runs anyway.
 
 ## The relation each row declares
 
@@ -446,10 +446,10 @@ one netem link's counter:
 `int_down = int_pair.stats_s2c()`).
 
 **The counter is right; the label is not.**
-`Counters::received_bytes` (`crates/netem_test/netem-test/src/lib.rs:486`) is,
+`Counters::received_bytes` (`crates/netem_test/netem-test/src/lib.rs`) is,
 by construction, *one direction of one link*: it is incremented exactly once
-per datagram accepted on that link's socket, before impairment, at four
-handlers (`:908`, `:969`, `:994`, `:1193`). It cannot count bytes that never
+per datagram accepted on that link's socket, before impairment, at the four
+`add_single_writer(|s| &s.received_bytes, …)` sites. It cannot count bytes that never
 reach that link, and it is now pinned by
 `netem-test::tests::received_bytes_counts_every_offered_datagram_once_on_every_schedule_path`
 plus `tests::conservation_identity::received_bytes_conserves_the_senders_offer_under_the_minecraft_config`,
@@ -500,7 +500,7 @@ to any window, threshold, cadence or tier):
    and only then add the `members.<family>` lines `netem-tools check-gate` requires;
    pasting them as they stand is a red gate.
 4. Run `cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`
-   through `tools/mandate-check`, then
+   through `rtp_mux/tools/mandate-check`, then
    `netem-tools check-gate --crate . rtp_mux tests GATE.md
    --mandate-check-json <run>/mandate-check.json`. The checker resolves every
    row against the compiled test set and compares the four `mandate_smoke`

@@ -335,7 +335,7 @@ checks:
 netem-tools check-gate
 ```
 
-**The measured side** is the runner's report. `tools/mandate-check` times each
+**The measured side** is the runner's report. `rtp_mux/tools/mandate-check` times each
 test and each mandate as their output lines arrive (see
 `tools/MANDATE_SMOKE.md`, "The per-test timings"), so a declared cost can be
 compared with what the run took rather than with a whole-run proxy. Pass the
@@ -361,7 +361,7 @@ Where the migration stands:
 
 - **`netem_test`** (this repository) — declared, in `tests/GATE.md`, and its
   perf-tier probes are a recorded producer: their five `probe-*` rows are the
-  `probe` family, and `tools/mandate-check` records their arms alongside
+  `probe` family, and `rtp_mux/tools/mandate-check` records their arms alongside
   `rtp_mux`'s (see "The producers: which are covered"). Four of the five are
   `perf`-tier and recorded; `probe-deadline-accuracy` is `standard` tier and
   asserts, because its reading is a property of the rig and not a number a
@@ -465,7 +465,7 @@ Where it is covered today:
 `rtp_mux`'s `mandate_smoke::m4_interactive_lane_fairness`, default tier and
 listed in `gate-default-required` — measures the interactive lane's split across
 four flows on both the clean and hostile arms, so a plain `cargo test -p rtp_mux`
-and `tools/mandate-check` both gate on per-flow fairness. Its bounds, arms and
+and `rtp_mux/tools/mandate-check` both gate on per-flow fairness. Its bounds, arms and
 faults are in `rtp_mux/GATE.md` (§M4) and are not restated here. The bulleted
 instruments above remain opt-in additional coverage.
 
@@ -497,7 +497,7 @@ not a reason to leave a measured field defect in place.
 
 **How to make a consumer build a local `rtp` for a measurement.** The
 checked-in manifests keep the published git tag — `rtp_mux/Cargo.toml` pins
-`rtp v0.0.94` and only comments out `# rtp = { path = "../rtp" }` — and must
+the published `rtp` tag (read the manifest for the current value) and only comments out `# rtp = { path = "../rtp" }` — and must
 not be repointed for a measurement: uncommenting that line changes what every
 later run builds, and the crates-level `DEPENDENCY_SOURCES.md` calls the
 resulting tag-vs-local mismatch the "silent verdict" trap. The supported
@@ -515,11 +515,12 @@ reports.
 
 Facts and numbers, as recorded at this writing.
 
-The interactive path's transport pin is `rtp v0.0.94` (`rtp_mux/Cargo.toml`).
-On that pin:
+The interactive path's transport pin is the published `rtp` tag that
+`rtp_mux/Cargo.toml` names — `rtp v0.0.94` when the measurements below were
+recorded; read the manifest for the value in force now. On that pin:
 
 - **M1 holds on the arm the bound is asserted on** — the `clean` smoke arm —
-  and `tools/mandate-check` exits zero.
+  and `rtp_mux/tools/mandate-check` exits zero.
 - **The hostile and lone-tail defects are open, and they are M1 defects.**
   The breach is the 250 ms ceiling and the samples over it. Their arms assert
   derived regression guards, not the mandate ceiling, so a green run does
@@ -539,7 +540,7 @@ On that pin:
   `TAIL_PROBED_MIN_RTO` (`300 ms`) compounded onto the current RTO, so one
   losing episode's latency is a multiple of 300 ms.
 - **Known-wrong in `rtp_mux`, recorded 2026-09-26.**
-  `crates/rtp_mux/GATE.md:158` names the hostile defect's mechanism as "the
+  `crates/rtp_mux/GATE.md` names the hostile defect's mechanism as "the
   1 s `MIN_RTO` repair floor plus exponential backoff", which understates what
   was measured — the compounding `TAIL_PROBED_MIN_RTO` (`300 ms`) rung ladder
   above (a seeded probe produces 613/918/1222/1520 ms rungs; the field's 1063
@@ -604,12 +605,19 @@ tail.
 
 ## Half 2 — the infrastructure
 
-### `tools/mandate-check` — the one command
+### `rtp_mux/tools/mandate-check` — the one command
 
-Run from this workspace root, with no arguments:
+The runner lives in the sibling `rtp_mux` checkout, not in this one: it is
+`rtp_mux/tools/mandate-check`, an `sh` shim over `netem-tools mandate-check`
+(built with `cargo build --release -p rtp_mux --features perf --bin
+netem-tools`). Every `tools/mandate-check`, `./tools/mandate-check` and
+`netem-tools <subcommand>` in this file names that checkout's tool; the other
+`tools/…` paths here (`tools/PERF_INFRA.md`, `tools/perf_loop.py`, the Python
+capture tooling) are this crate's. Run it from the `rtp_mux` checkout, with no
+arguments:
 
 ```sh
-tools/mandate-check
+cd ../rtp_mux && tools/mandate-check
 ```
 
 It runs `cargo test --release -p rtp_mux --test mandate_smoke -- -Z
@@ -638,7 +646,7 @@ resolution, `exec.rs` for the two child processes and the panel verifier,
 number coercion). The Python file is deleted with the port, so no behaviour has
 two implementations.
 
-`tools/mandate-check` remains, as the documented entry point, but it is a **sh
+`rtp_mux/tools/mandate-check` remains, as the documented entry point, but it is a **sh
 shim**: it resolves `target/{release,debug}/netem-tools`, builds it when it is
 missing, and `exec`s it with the arguments unchanged. The battery, the history
 step (which runs the `perf-history` bin and carries its status), the artifacts
@@ -695,7 +703,7 @@ command wrote.
 
 ### The perf-history M1 band — measured, not a fixed percentage
 
-After the battery, `tools/mandate-check` runs the `perf-history` bin
+After the battery, `rtp_mux/tools/mandate-check` runs the `perf-history` bin
 (`rtp_mux/src/bin/perf-history.rs`, built with `--features perf`) over the run:
 it archives the run's artifacts, compares it to the previous archived one, and —
 because M1 is the standing priority — **exits 6 when an interactive arm's tail
@@ -819,7 +827,7 @@ assertion is a tripwire, the panel is the evidence.** The guard values and the
 arms asserting them live in `rtp_mux` (`rtp_mux/GATE.md`,
 `rtp_mux/tests/mandate_smoke.rs`) and are unchanged. `rtp_mux/GATE.md` lists
 the three tests in `gate-default-required`, so a plain `cargo test -p rtp_mux`
-runs them too; `tools/mandate-check` is the release, evidence-producing
+runs them too; `rtp_mux/tools/mandate-check` is the release, evidence-producing
 invocation.
 
 ### The producers: which are covered
@@ -828,7 +836,7 @@ invocation.
 no longer the only one. A **producer** is one entry of
 `rtp_mux/tools/mandate-producers.json`: its cargo invocation, its source, its log, the
 sections its arms are attributed to, and which of those sections print a
-`MANDATE` line and write plots. `tools/mandate-check` runs **every** declared
+`MANDATE` line and write plots. `rtp_mux/tools/mandate-check` runs **every** declared
 producer by default, so a single invocation produces per-arm records for all
 of them — that is what makes the coverage-preservation comparison available to
 a crate that is not `rtp_mux`. Two producers are declared and covered today:
@@ -858,9 +866,9 @@ measured, so a shortening that halves an arm's samples can pass every assertion
 while quietly weakening the p99 that assertion reads. Two tools close that
 hole.
 
-**`tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
+**`rtp_mux/tools/mandate-check` records the arms.** Each `[mandate-smoke <arm>]` line
 a producer printed becomes an `arms` entry in `mandate-check.json` (schema
-`mandate-check/9`, which over `/8` records `delivery_granularity`: one entry per
+`mandate-check/10`, which over `/8` records `delivery_granularity`: one entry per
 mandate that declares a `delivery_floor`, holding the units that floor
 tolerates at the run's own smallest offered count and the count that first
 breaches it, because a delivery floor is a ratio over counted units and three
@@ -959,9 +967,9 @@ and the cells it reads.
 ### The checked-in baseline
 
 `rtp_mux/mandate-baseline.json` is the `mandate-check.json` of one real
-`tools/mandate-check` run, checked in so that the `mandate-compare` subcommand has a
+`rtp_mux/tools/mandate-check` run, checked in so that the `mandate-compare` subcommand has a
 reference: it records the per-arm measurements a later run's coverage is
-compared against. It was taken with `tools/mandate-check` (no `--quick`, and no
+compared against. It was taken with `rtp_mux/tools/mandate-check` (no `--quick`, and no
 other argument that reaches a producer) on
 2026-09-28, with the runner at commit `baf53011` (change
 `xpnvwtnp`; the working-copy snapshot read at that
@@ -983,7 +991,7 @@ measured value, the command, the revisions, the trees and the duration are
 verbatim. The plots themselves are not committed; re-run the command to
 regenerate them.
 Because the comparison refuses a baseline whose schema predates the per-arm
-record, this file has to be re-recorded with a current `tools/mandate-check`
+record, this file has to be re-recorded with a current `rtp_mux/tools/mandate-check`
 (no `--quick`) whenever the runner or a producer changes shape; the checked-in
 file is schema `mandate-check/10`, whose `timings` block is libtest's own
 per-test measurement, and is read by nothing: only `arms` is compared. A `/4`
@@ -1047,7 +1055,7 @@ the reader:
   the bars beyond it is read as a departure, and whether that departure is a
   breach or an arm's tolerated tripwire is a property of *the run*: the panel
   names the run's own per-arm `*_guard` measurements (which
-  `tools/mandate-check` passes in with `--run-values`), and a declaration can
+  `rtp_mux/tools/mandate-check` passes in with `--run-values`), and a declaration can
   state its own governance with `bounds[i].series` (a declared series) and/or
   `bounds[i].x` (a category, a list, or `{"min", "max"}`, which must be
   categories the panel draws — the line is then drawn only over that window).
@@ -1138,7 +1146,7 @@ the reader:
   `GAP_WALL_STEP_MULTIPLE` times the series' own median step, so a coarse but
   regular cadence is not mistaken for one.
 - **a run's own per-arm reading must be on the panel it is about.**
-  `check_readings_stated` requires the reading `tools/mandate-check` parsed from
+  `check_readings_stated` requires the reading `rtp_mux/tools/mandate-check` parsed from
   the producer's own `[m1-censoring] arm=…` rows to be drawn, per arm, on the
   line panel that draws that arm — the verdict, the arm's `room` and
   `rungs_at_edge`, and the pixel facts that separate a peak which returned from
@@ -1168,9 +1176,9 @@ codes`.
 
 Its cost is the freeze plus one timed run per role per seed (the documented
 defaults are `--seeds 11,21 --window-seconds 30` with a warmup), so it is much
-slower than `tools/mandate-check`. Use it when a delta needs attribution
+slower than `rtp_mux/tools/mandate-check`. Use it when a delta needs attribution
 under the lane taxonomy in `tests/GATE.md` (`gate-lane-roles`); use
-`tools/mandate-check` to check the mandates themselves. Its mandatory rendered
+`rtp_mux/tools/mandate-check` to check the mandates themselves. Its mandatory rendered
 graph is produced by `tools/render_graph.py`.
 
 ### One line each, the supporting tools
@@ -1232,13 +1240,12 @@ by the repo of the crate it tracks, so a `crates/` listing may hold several
 `<crate>_ws` directories at once — one per crate being worked on, plus a
 preserved candidate — beside the crates' default checkouts; such a directory
 is a registered workspace, not a stale copy. A crate's local checkout can
-also be ahead of what its consumers build: `crates/rtp`'s `dev` bookmark sits
-at commit `61fc7ba9` (`test(rtp): measure the lone tail's repair deadline on
-a seeded connection`), one commit past `rtp v0.0.94`. The authority for what a
-run actually built is the **tag the consumer pins** — `rtp_mux/Cargo.toml`
-pins `rtp v0.0.94`, and `mandate-check.json` records the resolved `rtp_mux`
-revision — while the local `dev` is the authority only for local edits, not
-for the measurement.
+also be ahead of what its consumers build: a crate's `dev` bookmark can sit
+past the tag its consumers pin (at this writing `crates/rtp`'s `dev` was
+`d1329578`, long past `rtp v0.0.94`). The authority for what a run actually
+built is the **tag the consumer pins** — read it in `rtp_mux/Cargo.toml`, and
+`mandate-check.json` records the resolved `rtp_mux` revision — while the local
+`dev` is the authority only for local edits, not for the measurement.
 
 ### Running a single arm or a single probe
 

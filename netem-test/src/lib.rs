@@ -1,6 +1,6 @@
 //! Generic network-emulation harness: a reusable, deterministic in-process
 //! UDP proxy that applies netem-style impairment (delay, jitter, loss,
-//! duplication, reordering, rate-limiting) to forwarded datagrams.
+//! duplication, reordering, rate-limiting, queue-limit) to forwarded datagrams.
 //!
 //! The loss math mirrors the four-state Markov chain ("GI model") used by the
 //! Linux `sch_netem` qdisc, and the PRNG is the same Tausworthe `prandom`

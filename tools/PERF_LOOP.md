@@ -47,14 +47,15 @@ of the tag against itself.
 ## Tri-mandate smoke set
 
 The one-command, always-run instrument for the interactive path is
-`tools/mandate-check`. It runs `rtp_mux`'s tri-mandate smoke set
+`rtp_mux/tools/mandate-check` (the sibling `rtp_mux` checkout's shim over
+`netem-tools mandate-check`). It runs `rtp_mux`'s tri-mandate smoke set
 (`cargo test --release -p rtp_mux --test mandate_smoke -- --nocapture`),
 renders each mandate's panels through `netem-tools mandate-plot`, prints a
 verdict line per mandate, and writes `mandate-check.json` so a reader can
 verify from a machine that the mandated checks ran and what they measured:
 
 ```sh
-./tools/mandate-check
+cd ../rtp_mux && ./tools/mandate-check
 ```
 
 Any change to `rtp`, `mux` or `rtp_mux` must run it, and its plots must be
