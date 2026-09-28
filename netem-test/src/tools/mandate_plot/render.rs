@@ -121,6 +121,54 @@ pub fn panel_series_count(panel: &str) -> usize {
     series
 }
 
+/// Why a panel that draws no series geometry is empty, read out of the panel's
+/// own summary rather than assumed: a producer that emitted no rows and one
+/// that emitted a measured zero are different failures and must not be told
+/// apart by the same sentence.
+fn seriesless_reason(panel: &str) -> String {
+    let Some(summary) = checks::read_panel_summary(panel) else {
+        return "the panel carries no panel summary, so nothing states what the \
+                producer emitted for it"
+            .to_string();
+    };
+    let entries = summary.get("series").and_then(J::as_arr).unwrap_or(&[]);
+    let points: i64 = entries
+        .iter()
+        .map(|entry| entry.get("points").and_then(J::as_i64).unwrap_or(0))
+        .sum();
+    if entries.is_empty() || points == 0 {
+        return format!(
+            "the producer emitted no rows for it at all ({} series declared, {points} \
+             points drawn): there is nothing to plot",
+            entries.len()
+        );
+    }
+    let all_zero = entries.iter().all(|entry| {
+        entry
+            .get("min")
+            .and_then(J::as_f64)
+            .map(|value| value == 0.0)
+            .unwrap_or(false)
+            && entry
+                .get("max")
+                .and_then(J::as_f64)
+                .map(|value| value == 0.0)
+                .unwrap_or(false)
+    });
+    if all_zero {
+        return format!(
+            "the producer emitted rows and every one of the {points} points is 0, a \
+             measured zero (perfect fairness on this quantity, not an absence), and \
+             the panel drew no mark for it: a value at the baseline is drawn as a \
+             hollow floor mark there, so a panel without one is a rendering failure"
+        );
+    }
+    format!(
+        "the producer emitted {points} point(s) and the panel drew no geometry for any \
+         of them"
+    )
+}
+
 /// The problems that make this panel unusable as evidence.
 pub fn validate_panel(index: usize, panel: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -137,7 +185,9 @@ pub fn validate_panel(index: usize, panel: &str) -> Vec<String> {
     }
     if panel_series_count(panel) == 0 {
         problems.push(format!(
-            "panel {index}: no series data (an empty chart is not a graph)"
+            "panel {index}: no drawn series geometry ({}), and an empty chart is not a \
+             graph",
+            seriesless_reason(panel)
         ));
     }
     problems
@@ -680,6 +730,9 @@ pub fn panel_markup(
     ));
     if chart == Chart::Bar {
         problems.extend(checks::check_bar_separation(&panel.id, &markup));
+        problems.extend(checks::check_zero_bar_marks(
+            &panel.id, &series, axis, &markup,
+        )?);
         problems.extend(checks::check_sliver_bound_stated(
             &panel.id,
             &series,
@@ -909,8 +962,10 @@ fn render_mandate_on_this_thread(args: &Args) -> PlotResult<J> {
         let count = panel_series_count(&written);
         if count == 0 {
             return fail(format!(
-                "{} was written without series geometry (an empty chart is not a graph)",
-                svg_path.display()
+                "{} was written without series geometry ({}); an empty chart is not a \
+                 graph",
+                svg_path.display(),
+                seriesless_reason(&written)
             ));
         }
         let bounds = bound_specs(panel);
@@ -1096,6 +1151,80 @@ mod tests {
             panel_series_count("<svg><rect x=\"1\" y=\"2\" width=\"3\" height=\"4\"/></svg>"),
             1
         );
+        // A rect with a declared but zero size paints nothing, so it is not a
+        // series either. This is the property the zero-height floor mark must
+        // not be confused with: the mark is *drawn* with a positive height, and
+        // this rule is what still tells a label -- or any geometry-less rect --
+        // from a series.
+        assert_eq!(
+            panel_series_count("<svg><rect x=\"1\" y=\"2\" width=\"3\" height=\"0\"/></svg>"),
+            0
+        );
+        assert_eq!(
+            panel_series_count("<svg><rect x=\"1\" y=\"2\" width=\"0\" height=\"4\"/></svg>"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_bar_at_the_baseline_is_drawn_rather_than_dropped() {
+        let series: Series = vec![
+            ("clean".to_string(), vec![(1.0, 0.0), (2.0, 0.0)]),
+            ("hostile".to_string(), vec![(1.0, 0.0), (2.0, 0.0)]),
+        ];
+        let markup = draw::svg_bar_chart(
+            "t",
+            "flow",
+            "departure",
+            &series,
+            &[],
+            Some((0.0, 0.021)),
+            None,
+            "",
+        );
+        let marks = checks::zero_bar_marks(&markup);
+        assert_eq!(marks.len(), 4, "{markup}");
+        for mark in &marks {
+            // Hollow: a filled rect of any height is what a non-zero bar is.
+            assert_eq!(mark.fill, "none", "{markup}");
+            assert!(!mark.stroke.is_empty(), "{markup}");
+            let height = mark.box_.3 - mark.box_.1;
+            assert!(
+                (height - ZERO_BAR_MARK_HEIGHT_PX).abs() < 1e-9,
+                "the floor mark is {height} px, not the visible {ZERO_BAR_MARK_HEIGHT_PX}"
+            );
+        }
+        // The panel the producer measured is no longer read as empty: the four
+        // zero values are four drawn marks.
+        assert_eq!(panel_series_count(&markup), 4, "{markup}");
+        // The same four values with the mark removed leave a zero-height rect
+        // that paints nothing, which is the defect this test exists to catch.
+        let dropped = markup
+            .replace("class=\"zero-bar\" ", "")
+            .replace(" height=\"4.0\" ", " height=\"0.0\" ");
+        assert_eq!(checks::zero_bar_marks(&dropped).len(), 0);
+        assert_eq!(panel_series_count(&dropped), 0, "{dropped}");
+    }
+
+    #[test]
+    fn a_seriesless_panel_names_no_rows_and_a_measured_zero_differently() {
+        let panel = |series: &str| {
+            format!("<svg><desc class=\"panel-summary\">{{\"series\": [{series}]}}</desc></svg>")
+        };
+        let no_rows = panel(r#"{"name":"clean","points":0,"min":null,"max":null}"#);
+        let all_zero = panel(r#"{"name":"clean","points":4,"min":0.0,"max":0.0}"#);
+        let empty = validate_panel(0, &no_rows);
+        let zero = validate_panel(0, &all_zero);
+        assert_eq!(empty.len(), 1, "{empty:?}");
+        assert_eq!(zero.len(), 1, "{zero:?}");
+        assert!(empty[0].contains("emitted no rows"), "{}", empty[0]);
+        assert!(
+            zero[0].contains("every one of the 4 points is 0"),
+            "{}",
+            zero[0]
+        );
+        assert!(zero[0].contains("measured zero"), "{}", zero[0]);
+        assert_ne!(empty[0], zero[0]);
     }
 
     #[test]

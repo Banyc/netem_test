@@ -251,6 +251,179 @@ pub fn bar_boxes(markup: &str) -> Vec<(f64, f64, f64, f64)> {
         .collect()
 }
 
+/// A zero-height bar's floor mark, as the artifact draws it: the box it
+/// occupies and how it is painted. A mark is only a mark when it is hollow,
+/// which is what tells it from the filled rect every non-zero bar is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZeroBarMark {
+    /// `(left, top, right, bottom)` in the panel's own pixel space.
+    pub box_: (f64, f64, f64, f64),
+    pub fill: String,
+    pub stroke: String,
+}
+
+/// Every floor mark a panel draws for a value at its bar baseline.
+pub fn zero_bar_marks(markup: &str) -> Vec<ZeroBarMark> {
+    let mut marks = Vec::new();
+    for element in zero_bar_re().find_all_whole(markup) {
+        let attributes: Vec<(String, String)> = text_attribute_re()
+            .find_all(&element)
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].clone().unwrap_or_default(),
+                    pair[1].clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let lookup = |key: &str| {
+            attributes
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        let (Ok(x), Ok(y), Ok(width), Ok(height)) = (
+            lookup("x").parse::<f64>(),
+            lookup("y").parse::<f64>(),
+            lookup("width").parse::<f64>(),
+            lookup("height").parse::<f64>(),
+        ) else {
+            continue;
+        };
+        marks.push(ZeroBarMark {
+            box_: (x, y, x + width, y + height),
+            fill: lookup("fill"),
+            stroke: lookup("stroke"),
+        });
+    }
+    marks
+}
+
+/// How many of a bar panel's measurements sit at its own bar baseline.
+///
+/// This is the data side of the floor mark: the drawer cannot drop it without
+/// the drawn count disagreeing, and it cannot invent one for a value that is
+/// not there without the same disagreement.
+pub fn floor_value_count(series: &Series, extent: (f64, f64)) -> usize {
+    let floor = bar_baseline_value(extent);
+    series
+        .iter()
+        .flat_map(|(_, points)| points.iter())
+        .filter(|(_, value)| *value == floor)
+        .count()
+}
+
+/// What a bar panel drew for the values at its floor, or `null` when it has
+/// none: `null` is the statement that no measurement sits at the baseline.
+fn zero_bar_document(series: &Series, extent: (f64, f64), markup: &str) -> J {
+    let marks = zero_bar_marks(markup);
+    let values = floor_value_count(series, extent);
+    if marks.is_empty() && values == 0 {
+        return J::Null;
+    }
+    let height = marks
+        .iter()
+        .map(|mark| mark.box_.3 - mark.box_.1)
+        .fold(0.0, f64::max);
+    J::Obj(vec![
+        ("mark".to_string(), J::Str("hollow-bar".to_string())),
+        ("floor".to_string(), J::Float(bar_baseline_value(extent))),
+        ("bars".to_string(), J::Int(marks.len() as i64)),
+        ("values".to_string(), J::Int(values as i64)),
+        ("height_px".to_string(), J::Float(height)),
+    ])
+}
+
+/// Problems that make the floor marks not what they claim to be.
+pub fn check_zero_bar_marks(
+    panel_id: &str,
+    series: &Series,
+    extent: (f64, f64),
+    markup: &str,
+) -> PlotResult<Vec<String>> {
+    let marks = zero_bar_marks(markup);
+    let values = floor_value_count(series, extent);
+    if marks.is_empty() && values == 0 {
+        return Ok(Vec::new());
+    }
+    let mut problems = Vec::new();
+    if marks.len() != values {
+        problems.push(format!(
+            "panel {}: {} measured value(s) sit at the bar baseline ({}) and the panel \
+             draws {} floor mark(s) for them; the count is measured out of the drawn \
+             geometry and the data both, so a value at the floor without its mark \
+             reads as absent and a mark without its value reads as a claim the run \
+             never made",
+            pyjson::repr_str(panel_id),
+            values,
+            fg(bar_baseline_value(extent)),
+            marks.len()
+        ));
+    }
+    let (left, top, right, bottom) = panel_plot_rect(panel_id, markup)?;
+    if !marks.is_empty() {
+        let stated = read_panel_summary(markup)
+            .and_then(|summary| summary.get("zero_bar").cloned())
+            .filter(J::truthy);
+        if stated.is_none() {
+            problems.push(format!(
+                "panel {}: it draws {} floor mark(s) for values at the bar baseline and \
+                 its own summary states none; a mark the panel does not state is a value \
+                 the reader has to infer from the pixels, which is the failure the mark \
+                 exists to close",
+                pyjson::repr_str(panel_id),
+                marks.len()
+            ));
+        }
+    }
+    for mark in &marks {
+        let height = mark.box_.3 - mark.box_.1;
+        if mark.fill != "none" {
+            problems.push(format!(
+                "panel {}: a floor mark is painted {} rather than left hollow; a \
+                 filled rect of any height is what a non-zero bar is, so the mark \
+                 would be read as a small value instead of as a value at the floor",
+                pyjson::repr_str(panel_id),
+                pyjson::repr_str(&mark.fill)
+            ));
+        }
+        if mark.stroke.trim().is_empty() {
+            problems.push(format!(
+                "panel {}: a floor mark is drawn with no stroke, so a hollow fill \
+                 paints nothing and the value is invisible",
+                pyjson::repr_str(panel_id)
+            ));
+        }
+        if height < ZERO_BAR_MARK_HEIGHT_PX {
+            problems.push(format!(
+                "panel {}: a floor mark is {} px tall, under the {} px the mark needs \
+                 to survive rasterization; a mark too short to see leaves the value \
+                 absent, which is the defect the mark exists to close",
+                pyjson::repr_str(panel_id),
+                f1(height),
+                f1(ZERO_BAR_MARK_HEIGHT_PX)
+            ));
+        }
+        if mark.box_.0 < left || mark.box_.2 > right || mark.box_.1 < top || mark.box_.3 > bottom {
+            problems.push(format!(
+                "panel {}: a floor mark at ({}, {})..({}, {}) is outside the plot area \
+                 ({}..{}) x ({}..{}), so it is drawn off the panel the value belongs to",
+                pyjson::repr_str(panel_id),
+                f1(mark.box_.0),
+                f1(mark.box_.1),
+                f1(mark.box_.2),
+                f1(mark.box_.3),
+                f1(left),
+                f1(right),
+                f1(top),
+                f1(bottom)
+            ));
+        }
+    }
+    Ok(problems)
+}
+
 /// Each drawn `<text>` as `(text, (x0, y0, x1, y1))`.
 pub fn drawn_text_boxes(markup: &str) -> Vec<(String, (f64, f64, f64, f64))> {
     let mut boxes = Vec::new();
@@ -1620,6 +1793,14 @@ pub fn panel_summary_document(
         ("x_label".to_string(), J::Str(x_label.to_string())),
         ("y_label".to_string(), J::Str(y_label.to_string())),
         ("series".to_string(), J::Arr(series_entries)),
+        (
+            "zero_bar".to_string(),
+            if chart == Chart::Bar {
+                zero_bar_document(series, extent, markup)
+            } else {
+                J::Null
+            },
+        ),
         ("bounds".to_string(), J::Arr(entries)),
         (
             "reading".to_string(),
@@ -1687,6 +1868,19 @@ pub fn panel_summary_block(document: &J) -> String {
             })
             .collect();
         lines.push(format!("  series: {}", listed.join("; ")));
+    }
+    if let Some(zero_bar) = document.get("zero_bar")
+        && zero_bar.truthy()
+    {
+        lines.push(format!(
+            "  zero_bar: {} bar(s) drawn as a {} outline {} px tall at the bar \
+             baseline ({}); {} measured value(s) sit on that baseline",
+            zero_bar.get("bars").and_then(J::as_i64).unwrap_or(0),
+            zero_bar.get("mark").and_then(J::as_str).unwrap_or(""),
+            f1(zero_bar.get("height_px").and_then(J::as_f64).unwrap_or(0.0)),
+            sliver_number(zero_bar.get("floor").and_then(J::as_f64).unwrap_or(0.0)),
+            zero_bar.get("values").and_then(J::as_i64).unwrap_or(0)
+        ));
     }
     let bounds = document.get("bounds").and_then(J::as_arr).unwrap_or(&[]);
     if bounds.is_empty() {
@@ -4461,6 +4655,157 @@ mod tests {
         let markup = draw::svg_bar_chart("t", "x", "value", &series, &bounds, None, None, "");
         assert_eq!(bar_boxes(&markup).len(), 3);
         assert!(check_bar_separation("latency", &markup).is_empty());
+    }
+
+    #[test]
+    fn a_floor_mark_that_is_not_hollow_or_not_drawn_is_refused() {
+        let series = bars_of("clean", vec![(1.0, 0.0), (2.0, 0.0)]);
+        let extent = (0.0, 0.021);
+        let drawn = draw::svg_bar_chart(
+            "t",
+            "flow",
+            "departure",
+            &series,
+            &[],
+            Some(extent),
+            None,
+            "",
+        );
+        assert_eq!(zero_bar_marks(&drawn).len(), 2, "{drawn}");
+        // The panel is checked the way the renderer checks it: with its own
+        // summary already in place, so the mark has to be both drawn and stated.
+        let plot_height = draw::bar_plot_height(1) as f64;
+        let summary = panel_summary_document(
+            "imbalance",
+            Chart::Bar,
+            "flow",
+            "departure",
+            &series,
+            &[],
+            extent,
+            &drawn,
+            "",
+            plot_height,
+            None,
+            None,
+        );
+        let markup = introduce_panel_summary(&drawn, &summary);
+        assert!(
+            check_zero_bar_marks("imbalance", &series, extent, &markup)
+                .expect("reads")
+                .is_empty()
+        );
+        // Red: the panel draws the mark and its summary is silent about it.
+        let silent = drawn.clone();
+        let problems = check_zero_bar_marks("imbalance", &series, extent, &silent).expect("reads");
+        assert!(
+            problems.iter().any(|p| p.contains("states none")),
+            "{problems:?}"
+        );
+        // Red: the mark painted solid. A filled rect of the mark's own size is
+        // exactly what a small non-zero bar is, so it must be refused.
+        let solid = markup.replace("fill=\"none\"", "fill=\"#2563eb\"");
+        assert_ne!(solid, markup);
+        let problems = check_zero_bar_marks("imbalance", &series, extent, &solid).expect("reads");
+        assert!(
+            problems.iter().any(|p| p.contains("is painted")),
+            "{problems:?}"
+        );
+        // Red: a mark drawn shorter than the visible floor.
+        let short = markup.replace("height=\"4.0\"", "height=\"1.0\"");
+        assert_ne!(short, markup);
+        let problems = check_zero_bar_marks("imbalance", &series, extent, &short).expect("reads");
+        assert!(
+            problems.iter().any(|p| p.contains("px tall")),
+            "{problems:?}"
+        );
+        // Red: the mark dropped, which is the defect this whole change is
+        // about -- the producer measured 0 and the panel shows nothing.
+        let dropped = markup.replace("class=\"zero-bar\"", "class=\"bar\"");
+        assert_ne!(dropped, markup);
+        let problems = check_zero_bar_marks("imbalance", &series, extent, &dropped).expect("reads");
+        assert!(
+            problems.iter().any(|p| p.contains("draws 0 floor mark")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_summary_that_states_a_floor_mark_the_panel_dropped_is_refused() {
+        let series = bars_of("clean", vec![(1.0, 0.0), (2.0, 0.0)]);
+        let extent = (0.0, 0.021);
+        let drawn = draw::svg_bar_chart(
+            "t",
+            "flow",
+            "departure",
+            &series,
+            &[],
+            Some(extent),
+            None,
+            "",
+        );
+        let plot_height = draw::bar_plot_height(1) as f64;
+        let stated = panel_summary_document(
+            "imbalance",
+            Chart::Bar,
+            "flow",
+            "departure",
+            &series,
+            &[],
+            extent,
+            &drawn,
+            "",
+            plot_height,
+            None,
+            None,
+        );
+        let zero = stated
+            .get("zero_bar")
+            .expect("the panel summary must state the floor mark it drew");
+        assert_eq!(zero.get("bars").and_then(J::as_i64), Some(2));
+        assert_eq!(zero.get("values").and_then(J::as_i64), Some(2));
+        assert_eq!(zero.get("mark").and_then(J::as_str), Some("hollow-bar"));
+        let markup = introduce_panel_summary(&drawn, &stated);
+        assert!(
+            check_panel_summary_stated(
+                "imbalance",
+                Chart::Bar,
+                "flow",
+                "departure",
+                &series,
+                &[],
+                extent,
+                &markup,
+                plot_height,
+                "",
+                None,
+                None,
+            )
+            .is_empty()
+        );
+        // Red: the same stated summary against a panel whose marks are not
+        // drawn. The summary has to be the drawn geometry, so a panel that
+        // says it drew two floor marks and drew none is refused by name.
+        let dropped = drawn.replace("class=\"zero-bar\"", "class=\"bar\"");
+        let markup = introduce_panel_summary(&dropped, &stated);
+        let problems = check_panel_summary_stated(
+            "imbalance",
+            Chart::Bar,
+            "flow",
+            "departure",
+            &series,
+            &[],
+            extent,
+            &markup,
+            plot_height,
+            "",
+            None,
+            None,
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("zero_bar")),
+            "{problems:?}"
+        );
     }
 
     #[test]

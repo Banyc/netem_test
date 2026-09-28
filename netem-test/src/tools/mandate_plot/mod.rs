@@ -177,6 +177,29 @@ pub const MIN_AXIS_INSET_PIXELS: f64 = 2.0;
 /// The least gap between two drawn bars.
 pub const MIN_BAR_GAP_PIXELS: f64 = 1.0;
 
+/// The class of the floor mark a bar of exactly the baseline's own value is
+/// drawn as, in place of the zero-height bar that would paint nothing.
+pub const ZERO_BAR_CLASS: &str = "zero-bar";
+
+/// The height, in pixels, of the zero-height bar's floor mark: tall enough
+/// that its two outline strokes and the hollow interior between them survive
+/// rasterization, so the mark is visible rather than a hairline that antialiases
+/// away.
+pub const ZERO_BAR_MARK_HEIGHT_PX: f64 = 4.0;
+
+/// The stroke width of the floor mark's hollow outline.
+pub const ZERO_BAR_STROKE_WIDTH_PX: f64 = 0.8;
+
+/// The dash pattern of the floor mark's outline, so it reads as a floor rule
+/// and not as a filled bar at any height.
+pub const ZERO_BAR_DASH: &str = "2 2";
+
+/// The value a bar panel's bars are drawn from: zero, or the frame's own
+/// pinned floor when the axis was drawn above zero.
+pub fn bar_baseline_value(extent: (f64, f64)) -> f64 {
+    if extent.0 <= 0.0 { 0.0 } else { extent.0 }
+}
+
 /// The smallest span a fraction panel may be drawn over.
 pub const MIN_UNIT_SPAN: f64 = 0.01;
 
@@ -283,6 +306,15 @@ fn bar_rect_re() -> &'static Regex {
             r#"<rect x="([-0-9.]+)" y="([-0-9.]+)" width="([-0-9.]+)" height="([-0-9.]+)" fill="(#[0-9A-Fa-f]{6})""#,
         )
     })
+}
+
+/// The whole element of a zero-height bar's floor mark, as the renderer writes
+/// it. The geometry and the paint are both part of the match because the mark
+/// is only a mark when it is hollow *and* drawn: a solid rect of the same size
+/// is a small non-zero bar.
+fn zero_bar_re() -> &'static Regex {
+    static ONCE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| regex(r#"<rect class="zero-bar"[^>]*>"#))
 }
 
 fn legend_group_re() -> &'static Regex {

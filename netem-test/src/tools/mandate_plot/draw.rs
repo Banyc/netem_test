@@ -943,7 +943,7 @@ pub fn svg_bar_chart(
     let bar_slot = ((band - 2.0 * inset) / series.len() as f64).max(0.0);
     let bar_gap = (bar_slot * BAR_GAP_SHARE).min(bar_slot / 2.0);
     let bar_width = (bar_slot - bar_gap).max(0.0);
-    let baseline = sy(if y_min <= 0.0 { y_min.max(0.0) } else { y_min });
+    let baseline = sy(bar_baseline_value((y_min, y_max)));
     let step = (y_max - y_min) / 5.0;
     let mut y_decimals = 2usize;
     if step > 0.0 {
@@ -1019,6 +1019,31 @@ pub fn svg_bar_chart(
                     + inset
                     + index as f64 * bar_slot;
                 let top = sy(*y_value);
+                let height = (top - baseline).abs();
+                if height == 0.0 {
+                    // A value at the baseline has no bar to paint, so a
+                    // zero-height <rect> is not drawable and the panel would
+                    // carry no geometry for a value the producer measured.
+                    // The floor mark is hollow and dashed, which no filled bar
+                    // is, so it can never be read as a small non-zero bar: its
+                    // whole paint is an outline, where every bar is a solid
+                    // fill.
+                    let mark_top = baseline - ZERO_BAR_MARK_HEIGHT_PX;
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut parts,
+                        format_args!(
+                            "<rect class=\"{ZERO_BAR_CLASS}\" x=\"{}\" y=\"{}\" \
+                             width=\"{}\" height=\"{}\" fill=\"none\" stroke=\"{color}\" \
+                             stroke-width=\"{}\" stroke-dasharray=\"{ZERO_BAR_DASH}\"/>",
+                            f1(left),
+                            f1(mark_top),
+                            f1(bar_width),
+                            f1(ZERO_BAR_MARK_HEIGHT_PX),
+                            f1(ZERO_BAR_STROKE_WIDTH_PX)
+                        ),
+                    );
+                    continue;
+                }
                 let _ = std::fmt::Write::write_fmt(
                     &mut parts,
                     format_args!(
