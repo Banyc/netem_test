@@ -2325,12 +2325,91 @@ mod tests {
     #[cfg(feature = "test-kit")]
     use crate::kit::emulated::{Forwarded, emulated_forward};
 
+    /// Same seed -> same sequence. This is determinism only: a generator swap
+    /// with the same interface is invisible here (dropping `s4` from the final
+    /// xor keeps this arm green), so it does not claim to pin the generator's
+    /// identity. Identity is pinned separately by
+    /// [`prng_matches_the_kernel_known_answers`] (the generator itself) and by
+    /// `decision_replay_matches_recorded_sequence_for_fixed_config_and_seed`
+    /// (the whole decision pipeline).
     #[test]
-    fn prng_is_deterministic() {
+    fn prng_same_seed_replays_the_same_sequence() {
         let mut a = RndState::seed(0xDEAD_BEEF_CAFE_F00D);
         let mut b = RndState::seed(0xDEAD_BEEF_CAFE_F00D);
         for _ in 0..1024 {
             assert_eq!(a.next_u32(), b.next_u32());
+        }
+    }
+
+    /// The generator must be *the kernel's* `prandom`, not merely a
+    /// deterministic generator with the same interface. The vectors are the
+    /// kernel's own published answers: `test1` and `test2` in `lib/random32.c`'s
+    /// `prandom_state_selftest` (built with `CONFIG_RANDOM32_SELFTEST`), reached
+    /// through the kernel's `prandom_state_selftest_seed` LCG assembled here
+    /// from the four lanes, so the arm pins `next_u32` itself rather than the
+    /// `RndState::seed` derivation (which the `decision_replay` golden already
+    /// pins through the whole decision pipeline). Dropping `s4` from the final
+    /// xor reddens it.
+    #[test]
+    fn prng_matches_the_kernel_known_answers() {
+        // `prandom_state_selftest_seed` + `__seed` from `lib/random32.c` /
+        // `include/linux/prandom.h`: an LCG chain with a per-lane floor.
+        fn kernel_selftest_state(seed: u32) -> RndState {
+            fn floor(x: u32, m: u32) -> u32 {
+                if x < m { x.wrapping_add(m) } else { x }
+            }
+            let lcg = |x: u32| x.wrapping_mul(69069);
+            let s1 = lcg(seed);
+            let s2 = lcg(s1);
+            let s3 = lcg(s2);
+            let s4 = lcg(s3);
+            RndState {
+                s1: floor(s1, 2),
+                s2: floor(s2, 8),
+                s3: floor(s3, 16),
+                s4: floor(s4, 128),
+            }
+        }
+        // `prandom_warmup`: ten draws satisfy the recurrence condition.
+        fn warmup(state: &mut RndState) {
+            for _ in 0..10 {
+                state.next_u32();
+            }
+        }
+        // `test1`: seed-boundary vectors.
+        for (seed, expected) in [
+            (1u32, 3_484_351_685u32),
+            (2, 2_623_130_059),
+            (3, 3_125_133_893),
+            (4, 984_847_254),
+        ] {
+            let mut state = kernel_selftest_state(seed);
+            warmup(&mut state);
+            assert_eq!(
+                state.next_u32(),
+                expected,
+                "next_u32 must reproduce lib/random32.c's test1 vector for seed {seed}"
+            );
+        }
+        // `test2`: long-iteration vectors, validated against taus113 from GSL.
+        for (seed, iteration, expected) in [
+            (931_557_656u32, 959u32, 2_975_593_782u32),
+            (1_339_693_295, 876, 3_887_776_532),
+            (1_545_556_285, 961, 1_615_538_833),
+            (1_223_800_550, 539, 3_954_229_517),
+            (1_986_257_729, 931, 935_013_962),
+            (407_983_964, 921, 728_767_059),
+        ] {
+            let mut state = kernel_selftest_state(seed);
+            warmup(&mut state);
+            for _ in 0..iteration - 1 {
+                state.next_u32();
+            }
+            assert_eq!(
+                state.next_u32(),
+                expected,
+                "next_u32 must reproduce lib/random32.c's test2 vector for seed {seed} at iteration {iteration}"
+            );
         }
     }
 
@@ -2347,6 +2426,11 @@ mod tests {
         assert!(diffs > 60);
     }
 
+    /// Large jitter must still *spread* the sampled delay, not merely produce
+    /// a non-zero value. A constant `latency` -- the shape a dropped jitter
+    /// term takes -- satisfies a "some sample is non-zero" check, so this arm
+    /// requires at least two distinct delays across the draws and thus reddens
+    /// when the jitter term is removed.
     #[test]
     fn large_jitter_still_jitters() {
         for secs in [2, 3, 4, 5, 10] {
@@ -2357,21 +2441,29 @@ mod tests {
             };
             let mut rng = RndState::seed(config.seed);
             let mut cor = CorRng::new(config.delay_corr);
-            let mut nonzero = 0;
+            let mut seen = std::collections::BTreeSet::new();
             for _ in 0..256 {
-                if !sample_delay(&config, &mut rng, &mut cor).is_zero() {
-                    nonzero += 1;
-                }
+                seen.insert(sample_delay(&config, &mut rng, &mut cor));
             }
             assert!(
-                nonzero > 0,
-                "{secs} s of jitter produced 256 consecutive zero delays - the sigma truncation collapsed the spread window below the subtracted jitter"
+                seen.len() > 1,
+                "{secs} s of jitter produced {} distinct delays over 256 draws - the spread window \
+                 collapsed to a constant",
+                seen.len()
             );
         }
     }
 
+    /// Every sampled delay lies inside the configured jitter envelope
+    /// `[mu - sigma, mu + sigma]`. This is *not* a clamp guard: the readback is
+    /// `as_nanos() as i64`, which recovers the negative value a `u64` wrap had
+    /// encoded, so removing the lower-tail clamp leaves this arm green (the
+    /// clamp's effect is pinned by
+    /// `jitter_larger_than_latency_clamps_the_lower_tail_to_zero`). What it
+    /// does pin is that `sample_delay` treats `jitter` as the full +-sigma
+    /// magnitude: a doubled or truncated jitter term escapes the envelope.
     #[test]
-    fn sub_clamp_jitter_is_untouched_by_the_ceiling() {
+    fn sampled_delay_stays_within_the_configured_jitter_envelope() {
         let config = NetemConfig {
             latency: Duration::from_millis(300),
             jitter: Duration::from_millis(500),

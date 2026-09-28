@@ -97,10 +97,22 @@ in this tier; `netem-tools check-gate` fails if one is re-`#[ignore]`d or remove
 name the reserved `lib` target beside the scenario targets — the harness's own
 `--lib` unit tests — and the checker resolves such an entry against
 `cargo test -p netem-test --lib` rather than `--test lib`:
-`lib::tests::a_closed_blackout_gate_consumes_no_prng_draws` and
-`lib::tests::jitter_larger_than_latency_clamps_the_lower_tail_to_zero` are the
-lib properties pinned here, so the PRNG-draw conformance rule the emulation is
-reproducible from, and the delay model's lower-tail clamp, cannot be silently
+`lib::tests::prng_matches_the_kernel_known_answers` (the generator's identity
+against the kernel's own self-test vectors) and
+`lib::tests::decision_replay_matches_recorded_sequence_for_fixed_config_and_seed`
+(the seeded decision pipeline's recorded sequence) pin the PRNG *identity* the
+reproducibility claim rests on — a generator swap reddens both, and the
+`prng_same_seed_replays_the_same_sequence` arm alone does not — while
+`lib::tests::a_closed_blackout_gate_consumes_no_prng_draws`,
+`lib::tests::limit_decisions_consume_no_prng_draws`,
+`lib::tests::four_state_loss_consumes_exactly_one_draw_per_packet`,
+`lib::tests::limit_tail_drops_and_counts_overflow`,
+`lib::tests::overflow_drops_do_not_advance_shaper_clock_or_reorder_slot`,
+`lib::tests::jitter_larger_than_latency_clamps_the_lower_tail_to_zero`,
+`lib::tests::large_jitter_still_jitters` and
+`lib::tests::sampled_delay_stays_within_the_configured_jitter_envelope` pin the
+draw-order/quantity, queue-limit and delay-spread properties the
+`netem_scenarios` conformance package is blind to, so none can be silently
 dropped from the always-run tier.
 
 Those lib tests live in the `netem-test` member, not in the `tests` package
@@ -121,23 +133,31 @@ source diff is the injection, the quoted line is the arm's own message.
 
 | impairment | arm(s) | injection | observed red |
 |---|---|---|---|
-| seed / PRNG identity | `lib::tests::decision_replay_matches_recorded_sequence_for_fixed_config_and_seed` | drop `s4` from the final xor in `RndState::next_u32` (a different generator, same interface) | `assertion left == right failed: the fixed-config replay must reproduce the recorded per-datagram decision sequence` (`lib.rs:5390`); `prng_is_deterministic` stayed **green** |
-| pipeline draw order/quantity | the seven `*_consumes_*_no_prng_draws` / `decision_replay` lib arms | one stray `self.rng.next_u32()` in `surviving_copies` | `91 passed; 7 failed`; the whole `netem_scenarios` package stayed **green** |
+| seed / PRNG identity | `lib::tests::decision_replay_matches_recorded_sequence_for_fixed_config_and_seed`, `lib::tests::prng_matches_the_kernel_known_answers` | drop `s4` from the final xor in `RndState::next_u32` (a different generator, same interface) | the golden reddens with `assertion left == right failed: the fixed-config replay must reproduce the recorded per-datagram decision sequence` (`lib.rs:5521`); the kernel-KAT arm reddens with `assertion left == right failed: next_u32 must reproduce lib/random32.c's test1 vector for seed 1` (`left: 1334429701`, `right: 3484351685`, `lib.rs:2388`); `prng_same_seed_replays_the_same_sequence` stayed **green** (determinism alone does not pin identity) |
+| pipeline draw order/quantity | the seven `*_consumes_*_no_prng_draws` / `decision_replay` lib arms | one stray `self.rng.next_u32()` in `surviving_copies` | `93 passed; 7 failed`; the whole `netem_scenarios` package stayed **green** |
 | loss (four-state) | `netem_scenarios::netem_four_state_loss_drops_some` | `LossModel::FourState(p) => four_state_loss(..)` → `=> true` (drop everything) | `four-state model should forward some` (`netem_scenarios.rs:181`) |
-| delay jitter | `kit::emulated::tests::jitter_reorders_where_a_zero_jitter_lane_cannot`, `lane_regime_coverage::jittery_lane_*`, `decision_replay` | `sample_delay`: `+ delta` → `+ (delta - delta)` | `jitter_reorders…` (`emulated.rs:394`) and both `jittery_lane_*` arms red; `large_jitter_still_jitters` and `sub_clamp_jitter_is_untouched_by_the_ceiling` stayed **green** |
+| delay jitter | `kit::emulated::tests::jitter_reorders_where_a_zero_jitter_lane_cannot`, `lane_regime_coverage::jittery_lane_*`, `lib::tests::large_jitter_still_jitters`, `decision_replay` | `sample_delay`: `+ delta` → `+ (delta - delta)` | `jitter_reorders…` (`emulated.rs:394`), both `jittery_lane_*` arms, and `large_jitter_still_jitters` red — the last with `2 s of jitter produced 1 distinct delays over 256 draws - the spread window collapsed to a constant` (`lib.rs:2448`); `sampled_delay_stays_within_the_configured_jitter_envelope` stays **green**, because it bounds the envelope rather than requiring spread |
 | delay lower-tail clamp | `lib::tests::jitter_larger_than_latency_clamps_the_lower_tail_to_zero` (added here) | remove `if ns < 0 { Duration::ZERO }` in `sample_delay` | `a negative sampled delay must clamp to zero, not wrap: got 18446744073511579441 ns, ceiling 800000000 ns` (`lib.rs`) |
 | duplication | `netem_scenarios::netem_duplicate_produces_extra_packets` | `count += 1` → `count += 0` (counter still fires, no second copy) | `should receive more than sent due to dups, got 10` (`netem_scenarios.rs:221`) while `stats.duplicated == 10` still held |
 | rate shaping | `netem_scenarios::netem_rate_limit_throttles_burst` | `serialization_delay` → `None` | `some packets should be rate-shaped, got … rate_limited: 0` (`netem_scenarios.rs:251`) |
 | reorder | `netem_scenarios::netem_reorder_with_rate_jumps_ahead` | reorder gate `reorder_gap_pkts - 1` → `reorder_gap_pkts` | `reordered packet should be delivered first, got [6, 1, 2, 3, 4, 5]` (`netem_scenarios.rs:331`) |
-| queue limit (heap) | `limit_tail_drops_and_counts_overflow`, `overflow_drops_do_not_advance_shaper_clock_or_reorder_slot`, `limit_decisions_consume_no_prng_draws`, `decision_replay` | heap `self.queue.len() >= limit` → `>` | `94 passed; 4 failed`; `netem_snapshot_reports_queue_and_stats` stayed **green** (it drives the FIFO path) |
+| queue limit (heap) | `lib::tests::limit_tail_drops_and_counts_overflow`, `lib::tests::overflow_drops_do_not_advance_shaper_clock_or_reorder_slot`, `lib::tests::limit_decisions_consume_no_prng_draws`, `decision_replay` | heap `self.queue.len() >= limit` → `>` | `96 passed; 4 failed` (`decision_replay`, `limit_decisions_consume_no_prng_draws`, `limit_tail_drops_and_counts_overflow`, `overflow_drops_do_not_advance_shaper_clock_or_reorder_slot`); `netem_snapshot_reports_queue_and_stats` stayed **green** (it drives the FIFO path) |
 | queue limit (FIFO) | `netem_snapshot_reports_queue_and_stats`, `fifo_queue_limit_tail_drops_at_the_configured_depth` | `fifo.packets.len() >= limit` → `>` | `the excess over the queue limit must be tail-dropped` (`left: 1`, `right: 2`, `netem_scenarios.rs:416`); `decision_replay` stayed green |
 
-The **green** rows are the inventory's negative results: `large_jitter_still_jitters`
-asserts only that a sampled delay is non-zero, which a constant `latency`
-satisfies, and `sub_clamp_jitter_is_untouched_by_the_ceiling` compares after
-`as_nanos() as i64`, which recovers the value a `u64` wrap had encoded — which
-is why the clamp needed the new arm above. Neither arm is the jitter or clamp
-guard; the arms that are are named in their rows.
+The **green** rows were the inventory's negative results, and two of them have
+been repaired so their teeth match their names. `large_jitter_still_jitters`
+now requires at least two distinct delays, so a constant `latency` no longer
+satisfies it and the jitter-removal injection reddens it.
+`sub_clamp_jitter_is_untouched_by_the_ceiling` could not see the clamp through
+`as_nanos() as i64`, and did not test the ceiling either, so it is renamed
+`sampled_delay_stays_within_the_configured_jitter_envelope` — the envelope
+bound it actually asserts and still guards (a doubled or truncated jitter term
+escapes `[mu - sigma, mu + sigma]`). The clamp itself is pinned by
+`jitter_larger_than_latency_clamps_the_lower_tail_to_zero`. The
+`netem_scenarios`-package blindness in the draw-order and heap rows is not a
+default-tier gap: the lib arms named in those rows redden on both injections,
+so no parallel scenario was added — it would duplicate that coverage inside the
+same `cargo test --lib`, which already runs in about two seconds.
 
 ```gate-lib-package
 netem-test
@@ -159,6 +179,14 @@ lane_regime_coverage::jittery_lane_reorders_where_every_battery_lane_and_a_rate_
 lane_regime_coverage::jittery_lane_moves_the_variance_the_fast_loss_gate_decides_on
 lib::tests::a_closed_blackout_gate_consumes_no_prng_draws
 lib::tests::jitter_larger_than_latency_clamps_the_lower_tail_to_zero
+lib::tests::prng_matches_the_kernel_known_answers
+lib::tests::decision_replay_matches_recorded_sequence_for_fixed_config_and_seed
+lib::tests::limit_decisions_consume_no_prng_draws
+lib::tests::four_state_loss_consumes_exactly_one_draw_per_packet
+lib::tests::limit_tail_drops_and_counts_overflow
+lib::tests::overflow_drops_do_not_advance_shaper_clock_or_reorder_slot
+lib::tests::large_jitter_still_jitters
+lib::tests::sampled_delay_stays_within_the_configured_jitter_envelope
 ```
 
 ## Opt-in manifest
@@ -200,6 +228,14 @@ lane_regime_coverage::high_rtt_low_rate_lane_reaches_a_tens_of_seconds_rto_the_b
 scheduled_delivery_deadline::scheduled_deliveries_leave_at_their_own_deadline
 lib::tests::a_closed_blackout_gate_consumes_no_prng_draws
 lib::tests::jitter_larger_than_latency_clamps_the_lower_tail_to_zero
+lib::tests::prng_matches_the_kernel_known_answers
+lib::tests::decision_replay_matches_recorded_sequence_for_fixed_config_and_seed
+lib::tests::limit_decisions_consume_no_prng_draws
+lib::tests::four_state_loss_consumes_exactly_one_draw_per_packet
+lib::tests::limit_tail_drops_and_counts_overflow
+lib::tests::overflow_drops_do_not_advance_shaper_clock_or_reorder_slot
+lib::tests::large_jitter_still_jitters
+lib::tests::sampled_delay_stays_within_the_configured_jitter_envelope
 ```
 
 ## Deadline accuracy: the runner's own forward lateness
