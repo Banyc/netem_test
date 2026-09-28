@@ -40,6 +40,10 @@ def binary():
     anything.
     """
     candidates = (
+        # The tooling lives in the `rtp_mux` checkout beside this one, so
+        # the binary it builds sits under *that* crate's target directory.
+        CRATE.parent / "rtp_mux" / "target" / "release" / "perf-history",
+        CRATE.parent / "rtp_mux" / "target" / "debug" / "perf-history",
         CRATE / "target" / "release" / "perf-history",
         CRATE / "target" / "debug" / "perf-history",
         CRATE / "netem-test" / "target" / "release" / "perf-history",
@@ -50,7 +54,7 @@ def binary():
             return candidate
     raise AssertionError(
         "perf-history is not built; build it with "
-        "`cargo build -p netem-test --features cli --bin perf-history` before running this suite"
+        "`cargo build -p rtp_mux --features perf --bin perf-history` before running this suite"
     )
 
 

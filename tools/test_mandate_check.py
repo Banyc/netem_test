@@ -56,6 +56,10 @@ def binary():
     nothing.
     """
     candidates = (
+        # The tooling lives in the `rtp_mux` checkout beside this one, so
+        # the binary it builds sits under *that* crate's target directory.
+        WORKSPACE.parent / "rtp_mux" / "target" / "release" / "netem-tools",
+        WORKSPACE.parent / "rtp_mux" / "target" / "debug" / "netem-tools",
         WORKSPACE / "target" / "release" / "netem-tools",
         WORKSPACE / "target" / "debug" / "netem-tools",
         WORKSPACE / "netem-test" / "target" / "release" / "netem-tools",
@@ -66,7 +70,7 @@ def binary():
             return candidate
     raise AssertionError(
         "netem-tools is not built; build it with "
-        "`cargo build --release -p netem-test --features cli --bin netem-tools` "
+        "`cargo build --release -p rtp_mux --features perf --bin netem-tools` "
         "before running this suite"
     )
 
@@ -77,6 +81,10 @@ BINARY = binary()
 def perf_history_binary():
     """The built `perf-history`, which the runner's history step invokes."""
     candidates = (
+        # The tooling lives in the `rtp_mux` checkout beside this one, so
+        # the binary it builds sits under *that* crate's target directory.
+        WORKSPACE.parent / "rtp_mux" / "target" / "release" / "perf-history",
+        WORKSPACE.parent / "rtp_mux" / "target" / "debug" / "perf-history",
         WORKSPACE / "target" / "release" / "perf-history",
         WORKSPACE / "target" / "debug" / "perf-history",
         WORKSPACE / "netem-test" / "target" / "release" / "perf-history",
@@ -87,7 +95,7 @@ def perf_history_binary():
             return candidate
     raise AssertionError(
         "perf-history is not built; build it with "
-        "`cargo build --release -p netem-test --features cli --bin perf-history` "
+        "`cargo build --release -p rtp_mux --features perf --bin perf-history` "
         "before running this suite"
     )
 
@@ -492,6 +500,13 @@ class MandateCheckTest(unittest.TestCase):
         )
         (self.crate / "tests" / "mandate_smoke.rs").write_text(
             "// the mandate smoke set\n", encoding="utf-8"
+        )
+        # The arm declaration travels with the producer that owns it — the runner
+        # resolves it from that producer's own checkout, never from a tool's own
+        # directory — so the fake checkout carries the real crate's file.
+        shutil.copy(
+            WORKSPACE.parent / "rtp_mux" / ARMS_DECLARATION_NAME,
+            self.crate / ARMS_DECLARATION_NAME,
         )
         self.cargo = self.root / "fake-cargo"
         self.cargo.write_text(FAKE_CARGO, encoding="utf-8")
@@ -1831,7 +1846,7 @@ class MandateCheckTest(unittest.TestCase):
         self.assertEqual(smoke["package"], "rtp_mux")
         self.assertEqual(smoke["target"], "mandate_smoke")
         self.assertEqual(smoke["source"], "tests/mandate_smoke.rs")
-        self.assertEqual(smoke["default_path"], "../rtp_mux")
+        self.assertEqual(smoke["default_path"], ".")
         self.assertEqual(smoke["sections"], ["M1", "M2", "M3", "M4"])
         self.assertEqual(smoke["verdicts"], ["M1", "M2", "M3", "M4"])
         self.assertTrue(smoke["evidence"])

@@ -40,6 +40,10 @@ def binary():
     nothing.
     """
     candidates = (
+        # The tooling lives in the `rtp_mux` checkout beside this one, so
+        # the binary it builds sits under *that* crate's target directory.
+        CRATE.parent / "rtp_mux" / "target" / "release" / "netem-tools",
+        CRATE.parent / "rtp_mux" / "target" / "debug" / "netem-tools",
         CRATE / "target" / "release" / "netem-tools",
         CRATE / "target" / "debug" / "netem-tools",
         CRATE / "netem-test" / "target" / "release" / "netem-tools",
@@ -50,7 +54,7 @@ def binary():
             return candidate
     raise AssertionError(
         "netem-tools is not built; build it with "
-        "`cargo build -p netem-test --features cli --bin netem-tools` before running this suite"
+        "`cargo build -p rtp_mux --features perf --bin netem-tools` before running this suite"
     )
 
 

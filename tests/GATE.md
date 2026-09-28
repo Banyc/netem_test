@@ -534,15 +534,15 @@ probes prints one `[mandate-smoke <arm>] section=probe <key>=<value> ...` line
 carrying the arm's sample count — the iteration count it actually ran — and the
 rates it measured, and `tools/mandate-check` records those arms in the same
 report as `rtp_mux`'s, which is what the `mandate-compare` subcommand diffs against
-`tools/mandate-baseline.json`.
+`rtp_mux/mandate-baseline.json`.
 
 Three things make it one declaration and not two. The producer's entry is the
-`netem_test` one in `tools/mandate-producers.json`, which names the `probe`
+`netem_test` one in `rtp_mux/tools/mandate-producers.json`, which names the `probe`
 section, the `--ignored --test-threads=1` invocation, and that it writes no
 plots. The arm lines' contract — including what `section=` means and why a
 report-only producer needs it — is in `tools/MANDATE_SMOKE.md`. The cells the
 arms cover, and the baselines they are stated against, are the `probe-*` cells
-**above**: `tools/mandate-arms.json` only restates them for the runner, and
+**above**: `rtp_mux/mandate-arms.json` only restates them for the runner, and
 this section remains their one authority.
 
 ```gate-budgets

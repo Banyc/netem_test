@@ -13,7 +13,7 @@ binary recordable. Run it from this workspace root with no arguments:
 ./tools/mandate-check
 ```
 
-It then runs every producer declared in `tools/mandate-producers.json`, so one
+It then runs every producer declared in `rtp_mux/tools/mandate-producers.json`, so one
 invocation produces per-arm records for all of them. Optional arguments, none
 of them required:
 
@@ -30,7 +30,7 @@ of them required:
 
 ## The producers, and which are covered
 
-A producer is one entry of `tools/mandate-producers.json` (schema
+A producer is one entry of `rtp_mux/tools/mandate-producers.json` (schema
 `mandate-producers/1`). The entry declares, and the runner honours:
 
 - `id` — the producer's name in the report, on the command line, and the head
@@ -185,7 +185,7 @@ only.
    follows and that carries no `section=` token cannot be attributed and is a
    failure, an arm attributed to a section its producer does not declare is a
    failure, a section with no arm line was never measured and is a failure, an
-   arm whose coverage cell is not declared in `tools/mandate-arms.json` is a
+   arm whose coverage cell is not declared in `rtp_mux/mandate-arms.json` is a
    failure, and a run with no arm measurement at all is a failure. A
    `[mandate-smoke ...]` line matching neither shape is recorded as an arm
    *note* (prose the command does not depend on) and stays visible in the
@@ -314,7 +314,7 @@ selected; `command` and `cwd` are the first selected producer's, which is the
 - **`windows`** — the measured geometry (`window_seconds`, `wall_seconds`,
   `elapsed_seconds`). A shortened window is a coverage change.
 - **`cells`** — the coverage cells the arm is declared to exercise, read from
-  `tools/mandate-arms.json` by the longest matching arm-id prefix (so
+  `rtp_mux/mandate-arms.json` by the longest matching arm-id prefix (so
   `M4/m4/clean` covers `M4/m4/clean flow A`).
 - **`values`** — every parsed token verbatim, so a quantity the record does not
   normalise is still recorded rather than lost.
@@ -389,13 +389,13 @@ report measured, and it says how many rows it compared.
 
 `arms` is what makes a shortening checkable, and the `mandate-compare`
 subcommand is what checks it: it diffs a fresh report against the committed
-`tools/mandate-baseline.json` and reports, per arm, exactly which quantities
+`rtp_mux/mandate-baseline.json` and reports, per arm, exactly which quantities
 moved. Every arm of every producer the report covers is compared, and the
 verdict block names both runs' producers, so a variant that dropped a whole
 producer's arms is not a green diff but a coverage regression.
 
 ```sh
-cargo run -p netem-test --features cli --bin netem-tools -- mandate-compare <run>/mandate-check.json
+cargo run -p rtp_mux --features perf --bin netem-tools -- mandate-compare <run>/mandate-check.json
 ```
 
 A **coverage regression** (exit `4`) is a movement that means the arm no longer
@@ -453,12 +453,12 @@ read as agreement.
 `tools/test_mandate_check.py` exercises the whole command through the built
 `netem-tools` binary against a fake cargo and fake producer checkouts, so it
 needs no network and no real producer build — but it does need the runner
-built (`cargo build --release -p netem-test --features cli --bin netem-tools`),
+built (`cargo build --release -p rtp_mux --features perf --bin netem-tools`),
 and a missing binary is a failure rather than a skip; `python3 -m pytest tools/
 -q` runs it with the rest of the tooling suite. The parts that cannot be driven
 from a fixture (the line parsers, the timing derivation, the declaration
 validation, the panel verifier) are unit tests under
-`netem-test/src/tools/mandate_check/`. It covers the passing run with its written report and its per-arm
+`rtp_mux/src/tools/mandate_check/`. It covers the passing run with its written report and its per-arm
 record, a failing mandate, a missing mandate line, a missing or empty CSV, a
 declaration whose series has no rows, a compile failure, a timeout, a missing
 checkout and a plot that cannot be produced, that a directory holding someone

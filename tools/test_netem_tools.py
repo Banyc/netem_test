@@ -101,6 +101,10 @@ def binary():
     anything.
     """
     candidates = (
+        # The tooling lives in the `rtp_mux` checkout beside this one, so
+        # the binary it builds sits under *that* crate's target directory.
+        CRATE.parent / "rtp_mux" / "target" / "release" / "netem-tools",
+        CRATE.parent / "rtp_mux" / "target" / "debug" / "netem-tools",
         CRATE / "target" / "release" / "netem-tools",
         CRATE / "target" / "debug" / "netem-tools",
         CRATE / "netem-test" / "target" / "release" / "netem-tools",
@@ -111,7 +115,7 @@ def binary():
             return candidate
     raise AssertionError(
         "netem-tools is not built; build it with "
-        "`cargo build -p netem-test --features cli --bin netem-tools` before running this suite"
+        "`cargo build -p rtp_mux --features perf --bin netem-tools` before running this suite"
     )
 
 
@@ -932,19 +936,23 @@ class MandateCompareTest(unittest.TestCase):
     def test_a_negative_tolerance_is_refused(self):
         self.reject(baseline_report(), "must not be negative", "--count-tolerance", "-1")
 
-    def test_the_default_baseline_is_the_tool_s_own_file(self):
-        # Without `--baseline`, the command compares against the committed
-        # baseline beside its own tooling; the verdict block names that file.
+    def test_the_default_baseline_belongs_to_the_mandate_owner(self):
+        # Without `--baseline`, the command compares against the baseline that
+        # belongs to the crate owning the mandate — the producer whose registry
+        # entry declares one — not a file beside this tool. The verdict block
+        # names that file.
         _code, stdout, stderr = self.run_tool_without_baseline(baseline_report())
         self.assertIn(
-            (TOOLS / "mandate-baseline.json").as_posix(), stdout, stdout + stderr
+            (CRATE.parent / "rtp_mux" / "mandate-baseline.json").as_posix(),
+            stdout,
+            stdout + stderr,
         )
 
     def test_the_committed_baseline_is_comparable_with_itself(self):
         # The real committed baseline must satisfy the comparison's own
         # preconditions; a baseline this command refuses would make the
         # instrument unusable the day it lands.
-        committed = TOOLS / "mandate-baseline.json"
+        committed = CRATE.parent / "rtp_mux" / "mandate-baseline.json"
         if not committed.is_file():
             self.skipTest("no committed baseline yet")
         candidate = self.root / "candidate.json"

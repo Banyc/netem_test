@@ -347,7 +347,8 @@ and the checker prints how many of the declared rows it compared, so an
 absent measurement is visible rather than read as agreement.
 
 **The mechanism is central; the rows are not.** `netem-tools check-gate` is the
-enforcement and it lives with the harness tooling, but a crate's budgets, its
+enforcement and it lives with the mandate tooling in the `rtp_mux` checkout
+(behind that crate's `perf` feature), but a crate's budgets, its
 nominal costs, its baseline and its coverage cells are that crate's own
 declaration in its own `GATE.md`. The checker can name a row it cannot resolve;
 it cannot know what another crate's tests cost or which cells they cover. The
@@ -614,7 +615,7 @@ what it writes and its exit codes are in `tools/MANDATE_SMOKE.md`.
 battery: it built and invoked the producers, collected each mandate's `json` and
 `csv`, called the plotter, enforced the producer contract and wrote the report.
 It is now the `mandate-check` subcommand of `netem-tools`, built from
-`netem-test/src/tools/mandate_check/` (`lines.rs` for the verdict and arm lines,
+`rtp_mux/src/tools/mandate_check/` (`lines.rs` for the verdict and arm lines,
 `timings.rs` for the libtest stamps and the mandate brackets, `delivery.rs` for a
 declaration's unit budget, `producers.rs` for the registry and the revision/tree
 resolution, `exec.rs` for the two child processes and the panel verifier,
@@ -636,7 +637,7 @@ healthy run and its report, each refusal the contract names, the two producers,
 the arms, the delivery granularity, the timings, the run directory, and the
 history step's two text artifacts. What cannot be driven from a plan — the line
 parsers, the timing derivation, the declaration validation, the panel verifier —
-is unit-tested where it lives, under `netem-test/src/tools/mandate_check/`. The
+is unit-tested where it lives, under `rtp_mux/src/tools/mandate_check/`. The
 cases that moved, so that no case was dropped without a named replacement:
 
 | Python case (in `tools/mandate_check.py`'s suite) | Rust assertion that carries it |
@@ -680,7 +681,7 @@ command wrote.
 ### The perf-history M1 band — measured, not a fixed percentage
 
 After the battery, `tools/mandate-check` runs the `perf-history` bin
-(`netem-test/src/bin/perf-history.rs`, built with `--features cli`) over the run:
+(`rtp_mux/src/bin/perf-history.rs`, built with `--features perf`) over the run:
 it archives the run's artifacts, compares it to the previous archived one, and —
 because M1 is the standing priority — **exits 6 when an interactive arm's tail
 regressed**, so the wrapper's status arms the quick-revert runbook.
@@ -810,7 +811,7 @@ invocation.
 
 `rtp_mux`'s smoke set is the producer the instrument was built for, and it is
 no longer the only one. A **producer** is one entry of
-`tools/mandate-producers.json`: its cargo invocation, its source, its log, the
+`rtp_mux/tools/mandate-producers.json`: its cargo invocation, its source, its log, the
 sections its arms are attributed to, and which of those sections print a
 `MANDATE` line and write plots. `tools/mandate-check` runs **every** declared
 producer by default, so a single invocation produces per-arm records for all
@@ -832,7 +833,7 @@ a crate that is not `rtp_mux`. Two producers are declared and covered today:
 
 The contract a producer owes, and the form a crate's author follows to make a
 new test binary recordable, is in `tools/MANDATE_SMOKE.md`; the cells each
-producer's arms cover are declared in `tools/mandate-arms.json`.
+producer's arms cover are declared in `rtp_mux/mandate-arms.json`.
 
 ### The per-arm record and the coverage comparison
 
@@ -876,17 +877,17 @@ bulk rates), the **delivery and wire counters** (`sent`, `received`,
 `wire_bytes`, `bulk_wire_bytes`, `bulk_sink_bytes`, and the
 offered/delivered/forwarded bytes where the arm has them), the **measured
 windows**, every parsed token verbatim, and the **declared coverage cells** the
-arm exercises, read from `tools/mandate-arms.json` (a declaration naming what
+arm exercises, read from `rtp_mux/mandate-arms.json` (a declaration naming what
 each smoke arm covers, matched by the longest arm-id prefix). The record is
 required, not decorative: a run that measured no arm, a mandate whose arm lines
 are gone, an arm line that cannot be attributed, and an arm that claims no
 declared cell each fail the run.
 
 **The `mandate-compare` subcommand turns a difference into a verdict.** It compares a
-fresh report with the committed `tools/mandate-baseline.json`:
+fresh report with the committed `rtp_mux/mandate-baseline.json`:
 
 ```sh
-cargo run -p netem-test --features cli --bin netem-tools -- mandate-compare <run>/mandate-check.json
+cargo run -p rtp_mux --features perf --bin netem-tools -- mandate-compare <run>/mandate-check.json
 ```
 
 A **coverage regression** (exit `4`) is a movement that means the arm no longer
@@ -936,13 +937,13 @@ cells as declared cannot tell that arm from the `M1/clean` arm that records
 `lane=dual` as a claim red-flags the residue; a rule that read it as a non-claim
 stops comparing the 8 MiB. So the floor stays for exactly those unstated pairs,
 the pairs are named in every verdict, and a *claiming* cell consults no floor at
-all. `netem-test/src/tools/mandate_compare.rs`'s docstring and
-`tools/mandate-arms.json`'s cell declarations are the authorities for the rule
+all. `rtp_mux/src/tools/mandate_compare.rs`'s docstring and
+`rtp_mux/mandate-arms.json`'s cell declarations are the authorities for the rule
 and the cells it reads.
 
 ### The checked-in baseline
 
-`tools/mandate-baseline.json` is the `mandate-check.json` of one real
+`rtp_mux/mandate-baseline.json` is the `mandate-check.json` of one real
 `tools/mandate-check` run, checked in so that the `mandate-compare` subcommand has a
 reference: it records the per-arm measurements a later run's coverage is
 compared against. It was taken with `tools/mandate-check` (no `--quick`, and no

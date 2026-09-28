@@ -19,17 +19,26 @@ instrument whose probe and lanes are hosted by the crates they measure.
   application scenarios that consume `rtp`, `mux` or `rtp_mux` live in those
   crates' own test targets, where the code they exercise lives; the harness
   depends on none of them.
-- `tools/` — the performance capture and comparison tooling (`perf-loop`,
-  `perf_loop.py`, `mandate-check`, `netem-tools mandate-plot`, `netem-tools check-gate`,
+- `tools/` — the performance *capture* tooling (`perf-loop`, `perf_loop.py`,
   `render_graph.py`, `rtp_trace_compare.py`, `rtp_trace_report.py`,
-  `samply_hotspots.py`, `calib.py`, …). The tooling stays here; the probe it
-  drives is `rtp_mux/tests/perf_probe.rs`, so
+  `samply_hotspots.py`, `calib.py`, …) and the pytest suites that drive it. The
+  probe it drives is `rtp_mux/tests/perf_probe.rs`, so
   `--component-revision rtp_mux=<commit>` selects the probe that runs.
 
+The **mandate tooling** — the `mandate-check` / `mandate-compare` /
+`mandate-plot` / `check-gate` subcommands of `netem-tools`, the `perf-history`
+binary, the arm coverage declaration, the committed baseline and the producer
+registry — lives in the `rtp_mux` checkout, behind that crate's `perf` feature
+(`cargo build --release -p rtp_mux --features perf --bin netem-tools`), and
+`crates/rtp_mux/tools/mandate-check` is its documented entry point. It is kept
+out of this crate on purpose: the harness is *other-project agnostic*, and a
+tool that reads the tri-mandate's ids, cells and baseline knows one specific
+product's constitution. `rtp_mux` owns the mandate, so it owns the tooling that
+enforces it.
+
 The harness is a leaf: `netem-test` depends only on `dfsql`, `serde`,
-`parking_lot`, and optionally `tokio` (the `test-kit` feature) and `clap` (the
-`cli` feature, which the two binaries alone require), and the `tests` package
-only on `netem-test` and `tokio`.
+`parking_lot`, and optionally `tokio` (the `test-kit` feature), and the `tests`
+package only on `netem-test` and `tokio`.
 
 ## Performance quick path
 
@@ -53,14 +62,15 @@ The historical/default profile remains hostile with MSS 8192:
 baseline/candidate pair and recorded in every manifest (`run.json`, both
 trace manifests, and the paired `manifest.csv`).
 
-For the interactive path's tri-mandate constitution, `./tools/mandate-check`
-runs every declared producer's perf target — `rtp_mux`'s smoke set and this
+For the interactive path's tri-mandate constitution,
+`cd crates/rtp_mux && tools/mandate-check` runs every declared producer's perf
+target — `rtp_mux`'s smoke set and this
 workspace's own perf-tier probes — renders the smoke set's panels and writes
 `mandate-check.json`; run it and read the plots for any change to `rtp`, `mux`
 or `rtp_mux` (see `tools/MANDATE_SMOKE.md`). The per-arm records it writes are
 what the `mandate-compare` subcommand of the `netem-tools` binary
-(`cargo run -p netem-test --features cli --bin netem-tools -- mandate-compare`)
-diffs against `tools/mandate-baseline.json`, so a
+(`cargo run -p rtp_mux --features perf --bin netem-tools -- mandate-compare`)
+diffs against `rtp_mux/mandate-baseline.json`, so a
 shortening of any recorded arm can be shown coverage-neutral. The intention
 behind the constitution, and the inventory of the tools and gates that measure
 it, are in `tools/PERF_INFRA.md`.
@@ -95,6 +105,8 @@ if a scenario is not classified.
 ```sh
 cargo test -p netem-test        # harness unit tests
 cargo test -p tests             # default gate (see tests/GATE.md)
-netem-tools check-gate     # verify the gate manifest matches reality
+cd ../rtp_mux && tools/mandate-check   # the mandate battery (see below)
+cargo run -p rtp_mux --features perf --bin netem-tools -- check-gate
+                          # verify a gate manifest matches reality
 python3 -m pytest tools/ -q     # verify the tooling
 ```

@@ -188,6 +188,10 @@ def pairs(values, specs):
 
 def binary():
     candidates = (
+        # The tooling lives in the `rtp_mux` checkout beside this one, so
+        # the binary it builds sits under *that* crate's target directory.
+        CRATE.parent / "rtp_mux" / "target" / "release" / "netem-tools",
+        CRATE.parent / "rtp_mux" / "target" / "debug" / "netem-tools",
         CRATE / "target" / "release" / "netem-tools",
         CRATE / "target" / "debug" / "netem-tools",
         CRATE / "netem-test" / "target" / "release" / "netem-tools",
@@ -198,7 +202,7 @@ def binary():
             return candidate
     raise SystemExit(
         "netem-tools is not built; run "
-        "`cargo build -p netem-test --features cli --bin netem-tools`"
+        "`cargo build -p rtp_mux --features perf --bin netem-tools`"
     )
 
 

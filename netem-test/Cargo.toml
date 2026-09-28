@@ -5,38 +5,17 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-clap = { version = "4.6.7", features = ["derive"], optional = true }
 dfsql = { git = "https://github.com/Banyc/dfsql", tag = "v0.18.0" }
 serde = { version = "1", features = ["derive"] }
 parking_lot = "0.12"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"], optional = true }
 
 [features]
-# Command-line parsing for the `netem-tools` and `perf-history` binaries. Both
-# binaries require this feature (`required-features` below), so it stays OFF
-# for plain library builds: this crate is pinned by published tags and consumed
-# as a dev-dependency by the sibling crates, and a plain `[dependencies]` entry
-# would make every consumer fetch and build a parser the library never calls.
-cli = ["dep:clap"]
 # Shared scenario-testing kit: generic helpers (deterministic payload,
 # impairment presets, reporting stats, task scopes, per-flow fans) consumed
 # by the scenario crates. The feature stays OFF for plain library builds so
 # the leaf harness does not drag tokio into the normal dependency graph.
 test-kit = ["dep:tokio"]
-
-# Both binaries parse their command line with clap, so they require the `cli`
-# feature (which is what pulls clap in). Declared explicitly rather than
-# auto-discovered, because a `[[bin]]` section is the only place
-# `required-features` can be stated.
-[[bin]]
-name = "netem-tools"
-path = "src/bin/netem-tools.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "perf-history"
-path = "src/bin/perf-history.rs"
-required-features = ["cli"]
 
 [dev-dependencies]
 # Self dev-dependency, mirroring the same self-dev-dependency pattern the
