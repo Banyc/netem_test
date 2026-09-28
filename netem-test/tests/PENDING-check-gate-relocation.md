@@ -231,18 +231,126 @@ own and moves with the targets.
 ## A second consequence: harness-mode doc counts are red until the authorities move
 
 Harness-mode `netem-tools check-gate` (no arguments, run from the harness root)
-reports every documented-count claim in `tools/PERF_INFRA.md` and
-`tools/MANDATE_SMOKE.md` as `cannot derive`, because the sources those counts
-are derived from moved with the tooling: `tools/mandate-producers.json`,
-`tools/mandate-arms.json`, `tools/mandate-baseline.json` and
-`netem-test/src/tools/mandate_compare.rs` all live under `rtp_mux` now. The
-`doc_counts()` entries in `rtp_mux/src/tools/check_gate/doc_counts.rs` still
-name the harness paths, so the checker can no longer determine a value. This is
-pre-existing at `e423c41b` (the sources were deleted there) and is not caused
-by the removal of the fixture targets, but it is the same relocation: each
-entry's `authority` path must point at the `rtp_mux`-side source, and the
-`check_gate_doc_counts` fixture — when it is relocated — must be shown to fail
-when one of those authorities is broken, or the counts go unguarded.
+fails with **31 `DOC COUNT` lines**, and they are the run's only red: the perf
+declaration, the env-tier block and the lane roles all pass. The sources every
+documented count in `tools/PERF_INFRA.md` and `tools/MANDATE_SMOKE.md` is
+derived from moved with the tooling, so the `doc_counts()` entries in
+`rtp_mux/src/tools/check_gate/doc_counts.rs` still look under the harness root
+and cannot determine a value. This is pre-existing at `e423c41b` (the sources
+were deleted there) and is not caused by the removal of the fixture targets.
+
+### The 31 lines, by cause
+
+Four lines say `cannot derive: <path> does not exist` — the moved authority
+itself. The other twenty-seven say `cannot be checked: nothing determined a
+value for '<key>' (<authority>)` — one per prose instance of a count whose
+value comes from one of the four. **Every one of the 31 is downstream of the
+four `cannot derive` lines; no count has any other cause.**
+
+| authority, harness path | new location | direct `cannot derive` | downstream `cannot be checked` |
+| --- | --- | --- | --- |
+| `tools/mandate-producers.json` | `rtp_mux/tools/mandate-producers.json` | 1 | 11 |
+| `tools/mandate-arms.json` | `rtp_mux/mandate-arms.json` (the subdirectory changed too) | 1 | 4 |
+| `tools/mandate-baseline.json` | `rtp_mux/mandate-baseline.json` (the subdirectory changed too) | 1 | 11 |
+| `netem-test/src/tools/mandate_compare.rs` | `rtp_mux/src/tools/mandate_compare.rs` | 1 | 1 |
+
+The four lines, verbatim (`cd crates/netem_test && netem-tools check-gate`):
+
+```
+DOC COUNT: cannot derive: tools/mandate-producers.json does not exist
+DOC COUNT: cannot derive: tools/mandate-arms.json does not exist
+DOC COUNT: cannot derive: tools/mandate-baseline.json does not exist
+DOC COUNT: cannot derive: <root>/netem-test/src/tools/mandate_compare.rs does not exist, so COUNT_FLOORS_BYTES has no declared source
+```
+
+### The 15 declarations, their keys and their new owner
+
+One row per `DocCount` entry of
+`rtp_mux/src/tools/check_gate/doc_counts.rs`, with the prose that states it and
+the declaration data that now owns the number (the `authority` string the
+diagnostic prints today).
+
+| `DocCount` label (keys) | prose | new owner |
+| --- | --- | --- |
+| `producers declared` (`producers`) | `tools/PERF_INFRA.md:826`, `tools/MANDATE_SMOKE.md:55` | `rtp_mux/tools/mandate-producers.json`, the `producers[]` array |
+| `the ordinal after the declared producers` (`next_producer`) | `tools/MANDATE_SMOKE.md:62` | the same array, one past its end |
+| `evidence files per run` (`evidence_files`) | `tools/PERF_INFRA.md:612`, `:831`, `tools/MANDATE_SMOKE.md:59`, `:155`, `:330` | `rtp_mux/tools/mandate-producers.json`, `2 x len(producers[id=rtp_mux].verdicts)` |
+| `MANDATE lines per run` (`verdicts`) | `tools/MANDATE_SMOKE.md:154` | the same `verdicts[]` array |
+| `panels and plot files of a mandate-check run` (`baseline_panels`, `baseline_plot_files`) | `tools/PERF_INFRA.md:613` | `rtp_mux/mandate-baseline.json`, the summed `mandates[*].panels` (twice for the plot files) |
+| `mandates and verified panels of the baseline run` (`verdicts`, `baseline_panels`) | `tools/PERF_INFRA.md:964` | both of the above |
+| `arms recorded in the baseline run` (`arms_total`) | `tools/PERF_INFRA.md:965` | `rtp_mux/mandate-baseline.json`, `len(arms)` |
+| `rtp_mux arms in the baseline run` (`arms_rtp_mux`) | `tools/PERF_INFRA.md:965` | the same `arms[]`, `producer == "rtp_mux"` |
+| `per-mandate arm counts in the baseline run` (`arms_M1`..`arms_M4`) | `tools/PERF_INFRA.md:966` | the same `arms[]`, grouped by `mandate` |
+| `probes recorded in the baseline run` (`baseline_probes`) | `tools/PERF_INFRA.md:966` | the same `arms[]`, `producer == "netem_test"` |
+| `probe arms in the probe section` (`arms_probe`) | `tools/PERF_INFRA.md:836`, `tools/MANDATE_SMOKE.md:60` | `rtp_mux/mandate-arms.json`, the `probe/` keys of `cells` |
+| `perf-tier probes of the harness` (`arms_probe`) | `tools/PERF_INFRA.md:832`, `tools/MANDATE_SMOKE.md:60` | the same `probe/` keys |
+| `duration of the baseline run` (`baseline_duration`) | `tools/PERF_INFRA.md:964` | `rtp_mux/mandate-baseline.json`, `duration_seconds` |
+| `producers a two-producer case runs` (`producers`) | `tools/MANDATE_SMOKE.md:469` | `rtp_mux/tools/mandate-producers.json`, the `producers[]` array |
+| `counted floors applied to an unstated lane` (`count_floor_counters`) | `tools/MANDATE_SMOKE.md:421` | `rtp_mux/src/tools/mandate_compare.rs`, the `COUNT_FLOORS_BYTES` const array |
+
+The prose here is **not** stale. Every sentence is still present, and the
+ones that name a source already name the `rtp_mux` path
+(`tools/PERF_INFRA.md:821`, `:843`, `:887`, `:947`). Read once by hand against
+the moved data, every number they state still matches: two producers, eight
+evidence files, 12 panels and 24 plot files, 23 arms (19 `rtp_mux` + 4 probes;
+3 M1, 3 M2, 3 M3, 10 M4), 189.7 s, four `probe/` cells, two counted floors.
+So nothing is deleted from the harness docs: **what is stale is the checker's
+lookup, not the declaration.**
+
+The hand check is one command (run from `crates/rtp_mux`):
+
+```sh
+python3 - <<'PY'
+import json
+from collections import Counter
+b = json.load(open("mandate-baseline.json"))
+arms = b["arms"]
+producers = json.load(open("tools/mandate-producers.json"))["producers"]
+print(len(producers), 2 * len([p for p in producers if p["id"] == "rtp_mux"][0]["verdicts"]))
+print(len(arms), Counter(a["producer"] for a in arms), Counter(a["mandate"] for a in arms))
+print(sum(int(v.get("panels") or 0) for v in b["mandates"].values()), b["duration_seconds"])
+print(len([k for k in json.load(open("mandate-arms.json"))["cells"] if k.startswith("probe/")]))
+PY
+```
+
+It prints `2 8`, then `23 Counter({'rtp_mux': 19, 'netem_test': 4})
+Counter({'M4': 10, 'probe': 4, 'M1': 3, 'M2': 3, 'M3': 3})`, then `12
+189.736`, then `4`.
+
+### The fix belongs to `rtp_mux`, and this is exactly what it is
+
+Point four lookups in `rtp_mux/src/tools/check_gate/doc_counts.rs` at the
+mandate owner's checkout:
+
+- `doc_count_values()` (`doc_counts.rs:659-661`) — `doc_json(root,
+  "tools/mandate-producers.json", ...)`, `doc_json(root,
+  "tools/mandate-arms.json", ...)` and `doc_json(root,
+  "tools/mandate-baseline.json", ...)`. The first is at `tools/` under
+  `rtp_mux`; the other two are at that crate's root.
+- `count_floor_counters()` (`doc_counts.rs:608-615`) — the
+  `root/netem-test/src/tools/mandate_compare.rs` join; the file is
+  `rtp_mux/src/tools/mandate_compare.rs`.
+- The 15 `authority` strings tabled above: they are printed in every
+  diagnostic, so they must name the new paths once the lookups are fixed.
+
+Harness mode's root is the harness checkout while these four live in the
+mandate owner's. The checker already computes the sibling checkouts
+(`Layout::crates_root`, `check_gate/mod.rs:190`), so the re-point can resolve
+them there; alternatively the doc-count half can be declared to run only from a
+checkout that holds them. Either way `tests/GATE.md`'s account of the
+no-argument form has to say which checkout it needs.
+
+**Vacuity for the relocated fixture.** `check_gate_doc_counts.rs` (15 tests,
+removed here) drove `check_doc_counts` over a temp copy of the repository and
+asserted each failure mode fires. When it is relocated it must be re-pinned
+against the new authority paths and shown to fail — by the checker's own
+message, or by the count it guards changing — when one of the four authorities
+is broken, or the counts go unguarded while the checker reads green.
+
+**Noticed while characterising this:** `tools/PERF_INFRA.md` never describes the
+doc-count half at all (it documents the perf declaration and the env-tier
+block, not the documented counts). That is why a reader of the harness docs
+could not see that harness mode runs the check, or that it had gone red.
 
 ## The `gate-env-tier` rows that moved with the code
 
