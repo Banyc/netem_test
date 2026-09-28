@@ -433,6 +433,55 @@ attribution@baseline-family=instrument-sanity = perf_probe::deterministic_iid_lo
 attribution@baseline-family=lone-tail = rtp_mux_jitter::jitter_request_response_arms is two declared dimensions from each of its family's other rows (impairment with jitter, and impairment with loss); a request/response arm varying one axis is what closes this.
 ```
 
+## Pending `rtp_mux` finding: the Minecraft arm's "offered down" is a per-link figure
+
+Named queue entry for an `rtp_mux`-side fix; nothing in `netem_test` changes
+its behaviour. Found while pinning the harness's offered-byte identity.
+
+**The line.** `mc_downstream_saturating_bulk` prints
+`interactive offered down {int_down_offered_bytes} B`
+(`crates/rtp_mux/tests/minecraft_contested.rs:772`) and fills that field from
+one netem link's counter:
+`int_down_offered_bytes: int_down.received_bytes` (`:1308`, where
+`int_down = int_pair.stats_s2c()`).
+
+**The counter is right; the label is not.**
+`Counters::received_bytes` (`crates/netem_test/netem-test/src/lib.rs:486`) is,
+by construction, *one direction of one link*: it is incremented exactly once
+per datagram accepted on that link's socket, before impairment, at four
+handlers (`:908`, `:969`, `:994`, `:1193`). It cannot count bytes that never
+reach that link, and it is now pinned by
+`netem-test::tests::received_bytes_counts_every_offered_datagram_once_on_every_schedule_path`
+plus `tests::conservation_identity::received_bytes_conserves_the_senders_offer_under_the_minecraft_config`,
+which derive the offered total from the sender's own bookkeeping rather than
+from the counter.
+
+**The reading was wrong because the streams' data is not confined to that
+link.** One run (`MC_CONTESTED_FAULT=no_bulk MC_RUNS=1 MC_WINDOW_SECS=20`,
+`[mc-downstream offer run 0] down_small 1000/1000 | down_burst 4/4 | ...
+interactive offered down 2090022 B`) reads ~2.09 MB on the interactive link
+while the interactive streams delivered ~2.4 MB of payload
+(4 x 512 KiB + 1000 x 300 B + 48 B echoes), and the *bulk* pair's own
+`[mc-downstream bulk run 0] down_offered=0.113 MiB/s ... push_writes=0` shows
+~2.19 MB arriving on that link's downstream (0.113 MiB/s x 18.5 s) even though
+its `MODE_BULK_DOWN` handler wrote nothing. The interactive downstream
+therefore crosses both netem links; summing both pairs would include the bulk
+push, and no harness counter answers "what did the interactive streams offer".
+
+**What the `rtp_mux` owner should do** (a change to the arm's accounting, not
+to any window, threshold, cadence or tier):
+
+1. Compute the interactive offer at its **source** -- `push_shaped` and
+   `push_bulk` already know exactly which bytes their `write_all` calls
+   accepted -- and print that as the offered figure, as `push_writes` and the
+   payload reads already do for delivery.
+2. If the per-link number is wanted at all, label it for what it is ("netem
+   interactive link received"), never "interactive offered", and never
+   attribute a per-link counter to a stream: a session's streams may be
+   carried over more than one link, as this arm's own output shows.
+3. Reconcile before trusting any per-lane wire figure in that arm's report, as
+   the arm's module header already promises.
+
 ## How to make the draft real
 
 1. Measure the `TBD` rows: one invocation per row as described above, rounding

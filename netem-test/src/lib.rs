@@ -471,6 +471,15 @@ impl Default for NetemConfig {
 /// separate overflow-drop counter required by the packet queue limit, and the
 /// scheduler-drain counters describing non-empty FIFO/heap drains (never the
 /// direct forwarding paths).
+///
+/// **Scope:** one `Counters` describes **one direction of one link**. Nothing
+/// here spans both directions, and nothing spans two links: a `NetemPair`
+/// keeps `stats_c2s` and `stats_s2c` apart and `NetemPair::stats` is the only
+/// place that sums them. Read a per-link figure as "what crossed this link",
+/// never as "what an application offered" — a caller that wants an
+/// application's own offer must account for it at the source, because bytes a
+/// sender drops in its own stack, or that a peer's session routes over a
+/// different link, never appear here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     pub delayed: u64,
@@ -480,9 +489,17 @@ pub struct Counters {
     pub rate_limited: u64,
     pub forwarded: u64,
     pub received: u64,
-    /// Payload bytes emitted by successful `send_to` calls.
+    /// Payload bytes emitted by successful `send_to` calls, on this link and
+    /// direction. A duplicated datagram contributes one copy per send.
     pub forwarded_bytes: u64,
-    /// Payload bytes accepted before impairment.
+    /// Payload bytes accepted on this link and direction **before**
+    /// impairment. Counted exactly once per accepted datagram, whether the
+    /// impairment later forwards, drops, duplicates or queues it.
+    ///
+    /// This is an *offered to this link* figure, not the sender's own offer:
+    /// datagrams lost between the sender and this link are invisible, and
+    /// there is no per-cause byte breakdown, so `received_bytes` is not
+    /// conserved against `forwarded_bytes` alone.
     pub received_bytes: u64,
     /// Packets dropped because the per-direction queue exceeded `limit`.
     pub overflow_dropped: u64,
@@ -6156,6 +6173,135 @@ mod tests {
             iid, correlated,
             "the reorder correlation knob must change the reorder pattern (both {iid})"
         );
+    }
+
+    /// The offered-byte identity: every datagram a link accepts contributes
+    /// its length to `received_bytes` **exactly once**, on every forwarding
+    /// path, whatever the impairment later does with it (forward, drop,
+    /// duplicate, leave queued, or tail-drop at the shared shaper).
+    ///
+    /// Both sides are derived independently: `offered_bytes` is summed here
+    /// from the datagrams this test feeds in -- never read back from the link
+    /// -- so a dropped increment cannot cancel against an expectation that was
+    /// itself computed from `received_bytes`. Mixed, non-monotone lengths keep
+    /// a packet-count increment or a constant-size assumption from matching by
+    /// accident.
+    #[test]
+    fn received_bytes_counts_every_offered_datagram_once_on_every_schedule_path() {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2000));
+        let datagrams: Vec<Vec<u8>> = (0..48u32)
+            .map(|i| vec![i as u8; 20 + (i as usize * 13) % 300])
+            .collect();
+        let offered_packets = datagrams.len() as u64;
+        let offered_bytes: u64 = datagrams.iter().map(|d| d.len() as u64).sum();
+        assert!(
+            offered_bytes != offered_packets * 20,
+            "the fixture's lengths must vary, or a constant-size increment would match by accident"
+        );
+
+        let conserved = |label: &str, stats: Counters| {
+            assert_eq!(
+                stats.received, offered_packets,
+                "{label}: the link accepted {offered_packets} datagram(s) but counted {}",
+                stats.received
+            );
+            assert_eq!(
+                stats.received_bytes, offered_bytes,
+                "{label}: the link was offered {offered_bytes} byte(s) but counted {}",
+                stats.received_bytes
+            );
+        };
+
+        // 1. Clean direct path.
+        let (runner, sent) = mock_runner(NetemConfig::default());
+        assert!(runner.pipeline.direct_forward);
+        for d in &datagrams {
+            runner.pipeline.forward_direct(d, Some(server_addr), &*sent);
+        }
+        conserved("direct", runner.pipeline.stats.snapshot());
+
+        // 2. Stochastic direct path: loss and duplication both fire.
+        let (mut runner, sent) = mock_runner(NetemConfig {
+            loss: u32::MAX / 2,
+            duplicate: u32::MAX / 2,
+            ..NetemConfig::default()
+        });
+        assert!(runner.pipeline.direct_stochastic);
+        for d in &datagrams {
+            runner
+                .pipeline
+                .forward_stochastic_direct(d, Some(server_addr), &*sent);
+        }
+        let stats = runner.pipeline.stats.snapshot();
+        assert!(
+            stats.dropped > 0 && stats.duplicated > 0,
+            "the stochastic fixture must actually drop and duplicate (dropped {}, duplicated {})",
+            stats.dropped,
+            stats.duplicated
+        );
+        conserved("stochastic direct", stats);
+
+        // 3. FIFO path with a queue limit so tail-drops fire.
+        let (mut runner, sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(10),
+            queue_limit_pkts: 8,
+            ..NetemConfig::default()
+        });
+        assert_eq!(runner.pipeline.schedule(), Schedule::Fifo);
+        let clock = sent.clock();
+        let mut fifo = FifoQueue::default();
+        for d in &datagrams {
+            runner
+                .pipeline
+                .handle_datagram_fifo(d, clock.now(), Some(server_addr), &mut fifo);
+        }
+        let stats = runner.pipeline.stats.snapshot();
+        assert!(
+            stats.overflow_dropped > 0,
+            "the FIFO fixture must exceed queue_limit_pkts so the tail-drop branch runs"
+        );
+        conserved("fifo", stats);
+
+        // 4. Heap path (jitter selects it).
+        let (mut runner, sent) = mock_runner(NetemConfig {
+            latency: Duration::from_millis(10),
+            jitter: Duration::from_millis(5),
+            ..NetemConfig::default()
+        });
+        assert_eq!(runner.pipeline.schedule(), Schedule::Heap);
+        let clock = sent.clock();
+        for d in &datagrams {
+            runner
+                .pipeline
+                .handle_datagram(d, clock.now(), Some(server_addr));
+        }
+        conserved("heap", runner.pipeline.stats.snapshot());
+
+        // 5. Shared shaper with a byte limit smaller than any datagram, so
+        // every packet takes the shaper's tail-drop branch.
+        let stats = Arc::new(AtomicCounters::default());
+        let mut state = NetemState::new(
+            NetemConfig {
+                jitter: Duration::from_millis(5),
+                ..NetemConfig::default()
+            },
+            Arc::clone(&stats),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Some(BottleneckShaper::new(8 * 1024 * 1024, 1)),
+            None,
+        );
+        for d in &datagrams {
+            state.handle_datagram(d, Instant::now(), Some(server_addr));
+        }
+        let snapshot = stats.snapshot();
+        assert!(
+            snapshot.overflow_dropped == offered_packets,
+            "the shared-shaper fixture must tail-drop every datagram (dropped {})",
+            snapshot.overflow_dropped
+        );
+        conserved("shared shaper", snapshot);
     }
 
     /// The byte counters must actually track the payload lengths the transport
