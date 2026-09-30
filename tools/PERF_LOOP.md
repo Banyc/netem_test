@@ -658,7 +658,7 @@ reuses those exact bytes for both roles, writes role-specific source
 manifests (`{baseline,candidate}-probe-source.json`) against the same
 SHA-256, fails if the role hashes differ, and continues the counterbalanced
 role order and safe target/temp roots. Every build, run, and temporary
-artifact stays beneath `~/code/tmp`, and both roles record exact executable
+artifact stays beneath `$TMPDIR`, and both roles record exact executable
 hashes, component revisions, scenario, FEC settings, and allowed mismatches.
 
 Treatment contracts: never compile baseline and candidate separately

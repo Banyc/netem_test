@@ -19,9 +19,9 @@ LOOP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(LOOP)
 
 # perf_loop refuses every output/temp path that escapes its safe root, so
-# unit-test scratch directories must live beneath ~/code/tmp regardless of
-# the ambient TMPDIR.
-_SAFE_TEST_TMP = LOOP.SAFE_TEMP_ROOT / "perf-loop-unit-tests"
+# unit-test scratch directories live in a dedicated subdirectory of the safe
+# root ($TMPDIR).
+_SAFE_TEST_TMP = LOOP.TEMP_ROOT / "perf-loop-unit-tests"
 _SAFE_TEST_TMP.mkdir(parents=True, exist_ok=True)
 os.environ["TMPDIR"] = str(_SAFE_TEST_TMP)
 os.environ["TMP"] = str(_SAFE_TEST_TMP)
@@ -83,7 +83,7 @@ class PerfLoopTest(unittest.TestCase):
             LOOP.safe_output_dir(outside)
         with self.assertRaises(ValueError):
             LOOP.safe_build_dir(outside, outside, "release")
-        string_output = LOOP.SAFE_TEMP_ROOT / f"perf-string-output-{os.getpid()}"
+        string_output = LOOP.TEMP_ROOT / f"perf-string-output-{os.getpid()}"
         try:
             self.assertEqual(
                 LOOP.safe_output_dir(str(string_output)),
@@ -240,7 +240,7 @@ class PerfLoopTest(unittest.TestCase):
             source = self.make_workspace(source_root, "netem_test")
             for component in LOOP.COMPONENTS:
                 (source_root / component).mkdir(parents=True, exist_ok=True)
-            output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-test-{os.getpid()}"
+            output = LOOP.TEMP_ROOT / f"perf-snapshot-test-{os.getpid()}"
             snapshot_calls = []
 
             def fake_snapshot(component_source, component_output, revision):
@@ -292,7 +292,7 @@ class PerfLoopTest(unittest.TestCase):
                     ([("missing", "a" * 40)], "unknown component revision"),
                 )
             ):
-                reject_output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-reject-{os.getpid()}-{index}"
+                reject_output = LOOP.TEMP_ROOT / f"perf-snapshot-reject-{os.getpid()}-{index}"
                 try:
                     with self.assertRaisesRegex(ValueError, message):
                         LOOP.command_snapshot(
@@ -368,7 +368,7 @@ class PerfLoopTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
             root = Path(directory)
             source = self.snapshot_under_test_fixture(root, "netem_test_change")
-            output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-under-test-{os.getpid()}"
+            output = LOOP.TEMP_ROOT / f"perf-snapshot-under-test-{os.getpid()}"
             snapshot_calls = {}
 
             def fake_snapshot(component_source, component_output, revision):
@@ -699,7 +699,7 @@ class PerfLoopTest(unittest.TestCase):
             source = self.make_workspace(root / "source", "netem_test")
             for component in LOOP.COMPONENTS:
                 (root / "source" / component).mkdir(parents=True, exist_ok=True)
-            output = LOOP.SAFE_TEMP_ROOT / f"perf-snapshot-rewrite-{os.getpid()}"
+            output = LOOP.TEMP_ROOT / f"perf-snapshot-rewrite-{os.getpid()}"
             fixture = self.frozen_suite_fixture(Path(directory) / "fixture")
 
             def fake_snapshot(component_source, component_output, revision):
@@ -1143,8 +1143,8 @@ class PerfLoopTest(unittest.TestCase):
             self.assertEqual(env["NETEM_PERF_REVISION"], "abc123")
             self.assertEqual(env["NETEM_PERF_TRACE_RTP"], "1")
             # Safe temp and target dirs beneath $TMPDIR.
-            self.assertTrue(str(env["TMPDIR"]).startswith(str(LOOP.SAFE_TEMP_ROOT)))
-            self.assertTrue(str(env["CARGO_TARGET_DIR"]).startswith(str(LOOP.SAFE_TEMP_ROOT)))
+            self.assertTrue(str(env["TMPDIR"]).startswith(str(LOOP.TEMP_ROOT)))
+            self.assertTrue(str(env["CARGO_TARGET_DIR"]).startswith(str(LOOP.TEMP_ROOT)))
             # The frozen executable is invoked directly: the command begins
             # with its resolved path, selects the scenario's probe test, and
             # contains no cargo.
@@ -1239,7 +1239,7 @@ class PerfLoopTest(unittest.TestCase):
             self.assertNotIn("--ignored", command)
             self.assertNotIn("--nocapture", command)
             self.assertTrue(
-                calls[0]["env"]["CARGO_TARGET_DIR"].startswith(str(LOOP.SAFE_TEMP_ROOT))
+                calls[0]["env"]["CARGO_TARGET_DIR"].startswith(str(LOOP.TEMP_ROOT))
             )
             # Inherited compiler wrappers and flags cannot alter the frozen
             # bytes: RUSTC_WRAPPER and RUSTFLAGS are cleared beside the two
@@ -2678,7 +2678,7 @@ class PerfLoopTest(unittest.TestCase):
             self.assertIn("counterbalanced_goodput_analysis", updated)
 
     def test_analyze_existing_result_rejects_paths_outside_safe_root(self):
-        outside = LOOP.SAFE_TEMP_ROOT.parent.parent / "perf-outside-safe-root-test"
+        outside = LOOP.TEMP_ROOT.parent.parent / "perf-outside-safe-root-test"
         with self.assertRaisesRegex(ValueError, "beneath"):
             LOOP.checked_result_dir(str(outside))
 
@@ -2946,7 +2946,7 @@ class PerfLoopTest(unittest.TestCase):
         comparison.json into the output; reusing an existing directory would
         mix a previous run's artifacts into the new evidence.
         """
-        existing = LOOP.SAFE_TEMP_ROOT / f"perf-output-exists-{os.getpid()}"
+        existing = LOOP.TEMP_ROOT / f"perf-output-exists-{os.getpid()}"
         created = LOOP.safe_output_dir(str(existing))
         try:
             with self.assertRaises(FileExistsError):
@@ -2962,11 +2962,11 @@ class PerfLoopTest(unittest.TestCase):
         distinct rule; neither guard may be the only reason the other is not
         reached.
         """
-        inside_root = LOOP.SAFE_TEMP_ROOT / f"perf-build-wrong-name-{os.getpid()}"
+        inside_root = LOOP.TEMP_ROOT / f"perf-build-wrong-name-{os.getpid()}"
         try:
             with self.assertRaisesRegex(ValueError, "final 'target'"):
                 LOOP.safe_build_dir(
-                    str(inside_root / "not-target"), LOOP.SAFE_TEMP_ROOT, "release"
+                    str(inside_root / "not-target"), LOOP.TEMP_ROOT, "release"
                 )
         finally:
             shutil.rmtree(inside_root, ignore_errors=True)
@@ -2974,7 +2974,7 @@ class PerfLoopTest(unittest.TestCase):
         try:
             with self.assertRaisesRegex(ValueError, "beneath"):
                 LOOP.safe_build_dir(
-                    str(outside_root / "target"), LOOP.SAFE_TEMP_ROOT, "release"
+                    str(outside_root / "target"), LOOP.TEMP_ROOT, "release"
                 )
         finally:
             shutil.rmtree(outside_root, ignore_errors=True)

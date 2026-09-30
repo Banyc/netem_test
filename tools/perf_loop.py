@@ -21,10 +21,11 @@ import statistics
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
-SAFE_TEMP_ROOT = Path.home() / "code" / "tmp"
+TEMP_ROOT = Path(tempfile.gettempdir()).resolve()
 DEFAULT_SEEDS = (11, 21)
 DEFAULT_WARMUP_SECONDS = 5.0
 MATERIAL_PHASE_DRIFT_PERCENT = 20.0
@@ -178,7 +179,7 @@ def parse_component_revision(value):
 
 
 def safe_output_dir(requested=None):
-    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    safe_root = TEMP_ROOT.expanduser().resolve()
     safe_root.mkdir(parents=True, exist_ok=True)
     if requested is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -216,7 +217,7 @@ def probe_component_workspace(workspace):
 
 
 def safe_build_dir(requested, workspace, profile):
-    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    safe_root = TEMP_ROOT.expanduser().resolve()
     safe_root.mkdir(parents=True, exist_ok=True)
     requested = requested if requested is not None else safe_root / "net-perf-targets" / f"{hashlib.sha256(str(workspace).encode()).hexdigest()[:16]}-{profile}" / "target"
     resolved = Path(requested).expanduser().resolve()
@@ -227,7 +228,7 @@ def safe_build_dir(requested, workspace, profile):
 
 
 def safe_temp_dir(role, seed):
-    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    safe_root = TEMP_ROOT.expanduser().resolve()
     safe_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     resolved = (safe_root / f"net-perf-tmp-{stamp}-{os.getpid()}-{role}-{seed}").resolve()
@@ -1380,7 +1381,7 @@ def preserve_built_probe(executable, destination=None):
     digest = executable_sha256(executable)
     destination_given = destination is not None
     destination = executable.parent if destination is None else Path(destination).expanduser().resolve()
-    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    safe_root = TEMP_ROOT.expanduser().resolve()
     (_ for _ in ()).throw(ValueError(f"frozen probe destination must remain beneath {safe_root}")) if destination_given and not Path(destination).is_relative_to(safe_root) else None
     Path(destination).mkdir(parents=True, exist_ok=True)
     preserved = Path(destination) / f"{executable.name}.perf-loop-{digest}"
@@ -1402,7 +1403,7 @@ def prune_built_role_target(target_dir, frozen_executable):
     """
     target = Path(target_dir).expanduser().resolve()
     frozen = Path(frozen_executable).expanduser().resolve()
-    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    safe_root = TEMP_ROOT.expanduser().resolve()
     (_ for _ in ()).throw(ValueError(f"role target must remain beneath {safe_root}")) if not target.is_relative_to(safe_root) else None
     (_ for _ in ()).throw(ValueError("role target must use a final 'target' path component")) if target.name != "target" else None
     (_ for _ in ()).throw(ValueError(f"cannot prune the role target while the frozen perf_probe lives inside it: {frozen}")) if frozen.is_relative_to(target) else None
@@ -1871,7 +1872,7 @@ def paired_result_analysis(comparison, runs, *, same_binary_control=False):
 def checked_result_dir(result_dir):
     """Validate a preserved result directory and return it resolved."""
     result_dir = Path(result_dir).expanduser().resolve()
-    safe_root = SAFE_TEMP_ROOT.expanduser().resolve()
+    safe_root = TEMP_ROOT.expanduser().resolve()
     (_ for _ in ()).throw(ValueError(f"result directory must remain beneath {safe_root}")) if not result_dir.is_relative_to(safe_root) else None
     (_ for _ in ()).throw(ValueError(f"result directory is missing: {result_dir}")) if not result_dir.is_dir() else None
     return result_dir
